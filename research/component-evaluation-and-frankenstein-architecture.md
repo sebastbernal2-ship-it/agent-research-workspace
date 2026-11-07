@@ -83,7 +83,9 @@ The adapters should be replaceable. The project/task DB and event log should not
 
 ## Comparative pilot plan
 
-Run **the same bounded non-coding research scenario** on Meldwork and AgenticX separately, then a narrow adapter/fusion spike only if each passes relevant gates. Use public upstream documentation, a synthetic project charter, no private profile data, no shell/code execution, no external side effects, and fixed source/time/cost limits. See [`first-research-pilot.md`](../pilots/first-research-pilot.md).
+Run **the same bounded non-coding research scenario** on Meldwork, AgenticX Studio, and AG2 separately, then a narrow adapter/fusion spike only if the relevant components pass. Use public upstream documentation, a synthetic project charter, no private profile data, no shell/code execution, no external side effects, and fixed source/time/cost limits. See [`first-research-pilot.md`](../pilots/first-research-pilot.md).
+
+**Current status:** AgenticX has an isolated install, mock executor run, 22 collaboration-intelligence tests, 83 newer Studio group-path tests, selected in-process API auth checks, and source-level review; no server socket or real model was used. AG2 v1.0.0 has an isolated install, 481 Network tests, and a scripted three-agent WAL exchange; no model was used. Detailed evidence is in the two spike READMEs. Meldwork has not been installed/run; Linux compatibility remains untested.
 
 ### Track A — Meldwork collaboration evaluation
 
@@ -93,13 +95,9 @@ Run **the same bounded non-coding research scenario** on Meldwork and AgenticX s
 - Test gate/inbox behavior and trace export. Mark separate web inbox and remote workers `NOT SUPPORTED` if absent.
 - Evaluate whether its collaboration domain can be extracted via stable API/record schema without coupling to Electron/local JSON.
 
-### Track B — AgenticX runtime/platform evaluation
+### Track B — AgenticX runtime/platform evaluation (partial spike completed)
 
-- Review pinned release, package lock, dependency notices and `SafetyLayer`/Studio authorization code before install. Do not use `.[all]`; test minimal runtime in isolated environment.
-- Run core/Studio server; verify non-coding role hierarchy, group discussion and event observability.
-- Test a user decision interruption, process restart, persistence/export, API auth, and sandbox deny cases.
-- Test single remote-server support only on controlled hosts. Record cluster/HA as not delivered until proven.
-- Verify which Enterprise UI calls which runtime APIs; do not assume their README diagrams are integrated.
+See [`../spikes/agenticx-runtime/README.md`](../spikes/agenticx-runtime/README.md). Install/import, mock execution, targeted tests, limited API auth checks, and group-router source review are recorded there. Still outstanding before any adoption: full route/auth audit, secured server and restart/persistence exercise, user-question pause/resume, model-backed non-coding pilot, and remote deployment checks. Do not use `.[all]`; keep any continuation in the isolated environment.
 
 ### Track C — role-specific alternatives
 
@@ -135,7 +133,7 @@ Score PASS/FAIL/NOT TESTED with evidence. Critical gates cannot be averaged away
 - If one fails, seek a better role-specific component; retain neither just because the prior search selected it.
 - If both fail critical gates, build the collaboration/control plane from our contracts and choose only underlying frameworks/services whose operations and licensing are acceptable.
 
-The next execution is Track B source-level safety/API validation, then Track A only if a compatible Mac is available. Actual installs and model calls should wait for explicit environment/provider setup. HiperGator remains outside scope pending UF Research Computing approval.
+**Next:** If an approved provider/model and budget are configured, run the bounded synthetic non-coding pilot on AG2 and AgenticX separately, measuring actual discussion quality and evidence use. Otherwise, continue only offline tests. Run Meldwork only when a compatible Apple Silicon Mac is available (or budget a source-build/port spike). Do not compose runtimes yet; the AG2↔AgenticX bridge needs its own contract test. HiperGator remains outside scope pending UF Research Computing approval.
 
 ## Sources
 

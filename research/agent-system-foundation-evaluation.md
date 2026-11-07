@@ -1,7 +1,7 @@
 # Agent-system foundations for a project-first collaborative AI workspace
 
 **As of:** 2026-11-07 (upstream repository metadata and documentation reviewed)  
-**Scope:** bounded desk research for a non-coding research pilot. No software was installed or deployed.
+**Scope:** Initial bounded desk research for a non-coding research pilot; subsequent isolated component installs/tests are linked below. No system was deployed or run with real model/provider credentials.
 
 ## Executive recommendation
 
@@ -58,7 +58,7 @@ These are upstream documentation/repository claims, not independently verified r
 
 The detailed protocol, role cards, safety gates, collaboration trace, inbox scenario, scorecard, and run-record template are in [`pilots/first-research-pilot.md`](../pilots/first-research-pilot.md).
 
-**Candidate order:** Meldwork first because agent-to-agent collaboration is the highest-risk requirement; AgenticX is the breadth comparison. This is a pilot order, not a foundation decision. **Execution has not started:** Meldwork's published preview requires Apple Silicon macOS, while the current research environment is Linux; no candidate has been installed. Provider configuration and any use of non-public project context require explicit user setup/approval. Do not import the user's private profile into an unverified system.
+**Candidate order:** Meldwork remains first for a real-model collaboration pilot because agent-to-agent interaction is the highest-risk requirement; AgenticX is the breadth comparison, and AG2 is now a promising message-network component. The AgenticX and AG2 offline component spikes are not the non-coding research pilot and do not decide the foundation. Meldwork's published preview requires Apple Silicon macOS, while the current research environment is Linux. Provider configuration and any use of non-public project context require explicit user setup/approval. Do not import the user's private profile into an unverified system.
 
 
 ### Pilot choice and execution status
