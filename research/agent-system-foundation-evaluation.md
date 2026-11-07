@@ -9,6 +9,10 @@ No single open-source project reviewed here provides the entire vision. Do not a
 
 Treat Meldwork, AgenticX, and Orkas as product and UX references, not as vetted foundations. OpenClaw is primarily an assistant/gateway and tool ecosystem, not a project hierarchy or durable-work system. For HiperGator, define a worker adapter, but do not deploy until UF Research Computing policy and constraints are checked. No source reviewed establishes HiperGator suitability or authorization.
 
+### Local-harness update (2026-11-07)
+
+The repo now contains a local, deterministic reference implementation for canonical project/work events, replay, question pause/resume/closure, scoped capability-grant records, and separate AG2/Meldwork/AgenticX adapters. An offline V4+AgenticX integration and AG2 WAL recovery tests pass. This increases implementation evidence about adapter plumbing only; no real model, provider credentials, Electron app, private user data, or HiperGator was used. See [ADR-0001](../decisions/ADR-0001-canonical-control-plane-and-adapters.md), [the harness](../harness/README.md), and [the threat model](../security/THREAT_MODEL.md).
+
 ## Vision translated into system requirements
 
 | Requirement | Required system behavior |

@@ -1,6 +1,6 @@
 # Component evaluation and the “Frankenstein harness” architecture
 
-**Status:** Initial research proposal, updated by isolated spikes. AgenticX 0.6.5 and AG2 1.0.0 were installed/tested separately; Meldwork V1.0.9 source and selected Node suites were tested on Linux. No real model calls or product integration. See the [AgenticX](../spikes/agenticx-runtime/README.md), [AG2](../spikes/ag2-collaboration/README.md), and [Meldwork](../spikes/meldwork-review/README.md) spike reports.
+**Status:** Initial research proposal, updated by isolated spikes and a local adapter prototype. AgenticX 0.6.5 and AG2 1.0.0 were installed/tested separately; Meldwork V1.0.9 source and selected Node suites were tested on Linux. Local AG2, AgenticX subprocess, and Meldwork Node V4 paths now connect to a synthetic canonical store in deterministic tests; no product deployment or real model calls. See the [AgenticX](../spikes/agenticx-runtime/README.md), [AG2](../spikes/ag2-collaboration/README.md), [Meldwork](../spikes/meldwork-review/README.md), and [harness](../harness/README.md) reports.
 
 **Purpose:** Evaluate Meldwork and AgenticX in distinct roles, compare better candidates for specific layers, and define how to integrate only what passes.
 
@@ -30,7 +30,7 @@ These are frameworks or task-workforce projects, not replacements for the whole 
 - **[CAMEL-AI OWL](https://github.com/camel-ai/owl)** and [CAMEL](https://github.com/camel-ai/camel) (Apache-2.0; active): describe general multi-agent workforce automation, dynamic interactions, a Web UI and non-coding examples. Useful **workforce/task-completion comparison**. The repository is a framework/demo with benchmark claims, not demonstrated persistent project governance, VP identity, separate user inbox, or multi-machine durable scheduling.
 - **[Letta Code](https://github.com/letta-ai/letta-code)** is more interesting for the VP-memory subproblem than the previous summary implied: its README describes stateful agent identity/memory, subagents, and Git-tracked memory (MemFS), with optional sync/remote execution. Still treat this as an **agent identity/memory implementation candidate**, not canonical user/project truth; evaluate privacy, self-editing memory governance, portability, and coding-centric assumptions.
 
-The practical comparison is therefore: **Meldwork for human-readable multi-agent discussion and gates; AG2 for agent-network/message mechanics; AgenticX for broad runtime/platform scope; CrewAI or LangGraph for workflow logic; Letta for persistent agent memory.** These remain role hypotheses, not integration findings. AgenticX and AG2 have isolated Linux smoke/test evidence, but neither has been run with a real model or combined with another component. Meldwork, CrewAI, LangGraph and Letta remain source-level candidates only.
+The practical comparison is therefore: **Meldwork for human-readable multi-agent discussion and gates; AG2 for agent-network/message mechanics; AgenticX for broad runtime/platform scope; CrewAI or LangGraph for workflow logic; Letta for persistent agent memory.** These remain role hypotheses, not production adoption findings. Local adapter composition now has deterministic Linux evidence, but no real model quality, user-facing product, secure service, or remote worker has been tested. CrewAI, LangGraph and Letta remain source-level candidates only.
 
 ## Distinct roles: Meldwork and AgenticX
 
@@ -134,7 +134,7 @@ Score PASS/FAIL/NOT TESTED with evidence. Critical gates cannot be averaged away
 - If one fails, seek a better role-specific component; retain neither just because the prior search selected it.
 - If both fail critical gates, build the collaboration/control plane from our contracts and choose only underlying frameworks/services whose operations and licensing are acceptable.
 
-**Next:** If an approved provider/model and budget are configured, run the bounded synthetic non-coding pilot on AG2 and AgenticX separately, measuring actual discussion quality and evidence use. Otherwise, continue only offline tests. Run Meldwork only when a compatible Apple Silicon Mac is available (or budget a source-build/port spike). Do not compose runtimes yet; the AG2↔AgenticX bridge needs its own contract test. HiperGator remains outside scope pending UF Research Computing approval.
+**Next:** Continue offline work on migration, authenticated capability enforcement, failure recovery, and the separate inbox/API contract. The narrow AG2/AgenticX/Meldwork adapter paths now have their own contract tests; keep candidate databases and source trees separate and do not treat the prototype as product integration. Real-model comparison remains future optional work requiring explicit provider/model/spend approval; Meldwork's Electron/macOS gate remains separate. HiperGator remains out of scope pending official UF Research Computing review and authorization.
 
 ## Sources
 

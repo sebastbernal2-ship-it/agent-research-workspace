@@ -76,4 +76,8 @@ cd upstream
 
 AG2 may be the strongest current candidate for the **collaboration transport/protocol**. Keep the product control plane authoritative and expose work/project/decision identities in a versioned envelope contract. Initially use AG2 `AgentClient` agents end-to-end. Only after that is stable should we test an AgenticX-to-AG2 bridge; wrapping AgenticX now would combine two runtimes before either's product role is proven. If the whole team eventually uses AG2 agents, this avoids the bridge and treats AgenticX as a set of optional worker capabilities instead.
 
-**Decision:** advance AG2 to a controlled non-coding, real-model pilot after a provider is explicitly configured. Do not integrate either runtime into the product yet. Compare AG2's real-model discussion quality against AgenticX Studio's Workforce path with the same prompt, evidence corpus, budget, and rubric.
+**Decision:** continue AG2 as the message-transport candidate behind a local canonical adapter. Do not make it the project database or product security boundary. A real-model non-coding pilot is future optional work requiring explicit provider/model/spend approval; it does not block the current offline harness.
+
+## Harness follow-up (2026-11-07)
+
+A separate adapter now mirrors accepted AG2 discussion envelopes into canonical project/work events. Tests run the pinned in-process round-robin Hub, AgenticX mock-worker challenge/revision, persistent DiskKnowledgeStore WAL restart/replay, idempotency, and canonical history after deleting AG2 state. A combined test also routes a synthetic Meldwork V4 verification receipt into the same project stream. These validate protocol/storage convergence only; no remote Hub, network auth deployment, provider, or model reasoning was tested. Upstream HubListener callbacks swallow errors, so the adapter exposes degradation and WAL replay remains the recovery path; a production outbox/reconciliation boundary is still open.

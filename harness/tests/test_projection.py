@@ -1,11 +1,13 @@
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from harness.event_store import SQLiteEventStore
-from harness.projection import Projector
+from harness.control_plane import ProjectControlPlane
+from harness.event_store import IntegrityFailure, SQLiteEventStore
+from harness.projection import Projector, ProjectionError
 
 
 NOW = "2026-04-16T12:00:00Z"
@@ -145,6 +147,7 @@ class ProjectorTests(unittest.TestCase):
             "projectId": "project.alpha",
             "questionId": "question.scope",
             "questionType": "clarification",
+            "priority": "normal",
             "blocking": True,
             "requestedBy": VP,
             "workIds": [primary["workId"]],
@@ -159,6 +162,7 @@ class ProjectorTests(unittest.TestCase):
         self.event("human.question_opened", {
             "questionId": question["questionId"],
             "questionType": question["questionType"],
+            "priority": question["priority"],
             "blocking": True,
             "workIds": question["workIds"],
             "questionRef": question["questionId"],
@@ -190,6 +194,145 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(rebuilt["questions"]["question.scope"]["status"], "answered")
         self.assertEqual(rebuilt["messages"][0]["content"], "A sourced proposal.")
         self.assertEqual(len(rebuilt["messages"]), 1)
+
+    def test_replay_detects_artifact_content_tampering(self):
+        self.create_project()
+        work = self.create_work("work.artifact", "Review stored artifact")
+        content = b"synthetic artifact body"
+        storage_ref, digest = self.store.put_blob(content)
+        artifact = {
+            "recordType": "artifact", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "artifactId": "artifact.synthetic",
+            "workId": work["workId"], "name": "synthetic.txt", "mediaType": "text/plain",
+            "sha256": digest, "byteSize": len(content), "storageRef": storage_ref,
+            "createdBy": VP, "createdAt": NOW, "reviewStatus": "unreviewed",
+        }
+        record_hash = self.store.put_record(artifact)
+        self.event("artifact.registered", {
+            "artifactId": artifact["artifactId"], "workId": work["workId"],
+            "sha256": digest, "recordHash": record_hash,
+        }, actor=VP)
+        self.assertIn("artifact.synthetic", Projector(self.store).replay("project.alpha")["artifacts"])
+
+        conn = sqlite3.connect(self.store.path)
+        conn.execute("DROP TRIGGER canonical_blobs_no_update")
+        conn.execute("UPDATE canonical_blobs SET content=? WHERE content_hash=?", (b"tampered", digest))
+        conn.commit()
+        conn.close()
+        with self.assertRaisesRegex(IntegrityFailure, "blob hash mismatch"):
+            Projector(self.store).replay("project.alpha")
+
+    def test_replay_rejects_forged_terminal_work_resurrection(self):
+        self.create_project()
+        work = self.create_work("work.terminal", "Terminal work")
+        control = ProjectControlPlane(self.store)
+        control.transition_work("project.alpha", work["workId"], "running", actor=VP)
+        completed = control.transition_work("project.alpha", work["workId"], "completed", actor=VP)
+        resurrected = dict(completed)
+        resurrected.update({
+            "revision": completed["revision"] + 1,
+            "status": "running",
+            "updatedAt": "2026-04-16T12:03:00Z",
+        })
+        record_hash = self.store.put_record(resurrected)
+        self.event("work.status_changed", {
+            "workId": work["workId"], "from": "completed", "to": "running",
+            "recordHash": record_hash,
+        }, actor=VP)
+        with self.assertRaisesRegex(ProjectionError, "forbidden work status transition"):
+            Projector(self.store).replay("project.alpha")
+
+    def test_replay_rejects_forged_work_revision_inside_live_question_closure(self):
+        self.create_project()
+        work = self.create_work("work.paused", "Research while gated")
+        question = {
+            "recordType": "human_question", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "questionId": "question.freeze",
+            "questionType": "clarification", "priority": "normal", "blocking": True,
+            "requestedBy": VP, "workIds": [work["workId"]], "runId": None,
+            "questionText": "Clarify the scope?", "impact": "It changes the work.",
+            "options": [], "status": "open", "createdAt": NOW,
+        }
+        ProjectControlPlane(self.store).open_question(question)
+        paused_work = Projector(self.store).replay("project.alpha")["workItems"][work["workId"]]
+        changed = dict(paused_work)
+        changed.update({
+            "revision": paused_work["revision"] + 1,
+            "objective": "Altered while blocked.",
+            "updatedAt": "2026-04-16T12:02:00Z",
+        })
+        record_hash = self.store.put_record(changed)
+        self.event("work.revised", {
+            "workId": work["workId"], "fromRevision": paused_work["revision"],
+            "toRevision": changed["revision"], "recordHash": record_hash,
+        }, actor=VP)
+        with self.assertRaisesRegex(ProjectionError, "live blocking question dependency closure"):
+            Projector(self.store).replay("project.alpha")
+
+    def test_replay_preserves_failed_runs_and_conflicting_evidence(self):
+        self.create_project()
+        work = self.create_work("work.conflicts", "Compare evidence")
+        run = {
+            "recordType": "agent_run",
+            "schemaVersion": "0.1",
+            "projectId": "project.alpha",
+            "runId": "run.failed",
+            "workId": work["workId"],
+            "agent": {"actorType": "agent", "actorId": "agent.researcher", "role": "specialist"},
+            "adapter": {"name": "test-adapter", "version": "1"},
+            "status": "running",
+            "contextHash": "a" * 64,
+            "capabilityGrantIds": [],
+            "startedAt": NOW,
+        }
+        run_hash = self.store.put_record(run)
+        self.event("run.started", {
+            "runId": run["runId"], "workId": work["workId"],
+            "adapter": run["adapter"], "contextHash": run["contextHash"],
+            "capabilityGrantIds": [], "recordHash": run_hash,
+        }, actor=run["agent"])
+        failed_run = {**run, "status": "failed", "finishedAt": "2026-04-16T12:01:00Z"}
+        failed_hash = self.store.put_record(failed_run)
+        self.event("run.finished", {
+            "runId": run["runId"], "terminalStatus": "failed", "recordHash": failed_hash,
+        }, actor=run["agent"])
+
+        source_hashes = ["b" * 64, "c" * 64]
+        stances = ["supports", "contradicts"]
+        for index, (source_hash, stance) in enumerate(zip(source_hashes, stances), start=1):
+            evidence = {
+                "recordType": "evidence",
+                "schemaVersion": "0.1",
+                "projectId": "project.alpha",
+                "evidenceId": f"evidence.claim.{index}",
+                "workId": work["workId"],
+                "claimText": "The synthetic claim is true.",
+                "stance": stance,
+                "source": {
+                    "uri": f"https://example.test/source-{index}",
+                    "title": f"Synthetic source {index}",
+                    "retrievedAt": NOW,
+                    "contentHash": source_hash,
+                },
+                "createdBy": run["agent"],
+                "createdAt": NOW,
+                "reviewStatus": "unreviewed",
+            }
+            evidence_hash = self.store.put_record(evidence)
+            self.event("evidence.registered", {
+                "evidenceId": evidence["evidenceId"],
+                "workId": work["workId"],
+                "stance": stance,
+                "sourceHash": source_hash,
+                "recordHash": evidence_hash,
+            }, actor=run["agent"])
+
+        state = Projector(self.store).replay("project.alpha")
+        self.assertEqual(state["agentRuns"]["run.failed"]["status"], "failed")
+        self.assertEqual(
+            {item["stance"] for item in state["evidence"].values()},
+            {"supports", "contradicts"},
+        )
 
     def test_replay_rejects_payload_snapshot_mismatch(self):
         project = project_record()

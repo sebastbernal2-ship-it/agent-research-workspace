@@ -14,7 +14,8 @@ This folder starts issue [#2](https://github.com/sebastbernal2-ship-it/agent-res
 `contracts/v0.1/schema.json` defines:
 
 - revisioned project charter (goals, non-goals, acceptance criteria);
-- hierarchical work item with owner role, dependencies, capability-grant references, budgets and acceptance criteria;
+- hierarchical work item with owner role, dependencies, scoped capability-grant references, budgets and acceptance criteria;
+- explicit capability grant snapshots scoped to project/work, agent, capability, opaque resource IDs, approver and expiry, with immutable revocation events;
 - agent run with adapter/version, context hash, grants, status and usage;
 - separate blocking/nonblocking human question and answer record;
 - immutable artifact metadata and claim-linked evidence record;
@@ -27,10 +28,12 @@ python3 -m pip install -r contracts/requirements-test.txt
 python3 -m unittest discover -s contracts/tests -v
 ```
 
+Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet.
+
 ## Explicitly incomplete
 
 - A SQLite reference store and deterministic projector now enforce event ordering/idempotency, snapshot hashes, selected cross-record references, replay, restart/export, and ordinary append-only behavior. This is still a single-host prototype, not a production transactional service.
-- Capability authorization, schema migrations, retention/deletion, multi-process stress/race behavior, crash-consistency fault injection, and broader transition/dependency-graph rules are not yet implemented or fully tested.
+- A local capability-authority prototype enforces exact project/work/agent/action/resource and expiry scope, plus user-actor grant/revocation and replay tests. It is not an authenticated identity service, is not wired to actual tools/adapters, and is not an OS sandbox or security approval. Schema migrations, retention/deletion, multi-process stress/race behavior, crash-consistency fault injection, and broader dependency-graph rules remain open.
 - `eventPayload` is a closed v0.1 union; schema changes require a new compatible version/migration decision, not adding arbitrary fields.
 - The user-alignment ledger is a separate workstream (#10); no personal profile fields are included here.
 - The question record and reference projector establish separate durable question state and a synthetic pause/answer/resume trace, but not UI, notification, expiry policy, or production scheduler pause/resume.

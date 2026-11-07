@@ -71,6 +71,7 @@ def valid_records():
             "projectId": "project.alpha",
             "questionId": "question.scope",
             "questionType": "clarification",
+            "priority": "normal",
             "blocking": True,
             "requestedBy": ACTOR,
             "workIds": ["work.research"],
@@ -87,6 +88,7 @@ def valid_records():
             "projectId": "project.alpha",
             "questionId": "question.answered",
             "questionType": "approval",
+            "priority": "high",
             "blocking": True,
             "requestedBy": ACTOR,
             "workIds": ["work.research"],
@@ -118,6 +120,21 @@ def valid_records():
             "runId": "run.first",
             "createdAt": NOW,
             "reviewStatus": "unreviewed",
+        },
+        {
+            "recordType": "capability_grant",
+            "schemaVersion": "0.1",
+            "projectId": "project.alpha",
+            "grantId": "grant.research.read",
+            "revision": 1,
+            "subject": ACTOR,
+            "workIds": ["work.research"],
+            "capability": "filesystem.read",
+            "resourceIds": ["resource.public-corpus"],
+            "grantedBy": {"actorType": "human", "actorId": "user.owner", "role": "user"},
+            "createdAt": NOW,
+            "expiresAt": "2026-04-17T12:00:00Z",
+            "status": "active",
         },
         {
             "recordType": "evidence",
@@ -183,6 +200,36 @@ class ContractSchemaTests(unittest.TestCase):
         event = valid_records()[-1]
         event["eventType"] = "work.status_changed"
         self.assertTrue(list(VALIDATOR.iter_errors(event)))
+
+    def test_question_terminal_states_require_actor_time_and_reason(self):
+        cancelled = valid_records()[3]
+        cancelled.update({
+            "status": "cancelled",
+            "closedBy": {"actorType": "human", "actorId": "user.owner", "role": "user"},
+            "closedAt": NOW,
+            "resolutionReason": "The user withdrew the question.",
+        })
+        self.assertEqual([], list(VALIDATOR.iter_errors(cancelled)))
+        cancelled.pop("closedBy")
+        self.assertTrue(list(VALIDATOR.iter_errors(cancelled)))
+
+    def test_capability_grants_are_scoped_and_revocation_is_attributed(self):
+        grant = valid_records()[6]
+        grant["resourceIds"] = ["*"]
+        self.assertTrue(list(VALIDATOR.iter_errors(grant)))
+
+        grant = valid_records()[6]
+        revoked = {
+            **grant,
+            "revision": 2,
+            "status": "revoked",
+            "revokedBy": {"actorType": "human", "actorId": "user.owner", "role": "user"},
+            "revokedAt": NOW,
+            "revokeReason": "Scope no longer required.",
+        }
+        self.assertEqual([], list(VALIDATOR.iter_errors(revoked)))
+        revoked.pop("revokeReason")
+        self.assertTrue(list(VALIDATOR.iter_errors(revoked)))
 
     def test_hashes_and_actor_roles_are_constrained(self):
         artifact = valid_records()[5]

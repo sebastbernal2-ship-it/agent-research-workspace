@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,13 @@ class SQLiteEventStoreTests(unittest.TestCase):
             self.store.append(changed)
 
     def test_sequence_is_contiguous_and_project_scoped(self):
+        reordered = initial_events()
+        reordered[0]["sequence"] = 2
+        reordered[1]["sequence"] = 1
+        with self.assertRaises(SequenceConflict):
+            self.store.append_many(reordered)
+        self.assertEqual(self.store.events("project.alpha"), [])
+
         events = initial_events()
         self.store.append(events[0])
         with self.assertRaises(SequenceConflict):
@@ -143,6 +151,29 @@ class SQLiteEventStoreTests(unittest.TestCase):
         exported = [json.loads(line) for line in restarted.export_jsonl("project.alpha").splitlines()]
         self.assertEqual([row["event"] for row in exported], events)
         self.assertTrue(all(len(row["recordHash"]) == 64 for row in exported))
+
+    def test_concurrent_appends_assign_unique_contiguous_sequences(self):
+        self.store.append(initial_events()[0])
+        events = [
+            make_event(
+                f"event.concurrent.{index}",
+                f"idem.concurrent.{index}",
+                "work.created",
+                {
+                    "workId": f"work.concurrent.{index}",
+                    "title": f"Concurrent {index}",
+                    "objective": "Synthetic sequence stress test.",
+                    "owner": AGENT,
+                    "recordHash": HASH,
+                },
+            )
+            for index in range(20)
+        ]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(self.store.append, events))
+        self.assertEqual(sorted(result.sequence for result in results), list(range(2, 22)))
+        self.assertEqual([event["sequence"] for event in self.store.events("project.alpha")], list(range(1, 22)))
+        self.assertTrue(self.store.verify("project.alpha"))
 
     def test_rows_are_append_only_and_hash_chain_detects_bypassed_trigger(self):
         self.store.append(initial_events()[0])

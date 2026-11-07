@@ -17,8 +17,10 @@ AG2 owns message transport/turn order; AgenticX executes one bounded worker task
 ## What currently works (offline, deterministic)
 
 - SQLite event append validates the v0.1 JSON Schema, assigns per-project sequence in a transaction, enforces event/idempotency uniqueness, rejects ordinary update/delete, stores content-addressed blobs and immutable record snapshots, supports atomic multi-event commits, hash-chains events, verifies/reopens, and exports JSONL.
-- The local control plane creates project/work state, enforces a bounded work-status graph, keeps human questions outside discussion threads, pauses only the explicitly affected work, and commits a user's answer plus exact resume set atomically.
-- A deterministic reference projector reconstructs project/work/message/run/question/artifact/evidence records from events and snapshots; tests cover restart/replay, independent work staying runnable while a blocking question pauses its dependency, user-only answers, and idempotent exact-work resume.
+- The local control plane creates and revises projects/work through immutable snapshots, checks parent/dependency references and rejects cycles, and freezes the dependency closure of work under an open blocking question. It keeps human questions outside discussion threads, pauses only the explicit affected IDs, and commits a user's answer plus exact resume set atomically. Rejected/cancelled/expired questions leave blocking work `blocked`; supersession carries the exact pause set.
+- A small capability authority atomically records explicit user-actor grants and work references, revocation, expiry (maximum seven-day prototype TTL), and exact project/work/agent/action/opaque-resource checks. Tests deny cross-project, wrong-subject, wrong-action/resource, expired, revoked, forged-event and non-runnable-work access. This prototype is not authenticated identity or effect enforcement.
+- A separate synthetic alignment-memory contract/evaluator covers provenance, scope, user confirmation, expiry, corrections, and conflicting confirmed constraints. It can flag a conflict and request clarification, but it does not authorize actions, rewrite project truth, or import private user data.
+- A deterministic reference projector reconstructs project/work/run/question/capability/artifact/evidence/message state. Tests cover restart/export, failed runs, contradictory evidence preservation, artifact-content tampering, forged transitions, dependency cycles/closures, and append contention.
 - AG2's real in-process round-robin Hub accepts proposal → AgenticX critique → revision. The AgenticX task runs in a separate process using the pinned AgenticX venv, temporary HOME/cwd, restricted environment, no tools, and an injected deterministic provider response.
 - AG2's durable DiskKnowledgeStore WAL can be reopened; a new mirror instance can replay it into canonical SQLite without duplicate events. The end-to-end AG2 + AgenticX integration also passes restart/replay.
 - The Meldwork adapter calls the pinned V4 receipt parser and sanitizer in a Node subprocess, maps supported phases to the shared discussion-event contract, persists sanitized content, and rejects invalid receipts.
@@ -35,6 +37,7 @@ From the repository root:
 python3 -m pip install -r contracts/requirements-test.txt
 python3 -m unittest discover -s contracts/tests -v
 python3 -m unittest discover -s harness/tests -v
+python3 -m unittest discover -s alignment/tests -v
 python3 -m unittest harness.integration_tests.test_meldwork_bridge -v
 python3 -m unittest harness.integration_tests.test_meldwork_agenticx_runtime -v
 ```
@@ -52,8 +55,8 @@ spikes/ag2-collaboration/.venv/bin/python -m unittest \
 
 ## Current limits / known failure surfaces
 
-- This remains a prototype. No web UI, user-facing VP, project browser, separate inbox screen, autonomous background scheduler, multi-laptop worker, or deployment service exists. The durable question record/API is present, but it has no notification UX or expired/rejected/cancelled command implementation yet.
-- The reference projector covers the current closed event vocabulary, but the v0.1 schema still needs independent review, migration policy, broader transition/dependency validation, crash/race tests, and a production store decision. Contract issue #2 remains open.
+- This remains a prototype. No web UI, user-facing VP, project browser, separate inbox screen, autonomous background scheduler, multi-laptop worker, or deployment service exists. The proposed inbox/API design is in `design/INBOX_API.md`; notification UX and scheduler continuations are absent. Capability actor fields are caller-supplied (not authenticated), no adapter/tool invokes the authority yet, and the policy check is not a sandbox or TOCTOU-safe side-effect boundary. Dependency revisions are locally validated/frozen under blocking questions, but no scheduler consumes the DAG and remote concurrency is untested.
+- The reference projector covers the current closed v0.1 event vocabulary; a written migration policy exists, but no migration dispatcher/second-version test exists. Independent contract review, process-level concurrency/crash fault injection, and production-store decision remain. Contract issue #2 remains open.
 - AG2's HubListener is observational and deliberately swallows listener exceptions. The mirror records degradation and exposes it to the caller; WAL replay repairs missed events only while the AG2 WAL still exists. This is not an atomic dual-write/outbox guarantee. Issue #3 remains open.
 - Current AG2 tests use local transports and no external network auth. The AG2 subprocess/adapter path has no production identity boundary yet.
 - AgenticX's bridge proves one deterministic AgentExecutor request over stdio. The worker is process-isolated, **not a hardened sandbox**. No Studio API/server, real model, persistent AgenticX session, tools, or approval resume was exercised. Issue #4 remains open.

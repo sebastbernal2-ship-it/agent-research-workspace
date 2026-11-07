@@ -5,6 +5,7 @@
   "description": "Language-neutral interchange records. Event records are authoritative; other records are projections or immutable references. No secrets or native runtime state belong here.",
   "oneOf": [
     { "$ref": "#/$defs/project" },
+    { "$ref": "#/$defs/capabilityGrant" },
     { "$ref": "#/$defs/workItem" },
     { "$ref": "#/$defs/agentRun" },
     { "$ref": "#/$defs/question" },
@@ -151,13 +152,14 @@
     "question": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["recordType", "schemaVersion", "projectId", "questionId", "questionType", "blocking", "requestedBy", "workIds", "questionText", "impact", "options", "status", "createdAt"],
+      "required": ["recordType", "schemaVersion", "projectId", "questionId", "questionType", "priority", "blocking", "requestedBy", "workIds", "questionText", "impact", "options", "status", "createdAt"],
       "properties": {
         "recordType": { "const": "human_question" },
         "schemaVersion": { "const": "0.1" },
         "projectId": { "$ref": "#/$defs/id" },
         "questionId": { "$ref": "#/$defs/id" },
         "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] },
+        "priority": { "enum": ["low", "normal", "high", "urgent"] },
         "blocking": { "type": "boolean" },
         "requestedBy": { "$ref": "#/$defs/actor" },
         "workIds": { "$ref": "#/$defs/refList" },
@@ -170,6 +172,10 @@
           "items": { "type": "object", "additionalProperties": false, "required": ["optionId", "label"], "properties": { "optionId": { "$ref": "#/$defs/id" }, "label": { "type": "string", "minLength": 1, "maxLength": 500 }, "consequence": { "type": "string", "maxLength": 2000 } } }
         },
         "status": { "enum": ["open", "answered", "rejected", "cancelled", "expired", "superseded"] },
+        "closedBy": { "$ref": "#/$defs/actor" },
+        "closedAt": { "$ref": "#/$defs/timestamp" },
+        "resolutionReason": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "supersededByQuestionId": { "$ref": "#/$defs/id" },
         "answer": {
           "anyOf": [
             { "type": "null" },
@@ -181,7 +187,9 @@
       },
       "allOf": [
         { "if": { "properties": { "status": { "const": "answered" } }, "required": ["status"] }, "then": { "properties": { "answer": { "type": "object" } }, "required": ["answer"] } },
-        { "if": { "properties": { "status": { "enum": ["open", "rejected", "cancelled", "expired", "superseded"] } }, "required": ["status"] }, "then": { "properties": { "answer": { "type": "null" } } } }
+        { "if": { "properties": { "status": { "enum": ["open", "rejected", "cancelled", "expired", "superseded"] } }, "required": ["status"] }, "then": { "properties": { "answer": { "type": "null" } } } },
+        { "if": { "properties": { "status": { "enum": ["rejected", "cancelled", "expired", "superseded"] } }, "required": ["status"] }, "then": { "required": ["closedBy", "closedAt", "resolutionReason"] } },
+        { "if": { "properties": { "status": { "const": "superseded" } }, "required": ["status"] }, "then": { "required": ["supersededByQuestionId"] } }
       ]
     },
     "artifact": {
@@ -204,6 +212,32 @@
         "createdAt": { "$ref": "#/$defs/timestamp" },
         "reviewStatus": { "enum": ["unreviewed", "reviewed", "accepted", "rejected"] }
       }
+    },
+    "capabilityGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "grantId", "revision", "subject", "workIds", "capability", "resourceIds", "grantedBy", "createdAt", "expiresAt", "status"],
+      "properties": {
+        "recordType": { "const": "capability_grant" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "grantId": { "$ref": "#/$defs/id" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "subject": { "$ref": "#/$defs/actor" },
+        "workIds": { "$ref": "#/$defs/refList", "minItems": 1 },
+        "capability": { "enum": ["artifact.read", "artifact.write", "source.fetch", "tool.execute", "network.request", "filesystem.read", "filesystem.write", "provider.call", "worker.delegate"] },
+        "resourceIds": { "$ref": "#/$defs/refList", "minItems": 1 },
+        "grantedBy": { "$ref": "#/$defs/actor" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "status": { "enum": ["active", "revoked"] },
+        "revokedBy": { "$ref": "#/$defs/actor" },
+        "revokedAt": { "$ref": "#/$defs/timestamp" },
+        "revokeReason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "revoked" } }, "required": ["status"] }, "then": { "required": ["revokedBy", "revokedAt", "revokeReason"] } }
+      ]
     },
     "evidence": {
       "type": "object",
@@ -244,13 +278,17 @@
         { "type": "object", "additionalProperties": false, "required": ["charterRevision", "charterHash", "recordHash"], "properties": { "charterRevision": { "type": "integer", "minimum": 1 }, "charterHash": { "$ref": "#/$defs/sha256" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["workId", "title", "objective", "owner", "recordHash"], "properties": { "workId": { "$ref": "#/$defs/id" }, "title": { "type": "string", "minLength": 1, "maxLength": 200 }, "objective": { "type": "string", "minLength": 1, "maxLength": 10000 }, "owner": { "$ref": "#/$defs/actor" }, "recordHash": { "$ref": "#/$defs/sha256" }, "parentWorkId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] } } },
         { "type": "object", "additionalProperties": false, "required": ["workId", "from", "to", "recordHash"], "properties": { "workId": { "$ref": "#/$defs/id" }, "from": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] }, "to": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] }, "recordHash": { "$ref": "#/$defs/sha256" }, "reason": { "type": "string", "maxLength": 2000 } } },
+        { "type": "object", "additionalProperties": false, "required": ["workId", "fromRevision", "toRevision", "recordHash"], "properties": { "workId": { "$ref": "#/$defs/id" }, "fromRevision": { "type": "integer", "minimum": 1 }, "toRevision": { "type": "integer", "minimum": 2 }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["workId", "threadId", "messageType", "contentRef", "contentHash", "visibleTo"], "properties": { "workId": { "$ref": "#/$defs/id" }, "threadId": { "$ref": "#/$defs/id" }, "messageType": { "enum": ["proposal", "question", "challenge", "evidence", "revision", "decision", "status"] }, "contentRef": { "$ref": "#/$defs/id" }, "contentHash": { "$ref": "#/$defs/sha256" }, "artifactIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "visibleTo": { "$ref": "#/$defs/refList" } } },
         { "type": "object", "additionalProperties": false, "required": ["runId", "workId", "adapter", "contextHash", "capabilityGrantIds", "recordHash"], "properties": { "runId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "adapter": { "$ref": "#/$defs/adapter" }, "contextHash": { "$ref": "#/$defs/sha256" }, "capabilityGrantIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["runId", "terminalStatus", "recordHash"], "properties": { "runId": { "$ref": "#/$defs/id" }, "terminalStatus": { "enum": ["succeeded", "failed", "cancelled", "interrupted"] }, "artifactIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" }, "summaryRef": { "$ref": "#/$defs/id" } } },
-        { "type": "object", "additionalProperties": false, "required": ["questionId", "questionType", "blocking", "workIds", "questionRef", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] }, "blocking": { "type": "boolean" }, "workIds": { "$ref": "#/$defs/refList" }, "questionRef": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["questionId", "questionType", "priority", "blocking", "workIds", "questionRef", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] }, "priority": { "enum": ["low", "normal", "high", "urgent"] }, "blocking": { "type": "boolean" }, "workIds": { "$ref": "#/$defs/refList" }, "questionRef": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["questionId", "answerRef", "resumedWorkIds", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "answerRef": { "$ref": "#/$defs/id" }, "resumedWorkIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["questionId", "from", "to", "affectedWorkIds", "resolutionReason", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "from": { "const": "open" }, "to": { "enum": ["rejected", "cancelled", "expired", "superseded"] }, "affectedWorkIds": { "$ref": "#/$defs/refList" }, "resolutionReason": { "type": "string", "minLength": 1, "maxLength": 4000 }, "supersededByQuestionId": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["artifactId", "workId", "sha256", "recordHash"], "properties": { "artifactId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "sha256": { "$ref": "#/$defs/sha256" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
-        { "type": "object", "additionalProperties": false, "required": ["evidenceId", "workId", "stance", "sourceHash", "recordHash"], "properties": { "evidenceId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "stance": { "enum": ["supports", "contradicts", "qualifies", "background"] }, "sourceHash": { "$ref": "#/$defs/sha256" }, "recordHash": { "$ref": "#/$defs/sha256" } } }
+        { "type": "object", "additionalProperties": false, "required": ["evidenceId", "workId", "stance", "sourceHash", "recordHash"], "properties": { "evidenceId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "stance": { "enum": ["supports", "contradicts", "qualifies", "background"] }, "sourceHash": { "$ref": "#/$defs/sha256" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["grantId", "workIds", "capability", "recordHash"], "properties": { "grantId": { "$ref": "#/$defs/id" }, "workIds": { "$ref": "#/$defs/refList" }, "capability": { "enum": ["artifact.read", "artifact.write", "source.fetch", "tool.execute", "network.request", "filesystem.read", "filesystem.write", "provider.call", "worker.delegate"] }, "recordHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["grantId", "recordHash", "revokeReason"], "properties": { "grantId": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" }, "revokeReason": { "type": "string", "minLength": 1, "maxLength": 2000 } } }
       ]
     },
     "event": {
@@ -263,7 +301,7 @@
         "eventId": { "$ref": "#/$defs/id" },
         "projectId": { "$ref": "#/$defs/id" },
         "sequence": { "type": "integer", "minimum": 1 },
-        "eventType": { "enum": ["project.created", "project.charter_revised", "work.created", "work.status_changed", "discussion.message_added", "run.started", "run.finished", "human.question_opened", "human.question_answered", "artifact.registered", "evidence.registered"] },
+        "eventType": { "enum": ["project.created", "project.charter_revised", "work.created", "work.status_changed", "work.revised", "discussion.message_added", "run.started", "run.finished", "human.question_opened", "human.question_answered", "human.question_closed", "capability.granted", "capability.revoked", "artifact.registered", "evidence.registered"] },
         "actor": { "$ref": "#/$defs/actor" },
         "occurredAt": { "$ref": "#/$defs/timestamp" },
         "causationId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
@@ -276,11 +314,15 @@
         { "if": { "properties": { "eventType": { "const": "project.charter_revised" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["charterRevision", "charterHash", "recordHash"] } } } },
         { "if": { "properties": { "eventType": { "const": "work.created" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "title", "objective", "owner", "recordHash"] } } } },
         { "if": { "properties": { "eventType": { "const": "work.status_changed" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "from", "to", "recordHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "work.revised" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "fromRevision", "toRevision", "recordHash"] } } } },
         { "if": { "properties": { "eventType": { "const": "discussion.message_added" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "threadId", "messageType", "contentRef", "contentHash", "visibleTo"] } } } },
         { "if": { "properties": { "eventType": { "const": "run.started" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["runId", "workId", "adapter", "contextHash", "capabilityGrantIds", "recordHash"] } } } },
         { "if": { "properties": { "eventType": { "const": "run.finished" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["runId", "terminalStatus", "recordHash"] } } } },
-        { "if": { "properties": { "eventType": { "const": "human.question_opened" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["questionId", "questionType", "blocking", "workIds", "questionRef", "recordHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "human.question_opened" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["questionId", "questionType", "priority", "blocking", "workIds", "questionRef", "recordHash"] } } } },
         { "if": { "properties": { "eventType": { "const": "human.question_answered" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["questionId", "answerRef", "resumedWorkIds", "recordHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "human.question_closed" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["questionId", "from", "to", "affectedWorkIds", "recordHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "capability.granted" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["grantId", "workIds", "capability", "recordHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "capability.revoked" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["grantId", "recordHash", "revokeReason"] } } } },
         { "if": { "properties": { "eventType": { "const": "artifact.registered" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["artifactId", "workId", "sha256", "recordHash"] } } } },
         { "if": { "properties": { "eventType": { "const": "evidence.registered" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["evidenceId", "workId", "stance", "sourceHash", "recordHash"] } } } }
       ]

@@ -86,8 +86,11 @@ Using FastAPI's in-process `TestClient` (no socket/server, no lifespan integrati
 
 ### Revised decision
 
-**Keep AgenticX as a conditional execution/workflow candidate; do not integrate the product yet.** Its Studio group team path has materially more orchestration than the legacy demo, and targeted tests pass. But its main team path does not establish the user's desired adversarial, evidence-citing, revisable agent discussion; separate collaboration semantics/control plane and safety policy are still needed. The API token is optional and binding defaults to all interfaces, so remote use needs wrapper-level fail-closed configuration and a complete route/auth review. Next, compare the relevant AG2 message/discussion model against this Studio group path, using the same non-coding scenario and trace contract.
+**Keep AgenticX as a conditional execution/workflow candidate; do not integrate the product yet.** Its Studio group team path has materially more orchestration than the legacy demo, and targeted tests pass. But its main team path does not establish the user's desired adversarial, evidence-citing, revisable agent discussion; separate collaboration semantics/control plane and safety policy are still needed. The API token is optional and binding defaults to all interfaces, so remote use needs wrapper-level fail-closed configuration and a complete route/auth review.
 
+## Harness follow-up (2026-11-07)
+
+`harness/agenticx_bridge.py` starts the pinned AgenticX venv in a child process with temporary HOME/cwd, reduced environment, bounded JSON input/output, timeout, no tool configuration, and an injected deterministic provider result. It is used in the AG2 proposal–critique–revision test and Meldwork V4 offline orchestration test. This process boundary is **not a hardened sandbox**. No credentials, actual model call, Studio HTTP server, network, tool, or HiperGator execution was introduced. AG2's local message path and Meldwork's Node `LocalWorkspace` path are now tested separately; neither changes the model-quality/security findings above.
 
 ## Cleanup / reset
 

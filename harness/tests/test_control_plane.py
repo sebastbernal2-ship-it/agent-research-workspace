@@ -11,6 +11,7 @@ from harness.projection import Projector
 NOW = "2026-04-16T12:00:00Z"
 USER = {"actorType": "human", "actorId": "user.owner", "role": "user"}
 VP = {"actorType": "agent", "actorId": "agent.vp", "role": "vp"}
+SYSTEM = {"actorType": "system", "actorId": "system.clock", "role": "system"}
 
 
 def make_project():
@@ -62,6 +63,7 @@ def make_question(work_ids):
         "projectId": "project.control",
         "questionId": "question.scope",
         "questionType": "clarification",
+        "priority": "normal",
         "blocking": True,
         "requestedBy": VP,
         "workIds": work_ids,
@@ -167,6 +169,192 @@ class ProjectControlPlaneTests(unittest.TestCase):
         state = Projector(self.store).replay("project.control")
         self.assertEqual(state["questions"]["question.scope"]["status"], "answered")
         self.assertEqual(state["workItems"]["work.primary"]["status"], "ready")
+
+    def test_rejection_closes_question_but_keeps_work_blocked_and_never_auto_approves(self):
+        question = make_question(["work.primary"])
+        question["questionId"] = "question.reject"
+        self.control.open_question(question)
+        rejected = self.control.close_question(
+            "project.control", "question.reject", "rejected", actor=USER,
+            reason="The proposed scope is not approved.", occurred_at="2026-04-16T12:04:00Z",
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        state = Projector(self.store).replay("project.control")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "blocked")
+        before_retry = len(self.store.events("project.control"))
+        self.control.close_question(
+            "project.control", "question.reject", "rejected", actor=USER,
+            reason="The proposed scope is not approved.", occurred_at="2026-04-16T12:04:00Z",
+        )
+        self.assertEqual(len(self.store.events("project.control")), before_retry)
+        with self.assertRaisesRegex(ControlPlaneError, "not open"):
+            self.control.answer_question("project.control", "question.reject", "yes", actor=USER)
+        self.assertEqual(Projector(self.store).replay("project.control")["workItems"]["work.primary"]["status"], "blocked")
+
+    def test_open_question_freezes_dependency_definitions_for_exact_work(self):
+        self.control.revise_work(
+            "project.control", "work.primary", {"dependsOn": ["work.independent"]},
+            actor=VP, occurred_at="2026-04-16T12:01:00Z",
+        )
+        question = make_question(["work.primary"])
+        question["questionId"] = "question.dependency-closure"
+        self.control.open_question(question)
+        before = len(self.store.events("project.control"))
+        with self.assertRaisesRegex(ControlPlaneError, "dependency closure"):
+            self.control.revise_work(
+                "project.control", "work.independent", {"objective": "Changed while blocked."},
+                actor=VP,
+            )
+        self.assertEqual(len(self.store.events("project.control")), before)
+
+    def test_answer_after_cancellation_is_denied(self):
+        question = make_question(["work.primary"])
+        question["questionId"] = "question.cancelled"
+        self.control.open_question(question)
+        self.control.close_question(
+            "project.control", "question.cancelled", "cancelled", actor=USER,
+            reason="The user withdrew the question.", occurred_at="2026-04-16T12:04:00Z",
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "not open"):
+            self.control.answer_question(
+                "project.control", "question.cancelled", "yes", actor=USER,
+            )
+        state = Projector(self.store).replay("project.control")
+        self.assertEqual(state["questions"]["question.cancelled"]["status"], "cancelled")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "blocked")
+
+    def test_expiry_requires_system_actor_and_passed_deadline(self):
+        question = make_question(["work.primary"])
+        question["questionId"] = "question.expiry"
+        question["dueAt"] = "2026-04-16T12:04:00Z"
+        self.control.open_question(question)
+        with self.assertRaisesRegex(ControlPlaneError, "only the system"):
+            self.control.close_question(
+                "project.control", "question.expiry", "expired", actor=USER,
+                reason="deadline", occurred_at="2026-04-16T12:05:00Z",
+            )
+        with self.assertRaisesRegex(ControlPlaneError, "has not passed"):
+            self.control.close_question(
+                "project.control", "question.expiry", "expired", actor=SYSTEM,
+                reason="deadline", occurred_at="2026-04-16T12:03:00Z",
+            )
+        self.assertEqual(Projector(self.store).replay("project.control")["questions"]["question.expiry"]["status"], "open")
+        expired = self.control.close_question(
+            "project.control", "question.expiry", "expired", actor=SYSTEM,
+            reason="deadline passed without user response", occurred_at="2026-04-16T12:05:00Z",
+        )
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(Projector(self.store).replay("project.control")["workItems"]["work.primary"]["status"], "blocked")
+
+    def test_superseding_question_preserves_pause_and_exact_successor(self):
+        original = make_question(["work.primary"])
+        original["questionId"] = "question.original"
+        self.control.open_question(original)
+        successor = make_question(["work.primary"])
+        successor.update({
+            "questionId": "question.revised",
+            "questionText": "Should we instead include only peer-reviewed historical sources?",
+            "createdAt": "2026-04-16T12:03:00Z",
+        })
+        closed = self.control.close_question(
+            "project.control", "question.original", "superseded", actor=VP,
+            reason="The original scope question was too broad.", successor_question=successor,
+            occurred_at="2026-04-16T12:03:00Z",
+        )
+        self.assertEqual(closed["status"], "superseded")
+        before_retry = len(self.store.events("project.control"))
+        self.control.close_question(
+            "project.control", "question.original", "superseded", actor=VP,
+            reason="The original scope question was too broad.", successor_question=successor,
+            occurred_at="2026-04-16T12:03:00Z",
+        )
+        self.assertEqual(len(self.store.events("project.control")), before_retry)
+        recovered = Projector(SQLiteEventStore(self.path)).replay("project.control")
+        self.assertEqual(recovered["questions"]["question.revised"]["status"], "open")
+        self.assertEqual(recovered["questions"]["question.original"]["supersededByQuestionId"], "question.revised")
+        self.assertEqual(recovered["workItems"]["work.primary"]["status"], "waiting_human")
+
+    def test_changed_affected_work_state_prevents_answer_resume(self):
+        question = make_question(["work.primary"])
+        question["questionId"] = "question.changed-work"
+        self.control.open_question(question)
+        self.control.transition_work("project.control", "work.primary", "blocked", actor=VP)
+        with self.assertRaisesRegex(ControlPlaneError, "not paused"):
+            self.control.answer_question(
+                "project.control", "question.changed-work", "yes", actor=USER,
+            )
+        state = Projector(self.store).replay("project.control")
+        self.assertEqual(state["questions"]["question.changed-work"]["status"], "open")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "blocked")
+
+    def test_overlapping_blocking_questions_are_rejected(self):
+        first = make_question(["work.primary"])
+        first["questionId"] = "question.first"
+        self.control.open_question(first)
+        second = make_question(["work.primary"])
+        second["questionId"] = "question.second"
+        with self.assertRaisesRegex(ControlPlaneError, "already covers"):
+            self.control.open_question(second)
+
+    def test_maximum_length_ids_still_produce_valid_event_and_answer_refs(self):
+        project_id = "p" + "x" * 127
+        work_id = "w" * 128
+        question_id = "q" * 128
+        project = make_project()
+        project["projectId"] = project_id
+        control = ProjectControlPlane(self.store, clock=lambda: "2026-04-16T12:03:00Z")
+        control.create_project(project)
+        work = make_work(work_id, "Long identifier work")
+        work["projectId"] = project_id
+        control.create_work(work)
+        question = make_question([work_id])
+        question.update({"projectId": project_id, "questionId": question_id})
+        control.open_question(question)
+        control.answer_question(project_id, question_id, "Continue.", actor=USER)
+        self.assertEqual(Projector(self.store).replay(project_id)["questions"][question_id]["status"], "answered")
+
+    def test_project_charter_and_work_revisions_replay_and_reject_dependency_cycles(self):
+        revised_project = self.control.revise_project_charter(
+            "project.control",
+            {
+                "revision": 1,
+                "goals": ["Test a revised durable contract"],
+                "nonGoals": ["No model calls"],
+                "acceptanceCriteria": ["Revision is replayable"],
+            },
+            actor=USER,
+            occurred_at="2026-04-16T12:04:00Z",
+        )
+        self.assertEqual(revised_project["revision"], 2)
+        self.assertEqual(revised_project["charter"]["revision"], 2)
+        revised_work = self.control.revise_work(
+            "project.control", "work.primary",
+            {"dependsOn": ["work.independent"], "objective": "Use independent scan results."},
+            actor=VP,
+            occurred_at="2026-04-16T12:05:00Z",
+        )
+        self.assertEqual(revised_work["revision"], 2)
+        self.assertEqual(revised_work["dependsOn"], ["work.independent"])
+        event_count = len(self.store.events("project.control"))
+        with self.assertRaisesRegex(ControlPlaneError, "cycle"):
+            self.control.revise_work(
+                "project.control", "work.independent", {"dependsOn": ["work.primary"]},
+                actor=VP, occurred_at="2026-04-16T12:06:00Z",
+            )
+        self.assertEqual(len(self.store.events("project.control")), event_count)
+        replayed = Projector(SQLiteEventStore(self.path)).replay("project.control")
+        self.assertEqual(replayed["project"], revised_project)
+        self.assertEqual(replayed["workItems"]["work.primary"], revised_work)
+
+    def test_active_question_freezes_the_affected_work_scope(self):
+        self.control.open_question(make_question(["work.primary"]))
+        before = len(self.store.events("project.control"))
+        with self.assertRaisesRegex(ControlPlaneError, "dependency closure"):
+            self.control.revise_work(
+                "project.control", "work.primary", {"dependsOn": ["work.independent"]},
+                actor=VP,
+            )
+        self.assertEqual(len(self.store.events("project.control")), before)
 
     def test_forbidden_work_transition_fails_without_state_change(self):
         self.control.transition_work("project.control", "work.primary", "running", actor=VP)

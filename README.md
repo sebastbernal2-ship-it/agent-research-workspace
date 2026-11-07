@@ -12,6 +12,10 @@ Research and development for a project-first collaborative AI workspace.
 - [AG2 Network collaboration spike](spikes/ag2-collaboration/README.md) — pinned v1.0.0, offline message/recovery tests, WebSocket/auth review, and component fit.
 - [Meldwork V1.0.9 source review](spikes/meldwork-review/README.md) — V4 collaboration behavior, isolated Linux test results, platform boundary, and dependency-audit warning.
 - [GitHub issue register](tracking/README.md) — owners, dependencies, blockers, and the recommended sequence for remaining work.
-- [Local harness prototype](harness/README.md) — canonical SQLite event store and isolated AG2, AgenticX, and Meldwork adapter integration tests.
+- [Local harness prototype](harness/README.md) — canonical SQLite event store, question/capability control prototypes, and isolated AG2, AgenticX, and Meldwork adapter integration tests.
+- [Security threat model](security/THREAT_MODEL.md) — trust boundaries, abuse cases, current gaps, and release gates; not a security approval.
+- [Alignment memory prototype](alignment/README.md) — synthetic, provenance-first conformance checks kept separate from project charter, permissions, and private profile data.
+- [ADR-0001](decisions/ADR-0001-canonical-control-plane-and-adapters.md) — why the control plane is canonical and how candidate runtimes stay replaceable.
+- [Inbox API/UI contract](design/INBOX_API.md) — proposed separation of project VP conversation and approval inbox; no service is implemented yet.
 
 This repository is separate from `pi-harness`; experiments and development should happen here unless explicitly agreed otherwise.

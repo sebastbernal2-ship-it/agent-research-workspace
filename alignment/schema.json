@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sebastbernal2-ship-it/agent-research-workspace/alignment/schema.json",
+  "title": "Transparent alignment memory record v0.1",
+  "description": "Separate, provenance-bearing preference/charter memory. Synthetic examples only; never store private profile data without separate review and opt-in.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["recordType", "schemaVersion", "memoryId", "revision", "scope", "kind", "topicId", "valueId", "polarity", "statement", "status", "confidence", "source", "recordedAt"],
+  "properties": {
+    "recordType": { "const": "alignment_memory" },
+    "schemaVersion": { "const": "0.1" },
+    "memoryId": { "$ref": "#/$defs/id" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "scopeId"],
+      "properties": {
+        "type": { "enum": ["user", "project", "task"] },
+        "scopeId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "kind": { "enum": ["preference", "goal", "non_goal", "constraint", "decision"] },
+    "topicId": { "$ref": "#/$defs/id" },
+    "valueId": { "$ref": "#/$defs/id" },
+    "polarity": { "enum": ["prefer", "avoid", "require", "forbid"] },
+    "statement": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "status": { "enum": ["observed", "confirmed", "retracted", "expired", "superseded"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceType", "sourceRef", "recordedBy", "recordedAt"],
+      "properties": {
+        "sourceType": { "enum": ["user_statement", "project_charter", "explicit_correction", "agent_inference"] },
+        "sourceRef": { "$ref": "#/$defs/id" },
+        "recordedBy": { "$ref": "#/$defs/actor" },
+        "recordedAt": { "$ref": "#/$defs/timestamp" },
+        "confirmedBy": { "$ref": "#/$defs/actor" },
+        "confirmedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "recordedAt": { "$ref": "#/$defs/timestamp" },
+    "expiresAt": { "$ref": "#/$defs/timestamp" },
+    "supersedesMemoryId": { "$ref": "#/$defs/id" },
+    "retractionReason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "confirmed" } }, "required": ["status"] },
+      "then": { "properties": { "source": { "required": ["confirmedBy", "confirmedAt"] } } }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["retracted", "superseded"] } }, "required": ["status"] },
+      "then": { "required": ["supersedesMemoryId", "retractionReason"] }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$" },
+    "timestamp": { "type": "string", "format": "date-time", "maxLength": 40 },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorType", "actorId", "role"],
+      "properties": {
+        "actorType": { "enum": ["human", "agent", "system"] },
+        "actorId": { "$ref": "#/$defs/id" },
+        "role": { "enum": ["user", "vp", "orchestrator", "specialist", "reviewer", "worker", "system"] }
+      }
+    }
+  }
+}

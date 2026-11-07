@@ -3,28 +3,19 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from hashlib import sha256
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .event_store import EventStoreError, SQLiteEventStore
-from .projection import Projector
+from .projection import Projector, ProjectionError, WORK_STATUS_TRANSITIONS
 
 
 class ControlPlaneError(EventStoreError):
     """A project/work/question command violates the local control contract."""
 
 
-_ALLOWED_WORK_TRANSITIONS = {
-    "proposed": {"ready", "cancelled"},
-    "ready": {"running", "blocked", "waiting_human", "cancelled"},
-    "running": {"blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"},
-    "blocked": {"ready", "failed", "cancelled"},
-    "waiting_human": {"ready", "cancelled"},
-    "verifying": {"running", "completed", "failed", "blocked", "cancelled"},
-    "failed": {"ready", "cancelled"},
-    "completed": set(),
-    "cancelled": set(),
-}
+_ALLOWED_WORK_TRANSITIONS = WORK_STATUS_TRANSITIONS
 
 
 class ProjectControlPlane:
@@ -46,6 +37,8 @@ class ProjectControlPlane:
         occurred_at: str | None = None,
         causation_id: str | None = None,
     ) -> dict[str, Any]:
+        if len(event_id) > 120:
+            event_id = f"event.{sha256(event_id.encode('utf-8')).hexdigest()}"
         return {
             "recordType": "event",
             "schemaVersion": "0.1",
@@ -55,7 +48,7 @@ class ProjectControlPlane:
             "actor": actor,
             "occurredAt": occurred_at or self.clock(),
             "causationId": causation_id,
-            "correlationId": f"project.{project_id}",
+            "correlationId": project_id,
             "idempotencyKey": f"idem.{event_id}",
             "payload": payload,
         }
@@ -100,6 +93,16 @@ class ProjectControlPlane:
             if state["workItems"][work_id] == work:
                 return work
             raise ControlPlaneError(f"work item {work_id!r} already exists")
+        try:
+            Projector._validate_work_graph({**state["workItems"], work_id: work})
+        except ProjectionError as exc:
+            raise ControlPlaneError(str(exc)) from exc
+        if any(
+            grant_id not in state["capabilityGrants"]
+            or work_id not in state["capabilityGrants"][grant_id]["workIds"]
+            for grant_id in work["capabilityGrantIds"]
+        ):
+            raise ControlPlaneError("work item references a missing or out-of-scope capability grant")
         creator = actor or work.get("createdBy") or work["owner"]
         record_hash = self.store.put_record(work)
         payload = {
@@ -118,6 +121,99 @@ class ProjectControlPlane:
             payload,
             event_id=f"event.work.created.{work_id}.r{work['revision']}",
             occurred_at=work["createdAt"],
+        )
+        self.store.append(event)
+        return self.projector.replay(project_id)["workItems"][work_id]
+
+    def revise_project_charter(
+        self,
+        project_id: str,
+        charter: dict[str, Any],
+        *,
+        actor: dict[str, str],
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        state = self.projector.replay(project_id)
+        old = state["project"]
+        when = occurred_at or self.clock()
+        updated = deepcopy(old)
+        updated["revision"] += 1
+        updated["charter"] = deepcopy(charter)
+        updated["charter"]["revision"] = old["charter"]["revision"] + 1
+        updated["updatedAt"] = when
+        self.store.validate_record(updated)
+        record_hash = self.store.put_record(updated)
+        charter_json = self.store._canonical_json(updated["charter"])
+        _, charter_hash = self.store.put_blob(charter_json)
+        event = self._event(
+            project_id,
+            "project.charter_revised",
+            actor,
+            {"charterRevision": updated["charter"]["revision"], "charterHash": charter_hash, "recordHash": record_hash},
+            event_id=f"event.project.charter.{project_id}.r{updated['charter']['revision']}",
+            occurred_at=when,
+        )
+        self.store.append(event)
+        return self.projector.replay(project_id)["project"]
+
+    def revise_work(
+        self,
+        project_id: str,
+        work_id: str,
+        changes: dict[str, Any],
+        *,
+        actor: dict[str, str],
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        allowed = {
+            "title", "objective", "workType", "parentWorkId", "owner",
+            "dependsOn", "capabilityGrantIds", "acceptanceCriteria", "budget",
+        }
+        if not isinstance(changes, dict) or not changes or set(changes) - allowed:
+            raise ControlPlaneError("work revision has no changes or contains unsupported fields")
+        state = self.projector.replay(project_id)
+        old = state["workItems"].get(work_id)
+        if old is None:
+            raise ControlPlaneError(f"unknown work item {work_id!r}")
+        protected_work_ids: set[str] = set()
+        for question in state["questions"].values():
+            if question.get("status") != "open" or not question.get("blocking"):
+                continue
+            pending = list(question.get("workIds", []))
+            while pending:
+                protected_id = pending.pop()
+                if protected_id in protected_work_ids:
+                    continue
+                protected_work_ids.add(protected_id)
+                pending.extend(state["workItems"][protected_id].get("dependsOn", []))
+        if work_id in protected_work_ids:
+            raise ControlPlaneError("cannot revise work scope in an open blocking question dependency closure")
+        updated = deepcopy(old)
+        updated.update(deepcopy(changes))
+        if updated == old:
+            return old
+        when = occurred_at or self.clock()
+        updated["revision"] += 1
+        updated["updatedAt"] = when
+        self.store.validate_record(updated)
+        if any(
+            grant_id not in state["capabilityGrants"]
+            or work_id not in state["capabilityGrants"][grant_id]["workIds"]
+            for grant_id in updated["capabilityGrantIds"]
+        ):
+            raise ControlPlaneError("work item references a missing or out-of-scope capability grant")
+        try:
+            Projector._validate_work_graph({**state["workItems"], work_id: updated})
+        except ProjectionError as exc:
+            raise ControlPlaneError(str(exc)) from exc
+        record_hash = self.store.put_record(updated)
+        event = self._event(
+            project_id,
+            "work.revised",
+            actor,
+            {"workId": work_id, "fromRevision": old["revision"], "toRevision": updated["revision"], "recordHash": record_hash},
+            event_id=f"event.work.revised.{work_id}.r{updated['revision']}",
+            occurred_at=when,
         )
         self.store.append(event)
         return self.projector.replay(project_id)["workItems"][work_id]
@@ -173,15 +269,23 @@ class ProjectControlPlane:
         if not work_ids or any(work_id not in state["workItems"] for work_id in work_ids):
             raise ControlPlaneError("question must reference existing affected work items")
         if question["blocking"]:
+            if any(
+                existing.get("blocking") and existing.get("status") == "open"
+                and set(existing.get("workIds", [])) & set(work_ids)
+                for existing in state["questions"].values()
+            ):
+                raise ControlPlaneError("an open blocking question already covers affected work")
             for work_id in work_ids:
                 status = state["workItems"][work_id]["status"]
-                if status not in {"ready", "running", "blocked"}:
+                if status not in {"ready", "running", "blocked", "waiting_human"}:
                     raise ControlPlaneError(f"cannot block work {work_id!r} from status {status!r}")
 
         events = []
         if question["blocking"]:
             for work_id in work_ids:
                 work = state["workItems"][work_id]
+                if work["status"] == "waiting_human":
+                    continue
                 updated = deepcopy(work)
                 updated["revision"] += 1
                 updated["status"] = "waiting_human"
@@ -204,6 +308,7 @@ class ProjectControlPlane:
             {
                 "questionId": question_id,
                 "questionType": question["questionType"],
+                "priority": question["priority"],
                 "blocking": question["blocking"],
                 "workIds": work_ids,
                 "questionRef": question_id,
@@ -212,6 +317,149 @@ class ProjectControlPlane:
             event_id=f"event.question.opened.{question_id}",
             occurred_at=question["createdAt"],
         ))
+        self.store.append_many(events)
+        return self.projector.replay(project_id)["questions"][question_id]
+
+    def close_question(
+        self,
+        project_id: str,
+        question_id: str,
+        new_status: str,
+        *,
+        actor: dict[str, str],
+        reason: str,
+        successor_question: dict[str, Any] | None = None,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        if new_status not in {"rejected", "cancelled", "expired", "superseded"}:
+            raise ControlPlaneError("question closure status is not a supported terminal state")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ControlPlaneError("question closure requires an explicit reason")
+        identity = (actor.get("actorType"), actor.get("role"))
+        if new_status in {"rejected", "cancelled"} and identity != ("human", "user"):
+            raise ControlPlaneError("only the user may reject or cancel an inbox question")
+        if new_status == "expired" and identity != ("system", "system"):
+            raise ControlPlaneError("only the system may expire an inbox question")
+        if new_status == "superseded" and identity not in {("human", "user"), ("agent", "vp")}:
+            raise ControlPlaneError("only the user or project VP may supersede a question")
+        if (new_status == "superseded") != (successor_question is not None):
+            raise ControlPlaneError("superseding requires exactly one successor question")
+
+        when = occurred_at or self.clock()
+        state = self.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None:
+            raise ControlPlaneError(f"unknown question {question_id!r}")
+        successor_id = successor_question.get("questionId") if successor_question else None
+        if question["status"] != "open":
+            if (
+                question["status"] == new_status
+                and question.get("closedBy") == actor
+                and question.get("resolutionReason") == reason.strip()
+                and question.get("supersededByQuestionId") == successor_id
+            ):
+                if successor_question is not None and state["questions"].get(successor_id) != successor_question:
+                    raise ControlPlaneError("question retry changed its successor record")
+                return question
+            raise ControlPlaneError(f"question {question_id!r} is not open")
+
+        if new_status == "expired":
+            due_at = question.get("dueAt")
+            if due_at is None:
+                raise ControlPlaneError("question has no expiry deadline")
+            try:
+                deadline = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+                now = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            except (AttributeError, ValueError) as exc:
+                raise ControlPlaneError("question expiry timestamp is invalid") from exc
+            if now < deadline:
+                raise ControlPlaneError("question expiry deadline has not passed")
+
+        affected_work_ids = list(question["workIds"]) if question["blocking"] else []
+        if question["blocking"] and any(
+            state["workItems"][work_id]["status"] != "waiting_human"
+            for work_id in affected_work_ids
+        ):
+            raise ControlPlaneError("affected work is no longer paused by this question")
+
+        successor_record_hash = None
+        if successor_question is not None:
+            self.store.validate_record(successor_question)
+            if (
+                successor_question.get("recordType") != "human_question"
+                or successor_question.get("status") != "open"
+                or successor_question.get("projectId") != project_id
+                or successor_question.get("questionId") == question_id
+                or successor_question.get("workIds") != question["workIds"]
+                or successor_question.get("blocking") != question["blocking"]
+                or successor_question.get("createdAt") != when
+                or successor_question.get("requestedBy") != actor
+                or successor_question.get("questionId") in state["questions"]
+            ):
+                raise ControlPlaneError("successor must be a new question for the same exact affected work set")
+            successor_record_hash = self.store.put_record(successor_question)
+
+        closed = deepcopy(question)
+        closed["status"] = new_status
+        closed["closedBy"] = actor
+        closed["closedAt"] = when
+        closed["resolutionReason"] = reason.strip()
+        if successor_id:
+            closed["supersededByQuestionId"] = successor_id
+        record_hash = self.store.put_record(closed)
+        events = []
+        if question["blocking"] and new_status != "superseded":
+            for work_id in affected_work_ids:
+                old_work = state["workItems"][work_id]
+                updated_work = deepcopy(old_work)
+                updated_work["revision"] += 1
+                updated_work["status"] = "blocked"
+                updated_work["updatedAt"] = when
+                work_hash = self.store.put_record(updated_work)
+                events.append(self._event(
+                    project_id,
+                    "work.status_changed",
+                    actor,
+                    {
+                        "workId": work_id, "from": "waiting_human", "to": "blocked",
+                        "recordHash": work_hash, "reason": f"{new_status} question {question_id}: {reason.strip()}",
+                    },
+                    event_id=f"event.work.status.{work_id}.r{updated_work['revision']}",
+                    occurred_at=when,
+                ))
+        events.append(self._event(
+            project_id,
+            "human.question_closed",
+            actor,
+            {
+                "questionId": question_id,
+                "from": "open",
+                "to": new_status,
+                "affectedWorkIds": affected_work_ids,
+                "resolutionReason": reason.strip(),
+                **({"supersededByQuestionId": successor_id} if successor_id else {}),
+                "recordHash": record_hash,
+            },
+            event_id=f"event.question.closed.{question_id}.{new_status}",
+            occurred_at=when,
+        ))
+        if successor_question is not None:
+            events.append(self._event(
+                project_id,
+                "human.question_opened",
+                actor,
+                {
+                    "questionId": successor_question["questionId"],
+                    "questionType": successor_question["questionType"],
+                    "priority": successor_question["priority"],
+                    "blocking": successor_question["blocking"],
+                    "workIds": successor_question["workIds"],
+                    "questionRef": successor_question["questionId"],
+                    "recordHash": successor_record_hash,
+                },
+                event_id=f"event.question.opened.{successor_question['questionId']}",
+                occurred_at=when,
+            ))
         self.store.append_many(events)
         return self.projector.replay(project_id)["questions"][question_id]
 
@@ -261,13 +509,14 @@ class ProjectControlPlane:
             **({"selectedOptionId": selected_option_id} if selected_option_id else {}),
         }
         record_hash = self.store.put_record(answered)
+        answer_ref_hash = sha256(f"{question_id}\0{when}".encode("utf-8")).hexdigest()
         events = [self._event(
             project_id,
             "human.question_answered",
             actor,
             {
                 "questionId": question_id,
-                "answerRef": f"answer.{question_id}.{answered['answer']['answeredAt'].replace(':', '-')}",
+                "answerRef": f"answer.{answer_ref_hash}",
                 "resumedWorkIds": resumed_work_ids,
                 "recordHash": record_hash,
             },
