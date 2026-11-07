@@ -1,3 +1,6 @@
 [submodule "spikes/agenticx-runtime/upstream"]
 	path = spikes/agenticx-runtime/upstream
 	url = https://github.com/DemonDamon/AgenticX.git
+[submodule "spikes/ag2-collaboration/upstream"]
+	path = spikes/ag2-collaboration/upstream
+	url = https://github.com/ag2ai/ag2.git
