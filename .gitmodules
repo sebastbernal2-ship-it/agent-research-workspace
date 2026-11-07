@@ -4,3 +4,6 @@
 [submodule "spikes/ag2-collaboration/upstream"]
 	path = spikes/ag2-collaboration/upstream
 	url = https://github.com/ag2ai/ag2.git
+[submodule "spikes/meldwork-review/upstream"]
+	path = spikes/meldwork-review/upstream
+	url = https://github.com/Ryder-Sun/Meldwork.git
