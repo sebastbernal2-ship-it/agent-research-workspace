@@ -151,7 +151,7 @@ def valid_records():
             "causationId": None,
             "correlationId": "trace.initial",
             "idempotencyKey": "idem.project-create",
-            "payload": {"name": "Synthetic research project", "charterHash": HASH},
+            "payload": {"name": "Synthetic research project", "charterHash": HASH, "recordHash": HASH},
         },
     ]
 
