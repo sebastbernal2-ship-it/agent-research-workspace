@@ -274,6 +274,30 @@ class ProjectControlPlaneTests(unittest.TestCase):
         self.assertEqual(recovered["questions"]["question.original"]["supersededByQuestionId"], "question.revised")
         self.assertEqual(recovered["workItems"]["work.primary"]["status"], "waiting_human")
 
+    def test_replay_accepts_answered_successor_in_question_supersession_chain(self):
+        original = make_question(["work.primary"])
+        original["questionId"] = "question.chain.original"
+        self.control.open_question(original)
+        successor = make_question(["work.primary"])
+        successor.update({
+            "questionId": "question.chain.successor",
+            "createdAt": "2026-04-16T12:03:00Z",
+        })
+        self.control.close_question(
+            "project.control", original["questionId"], "superseded", actor=VP,
+            reason="Clarify with a revised question.", successor_question=successor,
+            occurred_at="2026-04-16T12:03:00Z",
+        )
+        self.control.answer_question(
+            "project.control", successor["questionId"], "Use current sources only.",
+            actor=USER, selected_option_id="option.current",
+            occurred_at="2026-04-16T12:04:00Z",
+        )
+        state = Projector(SQLiteEventStore(self.path)).replay("project.control")
+        self.assertEqual(state["questions"][original["questionId"]]["status"], "superseded")
+        self.assertEqual(state["questions"][successor["questionId"]]["status"], "answered")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "ready")
+
     def test_changed_affected_work_state_prevents_answer_resume(self):
         question = make_question(["work.primary"])
         question["questionId"] = "question.changed-work"

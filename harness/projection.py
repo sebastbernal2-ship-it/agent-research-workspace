@@ -415,8 +415,8 @@ class Projector:
             if question["status"] != "superseded":
                 continue
             successor = state["questions"].get(question.get("supersededByQuestionId"))
-            if successor is None or successor["status"] != "open":
-                raise ProjectionError("superseded question does not reference an open successor")
+            if successor is None:
+                raise ProjectionError("superseded question does not reference a successor question")
             if successor["blocking"] != question["blocking"] or successor["workIds"] != question["workIds"]:
                 raise ProjectionError("successor question does not preserve the exact work set and blocking semantics")
         for work_id, work in state["workItems"].items():
