@@ -36,21 +36,58 @@ cd upstream
 | Mock multi-agent demo | **PARTIAL** | `examples/m6_multi_agent_demo.py` exited 0; four scripted mock agents completed. No LLM/provider was called. This validates only that this example's executor paths run. |
 | Actual message exchange in that demo | **FAIL** | It reports **0 messages sent/received** for all four agents. Its `send_team_message` example tool only returns a string; it does not route a message. |
 | BroadcastCommunication handoff | **FAIL in this usage** | Reproduced with two instances: each instance has its own group list (`['alice']`, `['bob']`); Alice's broadcast has zero recipients and Bob has no pending messages. The M6 example constructs one instance per agent, so `join_group` does not create a shared group. |
-| Studio/server, auth, restart persistence | **NOT TESTED** | We did not start a server or exercise API endpoints. |
+| Studio API auth / restart persistence | **PARTIAL / NOT TESTED** | Selected session routes passed in-process TestClient with a temporary token; no socket server, full route audit, or restart recovery test. |
 | Non-coding research task with an actual model | **NOT TESTED** | No API key/provider configured, by design. |
 
 The mock demo wrote `sales_analysis_report_report.md` in an isolated `/tmp` directory while its final status message claimed `sales_analysis_report.md`; this is an example-level artifact-name mismatch, not proof of a general runtime failure.
 
 ## Safety observations and hold points
 
-- `agx serve` in this tag defaults to `0.0.0.0` and an empty token; its own CLI prints an unauthenticated warning when no token is configured. **Do not run with defaults.** Before a server test, review the route-level auth behavior and test only with `--host 127.0.0.1`, a temporary `HOME`, a generated temporary token, and isolated data paths. We have not verified that every route is protected correctly.
+- `agx serve` in this tag defaults to `0.0.0.0` and an empty token; its own CLI prints an unauthenticated warning when no token is configured. **Do not run with defaults.** Selected API routes were tested in-process with auth enabled. Before a socket server test, complete the route-level auth review and use `--host 127.0.0.1`, temporary `HOME`, a generated token, and isolated data paths.
 - We intentionally did not start Studio, enable gateway/chat integrations, connect tools, provide credentials, or expose any port.
 - Existing mock demo uses a fake provider and tool callbacks. Its success count is not evidence of reasoning quality, meaningful critique, actual agent-to-agent exchange, or recovery.
-- The code has broad scope; the next gate is not importing it into the product. First establish that its selected collaboration/runtime path can exchange messages through a shared bus and that the secured Studio API works under a local-only test.
+- The code has broad scope; the next gate is not importing it into the product. Next compare its newer group path with AG2 on the same collaboration trace, and separately test restart persistence/recovery before considering an adapter.
 
-## Current decision
+## Follow-up: Studio group router and API checks (2026-11-07)
 
-**Keep AgenticX as a runtime candidate; do not integrate it yet.** Basic install/import on Linux passes, but this spike has not demonstrated the core required behavior of meaningful multi-agent discussion. The built-in `BroadcastCommunication` usage in the upstream M6 demo is not a working inter-agent message path as exercised. Before extending the spike, inspect the newer collaboration/group-router path and its shared transport; compare it with AG2 rather than patching upstream immediately. If we do patch or wrap it, keep the fix in our adapter/spike and add a regression test—do not silently fork behavior into the product.
+### Newer collaboration path
+
+The earlier M6 mock demo exercises the legacy `agenticx.core.BroadcastCommunication`; its zero-message result should **not** be generalized to the separate Studio group router. Studio's `GroupChatRouter` has a newer path: group context, mention-triggered follow-ups, workforce task decomposition/assignment, a DAG scheduler, progress events, shared artifact delivery, and a leader summary. Five targeted suites covering group workforce graph scheduling, broadcast-all, mention follow-ups, control-plane behavior, and artifact delivery passed (**83 passed**).
+
+That is meaningful implementation evidence, but it still does **not** demonstrate a Meldwork-like peer deliberation loop:
+
+- In the complex Workforce path, tasks are decomposed and workers run assigned nodes (parallel where dependencies permit); completed responses are appended to the group context for the leader summary.
+- Worker prompts are assembled before their parallel execution. The Workforce path does not itself run a critique/revision round or route each worker's results to peer agents for challenge; it is principally delegated execution + synthesis.
+- In ordinary mention follow-ups, an agent can address another member and that member gets a later turn with recent group dialogue. This is actual sequential handoff behavior, but it depends on the model producing a mention and is not a guaranteed evidence-review protocol.
+- `graph.social` creates message edges for UI projection. Its debate heat helper can be triggered by human→agent fan-out alone: we reproduced four such edges causing the “discussion is hot” nudge with no agent↔agent messages. Treat debate graph/nudge as visualization, not proof of substantive debate.
+- The legacy `BroadcastCommunication` failure remains real for its documented/example usage; the newer Studio router is a distinct path and should be judged separately.
+
+A broader targeted test command that also included `test_smoke_group_workforce_bridge.py` produced **83 passed, 2 failed**: both failures expect tool argument/result previews in `_runtime_event_to_progress_text`, but actual text contains only the tool name. The other tests in that run passed. This is a pinned-release test failure to record, not evidence of message-delivery failure.
+
+Reproduction for the passing Studio-group subset:
+
+```bash
+cd spikes/agenticx-runtime/upstream
+../.venv/bin/python -m pytest -q --no-cov \
+  tests/test_smoke_group_workforce_graph_schedule.py \
+  tests/test_smoke_group_broadcast_all.py \
+  tests/test_smoke_group_mention_followup.py \
+  tests/test_smoke_group_control_plane.py \
+  tests/test_group_shared_artifact_delivery.py
+```
+
+### Studio API authentication check
+
+Using FastAPI's in-process `TestClient` (no socket/server, no lifespan integration, no model call) and a temporary `HOME`/workspace:
+
+- `/api/session`: no token → **401**; correct `x-agx-desktop-token` → **200**.
+- `/api/session/messages`: no token → **401**; correct token → **200**.
+- The auth behavior is conditional: `_check_token` permits requests when `AGX_DESKTOP_TOKEN` is empty. The CLI defaults to `--host 0.0.0.0` and empty token, warning that the API is unauthenticated. Therefore, **never use those defaults**. Static inspection of `server.py` found only `/api/health` and `/api/ready` without direct token checks; the many remaining inline routes call the checker, while several registered routers accept it as a callback. This was not a full audit of every registered router, HTTP method, or downstream effect, and does not establish a remotely acceptable product security model. We did not start a socket server.
+
+### Revised decision
+
+**Keep AgenticX as a conditional execution/workflow candidate; do not integrate the product yet.** Its Studio group team path has materially more orchestration than the legacy demo, and targeted tests pass. But its main team path does not establish the user's desired adversarial, evidence-citing, revisable agent discussion; separate collaboration semantics/control plane and safety policy are still needed. The API token is optional and binding defaults to all interfaces, so remote use needs wrapper-level fail-closed configuration and a complete route/auth review. Next, compare the relevant AG2 message/discussion model against this Studio group path, using the same non-coding scenario and trace contract.
+
 
 ## Cleanup / reset
 
