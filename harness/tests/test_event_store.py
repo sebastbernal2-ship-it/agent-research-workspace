@@ -1,5 +1,8 @@
 import json
 import sqlite3
+import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
@@ -113,6 +116,56 @@ class SQLiteEventStoreTests(unittest.TestCase):
         other["eventId"] = "event.beta-created"
         other["idempotencyKey"] = "idem.beta-created"
         self.assertEqual(self.store.append(other).sequence, 1)
+
+    def test_process_kill_mid_batch_recovers_without_partial_commit(self):
+        signal_path = self.path.with_suffix(".inserted")
+        child = r'''
+import json
+import sys
+import time
+from pathlib import Path
+from harness.event_store import SQLiteEventStore
+
+class PausingStore(SQLiteEventStore):
+    def _connect(self):
+        connection = super()._connect()
+        def pause_after_insert():
+            signal = Path(sys.argv[2])
+            signal.write_text("inserted", encoding="utf-8")
+            while True:
+                time.sleep(0.1)
+        connection.create_function("pause_after_insert", 0, pause_after_insert)
+        return connection
+
+store = PausingStore(sys.argv[1])
+connection = store._connect()
+connection.execute("CREATE TRIGGER pause_batch AFTER INSERT ON canonical_events BEGIN SELECT pause_after_insert(); END")
+connection.close()
+store.append_many(json.loads(sys.argv[3]))
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(self.path), str(signal_path), json.dumps(initial_events())],
+            cwd=Path(__file__).resolve().parents[2],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        try:
+            while time.monotonic() < deadline and not signal_path.exists():
+                if process.poll() is not None:
+                    self.fail(f"crash-injection child exited before its transaction pause: {process.returncode}")
+                time.sleep(0.02)
+            self.assertTrue(signal_path.exists(), "child never reached the uncommitted first insert")
+            process.kill()
+            process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+
+        recovered = SQLiteEventStore(self.path)
+        self.assertEqual(recovered.events("project.alpha"), [])
+        self.assertTrue(recovered.verify("project.alpha"))
 
     def test_batch_append_is_atomic_and_retryable(self):
         events = initial_events()
