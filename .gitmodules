@@ -1,0 +1,3 @@
+[submodule "spikes/agenticx-runtime/upstream"]
+	path = spikes/agenticx-runtime/upstream
+	url = https://github.com/DemonDamon/AgenticX.git
