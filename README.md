@@ -2,8 +2,9 @@
 
 Research and development for a project-first collaborative AI workspace.
 
-## Current artifact
+## Current artifacts
 
-- [Agent-system foundation evaluation](research/agent-system-foundation-evaluation.md) — source-backed comparison and bounded non-coding pilot.
+- [Agent-system foundation evaluation](research/agent-system-foundation-evaluation.md) — source-backed comparison and recommended composition.
+- [First non-coding research pilot](pilots/first-research-pilot.md) — candidate roles, safety gates, collaboration trace, inbox scenario, scorecard, and run record.
 
 This repository is separate from `pi-harness`; experiments and development should happen here unless explicitly agreed otherwise.

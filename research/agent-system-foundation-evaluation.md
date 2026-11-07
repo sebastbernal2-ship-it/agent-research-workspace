@@ -56,7 +56,18 @@ These are upstream documentation/repository claims, not independently verified r
 
 ## Bounded non-coding research pilot
 
-**Scenario:** one literature question with a VP/research lead, two independent researcher agents, and a critic/synthesizer. Agents receive read-only web research and designated report-artifact output only. No code generation, agent shell execution, external side effects, account setup, external deployment, or HiperGator job. Freeze the source list; map final claims to citations and artifacts.
+The detailed protocol, role cards, safety gates, collaboration trace, inbox scenario, scorecard, and run-record template are in [`pilots/first-research-pilot.md`](../pilots/first-research-pilot.md).
+
+**Candidate order:** Meldwork first because agent-to-agent collaboration is the highest-risk requirement; AgenticX is the breadth comparison. This is a pilot order, not a foundation decision. **Execution has not started:** Meldwork's published preview requires Apple Silicon macOS, while the current research environment is Linux; no candidate has been installed. Provider configuration and any use of non-public project context require explicit user setup/approval. Do not import the user's private profile into an unverified system.
+
+
+### Pilot choice and execution status
+
+**Selected first candidate: Meldwork**, because the highest-risk product requirement to test first is genuine agent-to-agent collaboration, not code-generation quality. **AgenticX is the comparison candidate** for breadth of platform capabilities. This is a pilot choice, not a foundation decision.
+
+**Not yet executed.** Before running either system, confirm availability of a compatible Apple Silicon Mac, approved provider/model credentials, and permission to use a bounded non-coding research question with the selected providers. Use an explicitly non-sensitive question and synthetic or public project charter; do not import the user's private long-term profile into an unverified product. No agent/system has been installed, and no credentials or project data have been shared.
+
+**Run order:** (1) inspect the pinned Meldwork release, permission model, data storage, and agent integrations; (2) run the bounded pilot below with public sources only; (3) separately evaluate AgenticX on the same task and rubric, if its runtime can be deployed in the user's environment without excessive setup; (4) compare artifacts and event traces, not marketing claims; (5) retain no candidate-specific state as canonical until export/recovery is verified.
 
 **Limits:** one project; maximum four role instances, three decomposition levels, ten work items, thirty unique sources, twenty minutes active agent time, and a fixed model/token/cost ceiling selected before starting. Stop on budget exhaustion or unresolved safety/policy issue.
 
