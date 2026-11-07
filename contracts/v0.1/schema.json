@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sebastbernal2-ship-it/agent-research-workspace/contracts/v0.1/schema.json",
+  "title": "Project-first AI workspace canonical contracts v0.1",
+  "description": "Language-neutral interchange records. Event records are authoritative; other records are projections or immutable references. No secrets or native runtime state belong here.",
+  "oneOf": [
+    { "$ref": "#/$defs/project" },
+    { "$ref": "#/$defs/workItem" },
+    { "$ref": "#/$defs/agentRun" },
+    { "$ref": "#/$defs/question" },
+    { "$ref": "#/$defs/artifact" },
+    { "$ref": "#/$defs/evidence" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "maxLength": 40 },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorType", "actorId", "role"],
+      "properties": {
+        "actorType": { "enum": ["human", "agent", "system"] },
+        "actorId": { "$ref": "#/$defs/id" },
+        "role": { "enum": ["user", "vp", "orchestrator", "specialist", "reviewer", "worker", "system"] }
+      }
+    },
+    "refList": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "stringList": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 128,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "revision", "name", "status", "charter", "createdAt", "updatedAt"],
+      "properties": {
+        "recordType": { "const": "project" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "status": { "enum": ["active", "paused", "archived"] },
+        "charter": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["revision", "goals", "nonGoals", "acceptanceCriteria"],
+          "properties": {
+            "revision": { "type": "integer", "minimum": 1 },
+            "goals": { "$ref": "#/$defs/stringList" },
+            "nonGoals": { "$ref": "#/$defs/stringList" },
+            "acceptanceCriteria": { "$ref": "#/$defs/stringList" },
+            "policyRef": { "$ref": "#/$defs/id" }
+          }
+        },
+        "createdBy": { "$ref": "#/$defs/actor" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxInputTokens": { "type": "integer", "minimum": 0 },
+        "maxOutputTokens": { "type": "integer", "minimum": 0 },
+        "maxCostUsd": { "type": "number", "minimum": 0 },
+        "deadline": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "workItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "workId", "revision", "title", "objective", "workType", "status", "owner", "dependsOn", "capabilityGrantIds", "acceptanceCriteria", "createdAt", "updatedAt"],
+      "properties": {
+        "recordType": { "const": "work_item" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "workId": { "$ref": "#/$defs/id" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "parentWorkId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "objective": { "type": "string", "minLength": 1, "maxLength": 10000 },
+        "workType": { "enum": ["research", "analysis", "planning", "writing", "review", "implementation", "operations", "other"] },
+        "status": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] },
+        "owner": { "$ref": "#/$defs/actor" },
+        "dependsOn": { "$ref": "#/$defs/refList" },
+        "capabilityGrantIds": { "$ref": "#/$defs/refList" },
+        "acceptanceCriteria": { "$ref": "#/$defs/stringList" },
+        "budget": { "$ref": "#/$defs/budget" },
+        "createdBy": { "$ref": "#/$defs/actor" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 100 }
+      }
+    },
+    "agentRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "runId", "workId", "agent", "adapter", "status", "contextHash", "capabilityGrantIds", "startedAt"],
+      "properties": {
+        "recordType": { "const": "agent_run" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "runId": { "$ref": "#/$defs/id" },
+        "workId": { "$ref": "#/$defs/id" },
+        "agent": { "$ref": "#/$defs/actor" },
+        "adapter": { "$ref": "#/$defs/adapter" },
+        "providerClass": { "type": "string", "maxLength": 100 },
+        "modelClass": { "type": "string", "maxLength": 100 },
+        "status": { "enum": ["queued", "running", "waiting_human", "succeeded", "failed", "cancelled", "interrupted"] },
+        "contextHash": { "$ref": "#/$defs/sha256" },
+        "capabilityGrantIds": { "$ref": "#/$defs/refList" },
+        "idempotencyKey": { "$ref": "#/$defs/id" },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "inputTokens": { "type": "integer", "minimum": 0 },
+            "outputTokens": { "type": "integer", "minimum": 0 },
+            "toolCalls": { "type": "integer", "minimum": 0 },
+            "costUsd": { "type": "number", "minimum": 0 }
+          }
+        },
+        "outputArtifactIds": { "$ref": "#/$defs/refList" },
+        "startedAt": { "$ref": "#/$defs/timestamp" },
+        "finishedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "questionId", "questionType", "blocking", "requestedBy", "workIds", "questionText", "impact", "options", "status", "createdAt"],
+      "properties": {
+        "recordType": { "const": "human_question" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "questionId": { "$ref": "#/$defs/id" },
+        "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] },
+        "blocking": { "type": "boolean" },
+        "requestedBy": { "$ref": "#/$defs/actor" },
+        "workIds": { "$ref": "#/$defs/refList" },
+        "runId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "questionText": { "type": "string", "minLength": 1, "maxLength": 10000 },
+        "impact": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "options": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "object", "additionalProperties": false, "required": ["optionId", "label"], "properties": { "optionId": { "$ref": "#/$defs/id" }, "label": { "type": "string", "minLength": 1, "maxLength": 500 }, "consequence": { "type": "string", "maxLength": 2000 } } }
+        },
+        "status": { "enum": ["open", "answered", "rejected", "cancelled", "expired", "superseded"] },
+        "answer": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "object", "additionalProperties": false, "required": ["text", "answeredBy", "answeredAt"], "properties": { "text": { "type": "string", "minLength": 1, "maxLength": 10000 }, "selectedOptionId": { "$ref": "#/$defs/id" }, "answeredBy": { "$ref": "#/$defs/actor" }, "answeredAt": { "$ref": "#/$defs/timestamp" }, "resumedWorkIds": { "$ref": "#/$defs/refList" } } }
+          ]
+        },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "dueAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "answered" } }, "required": ["status"] }, "then": { "properties": { "answer": { "type": "object" } }, "required": ["answer"] } },
+        { "if": { "properties": { "status": { "enum": ["open", "rejected", "cancelled", "expired", "superseded"] } }, "required": ["status"] }, "then": { "properties": { "answer": { "type": "null" } } } }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "artifactId", "workId", "name", "mediaType", "sha256", "byteSize", "storageRef", "createdBy", "createdAt"],
+      "properties": {
+        "recordType": { "const": "artifact" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "artifactId": { "$ref": "#/$defs/id" },
+        "workId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "mediaType": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$", "maxLength": 127 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteSize": { "type": "integer", "minimum": 0 },
+        "storageRef": { "$ref": "#/$defs/id" },
+        "createdBy": { "$ref": "#/$defs/actor" },
+        "runId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "reviewStatus": { "enum": ["unreviewed", "reviewed", "accepted", "rejected"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "projectId", "evidenceId", "workId", "claimText", "stance", "source", "createdBy", "createdAt"],
+      "properties": {
+        "recordType": { "const": "evidence" },
+        "schemaVersion": { "const": "0.1" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "evidenceId": { "$ref": "#/$defs/id" },
+        "workId": { "$ref": "#/$defs/id" },
+        "claimText": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "stance": { "enum": ["supports", "contradicts", "qualifies", "background"] },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["uri", "title", "retrievedAt"],
+          "properties": {
+            "uri": { "type": "string", "format": "uri", "maxLength": 2048 },
+            "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "publisher": { "type": "string", "maxLength": 300 },
+            "publishedAt": { "$ref": "#/$defs/timestamp" },
+            "retrievedAt": { "$ref": "#/$defs/timestamp" },
+            "contentHash": { "$ref": "#/$defs/sha256" },
+            "locator": { "type": "string", "maxLength": 1000 },
+            "excerptRef": { "$ref": "#/$defs/id" }
+          }
+        },
+        "createdBy": { "$ref": "#/$defs/actor" },
+        "runId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "reviewStatus": { "enum": ["unreviewed", "corroborated", "contested", "human_verified"] }
+      }
+    },
+    "eventPayload": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["name", "charterHash"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 200 }, "charterHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["charterRevision", "charterHash"], "properties": { "charterRevision": { "type": "integer", "minimum": 1 }, "charterHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["workId", "title", "objective", "owner"], "properties": { "workId": { "$ref": "#/$defs/id" }, "title": { "type": "string", "minLength": 1, "maxLength": 200 }, "objective": { "type": "string", "minLength": 1, "maxLength": 10000 }, "owner": { "$ref": "#/$defs/actor" }, "parentWorkId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] } } },
+        { "type": "object", "additionalProperties": false, "required": ["workId", "from", "to"], "properties": { "workId": { "$ref": "#/$defs/id" }, "from": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] }, "to": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] }, "reason": { "type": "string", "maxLength": 2000 } } },
+        { "type": "object", "additionalProperties": false, "required": ["workId", "threadId", "messageType", "contentRef", "contentHash", "visibleTo"], "properties": { "workId": { "$ref": "#/$defs/id" }, "threadId": { "$ref": "#/$defs/id" }, "messageType": { "enum": ["proposal", "question", "challenge", "evidence", "revision", "decision", "status"] }, "contentRef": { "$ref": "#/$defs/id" }, "contentHash": { "$ref": "#/$defs/sha256" }, "artifactIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "visibleTo": { "$ref": "#/$defs/refList" } } },
+        { "type": "object", "additionalProperties": false, "required": ["runId", "workId", "adapter", "contextHash", "capabilityGrantIds"], "properties": { "runId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "adapter": { "$ref": "#/$defs/adapter" }, "contextHash": { "$ref": "#/$defs/sha256" }, "capabilityGrantIds": { "$ref": "#/$defs/refList" } } },
+        { "type": "object", "additionalProperties": false, "required": ["runId", "terminalStatus"], "properties": { "runId": { "$ref": "#/$defs/id" }, "terminalStatus": { "enum": ["succeeded", "failed", "cancelled", "interrupted"] }, "artifactIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "summaryRef": { "$ref": "#/$defs/id" } } },
+        { "type": "object", "additionalProperties": false, "required": ["questionId", "questionType", "blocking", "workIds", "questionRef"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] }, "blocking": { "type": "boolean" }, "workIds": { "$ref": "#/$defs/refList" }, "questionRef": { "$ref": "#/$defs/id" } } },
+        { "type": "object", "additionalProperties": false, "required": ["questionId", "answerRef", "resumedWorkIds"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "answerRef": { "$ref": "#/$defs/id" }, "resumedWorkIds": { "$ref": "#/$defs/refList" } } },
+        { "type": "object", "additionalProperties": false, "required": ["artifactId", "workId", "sha256"], "properties": { "artifactId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "sha256": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["evidenceId", "workId", "stance", "sourceHash"], "properties": { "evidenceId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "stance": { "enum": ["supports", "contradicts", "qualifies", "background"] }, "sourceHash": { "$ref": "#/$defs/sha256" } } }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordType", "schemaVersion", "eventId", "projectId", "sequence", "eventType", "actor", "occurredAt", "idempotencyKey", "payload"],
+      "properties": {
+        "recordType": { "const": "event" },
+        "schemaVersion": { "const": "0.1" },
+        "eventId": { "$ref": "#/$defs/id" },
+        "projectId": { "$ref": "#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "eventType": { "enum": ["project.created", "project.charter_revised", "work.created", "work.status_changed", "discussion.message_added", "run.started", "run.finished", "human.question_opened", "human.question_answered", "artifact.registered", "evidence.registered"] },
+        "actor": { "$ref": "#/$defs/actor" },
+        "occurredAt": { "$ref": "#/$defs/timestamp" },
+        "causationId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "correlationId": { "$ref": "#/$defs/id" },
+        "idempotencyKey": { "$ref": "#/$defs/id" },
+        "payload": { "$ref": "#/$defs/eventPayload" }
+      },
+      "allOf": [
+        { "if": { "properties": { "eventType": { "const": "project.created" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["name", "charterHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "project.charter_revised" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["charterRevision", "charterHash"] } } } },
+        { "if": { "properties": { "eventType": { "const": "work.created" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "title", "objective", "owner"] } } } },
+        { "if": { "properties": { "eventType": { "const": "work.status_changed" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "from", "to"] } } } },
+        { "if": { "properties": { "eventType": { "const": "discussion.message_added" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["workId", "threadId", "messageType", "contentRef", "contentHash", "visibleTo"] } } } },
+        { "if": { "properties": { "eventType": { "const": "run.started" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["runId", "workId", "adapter", "contextHash", "capabilityGrantIds"] } } } },
+        { "if": { "properties": { "eventType": { "const": "run.finished" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["runId", "terminalStatus"] } } } },
+        { "if": { "properties": { "eventType": { "const": "human.question_opened" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["questionId", "questionType", "blocking", "workIds", "questionRef"] } } } },
+        { "if": { "properties": { "eventType": { "const": "human.question_answered" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["questionId", "answerRef", "resumedWorkIds"] } } } },
+        { "if": { "properties": { "eventType": { "const": "artifact.registered" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["artifactId", "workId", "sha256"] } } } },
+        { "if": { "properties": { "eventType": { "const": "evidence.registered" } }, "required": ["eventType"] }, "then": { "properties": { "payload": { "required": ["evidenceId", "workId", "stance", "sourceHash"] } } } }
+      ]
+    }
+  }
+}

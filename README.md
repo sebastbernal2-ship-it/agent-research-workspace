@@ -11,5 +11,6 @@ Research and development for a project-first collaborative AI workspace.
 - [AgenticX 0.6.5 runtime spike](spikes/agenticx-runtime/README.md) — pinned isolated checkout, install/test results, and current blockers.
 - [AG2 Network collaboration spike](spikes/ag2-collaboration/README.md) — pinned v1.0.0, offline message/recovery tests, WebSocket/auth review, and component fit.
 - [Meldwork V1.0.9 source review](spikes/meldwork-review/README.md) — V4 collaboration behavior, isolated Linux test results, platform boundary, and dependency-audit warning.
+- [GitHub issue register](tracking/README.md) — owners, dependencies, blockers, and the recommended sequence for remaining work.
 
 This repository is separate from `pi-harness`; experiments and development should happen here unless explicitly agreed otherwise.
