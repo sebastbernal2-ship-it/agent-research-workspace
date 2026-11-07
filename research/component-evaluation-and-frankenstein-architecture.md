@@ -1,6 +1,6 @@
 # Component evaluation and the “Frankenstein harness” architecture
 
-**Status:** Research and architecture proposal; systems have not been installed or run.  
+**Status:** Initial research proposal, updated by isolated runtime spikes. AgenticX 0.6.5 and AG2 1.0.0 have now been installed/tested separately; no real model calls or product integration. See [`spikes/agenticx-runtime/README.md`](../spikes/agenticx-runtime/README.md) and [`spikes/ag2-collaboration/README.md`](../spikes/ag2-collaboration/README.md).
 **Purpose:** Evaluate Meldwork and AgenticX in distinct roles, compare better candidates for specific layers, and define how to integrate only what passes.
 
 ## Thesis
@@ -29,7 +29,7 @@ These are frameworks or task-workforce projects, not replacements for the whole 
 - **[CAMEL-AI OWL](https://github.com/camel-ai/owl)** and [CAMEL](https://github.com/camel-ai/camel) (Apache-2.0; active): describe general multi-agent workforce automation, dynamic interactions, a Web UI and non-coding examples. Useful **workforce/task-completion comparison**. The repository is a framework/demo with benchmark claims, not demonstrated persistent project governance, VP identity, separate user inbox, or multi-machine durable scheduling.
 - **[Letta Code](https://github.com/letta-ai/letta-code)** is more interesting for the VP-memory subproblem than the previous summary implied: its README describes stateful agent identity/memory, subagents, and Git-tracked memory (MemFS), with optional sync/remote execution. Still treat this as an **agent identity/memory implementation candidate**, not canonical user/project truth; evaluate privacy, self-editing memory governance, portability, and coding-centric assumptions.
 
-The practical comparison is therefore: **Meldwork for human-readable multi-agent discussion and gates; AG2 for agent-network/message mechanics; AgenticX for broad runtime/platform scope; CrewAI or LangGraph for workflow logic; Letta for persistent agent memory.** These are role hypotheses, not integration findings. We have not installed or run any of these systems.
+The practical comparison is therefore: **Meldwork for human-readable multi-agent discussion and gates; AG2 for agent-network/message mechanics; AgenticX for broad runtime/platform scope; CrewAI or LangGraph for workflow logic; Letta for persistent agent memory.** These remain role hypotheses, not integration findings. AgenticX and AG2 have isolated Linux smoke/test evidence, but neither has been run with a real model or combined with another component. Meldwork, CrewAI, LangGraph and Letta remain source-level candidates only.
 
 ## Distinct roles: Meldwork and AgenticX
 
