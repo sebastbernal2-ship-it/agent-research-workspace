@@ -380,6 +380,24 @@ class ProjectControlPlaneTests(unittest.TestCase):
             )
         self.assertEqual(len(self.store.events("project.control")), before)
 
+    def test_work_cannot_run_until_explicit_dependencies_complete(self):
+        self.control.revise_work(
+            "project.control", "work.primary", {"dependsOn": ["work.independent"]},
+            actor=VP, occurred_at="2026-04-16T12:01:00Z",
+        )
+        before = len(self.store.events("project.control"))
+        with self.assertRaisesRegex(ControlPlaneError, "dependencies complete"):
+            self.control.transition_work("project.control", "work.primary", "running", actor=VP)
+        self.assertEqual(len(self.store.events("project.control")), before)
+
+        self.control.transition_work("project.control", "work.independent", "running", actor=VP)
+        self.control.transition_work("project.control", "work.independent", "verifying", actor=VP)
+        self.control.transition_work("project.control", "work.independent", "completed", actor=VP)
+        self.control.transition_work("project.control", "work.primary", "running", actor=VP)
+        state = Projector(self.store).replay("project.control")
+        self.assertEqual(state["workItems"]["work.independent"]["status"], "completed")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "running")
+
     def test_forbidden_work_transition_fails_without_state_change(self):
         self.control.transition_work("project.control", "work.primary", "running", actor=VP)
         self.control.transition_work("project.control", "work.primary", "verifying", actor=VP)

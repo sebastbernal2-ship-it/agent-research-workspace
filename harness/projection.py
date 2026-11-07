@@ -208,6 +208,13 @@ class Projector:
                     raise ProjectionError(f"invalid prior work status for {work_id!r}")
                 if payload["to"] not in WORK_STATUS_TRANSITIONS.get(old["status"], set()):
                     raise ProjectionError(f"forbidden work status transition {old['status']!r} -> {payload['to']!r}")
+                if payload["to"] == "running":
+                    incomplete = [
+                        dependency for dependency in old["dependsOn"]
+                        if state["workItems"][dependency]["status"] != "completed"
+                    ]
+                    if incomplete:
+                        raise ProjectionError(f"work item {work_id!r} cannot run before dependencies complete: {incomplete}")
                 new = self._load_record(payload["recordHash"], "work_item", project_id)
                 if new["workId"] != work_id or new["status"] != payload["to"] or new["revision"] != old["revision"] + 1:
                     raise ProjectionError("work status event does not match next work record revision")

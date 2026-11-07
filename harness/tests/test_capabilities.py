@@ -77,6 +77,39 @@ class CapabilityAuthorityTests(unittest.TestCase):
                 capability="source.fetch", resource_id="resource.public-domain",
             )
 
+    def test_capability_authorization_waits_for_explicit_dependencies(self):
+        control = ProjectControlPlane(self.store, clock=lambda: NOW)
+        control.create_work({
+            "recordType": "work_item", "schemaVersion": "0.1",
+            "projectId": "project.capability", "workId": "work.prerequisite",
+            "revision": 1, "parentWorkId": None, "title": "Prerequisite",
+            "objective": "Complete prerequisite work.", "workType": "research",
+            "status": "ready", "owner": {"actorType": "agent", "actorId": "agent.vp", "role": "vp"},
+            "dependsOn": [], "capabilityGrantIds": [],
+            "acceptanceCriteria": ["Complete prerequisite"], "createdBy": USER,
+            "createdAt": NOW, "updatedAt": NOW,
+        })
+        control.revise_work(
+            "project.capability", "work.scoped", {"dependsOn": ["work.prerequisite"]},
+            actor={"actorType": "agent", "actorId": "agent.vp", "role": "vp"},
+        )
+        self.authority.grant(grant_record(), actor=USER)
+        with self.assertRaisesRegex(CapabilityDenied, "dependencies"):
+            self.authority.authorize(
+                "project.capability", "work.scoped", subject=SUBJECT,
+                capability="source.fetch", resource_id="resource.public-domain",
+            )
+        control.transition_work("project.capability", "work.prerequisite", "running", actor={"actorType": "agent", "actorId": "agent.vp", "role": "vp"})
+        control.transition_work("project.capability", "work.prerequisite", "verifying", actor={"actorType": "agent", "actorId": "agent.vp", "role": "vp"})
+        control.transition_work("project.capability", "work.prerequisite", "completed", actor={"actorType": "agent", "actorId": "agent.vp", "role": "vp"})
+        self.assertEqual(
+            self.authority.authorize(
+                "project.capability", "work.scoped", subject=SUBJECT,
+                capability="source.fetch", resource_id="resource.public-domain",
+            )["grantId"],
+            "grant.read-corpus",
+        )
+
     def test_only_user_can_grant_or_revoke_and_revocation_is_durable(self):
         with self.assertRaisesRegex(ControlPlaneError, "only a user actor"):
             self.authority.grant(grant_record(), actor=NON_USER)

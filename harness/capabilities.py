@@ -185,6 +185,8 @@ class CapabilityAuthority:
         work = state["workItems"].get(work_id)
         if work is None or work["status"] not in {"ready", "running", "verifying"}:
             raise CapabilityDenied("unknown or non-runnable work scope")
+        if any(state["workItems"][dependency]["status"] != "completed" for dependency in work["dependsOn"]):
+            raise CapabilityDenied("work dependencies are not complete")
         for grant in state["capabilityGrants"].values():
             if (
                 grant["status"] != "active"

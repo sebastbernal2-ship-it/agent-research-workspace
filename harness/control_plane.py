@@ -236,6 +236,13 @@ class ProjectControlPlane:
             return old
         if new_status not in _ALLOWED_WORK_TRANSITIONS.get(old["status"], set()):
             raise ControlPlaneError(f"work transition {old['status']!r} -> {new_status!r} is not allowed")
+        if new_status == "running":
+            incomplete = [
+                dependency for dependency in old["dependsOn"]
+                if state["workItems"][dependency]["status"] != "completed"
+            ]
+            if incomplete:
+                raise ControlPlaneError(f"work cannot start before dependencies complete: {incomplete}")
         when = occurred_at or self.clock()
         updated = deepcopy(old)
         updated["revision"] += 1

@@ -12,7 +12,7 @@ Canonical live tracking is in the [GitHub issues](https://github.com/sebastberna
 
 | Issue | Workstream | Current status / blocker | Depends on |
 |---|---|---|---|
-| [#2](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/2) | Canonical project/work/event/evidence contracts | OPEN; capability/question event contracts, local SQLite replay, failed-run/conflicting-evidence and migration policy added; migration implementation and fault coverage remain | — |
+| [#2](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/2) | Canonical project/work/event/evidence contracts | OPEN; capability/question event contracts, migration policy, local SQLite replay, failed-run/conflicting-evidence, dependency DAG validation and prerequisite execution gates added; migration implementation and crash/fault coverage remain | — |
 | [#3](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/3) | AG2 → canonical event adapter | OPEN; local AG2 WAL replay, restart, candidate-state deletion, and shared-stream composition tested; listener/outbox/auth gaps remain | #2 |
 | [#4](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/4) | AgenticX API/recovery/capability gate | OPEN; deterministic AgentExecutor bridge runs inside AG2 and Meldwork V4 prototypes; API/auth/recovery/sandbox gates remain | — |
 | [#5](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/5) | Meldwork extraction, portability, dependency remediation | OPEN; pinned Node LocalWorkspace V4 runtime tested with mocks; Electron/macOS product gate and 14 NPM audit findings remain | — |

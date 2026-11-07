@@ -222,6 +222,30 @@ class ProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(IntegrityFailure, "blob hash mismatch"):
             Projector(self.store).replay("project.alpha")
 
+    def test_replay_rejects_running_work_with_incomplete_dependencies(self):
+        self.create_project()
+        dependency = self.create_work("work.dependency", "Prerequisite")
+        work = self.create_work("work.dependent", "Dependent")
+        control = ProjectControlPlane(self.store)
+        control.revise_work(
+            "project.alpha", work["workId"], {"dependsOn": [dependency["workId"]]},
+            actor=VP, occurred_at="2026-04-16T12:01:00Z",
+        )
+        current = Projector(self.store).replay("project.alpha")["workItems"][work["workId"]]
+        running = dict(current)
+        running.update({
+            "revision": current["revision"] + 1,
+            "status": "running",
+            "updatedAt": "2026-04-16T12:02:00Z",
+        })
+        record_hash = self.store.put_record(running)
+        self.event("work.status_changed", {
+            "workId": work["workId"], "from": "ready", "to": "running",
+            "recordHash": record_hash,
+        }, actor=VP)
+        with self.assertRaisesRegex(ProjectionError, "cannot run before dependencies complete"):
+            Projector(self.store).replay("project.alpha")
+
     def test_replay_rejects_forged_terminal_work_resurrection(self):
         self.create_project()
         work = self.create_work("work.terminal", "Terminal work")
