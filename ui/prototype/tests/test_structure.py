@@ -46,20 +46,21 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertIn("SEPARATE FROM VP CHAT", self.html)
         self.assertTrue({"main", "nav", "aside", "header"}.issubset(self.parser.landmarks))
 
-    def test_demo_has_explicit_no_persistence_and_no_network_or_storage_code(self):
-        self.assertIn("no models, service, or persistence connected", self.html)
-        self.assertIn("nothing is saved", self.html)
-        self.assertNotIn("fetch(", self.js)
+    def test_browser_uses_only_same_origin_api_and_no_browser_storage(self):
+        self.assertIn('id="service-status"', self.html)
+        self.assertIn("fetch(path, options)", self.js)
+        self.assertNotRegex(self.js, r"https?://")
         self.assertNotIn("localStorage", self.js)
         self.assertNotIn("sessionStorage", self.js)
         self.assertNotIn("XMLHttpRequest", self.js)
         self.assertNotRegex(self.css, r"url\(\s*['\"]?https?://")
 
-    def test_inbox_decision_controls_have_confirmation_dialogs(self):
-        for dialog_id in ("answer-dialog", "clarify-dialog", "reject-dialog"):
+    def test_inbox_decision_controls_are_explicit_and_service_backed(self):
+        for dialog_id in ("answer-dialog", "reject-dialog"):
             self.assertIn(f'id="{dialog_id}"', self.html)
-        self.assertIn("Demo only. These controls do not save decisions", self.html)
-        self.assertIn('aria-live="polite"', self.html)
+        self.assertIn("Clarification commands are not implemented yet", self.html)
+        self.assertIn("local canonical project history", self.html)
+        self.assertIn("aria-live=\"polite\"", self.html)
 
 
 if __name__ == "__main__":

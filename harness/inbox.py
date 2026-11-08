@@ -167,6 +167,10 @@ class InboxApplication:
         self.access_policy.require_project_access(actor, project_id, action)
         return actor
 
+    def authorize(self, project_id: str, action: str) -> dict[str, str]:
+        """Apply the injected principal and project-access boundary."""
+        return self._user(project_id, action)
+
     @staticmethod
     def _require_etag(expected_etag: str) -> None:
         if not isinstance(expected_etag, str) or not expected_etag:

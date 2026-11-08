@@ -1,33 +1,36 @@
 # Offline project-first UI prototype
 
-This is a framework-neutral, static interaction mockup for issue #11. It uses synthetic content only and has no backend, external assets, storage, authentication, API requests, provider SDKs, or model calls. Buttons that resemble consequential actions explain that they are demo-only; they do not answer questions, resume work, save chats, or change routing. Do not enter private data.
+This is a framework-neutral, local-only project/inbox vertical slice for issue #11. The project, work, and inbox screens read one synthetic project from the canonical SQLite event store; answer and reject commands are persisted and replayed. VP chat and model assignments are still illustrative and do not call a model. There are no provider SDKs, credentials, tools, external assets, or real user data. Do not enter private data.
 
 ## Run locally
 
-From this directory, serve only on loopback:
+From the repository root (install the existing schema dependency once if it is not already available):
 
 ```bash
-python3 -m http.server --bind 127.0.0.1 4173
+python3 -m pip install -r contracts/requirements-test.txt
+python3 -m ui.prototype.server
 ```
 
-Open <http://127.0.0.1:4173>. Stop the server with Ctrl-C. This is a static mock, not a security boundary or deployable service.
+Open <http://127.0.0.1:4173>. Stop the server with Ctrl-C. The service hard-binds to IPv4 loopback, accepts only its local host/origin, serves only the seeded synthetic project, disables CORS, bounds JSON requests, and requires a local-demo header for writes. It has **no real authentication** and is not a hardened or deployable service. Do not expose it through a LAN, tunnel, reverse proxy, or public host.
+
+The SQLite database persists at `$XDG_STATE_HOME/northstar-ai-workspace-prototype/canonical.sqlite3`, or `~/.local/state/northstar-ai-workspace-prototype/canonical.sqlite3` when `XDG_STATE_HOME` is unset. Delete that demo directory while the server is stopped to reset the synthetic project. Startup refuses a database whose existing project is not the expected synthetic fixture.
 
 ## Screens represented
 
 - Project home with charter summary, work status, recent project activity, and a visibly separate inbox preview.
-- Dependency-aware work list (read-only mock).
+- Dependency-aware work list read from canonical project state (read-only in this slice).
 - User-initiated VP conversation, clearly marked as an unconnected local-Qwen profile.
-- Separate inbox with impact, explicit options, affected work, clarification/reject/answer confirmations, and resolved history.
+- Separate inbox with impact, explicit options, affected work, persisted answer/reject commands, and resolved history. Clarification is visibly unavailable because its command is not implemented.
 - Agent/model profiles illustrating local VP and potential remote orchestrator/specialist assignments. Codex terms and provider connections are intentionally marked unreviewed/unavailable.
-- Project charter and synthetic evidence.
+- Project charter from canonical records; evidence view accurately reports that no evidence/artifact records exist yet.
 
-The prototype is plain HTML/CSS/JavaScript to validate information architecture without selecting React, Svelte, or a backend framework. It has keyboard-operable navigation and question controls, visible focus styles, semantic landmarks/headings, responsive layout, reduced-motion handling, and no external fonts or assets. This has not received a browser-matrix or independent accessibility review.
+The UI is plain HTML/CSS/JavaScript; a small Python standard-library HTTP adapter serves it and exposes only the local project/inbox endpoints. This validates the workflow without selecting React, Svelte, or a production backend framework. It has keyboard-operable navigation and question controls, visible focus styles, semantic landmarks/headings, responsive layout, reduced-motion handling, and no external fonts or assets. This has not received a browser-matrix or independent accessibility review.
 
 ## Checks
 
 ```bash
-python3 -m unittest discover -s tests -v
-node --check app.js
+python3 -m unittest discover -s ui/prototype/tests -v
+node --check ui/prototype/app.js
 ```
 
-These are structural and syntax checks, not browser interaction or visual regression tests. The next UI gate is a human walkthrough on desktop and mobile, keyboard-only review, and independent accessibility review before framework selection or API wiring.
+The HTTP tests exercise answer/reject persistence across runtime restart, safe identical retries, stale ETag denial, cross-project denial, host/origin/write-header restrictions, invalid-command rejection, and request bounds. Headless Chromium exercised answering, rejecting, updating affected-work/inbox state, resolved history, and persistence after page reload. This is not a broad browser matrix or independent accessibility/security review. The next gate is a human workflow walkthrough, keyboard-only/accessibility review, and authenticated identity/authorization design before any remotely reachable service.

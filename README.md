@@ -16,9 +16,9 @@ Research and development for a project-first collaborative AI workspace.
 - [Security threat model](security/THREAT_MODEL.md) — trust boundaries, abuse cases, current gaps, and release gates; not a security approval.
 - [Alignment memory prototype](alignment/README.md) — synthetic, provenance-first conformance checks kept separate from project charter, permissions, and private profile data.
 - [ADR-0001](decisions/ADR-0001-canonical-control-plane-and-adapters.md) — why the control plane is canonical and how candidate runtimes stay replaceable.
-- [Inbox API/UI contract](design/INBOX_API.md) — proposed separation of project VP conversation and approval inbox; no HTTP service is implemented yet.
+- [Inbox API/UI contract](design/INBOX_API.md) — proposed product/API contract, with the current loopback-only synthetic HTTP adapter documented separately from real authentication and production service requirements.
 - [UI foundation evaluation](design/UI_FOUNDATION_EVALUATION.md) — first-pass source/license review and provisional custom-UI recommendation.
-- [Offline UI prototype](ui/prototype/README.md) — mock project overview, work, separate inbox, VP chat, agent/model routing, and evidence; no backend or persistence.
+- [Local UI/inbox vertical slice](ui/prototype/README.md) — canonical project/work/inbox reads and persisted answer/reject commands; synthetic data and loopback-only service, no real auth/models.
 - [Model routing contract](design/MODEL_ROUTING.md) — offline profile/adapter design and approval gates for local and remote models.
 
 This repository is separate from `pi-harness`; experiments and development should happen here unless explicitly agreed otherwise.
