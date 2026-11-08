@@ -263,6 +263,11 @@ class OrganizationCoordinator:
                     detail="The human question was resolved; continue under a fresh run ID.",
                 )
 
+        if work["status"] == "running" and existing is None:
+            return WorkOutcome(
+                WorkflowStatus.RECOVERY_REQUIRED, task.work_id, task.run_id,
+                detail="Work is running without this canonical run; recover or explicitly requeue it first.",
+            )
         other_active_runs = [
             run_id for run_id, run in state["agentRuns"].items()
             if run["workId"] == task.work_id and run["status"] == "running" and run_id != task.run_id

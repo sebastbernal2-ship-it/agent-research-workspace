@@ -434,6 +434,28 @@ class ProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectionError, "live blocking question dependency closure"):
             Projector(self.store).replay("project.alpha")
 
+    def test_replay_rejects_two_active_root_runs_for_one_work_item(self):
+        self.create_project()
+        work = self.create_work("work.root-owner", "Enforce one work owner")
+        ProjectControlPlane(self.store).transition_work(
+            "project.alpha", work["workId"], "running", actor=VP, reason="Begin work.",
+        )
+        agent = {"actorType": "agent", "actorId": "agent.owner", "role": "specialist"}
+        for run_id in ("run.root-one", "run.root-two"):
+            run = {
+                "recordType": "agent_run", "schemaVersion": "0.1", "projectId": "project.alpha",
+                "runId": run_id, "workId": work["workId"], "agent": agent,
+                "adapter": {"name": "test-adapter", "version": "1"}, "status": "running",
+                "contextHash": "d" * 64, "capabilityGrantIds": [], "startedAt": NOW,
+            }
+            record_hash = self.store.put_record(run)
+            self.event("run.started", {
+                "runId": run_id, "workId": work["workId"], "adapter": run["adapter"],
+                "contextHash": run["contextHash"], "capabilityGrantIds": [], "recordHash": record_hash,
+            }, actor=agent)
+        with self.assertRaisesRegex(ProjectionError, "concurrent active root-run ownership"):
+            Projector(self.store).replay("project.alpha")
+
     def test_run_started_actor_must_match_assigned_agent(self):
         self.create_project()
         work = self.create_work("work.run-actor", "Check run attribution")

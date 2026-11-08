@@ -132,6 +132,18 @@ class OrganizationCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             occurred_at=NOW,
         )
 
+    async def test_running_work_without_its_canonical_run_requires_recovery(self):
+        self.control.transition_work(
+            PROJECT_ID, WORK_ID, "running", actor=AGENT, reason="Synthetic orphaned running status.",
+        )
+        calls = []
+        outcome = await self.coordinator.run_work(self.make_task(
+            "run.orphaned-work", lambda _context: calls.append("invoked") or ExecutionSignal.COMPLETED,
+        ))
+        self.assertEqual(outcome.status, WorkflowStatus.RECOVERY_REQUIRED)
+        self.assertEqual(calls, [])
+        self.assertNotIn("run.orphaned-work", Projector(self.store).replay(PROJECT_ID)["agentRuns"])
+
     async def test_verifier_cancellation_marks_work_cancelled_without_replaying_adapter(self):
         calls = []
 

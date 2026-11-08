@@ -1,10 +1,11 @@
 import hashlib
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from harness.control_plane import ControlPlaneError, ProjectControlPlane
-from harness.event_store import SQLiteEventStore
+from harness.event_store import ConcurrentWriteConflict, SQLiteEventStore
 from harness.projection import Projector
 from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
@@ -58,8 +59,41 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(state["agentRuns"][started["runId"]]["status"], "running")
         self.assertTrue(self.store.verify(PROJECT_ID))
 
-    def test_start_and_finish_are_durable_and_identical_retries_are_idempotent(self):
+    def test_work_has_only_one_concurrent_root_run(self):
+        def start(run_id):
+            try:
+                self.ledger.start(
+                    PROJECT_ID, WORK_ID, run_id=run_id, agent=SPECIALIST,
+                    adapter={"name": "test-agent-runtime", "version": "0.1"},
+                    context_hash=hashlib.sha256(run_id.encode()).hexdigest(),
+                    correlation_id="run.team", occurred_at=NOW,
+                )
+                return "started"
+            except (ControlPlaneError, ConcurrentWriteConflict):
+                return "rejected"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(start, ("run.concurrent-a", "run.concurrent-b")))
+        self.assertEqual(results.count("started"), 1)
+        state = Projector(self.store).replay(PROJECT_ID)
+        active = [run_id for run_id, run in state["agentRuns"].items() if run["status"] == "running"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(state["workItems"][WORK_ID]["status"], "running")
+
+    def test_new_root_run_cannot_be_started_while_another_run_owns_work(self):
+        self.start_run("run.active-owner")
+        with self.assertRaisesRegex(ControlPlaneError, "another active run tree"):
+            self.start_run("run.second-owner")
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual([run_id for run_id, run in state["agentRuns"].items() if run["status"] == "running"], ["run.active-owner"])
+
+    def test_running_work_without_active_run_requires_recovery_before_new_start(self):
         self.start_work()
+        with self.assertRaisesRegex(ControlPlaneError, "no active canonical run"):
+            self.start_run("run.without-owner")
+        self.assertNotIn("run.without-owner", Projector(self.store).replay(PROJECT_ID)["agentRuns"])
+
+    def test_start_and_finish_are_durable_and_identical_retries_are_idempotent(self):
         started = self.start_run()
         event_count = len(self.store.verified_events(PROJECT_ID))
         self.assertEqual(self.start_run(), started)

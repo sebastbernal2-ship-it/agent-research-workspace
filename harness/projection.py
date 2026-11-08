@@ -49,6 +49,13 @@ class Projector:
                 raise ProjectionError(f"immutable identity field {field!r} changed")
 
     @staticmethod
+    def _run_root_id(run_id: str, agent_runs: dict[str, dict[str, Any]]) -> str:
+        current = run_id
+        while agent_runs[current].get("parentRunId") is not None:
+            current = agent_runs[current]["parentRunId"]
+        return current
+
+    @staticmethod
     def _work_dependency_scope(work_id: str, work_items: dict[str, dict[str, Any]]) -> set[str]:
         scope = {work_id}
         pending = list(work_items[work_id].get("dependsOn", []))
@@ -301,6 +308,15 @@ class Projector:
                         raise ProjectionError("child run requires a previously started active parent")
                     if parent_event is None or parent_event["correlationId"] != event["correlationId"]:
                         raise ProjectionError("parent and child runs must share a correlation ID")
+                    root_run_id = self._run_root_id(parent_run_id, state["agentRuns"])
+                else:
+                    root_run_id = run_id
+                for active_id, active_run in state["agentRuns"].items():
+                    if active_run["workId"] != run["workId"] or active_run["status"] != "running":
+                        continue
+                    active_root_id = self._run_root_id(active_id, state["agentRuns"])
+                    if active_root_id != root_run_id:
+                        raise ProjectionError("work item cannot have concurrent active root-run ownership")
                 state["agentRuns"][run_id] = run
                 run_start_events[run_id] = event
 

@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable
 
 from .control_plane import ControlPlaneError, ProjectControlPlane
 from .event_store import SQLiteEventStore
+from .projection import Projector
 
 
 _TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
@@ -93,6 +94,22 @@ class RunLedger:
                 raise ControlPlaneError("parent and child runs must share the same correlation ID")
         if work["status"] not in {"ready", "running"}:
             raise ControlPlaneError("agent runs require ready or running work")
+        active_work_runs = [
+            active_id for active_id, active_run in state["agentRuns"].items()
+            if active_run["workId"] == work_id and active_run["status"] == "running"
+        ]
+        if work["status"] == "running" and not active_work_runs:
+            raise ControlPlaneError("running work has no active canonical run; recover or explicitly requeue it")
+        run_root_id = (
+            run_id if parent_run_id is None
+            else Projector._run_root_id(parent_run_id, state["agentRuns"])
+        )
+        conflicting_roots = [
+            active_id for active_id in active_work_runs
+            if Projector._run_root_id(active_id, state["agentRuns"]) != run_root_id
+        ]
+        if conflicting_roots:
+            raise ControlPlaneError(f"work already belongs to another active run tree: {conflicting_roots}")
         if work["status"] == "ready":
             incomplete = [
                 dependency for dependency in work["dependsOn"]
