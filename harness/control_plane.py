@@ -8,11 +8,16 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .event_store import EventStoreError, SQLiteEventStore
+from .inbox import InboxReadModel
 from .projection import Projector, ProjectionError, WORK_STATUS_TRANSITIONS
 
 
 class ControlPlaneError(EventStoreError):
     """A project/work/question command violates the local control contract."""
+
+
+class StaleQuestionRevision(ControlPlaneError):
+    """The inbox question or affected work changed since the client read it."""
 
 
 _ALLOWED_WORK_TRANSITIONS = WORK_STATUS_TRANSITIONS
@@ -25,6 +30,18 @@ class ProjectControlPlane:
         self.store = store
         self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
         self.projector = Projector(store)
+
+    @staticmethod
+    def _check_question_etag(
+        question: dict[str, Any],
+        state: dict[str, Any],
+        expected_etag: str | None,
+    ) -> None:
+        if expected_etag is None:
+            return
+        actual = InboxReadModel.etag_for(question, state["workItems"])
+        if actual != expected_etag:
+            raise StaleQuestionRevision("question or affected work changed; refresh the inbox item")
 
     def _event(
         self,
@@ -340,6 +357,7 @@ class ProjectControlPlane:
         actor: dict[str, str],
         reason: str,
         successor_question: dict[str, Any] | None = None,
+        expected_etag: str | None = None,
         occurred_at: str | None = None,
     ) -> dict[str, Any]:
         if new_status not in {"rejected", "cancelled", "expired", "superseded"}:
@@ -373,6 +391,7 @@ class ProjectControlPlane:
                     raise ControlPlaneError("question retry changed its successor record")
                 return question
             raise ControlPlaneError(f"question {question_id!r} is not open")
+        self._check_question_etag(question, state, expected_etag)
 
         if new_status == "expired":
             due_at = question.get("dueAt")
@@ -482,6 +501,7 @@ class ProjectControlPlane:
         *,
         actor: dict[str, str],
         selected_option_id: str | None = None,
+        expected_etag: str | None = None,
         occurred_at: str | None = None,
     ) -> dict[str, Any]:
         if actor.get("actorType") != "human" or actor.get("role") != "user":
@@ -498,6 +518,7 @@ class ProjectControlPlane:
             if answer["text"] == answer_text and answer["answeredBy"] == actor and answer.get("selectedOptionId") == selected_option_id:
                 return question
             raise ControlPlaneError(f"question {question_id!r} already has a different answer")
+        self._check_question_etag(question, state, expected_etag)
         if question["status"] != "open":
             raise ControlPlaneError(f"question {question_id!r} is not open")
         if selected_option_id is not None and selected_option_id not in {option["optionId"] for option in question["options"]}:

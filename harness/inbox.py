@@ -72,6 +72,22 @@ class InboxReadModel:
         return {**summary, "record": question, "history": history}
 
     @staticmethod
+    def etag_for(question: dict[str, Any], work_items: dict[str, dict[str, Any]]) -> str:
+        affected = [
+            {
+                "workId": work_id,
+                "title": work_items[work_id]["title"],
+                "status": work_items[work_id]["status"],
+                "revision": work_items[work_id]["revision"],
+            }
+            for work_id in question["workIds"]
+        ]
+        version_material = {"question": question, "affectedWork": affected}
+        return hashlib.sha256(
+            SQLiteEventStore._canonical_json(version_material).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
     def _summary(question: dict[str, Any], work_items: dict[str, dict[str, Any]]) -> dict[str, Any]:
         affected = [
             {
@@ -82,13 +98,7 @@ class InboxReadModel:
             }
             for work_id in question["workIds"]
         ]
-        version_material = {
-            "question": question,
-            "affectedWork": affected,
-        }
-        etag = hashlib.sha256(
-            SQLiteEventStore._canonical_json(version_material).encode("utf-8")
-        ).hexdigest()
+        etag = InboxReadModel.etag_for(question, work_items)
         return {
             "questionId": question["questionId"],
             "questionType": question["questionType"],

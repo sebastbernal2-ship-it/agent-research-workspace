@@ -3,8 +3,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.control_plane import ControlPlaneError, ProjectControlPlane
+from harness.control_plane import ControlPlaneError, ProjectControlPlane, StaleQuestionRevision
 from harness.event_store import ConcurrentWriteConflict, EventStoreError, SQLiteEventStore
+from harness.inbox import InboxReadModel
 from harness.projection import Projector
 
 
@@ -215,6 +216,38 @@ class ProjectControlPlaneTests(unittest.TestCase):
                 actor=VP,
             )
         self.assertEqual(len(self.store.events("project.control")), before)
+
+    def test_stale_inbox_etag_is_denied_but_identical_answer_retry_succeeds(self):
+        question = make_question(["work.primary"])
+        question.update({"questionId": "question.etag", "blocking": False})
+        self.control.open_question(question)
+        inbox = InboxReadModel(self.store)
+        stale_etag = inbox.get_question("project.control", question["questionId"])["etag"]
+        self.control.revise_work(
+            "project.control", "work.primary", {"objective": "Updated while question remained open."},
+            actor=VP,
+        )
+        with self.assertRaisesRegex(StaleQuestionRevision, "refresh the inbox"):
+            self.control.answer_question(
+                "project.control", question["questionId"], "Proceed.", actor=USER,
+                expected_etag=stale_etag,
+            )
+        self.assertEqual(
+            Projector(self.store).replay("project.control")["questions"][question["questionId"]]["status"],
+            "open",
+        )
+
+        current_etag = inbox.get_question("project.control", question["questionId"])["etag"]
+        answered = self.control.answer_question(
+            "project.control", question["questionId"], "Proceed.", actor=USER,
+            expected_etag=current_etag,
+        )
+        retry = self.control.answer_question(
+            "project.control", question["questionId"], "Proceed.", actor=USER,
+            expected_etag=current_etag,
+        )
+        self.assertEqual(answered, retry)
+        self.assertEqual(retry["status"], "answered")
 
     def test_answer_after_cancellation_is_denied(self):
         question = make_question(["work.primary"])
