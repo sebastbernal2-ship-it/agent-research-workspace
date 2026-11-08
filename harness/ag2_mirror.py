@@ -33,12 +33,14 @@ class CanonicalAG2Mirror(BaseHubListener):
         work_id: str,
         actors_by_ag2_id: dict[str, dict[str, str]],
         message_types_by_ag2_id: dict[str, str],
+        correlation_id: str | None = None,
     ) -> None:
         self.event_store = event_store
         self.project_id = project_id
         self.work_id = work_id
         self.actors_by_ag2_id = actors_by_ag2_id
         self.message_types_by_ag2_id = message_types_by_ag2_id
+        self.correlation_id = correlation_id
         self.errors: list[str] = []
         self.mirrored_envelope_ids: dict[str, str] = {}
 
@@ -89,7 +91,7 @@ class CanonicalAG2Mirror(BaseHubListener):
                 "actor": actor,
                 "occurredAt": envelope.created_at,
                 "causationId": causation_id,
-                "correlationId": thread_id,
+                "correlationId": self.correlation_id or thread_id,
                 "idempotencyKey": event_id,
                 "payload": {
                     "workId": self.work_id,

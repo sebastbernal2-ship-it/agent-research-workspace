@@ -30,7 +30,15 @@ class MeldworkReceiptBridge:
         if not self.node:
             raise MeldworkBridgeError("Node.js executable not found")
 
-    def canonicalize(self, request: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    def canonicalize(
+        self,
+        request: dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        request = {**request}
+        if correlation_id is not None:
+            request["correlationId"] = correlation_id
         encoded = json.dumps(request, separators=(",", ":"), ensure_ascii=False)
         if len(encoded.encode("utf-8")) > 60000:
             raise MeldworkBridgeError("Meldwork adapter request exceeds 60 KB")
@@ -63,8 +71,8 @@ class MeldworkReceiptBridge:
             raise MeldworkBridgeError("Meldwork adapter response has invalid types")
         return event, blob_content
 
-    def persist(self, request: dict[str, Any]) -> AppendResult:
-        event, blob_content = self.canonicalize(request)
+    def persist(self, request: dict[str, Any], *, correlation_id: str | None = None) -> AppendResult:
+        event, blob_content = self.canonicalize(request, correlation_id=correlation_id)
         content_ref, content_hash = self.event_store.put_blob(blob_content)
         if (content_ref, content_hash) != (event["payload"]["contentRef"], event["payload"]["contentHash"]):
             raise MeldworkBridgeError("adapter blob digest did not match canonical event reference")

@@ -42,7 +42,13 @@ class MeldworkAgenticXRuntimeBridge:
         if not self.node:
             raise MeldworkRuntimeError("Node.js executable not found")
 
-    def run(self, *, project_id: str, work_id: str) -> dict[str, Any]:
+    def run(
+        self,
+        *,
+        project_id: str,
+        work_id: str,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         with tempfile.TemporaryDirectory(prefix="meldwork-runtime-bridge-") as home:
             env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             try:
@@ -93,9 +99,9 @@ class MeldworkAgenticXRuntimeBridge:
                 raise MeldworkRuntimeError("Meldwork runtime invocation is incomplete") from exc
             if actor_kind not in {"codex", "hermes"}:
                 raise MeldworkRuntimeError("Meldwork runtime returned an unknown AgenticX worker")
-            role = "reviewer" if phase in {"challenge", "verification"} else (
-                "orchestrator" if phase == "synthesis" else "specialist"
-            )
+            # A worker's project role is stable across phases; phase/message
+            # type carries whether that contribution critiques or verifies.
+            role = "orchestrator" if actor_kind == "hermes" else "specialist"
             request = {
                 "projectId": project_id,
                 "workId": work_id,
@@ -113,7 +119,9 @@ class MeldworkAgenticXRuntimeBridge:
                 "collaboration": collaboration,
             }
             try:
-                event, blob_content = receipt_bridge.canonicalize(request)
+                event, blob_content = receipt_bridge.canonicalize(
+                    request, correlation_id=correlation_id,
+                )
                 content_ref, content_hash = self.event_store.put_blob(blob_content)
                 if (content_ref, content_hash) != (
                     event["payload"]["contentRef"], event["payload"]["contentHash"]

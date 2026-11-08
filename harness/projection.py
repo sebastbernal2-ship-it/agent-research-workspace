@@ -258,6 +258,8 @@ class Projector:
                 run = self._load_record(payload["recordHash"], "agent_run", project_id)
                 if run["runId"] != run_id or run["workId"] != payload["workId"] or run["status"] != "running":
                     raise ProjectionError("run.started payload does not match run record")
+                if run["agent"] != event["actor"]:
+                    raise ProjectionError("run.started actor does not match the assigned agent")
                 if run["adapter"] != payload["adapter"] or run["contextHash"] != payload["contextHash"] or run["capabilityGrantIds"] != payload["capabilityGrantIds"]:
                     raise ProjectionError("run.started metadata does not match run record")
                 state["agentRuns"][run_id] = run
@@ -270,6 +272,8 @@ class Projector:
                 new = self._load_record(payload["recordHash"], "agent_run", project_id)
                 if new["runId"] != run_id or new["workId"] != old["workId"] or new["status"] != payload["terminalStatus"]:
                     raise ProjectionError("run.finished payload does not match terminal run record")
+                if event["actor"] != old["agent"]:
+                    raise ProjectionError("run.finished actor does not match the assigned agent")
                 self._check_same_identity(old, new, ("projectId", "runId", "workId", "agent", "adapter", "contextHash", "capabilityGrantIds", "startedAt"))
                 state["agentRuns"][run_id] = new
 

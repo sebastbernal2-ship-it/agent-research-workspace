@@ -86,6 +86,9 @@ function toCanonicalEvent(request) {
   const identityHash = digest(identity)
   const eventId = `event.meldwork.${identityHash}`
   const threadId = `thread.meldwork.${digest(`${projectId}\0${workId}`)}`
+  const correlationId = request.correlationId === undefined
+    ? threadId
+    : requireString(request.correlationId, 'correlationId', 128)
   const actorId = requireString(actor.actorId, 'actor.actorId', 128)
   const event = {
     recordType: 'event',
@@ -96,7 +99,7 @@ function toCanonicalEvent(request) {
     actor,
     occurredAt,
     causationId: request.causationId || null,
-    correlationId: threadId,
+    correlationId,
     idempotencyKey: eventId,
     payload: {
       workId,

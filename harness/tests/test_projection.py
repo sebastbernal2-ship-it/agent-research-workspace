@@ -298,6 +298,47 @@ class ProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectionError, "live blocking question dependency closure"):
             Projector(self.store).replay("project.alpha")
 
+    def test_run_started_actor_must_match_assigned_agent(self):
+        self.create_project()
+        work = self.create_work("work.run-actor", "Check run attribution")
+        agent = {"actorType": "agent", "actorId": "agent.specialist", "role": "specialist"}
+        run = {
+            "recordType": "agent_run", "schemaVersion": "0.1", "projectId": "project.alpha",
+            "runId": "run.actor-mismatch", "workId": work["workId"], "agent": agent,
+            "adapter": {"name": "test-adapter", "version": "1"}, "status": "running",
+            "contextHash": "a" * 64, "capabilityGrantIds": [], "startedAt": NOW,
+        }
+        record_hash = self.store.put_record(run)
+        self.event("run.started", {
+            "runId": run["runId"], "workId": work["workId"], "adapter": run["adapter"],
+            "contextHash": run["contextHash"], "capabilityGrantIds": [], "recordHash": record_hash,
+        }, actor=VP)
+        with self.assertRaisesRegex(ProjectionError, "assigned agent"):
+            Projector(self.store).replay("project.alpha")
+
+    def test_run_finished_actor_must_match_assigned_agent(self):
+        self.create_project()
+        work = self.create_work("work.run-finish-actor", "Check terminal run attribution")
+        agent = {"actorType": "agent", "actorId": "agent.specialist", "role": "specialist"}
+        run = {
+            "recordType": "agent_run", "schemaVersion": "0.1", "projectId": "project.alpha",
+            "runId": "run.finish-actor-mismatch", "workId": work["workId"], "agent": agent,
+            "adapter": {"name": "test-adapter", "version": "1"}, "status": "running",
+            "contextHash": "b" * 64, "capabilityGrantIds": [], "startedAt": NOW,
+        }
+        started_hash = self.store.put_record(run)
+        self.event("run.started", {
+            "runId": run["runId"], "workId": work["workId"], "adapter": run["adapter"],
+            "contextHash": run["contextHash"], "capabilityGrantIds": [], "recordHash": started_hash,
+        }, actor=agent)
+        finished = {**run, "status": "succeeded", "finishedAt": "2026-04-16T12:01:00Z"}
+        finished_hash = self.store.put_record(finished)
+        self.event("run.finished", {
+            "runId": run["runId"], "terminalStatus": "succeeded", "recordHash": finished_hash,
+        }, actor=VP)
+        with self.assertRaisesRegex(ProjectionError, "assigned agent"):
+            Projector(self.store).replay("project.alpha")
+
     def test_replay_preserves_failed_runs_and_conflicting_evidence(self):
         self.create_project()
         work = self.create_work("work.conflicts", "Compare evidence")

@@ -123,6 +123,26 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
         self.assertTrue(self.store.verify("project.meldwork"))
         self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 3)
 
+    def test_v4_receipt_can_carry_organization_run_correlation(self):
+        request_data = request(
+            "receipt.correlated.proposal",
+            "proposal",
+            "agent.proposer",
+            {
+                "version": 1,
+                "phase": "proposal",
+                "summary": "Explore the synthetic question.",
+                "capabilities": ["public-source analysis"],
+                "intendedWork": ["compare explanations"],
+                "deliverables": ["a sourced finding"],
+                "dependencies": [],
+            },
+            "Start with a testable proposal.",
+            "2026-04-16T12:00:00Z",
+        )
+        event, _ = self.bridge.canonicalize(request_data, correlation_id="run.organization")
+        self.assertEqual(event["correlationId"], "run.organization")
+
     def test_invalid_v4_receipt_does_not_enter_canonical_log(self):
         invalid = request(
             "receipt.invalid.challenge",
