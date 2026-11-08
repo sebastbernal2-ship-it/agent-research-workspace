@@ -19,7 +19,7 @@ There are currently no real credentials, personal profile data, provider calls, 
 
 | Boundary | Current prototype | Required before broader use |
 |---|---|---|
-| User ↔ project control plane | No UI/API or authenticated user principal. Test calls pass actor fields directly. | Authenticated principal, CSRF/session protections, explicit confirmation UX, authorization on every command. |
+| User ↔ project control plane | Framework-neutral inbox facade obtains actors through injected principal/access-policy interfaces, but tests use fakes; no UI/API or real authenticated principal exists. Lower-level test commands still accept actor fields directly. | Real authenticated principal, CSRF/session protections, explicit confirmation UX, authorization on every command. |
 | Control plane ↔ SQLite | Single-host SQLite, schema validation, append-only triggers, hashes and event replay. No per-project authorization or encryption. | Capability checks before reads/writes, protected backups, key management if private data is allowed, concurrency and crash tests. |
 | Canonical store ↔ candidate runtime | Separate AG2/Meldwork/AgenticX adapters; JSON boundary; canonical store remains authoritative. | Signed/validated adapter identity, bounded input/output, per-project grants, atomic outbox/reconciliation and replay controls. |
 | Harness ↔ AgenticX subprocess | Separate pinned venv, temporary HOME/cwd, reduced environment, bounded JSON/stdout/stderr/time, deterministic provider, no tools in tests; POSIX timeout/overflow kills the child process group. | OS-level sandbox, CPU/memory/filesystem/network limits, cross-platform process-tree cancellation, verified executable/dependency provenance. Current process split is **not** a sandbox. |

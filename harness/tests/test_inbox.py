@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from harness.event_store import SQLiteEventStore
-from harness.inbox import InboxNotFound, InboxReadModel
+from harness.inbox import InboxApplication, InboxForbidden, InboxNotFound, InboxReadModel
 from harness.testing import USER, seed_synthetic_project
 
 
@@ -31,6 +31,23 @@ def question(question_id, priority, *, blocking):
     }
 
 
+class StaticPrincipalProvider:
+    def __init__(self, actor):
+        self.actor = actor
+
+    def current_actor(self):
+        return self.actor
+
+
+class AllowlistProjectAccess:
+    def __init__(self, allowed_projects):
+        self.allowed_projects = set(allowed_projects)
+
+    def require_project_access(self, actor, project_id, action):
+        if project_id not in self.allowed_projects:
+            raise InboxForbidden("project access denied")
+
+
 class InboxReadModelTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -41,6 +58,9 @@ class InboxReadModelTests(unittest.TestCase):
         self.control.open_question(question("question.normal", "normal", blocking=True))
         self.control.open_question(question("question.high", "high", blocking=False))
         self.inbox = InboxReadModel(self.store)
+        self.principal = StaticPrincipalProvider(USER)
+        self.access = AllowlistProjectAccess({"project.inbox"})
+        self.application = InboxApplication(self.inbox, self.control, self.principal, self.access)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -74,6 +94,34 @@ class InboxReadModelTests(unittest.TestCase):
         )
         with self.assertRaises(InboxNotFound):
             self.inbox.get_question("project.other", "question.normal")
+
+    def test_application_uses_injected_principal_and_requires_project_access(self):
+        item = self.application.get_question("project.inbox", "question.normal")
+        answered = self.application.answer_question(
+            "project.inbox", "question.normal", expected_etag=item["etag"],
+            text="Proceed with the scoped review.", occurred_at="2026-04-16T12:01:00Z",
+        )
+        self.assertEqual(answered["status"], "answered")
+        with self.assertRaises(InboxForbidden):
+            self.application.list_questions("project.other")
+
+        self.principal.actor = {"actorType": "agent", "actorId": "agent.vp", "role": "vp"}
+        with self.assertRaisesRegex(InboxForbidden, "authenticated human user"):
+            self.application.list_questions("project.inbox")
+
+    def test_application_requires_current_etag_for_answer_and_closure(self):
+        item = self.application.get_question("project.inbox", "question.high")
+        with self.assertRaisesRegex(ValueError, "ETag precondition"):
+            self.application.answer_question(
+                "project.inbox", "question.high", expected_etag="",
+                text="Proceed.",
+            )
+        closed = self.application.close_question(
+            "project.inbox", "question.high", new_status="rejected",
+            expected_etag=item["etag"], reason="Not needed for this project.",
+            occurred_at="2026-04-16T12:01:00Z",
+        )
+        self.assertEqual(closed["status"], "rejected")
 
     def test_invalid_filters_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "nonempty subset"):

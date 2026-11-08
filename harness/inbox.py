@@ -6,7 +6,10 @@ This is not an HTTP API and does not authenticate or authorize a caller.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Protocol
+
+if TYPE_CHECKING:
+    from .control_plane import ProjectControlPlane
 
 from .event_store import SQLiteEventStore
 from .projection import Projector
@@ -18,6 +21,22 @@ PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
 
 class InboxNotFound(LookupError):
     """Question is not present in the requested project's canonical state."""
+
+
+class InboxForbidden(PermissionError):
+    """Caller lacks the authenticated user principal or project access."""
+
+
+class PrincipalProvider(Protocol):
+    """Trusted application adapter that returns the authenticated actor."""
+
+    def current_actor(self) -> dict[str, str]: ...
+
+
+class ProjectAccessPolicy(Protocol):
+    """Application adapter that enforces project membership/permissions."""
+
+    def require_project_access(self, actor: dict[str, str], project_id: str, action: str) -> None: ...
 
 
 class InboxReadModel:
@@ -119,3 +138,96 @@ class InboxReadModel:
             "supersededByQuestionId": question.get("supersededByQuestionId"),
             "etag": etag,
         }
+
+
+class InboxApplication:
+    """Framework-neutral inbox application boundary.
+
+    The HTTP/UI adapter must inject a genuinely authenticated principal
+    provider and project-access policy. Fake implementations are suitable for
+    offline tests only; this class does not authenticate by itself.
+    """
+
+    def __init__(
+        self,
+        read_model: InboxReadModel,
+        control_plane: ProjectControlPlane,
+        principal_provider: PrincipalProvider,
+        access_policy: ProjectAccessPolicy,
+    ):
+        self.read_model = read_model
+        self.control_plane = control_plane
+        self.principal_provider = principal_provider
+        self.access_policy = access_policy
+
+    def _user(self, project_id: str, action: str) -> dict[str, str]:
+        actor = self.principal_provider.current_actor()
+        if actor.get("actorType") != "human" or actor.get("role") != "user":
+            raise InboxForbidden("an authenticated human user is required")
+        self.access_policy.require_project_access(actor, project_id, action)
+        return actor
+
+    @staticmethod
+    def _require_etag(expected_etag: str) -> None:
+        if not isinstance(expected_etag, str) or not expected_etag:
+            raise ValueError("an inbox ETag precondition is required")
+
+    def list_questions(
+        self,
+        project_id: str,
+        *,
+        statuses: Iterable[str] = ("open",),
+        priority: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self._user(project_id, "inbox.read")
+        return self.read_model.list_questions(project_id, statuses=statuses, priority=priority)
+
+    def get_question(self, project_id: str, question_id: str) -> dict[str, Any]:
+        self._user(project_id, "inbox.read")
+        return self.read_model.get_question(project_id, question_id)
+
+    def answer_question(
+        self,
+        project_id: str,
+        question_id: str,
+        *,
+        expected_etag: str,
+        text: str,
+        selected_option_id: str | None = None,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_etag(expected_etag)
+        actor = self._user(project_id, "inbox.answer")
+        return self.control_plane.answer_question(
+            project_id,
+            question_id,
+            text,
+            actor=actor,
+            selected_option_id=selected_option_id,
+            expected_etag=expected_etag,
+            occurred_at=occurred_at,
+        )
+
+    def close_question(
+        self,
+        project_id: str,
+        question_id: str,
+        *,
+        new_status: str,
+        expected_etag: str,
+        reason: str,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        if new_status not in {"rejected", "cancelled"}:
+            raise ValueError("user inbox closure supports reject or cancel only")
+        self._require_etag(expected_etag)
+        actor = self._user(project_id, "inbox.close")
+        return self.control_plane.close_question(
+            project_id,
+            question_id,
+            new_status,
+            actor=actor,
+            reason=reason,
+            expected_etag=expected_etag,
+            occurred_at=occurred_at,
+        )
