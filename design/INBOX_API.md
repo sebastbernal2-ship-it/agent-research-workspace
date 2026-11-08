@@ -1,6 +1,6 @@
 # Separate project inbox and VP conversation API contract (design only)
 
-Status: proposed interface for issue #6. No HTTP server, UI, notifications, authentication, or scheduler continuation is implemented. All paths below are conceptual; the local Python control plane is not an API service.
+Status: proposed interface for issue #6. A local project-scoped read model now supplies filtered summaries, affected-work status, record detail, history metadata, and an ETag-like revision hash. No HTTP server, UI, notifications, authentication, or scheduler continuation is implemented. All paths below remain conceptual; the local Python read model/control plane is not an API service.
 
 ## Product boundary
 
@@ -76,4 +76,4 @@ Expiry is an internal scheduler command, not a user-facing approval action. It r
 
 ## Mapping to current local prototype
 
-The `human_question` record carries type, priority, impact, options, due date, source actor/run and work references. `ProjectControlPlane` tests open/answer/reject/cancel/expire/supersede semantics and atomic affected-work transitions. Remaining before this design can become an API: authenticated principal/session, versioned work/closure snapshots, scheduler/outbox, notification UX, cross-project authorization and a real independent acceptance review.
+The `human_question` record carries type, priority, impact, options, due date, source actor/run and work references. `ProjectControlPlane` tests open/answer/reject/cancel/expire/supersede semantics and atomic affected-work transitions; `InboxReadModel` tests project-scoped filtering, status, history metadata, and ETag change after answer/resume. Remaining before this design can become an API: authenticated principal/session, server-side authorization and expected-revision command checks, scheduler/outbox, notification UX, cross-project access policy and a real independent acceptance review.

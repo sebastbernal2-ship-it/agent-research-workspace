@@ -30,6 +30,38 @@ def _parse_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+class GuardedCapabilityExecutor:
+    """Check a synthetic grant immediately before a test effect callback.
+
+    This demonstrates adapter wiring only. It is neither atomic with revocation
+    nor a sandbox and must not guard real external side effects.
+    """
+
+    def __init__(self, authority: "CapabilityAuthority"):
+        self.authority = authority
+
+    def execute(
+        self,
+        project_id: str,
+        work_id: str,
+        *,
+        subject: dict[str, Any],
+        capability: str,
+        resource_id: str,
+        effect: Callable[[], Any],
+    ) -> Any:
+        if not callable(effect):
+            raise TypeError("effect must be callable")
+        self.authority.authorize(
+            project_id,
+            work_id,
+            subject=subject,
+            capability=capability,
+            resource_id=resource_id,
+        )
+        return effect()
+
+
 class CapabilityAuthority:
     """Issue/revoke user-approved grants and check their exact scope."""
 

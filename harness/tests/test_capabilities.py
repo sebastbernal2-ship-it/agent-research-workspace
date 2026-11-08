@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.capabilities import CapabilityAuthority, CapabilityDenied
+from harness.capabilities import CapabilityAuthority, CapabilityDenied, GuardedCapabilityExecutor
 from harness.control_plane import ControlPlaneError, ProjectControlPlane
 from harness.event_store import EventStoreError, SQLiteEventStore
 from harness.projection import Projector, ProjectionError
@@ -109,6 +109,42 @@ class CapabilityAuthorityTests(unittest.TestCase):
             )["grantId"],
             "grant.read-corpus",
         )
+
+    def test_guarded_executor_runs_only_after_exact_grant_check(self):
+        executor = GuardedCapabilityExecutor(self.authority)
+        self.authority.grant(grant_record(), actor=USER)
+        effects = []
+        request = {
+            "subject": SUBJECT,
+            "capability": "source.fetch",
+            "resource_id": "resource.public-domain",
+        }
+        self.assertEqual(
+            executor.execute(
+                "project.capability", "work.scoped", **request,
+                effect=lambda: effects.append("allowed") or "ok",
+            ),
+            "ok",
+        )
+        self.assertEqual(effects, ["allowed"])
+
+        with self.assertRaises(CapabilityDenied):
+            executor.execute(
+                "project.capability", "work.scoped", **{**request, "resource_id": "resource.other"},
+                effect=lambda: effects.append("denied"),
+            )
+        self.assertEqual(effects, ["allowed"])
+
+        self.authority.revoke(
+            "project.capability", "grant.read-corpus", actor=USER,
+            reason="Synthetic revocation", occurred_at=LATER,
+        )
+        with self.assertRaises(CapabilityDenied):
+            executor.execute(
+                "project.capability", "work.scoped", **request,
+                effect=lambda: effects.append("revoked"),
+            )
+        self.assertEqual(effects, ["allowed"])
 
     def test_only_user_can_grant_or_revoke_and_revocation_is_durable(self):
         with self.assertRaisesRegex(ControlPlaneError, "only a user actor"):
