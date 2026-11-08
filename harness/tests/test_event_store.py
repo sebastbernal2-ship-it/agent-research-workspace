@@ -120,6 +120,18 @@ class SQLiteEventStoreTests(unittest.TestCase):
         retry = self.store.commit_adapter_receipt("invocation.test")
         self.assertEqual([item.sequence for item in retry], [1, 2])
         self.assertTrue(all(item.duplicate for item in retry))
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                "UPDATE adapter_invocations SET result_json='not-json' WHERE invocation_id='invocation.test'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        repaired_state = self.store.get_adapter_invocation("invocation.test")
+        self.assertEqual(len(repaired_state["results"]), 2)
+        repaired = self.store.commit_adapter_receipt("invocation.test")
+        self.assertEqual([item.sequence for item in repaired], [1, 2])
         self.assertEqual(len(self.store.events("project.alpha")), 2)
         self.assertTrue(self.store.verify("project.alpha"))
 

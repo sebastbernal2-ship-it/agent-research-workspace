@@ -407,15 +407,8 @@ class SQLiteEventStore:
             ).fetchone()
             if row is None:
                 raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
-            if row["state"] == "imported":
-                saved = json.loads(row["result_json"])
-                results = [
-                    AppendResult(item["event"], item["sequence"], item["recordHash"], True)
-                    for item in saved
-                ]
-                conn.execute("COMMIT")
-                return results
-            if row["state"] != "receipt_staged" or row["receipt_json"] is None:
+            already_imported = row["state"] == "imported"
+            if row["state"] not in {"receipt_staged", "imported"} or row["receipt_json"] is None:
                 raise EventStoreError(f"adapter invocation {invocation_id!r} has no staged receipt to import")
             receipt_json = row["receipt_json"]
             if hashlib.sha256(receipt_json.encode("utf-8")).hexdigest() != row["receipt_hash"]:
@@ -438,6 +431,10 @@ class SQLiteEventStore:
                         raise IdempotencyConflict(f"idempotency key {idempotency_key!r} was reused with different content")
                     results.append(AppendResult(stored_event, previous["sequence"], previous["record_hash"], True))
                     continue
+                if already_imported:
+                    raise IntegrityFailure(
+                        f"imported adapter receipt {invocation_id!r} references a missing canonical event"
+                    )
                 last = conn.execute(
                     "SELECT sequence, record_hash FROM canonical_events WHERE project_id=? ORDER BY sequence DESC LIMIT 1",
                     (project_id,),
@@ -537,6 +534,13 @@ class SQLiteEventStore:
             conn.close()
         if row is None:
             return None
+        results = None
+        if row["state"] == "imported":
+            results = [{
+                "event": item.event, "sequence": item.sequence, "recordHash": item.record_hash,
+            } for item in self.commit_adapter_receipt(invocation_id)]
+        elif row["result_json"] is not None:
+            results = json.loads(row["result_json"])
         return {
             "invocationId": row["invocation_id"],
             "projectId": row["project_id"],
@@ -544,7 +548,7 @@ class SQLiteEventStore:
             "state": row["state"],
             "receiptHash": row["receipt_hash"],
             "receipt": None if row["receipt_json"] is None else json.loads(row["receipt_json"]),
-            "results": None if row["result_json"] is None else json.loads(row["result_json"]),
+            "results": results,
         }
 
     def put_blob(self, content: str | bytes) -> tuple[str, str]:
@@ -627,6 +631,8 @@ class SQLiteEventStore:
                     raise IntegrityFailure(
                         f"backup contains corrupt adapter receipt {invocation['invocation_id']}"
                     )
+            if invocation["state"] == "imported":
+                snapshot.commit_adapter_receipt(invocation["invocation_id"])
         return destination_path
 
     def _project_ids(self) -> set[str]:
