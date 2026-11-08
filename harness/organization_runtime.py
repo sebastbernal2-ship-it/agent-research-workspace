@@ -379,6 +379,14 @@ class OrganizationCoordinator:
             verified = await self._invoke(task.verify, context)
             if not isinstance(verified, bool):
                 raise TypeError("verification callback must return bool")
+        except asyncio.CancelledError:
+            current = self.projector.replay(task.project_id)["workItems"][task.work_id]
+            if current["status"] == "verifying":
+                self.control.transition_work(
+                    task.project_id, task.work_id, "cancelled", actor=task.verification_actor,
+                    reason="Verification was cancelled after adapter output was persisted.",
+                )
+            raise
         except Exception as exc:
             self._fail_verifying_work(task, "Verification callback failed.")
             return WorkOutcome(

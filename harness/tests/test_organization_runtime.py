@@ -132,6 +132,26 @@ class OrganizationCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             occurred_at=NOW,
         )
 
+    async def test_verifier_cancellation_marks_work_cancelled_without_replaying_adapter(self):
+        calls = []
+
+        def execute(context):
+            calls.append("execute")
+            self.write_output(context)
+            return ExecutionSignal.COMPLETED
+
+        async def cancel_verification(_context):
+            raise asyncio.CancelledError()
+
+        task = self.make_task("run.cancel-verifier", execute, verify=cancel_verification)
+        with self.assertRaises(asyncio.CancelledError):
+            await self.coordinator.run_work(task)
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(state["workItems"][WORK_ID]["status"], "cancelled")
+        self.assertEqual(state["agentRuns"][task.run_id]["status"], "succeeded")
+        self.assertEqual(calls, ["execute"])
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
     async def test_adapter_failure_interrupts_active_child_before_failing_parent(self):
         def fail_after_delegating(context):
             self.ledger.start(
