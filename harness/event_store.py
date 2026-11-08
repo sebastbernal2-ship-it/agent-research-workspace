@@ -123,6 +123,24 @@ class SQLiteEventStore:
                     receipt_hash TEXT,
                     result_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS scheduled_work (
+                    job_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('queued', 'leased', 'recovery_required', 'completed', 'failed')),
+                    lease_owner TEXT,
+                    lease_token TEXT,
+                    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),
+                    lease_expires_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS scheduled_work_ready
+                    ON scheduled_work(state, created_at, job_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS scheduled_work_one_open_per_work
+                    ON scheduled_work(project_id, work_id)
+                    WHERE state IN ('queued', 'leased', 'recovery_required');
                 CREATE TRIGGER IF NOT EXISTS canonical_blobs_no_update
                 BEFORE UPDATE ON canonical_blobs
                 BEGIN SELECT RAISE(ABORT, 'canonical blobs are immutable'); END;
@@ -592,7 +610,7 @@ class SQLiteEventStore:
         return [json.loads(row["event_json"]) for row in rows]
 
     def backup_to(self, destination: str | Path) -> Path:
-        """Create and verify a consistent SQLite snapshot including blobs and receipt journals."""
+        """Create and verify a consistent snapshot of events, blobs, receipts, and queue metadata."""
         destination_path = Path(destination).resolve()
         if self.path != ":memory:" and destination_path == Path(self.path).resolve():
             raise EventStoreError("backup destination must differ from the live database")

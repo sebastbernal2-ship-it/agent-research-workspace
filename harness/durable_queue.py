@@ -1,0 +1,353 @@
+"""SQLite-backed local work queue with expiring, fenced worker leases.
+
+Queue rows are operational metadata, not canonical project state. Expired leases
+enter recovery_required and are never silently handed to another worker.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import secrets
+import sqlite3
+from typing import Any
+
+from .event_store import EventStoreError, IdempotencyConflict, SQLiteEventStore
+from .projection import Projector
+
+
+class QueueError(EventStoreError):
+    """Invalid, conflicting, or stale durable queue operation."""
+
+
+MAX_LEASE_SECONDS = 7 * 24 * 60 * 60
+
+
+class SQLiteWorkQueue:
+    def __init__(self, store: SQLiteEventStore):
+        self.store = store
+        self.projector = Projector(store)
+
+    @staticmethod
+    def _json(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _positive(value: float, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise QueueError(f"{label} must be a positive finite number")
+        return float(value)
+
+    @classmethod
+    def _lease_seconds(cls, value: float) -> float:
+        seconds = cls._positive(value, "lease_seconds")
+        if seconds > MAX_LEASE_SECONDS:
+            raise QueueError(f"lease_seconds cannot exceed {MAX_LEASE_SECONDS}")
+        return seconds
+
+    @staticmethod
+    def _required_text(value: str, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise QueueError(f"{label} must be a non-empty string")
+        return value
+
+    def enqueue(
+        self,
+        job_id: str,
+        project_id: str,
+        work_id: str,
+        payload: dict[str, Any],
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        self._required_text(job_id, "job_id")
+        self._required_text(project_id, "project_id")
+        self._required_text(work_id, "work_id")
+        self._positive(now, "now")
+        if not isinstance(payload, dict):
+            raise QueueError("payload must be an object")
+        state = self.projector.replay(project_id)
+        if work_id not in state["workItems"]:
+            raise QueueError(f"unknown work item {work_id!r}")
+        payload_json = self._json(payload)
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            if row is not None:
+                if (
+                    row["project_id"] != project_id
+                    or row["work_id"] != work_id
+                    or row["payload_json"] != payload_json
+                ):
+                    raise IdempotencyConflict(f"scheduled job {job_id!r} was reused with different content")
+                conn.execute("COMMIT")
+                return self._decode(row)
+            conn.execute(
+                "INSERT INTO scheduled_work "
+                "(job_id, project_id, work_id, payload_json, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+                (job_id, project_id, work_id, payload_json, float(now), float(now)),
+            )
+            conn.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise QueueError(f"work already has an open scheduled job: {project_id}/{work_id}") from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return self.get(job_id)
+
+    def claim_next(
+        self,
+        worker_id: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> dict[str, Any] | None:
+        self._required_text(worker_id, "worker_id")
+        now = self._positive(now, "now")
+        lease_seconds = self._lease_seconds(lease_seconds)
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE scheduled_work SET state='recovery_required', lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE state='leased' AND lease_expires_at<=?",
+                (now, now),
+            )
+            candidates = conn.execute(
+                "SELECT * FROM scheduled_work WHERE state='queued' ORDER BY created_at, job_id"
+            ).fetchall()
+            for row in candidates:
+                state = self.projector.replay(row["project_id"])
+                work = state["workItems"].get(row["work_id"])
+                if work is None or not self._is_runnable(state, row["work_id"]):
+                    continue
+                token = secrets.token_urlsafe(32)
+                generation = row["lease_generation"] + 1
+                expires = now + lease_seconds
+                conn.execute(
+                    "UPDATE scheduled_work SET state='leased', lease_owner=?, lease_token=?, "
+                    "lease_generation=?, lease_expires_at=?, updated_at=? WHERE job_id=? AND state='queued'",
+                    (worker_id, token, generation, expires, now, row["job_id"]),
+                )
+                leased = conn.execute(
+                    "SELECT * FROM scheduled_work WHERE job_id=?", (row["job_id"],),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return self._decode(leased, expose_token=True)
+            conn.execute("COMMIT")
+            return None
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def renew(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        generation: int,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> dict[str, Any]:
+        now = self._positive(now, "now")
+        lease_seconds = self._lease_seconds(lease_seconds)
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            self._assert_lease(row, worker_id, lease_token, generation, now)
+            expires = now + lease_seconds
+            conn.execute(
+                "UPDATE scheduled_work SET lease_expires_at=?, updated_at=? WHERE job_id=?",
+                (expires, now, job_id),
+            )
+            renewed = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            conn.execute("COMMIT")
+            return self._decode(renewed, expose_token=True)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def complete(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        generation: int,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        now = self._positive(now, "now")
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            self._assert_lease(row, worker_id, lease_token, generation, now)
+            state = self.projector.replay(row["project_id"])
+            if state["workItems"][row["work_id"]]["status"] != "completed":
+                raise QueueError("a scheduled job can complete only after canonical work is completed")
+            if any(
+                run["workId"] == row["work_id"] and run["status"] == "running"
+                for run in state["agentRuns"].values()
+            ):
+                raise QueueError("scheduled work still has active agent runs")
+            conn.execute(
+                "UPDATE scheduled_work SET state='completed', lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
+                (now, job_id),
+            )
+            completed = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            conn.execute("COMMIT")
+            return self._decode(completed)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def release(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        generation: int,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        now = self._positive(now, "now")
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            self._assert_lease(row, worker_id, lease_token, generation, now)
+            state = self.projector.replay(row["project_id"])
+            target = "queued" if self._is_runnable(state, row["work_id"]) else "recovery_required"
+            conn.execute(
+                "UPDATE scheduled_work SET state=?, lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
+                (target, now, job_id),
+            )
+            released = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            conn.execute("COMMIT")
+            return self._decode(released)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def recover_expired(
+        self,
+        job_id: str,
+        *,
+        now: float,
+        attest_no_live_worker: bool = False,
+    ) -> dict[str, Any]:
+        now = self._positive(now, "now")
+        if attest_no_live_worker is not True:
+            raise QueueError("recovery requires an explicit no-live-worker attestation")
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise QueueError(f"unknown scheduled job {job_id!r}")
+            if row["state"] != "recovery_required":
+                raise QueueError("job is not awaiting expired-lease recovery")
+            state = self.projector.replay(row["project_id"])
+            work_status = state["workItems"].get(row["work_id"], {}).get("status")
+            if work_status == "completed":
+                target = "completed"
+            elif work_status == "failed":
+                target = "failed"
+            elif self._is_runnable(state, row["work_id"]):
+                target = "queued"
+            else:
+                target = "recovery_required"
+            conn.execute(
+                "UPDATE scheduled_work SET state=?, lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
+                (target, now, job_id),
+            )
+            recovered = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            conn.execute("COMMIT")
+            return self._decode(recovered)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def get(self, job_id: str) -> dict[str, Any]:
+        conn = self.store._connect()
+        try:
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise QueueError(f"unknown scheduled job {job_id!r}")
+        return self._decode(row)
+
+    @staticmethod
+    def _is_runnable(state: dict[str, Any], work_id: str) -> bool:
+        work = state["workItems"].get(work_id)
+        if work is None or work["status"] != "ready":
+            return False
+        if any(state["workItems"][dep]["status"] != "completed" for dep in work["dependsOn"]):
+            return False
+        if any(
+            question["status"] == "open" and question["blocking"] and work_id in question["workIds"]
+            for question in state["questions"].values()
+        ):
+            return False
+        return not any(
+            run["workId"] == work_id and run["status"] == "running"
+            for run in state["agentRuns"].values()
+        )
+
+    @staticmethod
+    def _assert_lease(row: Any, worker_id: str, lease_token: str, generation: int, now: float) -> None:
+        if row is None:
+            raise QueueError("unknown scheduled job")
+        if (
+            row["state"] != "leased"
+            or row["lease_owner"] != worker_id
+            or row["lease_token"] != lease_token
+            or row["lease_generation"] != generation
+            or row["lease_expires_at"] is None
+            or row["lease_expires_at"] <= now
+        ):
+            raise QueueError("lease is stale, expired, or owned by another worker")
+
+    @staticmethod
+    def _decode(row: Any, *, expose_token: bool = False) -> dict[str, Any]:
+        return {
+            "jobId": row["job_id"],
+            "projectId": row["project_id"],
+            "workId": row["work_id"],
+            "payload": json.loads(row["payload_json"]),
+            "state": row["state"],
+            "leaseOwner": row["lease_owner"],
+            "leaseToken": row["lease_token"] if expose_token else None,
+            "leaseGeneration": row["lease_generation"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
