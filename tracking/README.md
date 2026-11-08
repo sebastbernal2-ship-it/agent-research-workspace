@@ -21,16 +21,18 @@ Canonical live tracking is in the [GitHub issues](https://github.com/sebastberna
 | [#8](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/8) | Blind rubric and bounded real-model pilot | FUTURE; local harness proceeds with deterministic mocks; no provider call required | #2, #4, #5, #6, #7 |
 | [#9](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/9) | Laptop worker lifecycle / HiperGator policy gate | FUTURE; neither multi-laptop nor HPC work blocks the local harness | #2, #7 |
 | [#10](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/10) | Transparent VP alignment memory | OPEN; provenance/scope/confirmation/expiry/correction/conflict conformance tests use synthetic data only | #2 |
+| [#11](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/11) | Select project-first UI and service foundation | OPEN; initial source/license review recommends a custom project-first UI but no frontend prototype or authenticated API exists; awaiting user's previously mentioned candidate links | #6 |
+| [#12](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/12) | Define model routing and provider adapter contract | OPEN; offline deterministic route/profile contract tests exist; no real provider SDK, credentials, or network calls; official Codex account/service terms remain unreviewed | #2, #7 |
 
 ## Current recommended sequence
 
-1. #2 finish migration/fault contract gates; a written migration policy and local contract implementation now exist.
-2. #7 continue threat-model implementation: authenticate actor binding and wire grants into tool/adapter gates before effects.
-3. #6 durable terminal question states now fail closed; next add UI/notification and scheduler continuation semantics only after dependency updates are versioned.
-4. #3 and #5 adapters now converge on the canonical event store in isolated offline tests; keep their databases separate and continue fault/recovery/portability gates.
+1. #11 and #12 develop in parallel using mock data only: prototype the project/inbox UI against a service contract and exercise model routing with deterministic providers.
+2. #6 and #7 define authenticated principal binding, project authorization, and race-safe command semantics before any remotely reachable API or tool execution.
+3. #2 continue broader crash/fault coverage and migration validation; a written migration policy and local contract implementation exist.
+4. #3 and #5 adapter recovery/portability gates continue; keep candidate databases separate from canonical state.
 5. #4 and #7 candidate-specific API, security, and capability gates; no tools or deployment until reviewed.
-6. #8 real-model evaluations are optional future work; current integration uses deterministic mocks and does not wait on provider or budget decisions. Meldwork's packaged app still needs its supported Mac environment for product-level evaluation.
-7. #9 multi-laptop/HiperGator work is deferred and does not block local development.
-8. #10 synthetic VP memory/conformance tests; provenance and conflict rules are exercised, but no private profile import until explicitly approved.
+6. #8 real-model evaluation requires separate provider, data, and budget approval; current integration remains deterministic. Meldwork's packaged app still needs its supported Mac environment for product-level evaluation.
+7. #9 multi-laptop/HiperGator work remains deferred pending policy and authorization.
+8. #10 memory/conformance tests use synthetic data; no private profile import until explicitly approved.
 
 The full component evidence is in [`../spikes/`](../spikes/); this register intentionally tracks remaining work, not marketing capability claims.
