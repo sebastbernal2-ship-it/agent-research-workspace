@@ -90,6 +90,31 @@ class OrganizationCoordinator:
         """Mark abandoned active runs interrupted; never replay adapter work automatically."""
         return tuple(self.ledger.recover_interrupted(project_id, occurred_at=occurred_at))
 
+    async def serve_queue(
+        self,
+        queue: SQLiteWorkQueue,
+        worker_id: str,
+        execution_factory: Callable[[dict[str, Any]], WorkExecution],
+        stop_event: asyncio.Event,
+        *,
+        poll_interval: float = 1,
+        lease_seconds: float = 60,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        """Run a supervised local worker loop until asked to stop or an error occurs."""
+        if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)) or not 0.05 <= poll_interval <= 60:
+            raise ValueError("poll_interval must be between 0.05 and 60 seconds")
+        while not stop_event.is_set():
+            outcome = await self.run_queued(
+                queue, worker_id, execution_factory,
+                lease_seconds=lease_seconds, clock=clock,
+            )
+            if outcome is None:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+                except asyncio.TimeoutError:
+                    pass
+
     async def run_queued(
         self,
         queue: SQLiteWorkQueue,

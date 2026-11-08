@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import multiprocessing
 import tempfile
@@ -28,6 +29,7 @@ PROJECT_ID = "project.queue"
 WORK_ID = "work.queue"
 NOW = "2026-04-16T12:00:00Z"
 VP = {"actorType": "agent", "actorId": "agent.vp", "role": "vp"}
+USER = {"actorType": "human", "actorId": "user.synthetic", "role": "user"}
 SPECIALIST = {"actorType": "agent", "actorId": "agent.worker", "role": "specialist"}
 ADAPTER = {"name": "offline-queue-test", "version": "1"}
 CONTEXT_HASH = hashlib.sha256(b"queue context").hexdigest()
@@ -224,6 +226,32 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.queue.claim_next("worker.next", now=201, lease_seconds=10), None,
         )
 
+    async def test_supervised_worker_loop_runs_jobs_until_stop_requested(self):
+        coordinator = OrganizationCoordinator(self.store)
+        stop = asyncio.Event()
+
+        def resolve(job):
+            descriptor = job["payload"]
+
+            def execute(_context):
+                stop.set()
+                return ExecutionSignal.COMPLETED
+
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.worker.g{job['leaseGeneration']}",
+                correlation_id=descriptor["correlationId"], actor=descriptor["actor"],
+                adapter=descriptor["adapter"], context_hash=descriptor["contextHash"],
+                verification_actor=descriptor["verificationActor"],
+                execute=execute, verify=lambda _: True,
+            )
+
+        await coordinator.serve_queue(
+            self.queue, "worker.loop", resolve, stop,
+            poll_interval=0.05, lease_seconds=10, clock=lambda: 250,
+        )
+        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+
     async def test_inbox_answer_resumes_persisted_job_with_a_fresh_run_generation(self):
         coordinator = OrganizationCoordinator(self.store)
 
@@ -291,6 +319,51 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 lease_seconds=10, clock=lambda: 350,
             )
         self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
+
+    async def test_expired_active_job_requires_run_recovery_and_explicit_retry(self):
+        coordinator = OrganizationCoordinator(self.store)
+        ledger = RunLedger(self.store)
+        old = self.queue.claim_next("worker.crashed", now=600, lease_seconds=10)
+        self.assertEqual(old["leaseGeneration"], 1)
+        ledger.start(
+            PROJECT_ID, WORK_ID, run_id="run.crashed.g1", agent=SPECIALIST,
+            adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
+            occurred_at=NOW,
+        )
+        self.assertIsNone(self.queue.claim_next("worker.replacement", now=611, lease_seconds=10))
+        self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
+        self.queue.recover_expired(
+            "job.runtime", now=612, attest_no_live_worker=True,
+        )
+        self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
+
+        coordinator.recover_project(PROJECT_ID, occurred_at=NOW)
+        coordinator.retry_work(
+            PROJECT_ID, WORK_ID, actor=USER, reason="Reviewed the interrupted attempt.", occurred_at=NOW,
+        )
+        self.assertEqual(
+            self.queue.recover_expired("job.runtime", now=613, attest_no_live_worker=True)["state"],
+            "queued",
+        )
+
+        def resolve(job):
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.crashed.g{job['leaseGeneration']}",
+                correlation_id=job["payload"]["correlationId"], actor=job["payload"]["actor"],
+                adapter=job["payload"]["adapter"], context_hash=job["payload"]["contextHash"],
+                verification_actor=job["payload"]["verificationActor"],
+                execute=lambda _: ExecutionSignal.COMPLETED, verify=lambda _: True,
+            )
+
+        outcome = await coordinator.run_queued(
+            self.queue, "worker.replacement", resolve,
+            lease_seconds=10, clock=lambda: 614,
+        )
+        self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
+        state = coordinator.projector.replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"]["run.crashed.g1"]["status"], "interrupted")
+        self.assertEqual(state["agentRuns"]["run.crashed.g2"]["status"], "succeeded")
 
     async def test_missing_trusted_execution_factory_enters_recovery_not_replay(self):
         coordinator = OrganizationCoordinator(self.store)
