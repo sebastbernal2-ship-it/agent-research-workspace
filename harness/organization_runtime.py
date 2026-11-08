@@ -116,6 +116,16 @@ class OrganizationCoordinator:
                 raise QueueError("execution factory must return a trusted WorkExecution")
             if task.project_id != job["projectId"] or task.work_id != job["workId"]:
                 raise QueueError("resolved execution does not match its queued project/work assignment")
+            descriptor = job["payload"]
+            if (
+                task.actor != descriptor["actor"]
+                or task.verification_actor != descriptor["verificationActor"]
+                or task.adapter != descriptor["adapter"]
+                or task.context_hash != descriptor["contextHash"]
+                or task.correlation_id != descriptor["correlationId"]
+                or task.parent_run_id != descriptor.get("parentRunId")
+            ):
+                raise QueueError("resolved execution does not match its persisted run descriptor")
             state = self.projector.replay(task.project_id)
             if task.run_id in state["agentRuns"]:
                 raise QueueError("queued execution factory must supply a fresh run ID for each lease generation")

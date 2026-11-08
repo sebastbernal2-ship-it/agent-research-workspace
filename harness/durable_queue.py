@@ -31,7 +31,15 @@ class SQLiteWorkQueue:
 
     @staticmethod
     def _json(value: Any) -> str:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        try:
+            encoded = json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise QueueError("job descriptor must contain only finite JSON values") from exc
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            raise QueueError("job descriptor exceeds the 64 KiB limit")
+        return encoded
 
     @staticmethod
     def _positive(value: float, label: str) -> float:
@@ -54,6 +62,37 @@ class SQLiteWorkQueue:
             raise QueueError(f"{label} must be a non-empty string")
         return value
 
+    @classmethod
+    def _validate_descriptor(cls, descriptor: Any) -> None:
+        if not isinstance(descriptor, dict):
+            raise QueueError("job payload must be a versioned execution descriptor")
+        required = {
+            "descriptorVersion", "executionKey", "actor", "verificationActor", "adapter",
+            "contextHash", "correlationId",
+        }
+        if not required.issubset(descriptor) or set(descriptor) - required - {"parentRunId"}:
+            raise QueueError("job descriptor has missing or unsupported fields")
+        if type(descriptor["descriptorVersion"]) is not int or descriptor["descriptorVersion"] != 1:
+            raise QueueError("unsupported job descriptor version")
+        cls._required_text(descriptor["executionKey"], "executionKey")
+        cls._required_text(descriptor["correlationId"], "correlationId")
+        for actor_key in ("actor", "verificationActor"):
+            actor = descriptor[actor_key]
+            if not isinstance(actor, dict) or set(actor) != {"actorType", "actorId", "role"}:
+                raise QueueError(f"descriptor {actor_key} must contain actorType, actorId, and role")
+            for key in ("actorType", "actorId", "role"):
+                cls._required_text(actor[key], f"{actor_key}.{key}")
+        adapter = descriptor["adapter"]
+        if not isinstance(adapter, dict) or set(adapter) != {"name", "version"}:
+            raise QueueError("descriptor adapter must contain name and version")
+        cls._required_text(adapter["name"], "adapter.name")
+        cls._required_text(adapter["version"], "adapter.version")
+        digest = descriptor["contextHash"]
+        if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise QueueError("contextHash must be a lowercase SHA-256 digest")
+        if "parentRunId" in descriptor and descriptor["parentRunId"] is not None:
+            cls._required_text(descriptor["parentRunId"], "parentRunId")
+
     def enqueue(
         self,
         job_id: str,
@@ -67,8 +106,7 @@ class SQLiteWorkQueue:
         self._required_text(project_id, "project_id")
         self._required_text(work_id, "work_id")
         self._positive(now, "now")
-        if not isinstance(payload, dict):
-            raise QueueError("payload must be an object")
+        self._validate_descriptor(payload)
         state = self.projector.replay(project_id)
         if work_id not in state["workItems"]:
             raise QueueError(f"unknown work item {work_id!r}")

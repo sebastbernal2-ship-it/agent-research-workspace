@@ -29,6 +29,16 @@ WORK_ID = "work.queue"
 NOW = "2026-04-16T12:00:00Z"
 VP = {"actorType": "agent", "actorId": "agent.vp", "role": "vp"}
 SPECIALIST = {"actorType": "agent", "actorId": "agent.worker", "role": "specialist"}
+ADAPTER = {"name": "offline-queue-test", "version": "1"}
+CONTEXT_HASH = hashlib.sha256(b"queue context").hexdigest()
+
+
+def execution_descriptor(execution_key="offline"):
+    return {
+        "descriptorVersion": 1, "executionKey": execution_key, "actor": SPECIALIST,
+        "verificationActor": VP, "adapter": ADAPTER, "contextHash": CONTEXT_HASH,
+        "correlationId": "queue.integration",
+    }
 
 
 class SQLiteWorkQueueTests(unittest.TestCase):
@@ -46,7 +56,7 @@ class SQLiteWorkQueueTests(unittest.TestCase):
 
     def enqueue(self, job_id="job.first"):
         return self.queue.enqueue(
-            job_id, PROJECT_ID, WORK_ID, {"adapter": "offline-test", "version": "1"}, now=100,
+            job_id, PROJECT_ID, WORK_ID, execution_descriptor(), now=100,
         )
 
     def test_enqueue_is_idempotent_and_one_open_job_per_work(self):
@@ -55,6 +65,14 @@ class SQLiteWorkQueueTests(unittest.TestCase):
         self.assertEqual(first["jobId"], repeated["jobId"])
         with self.assertRaisesRegex(QueueError, "already has an open scheduled job"):
             self.enqueue("job.duplicate")
+
+    def test_enqueue_rejects_unversioned_or_malformed_execution_descriptor(self):
+        with self.assertRaisesRegex(QueueError, "missing or unsupported fields"):
+            self.queue.enqueue("job.invalid", PROJECT_ID, WORK_ID, {"executionKey": "bad"}, now=125)
+        invalid = execution_descriptor()
+        invalid["descriptorVersion"] = 2
+        with self.assertRaisesRegex(QueueError, "unsupported job descriptor version"):
+            self.queue.enqueue("job.v2", PROJECT_ID, WORK_ID, invalid, now=125)
 
     def test_claim_renew_release_and_reopen_are_durable(self):
         self.enqueue()
@@ -176,7 +194,7 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.queue = SQLiteWorkQueue(self.store)
         self.queue.enqueue(
-            "job.runtime", PROJECT_ID, WORK_ID, {"executionKey": "offline"}, now=100,
+            "job.runtime", PROJECT_ID, WORK_ID, execution_descriptor(), now=100,
         )
 
     async def asyncTearDown(self):
@@ -185,11 +203,12 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_coordinator_claims_runs_and_acknowledges_canonical_completion(self):
         def resolve(job):
             self.assertEqual(job["payload"]["executionKey"], "offline")
+            descriptor = job["payload"]
             return WorkExecution(
                 project_id=PROJECT_ID, work_id=WORK_ID,
-                run_id=f"run.runtime.g{job['leaseGeneration']}", correlation_id="queue.integration",
-                actor=SPECIALIST, adapter={"name": "offline-queue-test", "version": "1"},
-                context_hash=hashlib.sha256(b"queue context").hexdigest(),
+                run_id=f"run.runtime.g{job['leaseGeneration']}", correlation_id=descriptor["correlationId"],
+                actor=descriptor["actor"], adapter=descriptor["adapter"],
+                context_hash=descriptor["contextHash"],
                 verification_actor=VP,
                 execute=lambda _: ExecutionSignal.COMPLETED,
                 verify=lambda _: True,
@@ -227,9 +246,9 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             return WorkExecution(
                 project_id=PROJECT_ID, work_id=WORK_ID,
-                run_id=f"run.queued.g{generation}", correlation_id="queue.resume",
-                actor=SPECIALIST, adapter={"name": "offline-queue-test", "version": "1"},
-                context_hash=hashlib.sha256(f"attempt-{generation}".encode()).hexdigest(),
+                run_id=f"run.queued.g{generation}", correlation_id=job["payload"]["correlationId"],
+                actor=job["payload"]["actor"], adapter=job["payload"]["adapter"],
+                context_hash=job["payload"]["contextHash"],
                 verification_actor=VP, execute=execute, verify=lambda _: True,
             )
 
@@ -253,6 +272,25 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         state = coordinator.projector.replay(PROJECT_ID)
         self.assertEqual(state["agentRuns"]["run.queued.g1"]["status"], "succeeded")
         self.assertEqual(state["agentRuns"]["run.queued.g2"]["status"], "succeeded")
+
+    async def test_resolved_runtime_must_match_persisted_descriptor(self):
+        coordinator = OrganizationCoordinator(self.store)
+
+        def mismatched_factory(job):
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.mismatch.g{job['leaseGeneration']}", correlation_id="queue.integration",
+                actor=SPECIALIST, adapter={"name": "unapproved-runtime", "version": "1"},
+                context_hash=CONTEXT_HASH, verification_actor=VP,
+                execute=lambda _: ExecutionSignal.COMPLETED, verify=lambda _: True,
+            )
+
+        with self.assertRaisesRegex(QueueError, "persisted run descriptor"):
+            await coordinator.run_queued(
+                self.queue, "worker.runtime", mismatched_factory,
+                lease_seconds=10, clock=lambda: 350,
+            )
+        self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
 
     async def test_missing_trusted_execution_factory_enters_recovery_not_replay(self):
         coordinator = OrganizationCoordinator(self.store)
