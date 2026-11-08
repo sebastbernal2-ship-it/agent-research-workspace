@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PYTHON = REPO_ROOT / "spikes" / "agenticx-runtime" / ".venv" / "bin" / "python"
 WORKER_SCRIPT = Path(__file__).with_name("agenticx_worker.py")
+MAX_STDOUT_BYTES = 64 * 1024
+MAX_STDERR_BYTES = 16 * 1024
 
 
 class AgenticXWorkerError(RuntimeError):
@@ -50,25 +53,76 @@ class AgenticXSubprocessWorker:
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONNOUSERSITE": "1",
             }
+            process = subprocess.Popen(
+                [self.python, str(WORKER_SCRIPT)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=isolated_home,
+                env=env,
+            )
+            stdout = bytearray()
+            stderr = bytearray()
+            overflow = threading.Event()
+
+            def drain(stream, buffer, limit):
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        return
+                    if len(buffer) + len(chunk) > limit:
+                        overflow.set()
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        return
+                    buffer.extend(chunk)
+
+            readers = [
+                threading.Thread(target=drain, args=(process.stdout, stdout, MAX_STDOUT_BYTES), daemon=True),
+                threading.Thread(target=drain, args=(process.stderr, stderr, MAX_STDERR_BYTES), daemon=True),
+            ]
+            for reader in readers:
+                reader.start()
             try:
-                completed = subprocess.run(
-                    [self.python, str(WORKER_SCRIPT)],
-                    input=encoded + "\n",
-                    text=True,
-                    capture_output=True,
-                    timeout=self.timeout,
-                    cwd=isolated_home,
-                    env=env,
-                    check=False,
-                )
+                try:
+                    process.stdin.write((encoded + "\n").encode("utf-8"))
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                process.wait(timeout=self.timeout)
             except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.wait()
                 raise AgenticXWorkerError(f"AgenticX worker exceeded {self.timeout:g}s timeout") from exc
-            if completed.returncode != 0:
-                stderr = completed.stderr[-4000:]
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if process.stdin is not None and not process.stdin.closed:
+                    try:
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                for reader in readers:
+                    reader.join(timeout=2)
+                process.stdout.close()
+                process.stderr.close()
+            if any(reader.is_alive() for reader in readers):
+                raise AgenticXWorkerError("AgenticX output reader did not stop")
+            if overflow.is_set():
+                raise AgenticXWorkerError("AgenticX worker exceeded its stdout/stderr byte limit")
+            if process.returncode != 0:
+                stderr_text = bytes(stderr[-4000:]).decode("utf-8", errors="replace")
                 raise AgenticXWorkerError(
-                    f"AgenticX worker exited {completed.returncode}; stderr tail: {stderr}"
+                    f"AgenticX worker exited {process.returncode}; stderr tail: {stderr_text}"
                 )
-            lines = completed.stdout.splitlines()
+            try:
+                stdout_text = bytes(stdout).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise AgenticXWorkerError("AgenticX worker returned non-UTF-8 stdout") from exc
+            lines = stdout_text.splitlines()
             if len(lines) != 1:
                 raise AgenticXWorkerError(f"expected one JSON response line, received {len(lines)}")
             try:
