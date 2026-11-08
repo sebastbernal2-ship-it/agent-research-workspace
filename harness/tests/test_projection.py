@@ -123,6 +123,11 @@ class ProjectorTests(unittest.TestCase):
         }, actor=VP)
         return updated
 
+    def test_replay_reports_empty_project_state_without_inventing_history(self):
+        state = Projector(self.store).replay("project.missing")
+        self.assertIsNone(state["project"])
+        self.assertEqual(state["_eventSequence"], 0)
+
     def test_replay_rebuilds_work_discussion_and_inbox_pause_resume(self):
         project = self.create_project()
         primary = self.create_work("work.primary", "Primary research")

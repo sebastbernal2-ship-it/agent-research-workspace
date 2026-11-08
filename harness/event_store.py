@@ -31,6 +31,10 @@ class SequenceConflict(EventStoreError):
     """A caller-supplied sequence does not match the next project sequence."""
 
 
+class ConcurrentWriteConflict(EventStoreError):
+    """The project changed after a command read its verified snapshot."""
+
+
 class IntegrityFailure(EventStoreError):
     """Stored history or content-addressed data failed verification."""
 
@@ -71,7 +75,8 @@ class SQLiteEventStore:
         return conn
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS canonical_events (
@@ -104,6 +109,8 @@ class SQLiteEventStore:
                 BEGIN SELECT RAISE(ABORT, 'canonical blobs are immutable'); END;
                 """
             )
+        finally:
+            conn.close()
 
     @staticmethod
     def _canonical_json(value: dict[str, Any]) -> str:
@@ -147,7 +154,12 @@ class SQLiteEventStore:
             raise EventStoreError("events are stored in the append-only event table")
         return record
 
-    def append_many(self, events: list[dict[str, Any]]) -> list[AppendResult]:
+    def append_many(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        expected_sequence: int | None = None,
+    ) -> list[AppendResult]:
         """Append one logical batch atomically, assigning sequences under lock.
 
         Replaying a committed batch with the same idempotency keys and content
@@ -156,10 +168,30 @@ class SQLiteEventStore:
         """
         if not events:
             return []
+        if expected_sequence is not None and (
+            not isinstance(expected_sequence, int)
+            or isinstance(expected_sequence, bool)
+            or expected_sequence < 0
+        ):
+            raise EventStoreError("expected_sequence must be a nonnegative integer")
         conn = self._connect()
         results: list[AppendResult] = []
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if expected_sequence is not None:
+                project_ids = {event.get("projectId") for event in events}
+                if len(project_ids) != 1 or not all(isinstance(project_id, str) for project_id in project_ids):
+                    raise EventStoreError("expected_sequence requires one project-scoped batch")
+                project_id = next(iter(project_ids))
+                row = conn.execute(
+                    "SELECT sequence FROM canonical_events WHERE project_id=? ORDER BY sequence DESC LIMIT 1",
+                    (project_id,),
+                ).fetchone()
+                actual_sequence = 0 if row is None else row["sequence"]
+                if actual_sequence != expected_sequence:
+                    raise ConcurrentWriteConflict(
+                        f"project {project_id!r} changed: expected sequence {expected_sequence}, found {actual_sequence}"
+                    )
             for event in events:
                 candidate = dict(event)
                 project_id = candidate.get("projectId")
@@ -218,9 +250,14 @@ class SQLiteEventStore:
         finally:
             conn.close()
 
-    def append(self, event: dict[str, Any]) -> AppendResult:
+    def append(
+        self,
+        event: dict[str, Any],
+        *,
+        expected_sequence: int | None = None,
+    ) -> AppendResult:
         """Append one event; sequence is assigned transactionally if omitted."""
-        return self.append_many([event])[0]
+        return self.append_many([event], expected_sequence=expected_sequence)[0]
 
     def put_blob(self, content: str | bytes) -> tuple[str, str]:
         raw = content.encode("utf-8") if isinstance(content, str) else content
@@ -280,7 +317,8 @@ class SQLiteEventStore:
             for row in rows
         )
 
-    def verify(self, project_id: str) -> bool:
+    def verified_events(self, project_id: str) -> list[dict[str, Any]]:
+        """Read one consistent event snapshot and verify its complete hash chain."""
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -291,6 +329,7 @@ class SQLiteEventStore:
         finally:
             conn.close()
         expected_previous = ZERO_HASH
+        events: list[dict[str, Any]] = []
         for expected_sequence, row in enumerate(rows, start=1):
             event_json = row["event_json"]
             event = json.loads(event_json)
@@ -305,4 +344,9 @@ class SQLiteEventStore:
             if actual != row["record_hash"]:
                 raise IntegrityFailure(f"event hash mismatch at sequence {expected_sequence}")
             expected_previous = actual
+            events.append(event)
+        return events
+
+    def verify(self, project_id: str) -> bool:
+        self.verified_events(project_id)
         return True

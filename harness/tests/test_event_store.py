@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from harness.event_store import (
+    ConcurrentWriteConflict,
     EventStoreError,
     IdempotencyConflict,
     IntegrityFailure,
@@ -85,6 +86,14 @@ class SQLiteEventStoreTests(unittest.TestCase):
         self.assertEqual(retry.sequence, 1)
         self.assertTrue(retry.duplicate)
         self.assertEqual(len(self.store.events("project.alpha")), 1)
+
+    def test_expected_sequence_rejects_stale_command_without_append(self):
+        events = initial_events()
+        self.store.append(events[0])
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "expected sequence 0, found 1"):
+            self.store.append(events[1], expected_sequence=0)
+        self.assertEqual([event["eventId"] for event in self.store.events("project.alpha")], [events[0]["eventId"]])
+        self.assertTrue(self.store.verify("project.alpha"))
 
     def test_reused_idempotency_key_with_changed_content_fails(self):
         event = initial_events()[0]

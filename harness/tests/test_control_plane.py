@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.control_plane import ControlPlaneError, ProjectControlPlane
-from harness.event_store import EventStoreError, SQLiteEventStore
+from harness.event_store import ConcurrentWriteConflict, EventStoreError, SQLiteEventStore
 from harness.projection import Projector
 
 
@@ -129,6 +129,15 @@ class ProjectControlPlaneTests(unittest.TestCase):
         self.assertEqual(state["workItems"]["work.independent"]["status"], "ready")
         self.assertEqual(state["questions"]["question.scope"]["status"], "answered")
         self.assertTrue(self.store.verify("project.control"))
+
+    def test_work_creation_cannot_append_before_project_creation(self):
+        missing_store = SQLiteEventStore(Path(self.temp.name) / "missing-project.sqlite3")
+        missing_control = ProjectControlPlane(missing_store)
+        work = make_work("work.orphan", "Orphan work")
+        work["projectId"] = "project.missing"
+        with self.assertRaisesRegex(ControlPlaneError, "unknown project"):
+            missing_control.create_work(work)
+        self.assertEqual(missing_store.events("project.missing"), [])
 
     def test_non_user_cannot_answer_and_invalid_option_is_rejected(self):
         self.control.open_question(make_question(["work.primary"]))
@@ -397,6 +406,71 @@ class ProjectControlPlaneTests(unittest.TestCase):
         state = Projector(self.store).replay("project.control")
         self.assertEqual(state["workItems"]["work.independent"]["status"], "completed")
         self.assertEqual(state["workItems"]["work.primary"]["status"], "running")
+
+    def test_stale_answer_batch_cannot_partially_resume_work(self):
+        question = make_question(["work.primary"])
+        question["questionId"] = "question.concurrent-answer"
+        self.control.open_question(question)
+        content_ref, content_hash = self.store.put_blob("Intervening status message.")
+        intervening = self.control._event(
+            "project.control", "discussion.message_added", VP,
+            {
+                "workId": "work.primary", "threadId": "thread.answer-race",
+                "messageType": "status", "contentRef": content_ref,
+                "contentHash": content_hash, "visibleTo": [VP["actorId"]],
+            },
+            event_id="event.answer-race.message",
+        )
+        original_append = self.store.append
+        original_append_many = self.store.append_many
+        raced = False
+
+        def append_many_after_intervening(events, *, expected_sequence=None):
+            nonlocal raced
+            if not raced:
+                raced = True
+                original_append(intervening)
+            return original_append_many(events, expected_sequence=expected_sequence)
+
+        with patch.object(self.store, "append_many", side_effect=append_many_after_intervening):
+            with self.assertRaises(ConcurrentWriteConflict):
+                self.control.answer_question(
+                    "project.control", question["questionId"], "Proceed.", actor=USER,
+                )
+        state = Projector(self.store).replay("project.control")
+        self.assertEqual(state["questions"][question["questionId"]]["status"], "open")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "waiting_human")
+        self.assertEqual(len(state["messages"]), 1)
+
+    def test_stale_control_command_cannot_append_after_intervening_event(self):
+        content_ref, content_hash = self.store.put_blob("Concurrent but valid message.")
+        intervening = self.control._event(
+            "project.control", "discussion.message_added", VP,
+            {
+                "workId": "work.primary", "threadId": "thread.concurrent",
+                "messageType": "status", "contentRef": content_ref,
+                "contentHash": content_hash, "visibleTo": [VP["actorId"]],
+            },
+            event_id="event.concurrent.message",
+        )
+        original_append = self.store.append
+        raced = False
+
+        def append_after_intervening(event, *, expected_sequence=None):
+            nonlocal raced
+            if not raced:
+                raced = True
+                original_append(intervening)
+            return original_append(event, expected_sequence=expected_sequence)
+
+        with patch.object(self.store, "append", side_effect=append_after_intervening):
+            with self.assertRaises(ConcurrentWriteConflict):
+                self.control.transition_work(
+                    "project.control", "work.primary", "running", actor=VP,
+                )
+        state = Projector(self.store).replay("project.control")
+        self.assertEqual(state["workItems"]["work.primary"]["status"], "ready")
+        self.assertEqual(len(state["messages"]), 1)
 
     def test_forbidden_work_transition_fails_without_state_change(self):
         self.control.transition_work("project.control", "work.primary", "running", actor=VP)

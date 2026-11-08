@@ -149,7 +149,7 @@ class CapabilityAuthority:
                 f"event.work.revised.{work_id}.r{updated_work['revision']}",
                 record["createdAt"],
             ))
-        self.store.append_many(events)
+        self.store.append_many(events, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["capabilityGrants"][grant_id]
 
     def revoke(
@@ -196,7 +196,7 @@ class CapabilityAuthority:
             f"event.capability.revoked.{grant_id}.r{revoked['revision']}",
             when,
         )
-        self.store.append(event)
+        self.store.append(event, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["capabilityGrants"][grant_id]
 
     def authorize(

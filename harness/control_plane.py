@@ -79,7 +79,7 @@ class ProjectControlPlane:
             event_id=f"event.project.created.{project_id}.r{project['revision']}",
             occurred_at=project["createdAt"],
         )
-        self.store.append(event)
+        self.store.append(event, expected_sequence=0)
         return self.projector.replay(project_id)["project"]
 
     def create_work(self, work: dict[str, Any], *, actor: dict[str, str] | None = None) -> dict[str, Any]:
@@ -88,6 +88,8 @@ class ProjectControlPlane:
             raise ControlPlaneError("create_work requires a work_item record")
         project_id = work["projectId"]
         state = self.projector.replay(project_id)
+        if state["project"] is None:
+            raise ControlPlaneError(f"unknown project {project_id!r}")
         work_id = work["workId"]
         if work_id in state["workItems"]:
             if state["workItems"][work_id] == work:
@@ -122,7 +124,7 @@ class ProjectControlPlane:
             event_id=f"event.work.created.{work_id}.r{work['revision']}",
             occurred_at=work["createdAt"],
         )
-        self.store.append(event)
+        self.store.append(event, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["workItems"][work_id]
 
     def revise_project_charter(
@@ -135,6 +137,8 @@ class ProjectControlPlane:
     ) -> dict[str, Any]:
         state = self.projector.replay(project_id)
         old = state["project"]
+        if old is None:
+            raise ControlPlaneError(f"unknown project {project_id!r}")
         when = occurred_at or self.clock()
         updated = deepcopy(old)
         updated["revision"] += 1
@@ -153,7 +157,7 @@ class ProjectControlPlane:
             event_id=f"event.project.charter.{project_id}.r{updated['charter']['revision']}",
             occurred_at=when,
         )
-        self.store.append(event)
+        self.store.append(event, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["project"]
 
     def revise_work(
@@ -215,7 +219,7 @@ class ProjectControlPlane:
             event_id=f"event.work.revised.{work_id}.r{updated['revision']}",
             occurred_at=when,
         )
-        self.store.append(event)
+        self.store.append(event, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["workItems"][work_id]
 
     def transition_work(
@@ -257,7 +261,7 @@ class ProjectControlPlane:
             event_id=f"event.work.status.{work_id}.r{updated['revision']}",
             occurred_at=when,
         )
-        self.store.append(event)
+        self.store.append(event, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["workItems"][work_id]
 
     def open_question(self, question: dict[str, Any]) -> dict[str, Any]:
@@ -324,7 +328,7 @@ class ProjectControlPlane:
             event_id=f"event.question.opened.{question_id}",
             occurred_at=question["createdAt"],
         ))
-        self.store.append_many(events)
+        self.store.append_many(events, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["questions"][question_id]
 
     def close_question(
@@ -467,7 +471,7 @@ class ProjectControlPlane:
                 event_id=f"event.question.opened.{successor_question['questionId']}",
                 occurred_at=when,
             ))
-        self.store.append_many(events)
+        self.store.append_many(events, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["questions"][question_id]
 
     def answer_question(
@@ -545,5 +549,5 @@ class ProjectControlPlane:
                 event_id=f"event.work.status.{work_id}.r{updated['revision']}",
                 occurred_at=when,
             ))
-        self.store.append_many(events)
+        self.store.append_many(events, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["questions"][question_id]
