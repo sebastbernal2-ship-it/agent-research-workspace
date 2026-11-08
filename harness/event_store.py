@@ -408,6 +408,8 @@ class SQLiteEventStore:
             if row is None:
                 raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
             already_imported = row["state"] == "imported"
+            if already_imported:
+                self.verified_events(row["project_id"])
             if row["state"] not in {"receipt_staged", "imported"} or row["receipt_json"] is None:
                 raise EventStoreError(f"adapter invocation {invocation_id!r} has no staged receipt to import")
             receipt_json = row["receipt_json"]
