@@ -182,6 +182,11 @@ class ContractSchemaTests(unittest.TestCase):
             with self.subTest(recordType=record["recordType"], id=record.get("projectId", record.get("eventId"))):
                 self.assertEqual([], list(VALIDATOR.iter_errors(record)))
 
+    def test_evidence_requires_a_content_addressed_source_snapshot(self):
+        record = next(item for item in valid_records() if item["recordType"] == "evidence")
+        del record["source"]["contentHash"]
+        self.assertTrue(list(VALIDATOR.iter_errors(record)))
+
     def test_unknown_sensitive_fields_fail_closed(self):
         record = valid_records()[0]
         record["apiKey"] = "never-allowed"

@@ -49,6 +49,18 @@ class Projector:
                 raise ProjectionError(f"immutable identity field {field!r} changed")
 
     @staticmethod
+    def _work_dependency_scope(work_id: str, work_items: dict[str, dict[str, Any]]) -> set[str]:
+        scope = {work_id}
+        pending = list(work_items[work_id].get("dependsOn", []))
+        while pending:
+            dependency_id = pending.pop()
+            if dependency_id in scope:
+                continue
+            scope.add(dependency_id)
+            pending.extend(work_items[dependency_id].get("dependsOn", []))
+        return scope
+
+    @staticmethod
     def _validate_work_graph(work_items: dict[str, dict[str, Any]]) -> None:
         graph = {work_id: set(work.get("dependsOn", [])) for work_id, work in work_items.items()}
         for work_id, dependencies in graph.items():
@@ -469,6 +481,26 @@ class Projector:
                         or run["workId"] != artifact["workId"] or run["agent"] != artifact["createdBy"]
                     ):
                         raise ProjectionError("artifact run provenance does not match an active assigned run")
+                input_artifact_ids = artifact.get("inputArtifactIds", [])
+                evidence_ids = artifact.get("evidenceIds", [])
+                if (
+                    payload.get("inputArtifactIds", []) != input_artifact_ids
+                    or payload.get("evidenceIds", []) != evidence_ids
+                ):
+                    raise ProjectionError("artifact lineage payload does not match immutable artifact record")
+                allowed_work_ids = self._work_dependency_scope(artifact["workId"], state["workItems"])
+                if any(
+                    input_id not in state["artifacts"]
+                    or state["artifacts"][input_id]["workId"] not in allowed_work_ids
+                    for input_id in input_artifact_ids
+                ):
+                    raise ProjectionError("artifact derivation references missing or unrelated input artifacts")
+                if any(
+                    evidence_id not in state["evidence"]
+                    or state["evidence"][evidence_id]["workId"] not in allowed_work_ids
+                    for evidence_id in evidence_ids
+                ):
+                    raise ProjectionError("artifact derivation references missing or unrelated evidence")
                 if not artifact["storageRef"].startswith("blob.") or artifact["storageRef"][5:] != artifact["sha256"]:
                     raise ProjectionError("artifact storage reference does not match its content hash")
                 try:

@@ -132,6 +132,47 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(state["agentRuns"]["run.parent"]["status"], "succeeded")
         self.assertTrue(self.store.verify(PROJECT_ID))
 
+    def test_recovery_marks_dispatched_invocation_without_receipt_ambiguous(self):
+        run = self.start_run("run.ambiguous-invocation")
+        self.store.prepare_adapter_invocation("invocation.ambiguous-run", PROJECT_ID, "8" * 64)
+        self.store.start_adapter_invocation("invocation.ambiguous-run")
+        self.ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW)
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"][run["runId"]]["status"], "interrupted")
+        self.assertEqual(self.store.list_adapter_invocations(PROJECT_ID)[0]["state"], "ambiguous")
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
+    def test_recovery_imports_staged_adapter_receipt_before_interrupting_run(self):
+        run = self.start_run("run.with-staged-output")
+        content_ref, content_hash = self.store.put_blob("Durably staged output.")
+        started_event = next(
+            event for event in self.store.events(PROJECT_ID)
+            if event["eventType"] == "run.started" and event["payload"]["runId"] == run["runId"]
+        )
+        message_event = {
+            "recordType": "event", "schemaVersion": "0.1",
+            "eventId": "event.staged.message", "projectId": PROJECT_ID,
+            "eventType": "discussion.message_added", "actor": SPECIALIST,
+            "occurredAt": NOW, "causationId": started_event["eventId"],
+            "correlationId": "run.team", "idempotencyKey": "idem.staged.message",
+            "payload": {
+                "workId": WORK_ID, "threadId": "thread.recovery", "messageType": "status",
+                "runId": run["runId"], "contentRef": content_ref, "contentHash": content_hash,
+                "visibleTo": ["agent.vp"],
+            },
+        }
+        self.store.prepare_adapter_invocation("invocation.staged", PROJECT_ID, "e" * 64)
+        self.store.start_adapter_invocation("invocation.staged")
+        self.store.stage_adapter_receipt("invocation.staged", [message_event])
+
+        self.assertEqual(self.ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW), [run["runId"]])
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"][run["runId"]]["status"], "interrupted")
+        self.assertEqual(state["agentRuns"][run["runId"]]["outputEventIds"], ["event.staged.message"])
+        self.assertEqual(state["messages"][0]["content"], "Durably staged output.")
+        self.assertEqual(self.store.list_adapter_invocations(PROJECT_ID)[0]["state"], "imported")
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
     def test_recovery_closes_nested_runs_leaf_first(self):
         self.start_run("run.parent")
         self.ledger.start(

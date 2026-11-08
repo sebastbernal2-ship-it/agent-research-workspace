@@ -212,6 +212,8 @@
         "storageRef": { "$ref": "#/$defs/id" },
         "createdBy": { "$ref": "#/$defs/actor" },
         "runId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "inputArtifactIds": { "$ref": "#/$defs/refList" },
+        "evidenceIds": { "$ref": "#/$defs/refList" },
         "createdAt": { "$ref": "#/$defs/timestamp" },
         "reviewStatus": { "enum": ["unreviewed", "reviewed", "accepted", "rejected"] }
       }
@@ -257,7 +259,7 @@
         "source": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["uri", "title", "retrievedAt"],
+          "required": ["uri", "title", "retrievedAt", "contentHash"],
           "properties": {
             "uri": { "type": "string", "format": "uri", "maxLength": 2048 },
             "title": { "type": "string", "minLength": 1, "maxLength": 500 },
@@ -288,7 +290,7 @@
         { "type": "object", "additionalProperties": false, "required": ["questionId", "questionType", "priority", "blocking", "workIds", "questionRef", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] }, "priority": { "enum": ["low", "normal", "high", "urgent"] }, "blocking": { "type": "boolean" }, "workIds": { "$ref": "#/$defs/refList" }, "questionRef": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["questionId", "answerRef", "resumedWorkIds", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "answerRef": { "$ref": "#/$defs/id" }, "resumedWorkIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["questionId", "from", "to", "affectedWorkIds", "resolutionReason", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "from": { "const": "open" }, "to": { "enum": ["rejected", "cancelled", "expired", "superseded"] }, "affectedWorkIds": { "$ref": "#/$defs/refList" }, "resolutionReason": { "type": "string", "minLength": 1, "maxLength": 4000 }, "supersededByQuestionId": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
-        { "type": "object", "additionalProperties": false, "required": ["artifactId", "workId", "sha256", "recordHash"], "properties": { "artifactId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "sha256": { "$ref": "#/$defs/sha256" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["artifactId", "workId", "sha256", "recordHash"], "properties": { "artifactId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "sha256": { "$ref": "#/$defs/sha256" }, "inputArtifactIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["evidenceId", "workId", "stance", "sourceHash", "recordHash"], "properties": { "evidenceId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "stance": { "enum": ["supports", "contradicts", "qualifies", "background"] }, "sourceHash": { "$ref": "#/$defs/sha256" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["grantId", "workIds", "capability", "recordHash"], "properties": { "grantId": { "$ref": "#/$defs/id" }, "workIds": { "$ref": "#/$defs/refList" }, "capability": { "enum": ["artifact.read", "artifact.write", "source.fetch", "tool.execute", "network.request", "filesystem.read", "filesystem.write", "provider.call", "worker.delegate"] }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["grantId", "recordHash", "revokeReason"], "properties": { "grantId": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" }, "revokeReason": { "type": "string", "minLength": 1, "maxLength": 2000 } } }

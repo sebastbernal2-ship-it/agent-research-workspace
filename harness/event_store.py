@@ -101,6 +101,15 @@ class SQLiteEventStore:
                     content_hash TEXT PRIMARY KEY,
                     content BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS adapter_invocations (
+                    invocation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('prepared', 'executing', 'receipt_staged', 'imported', 'ambiguous')),
+                    receipt_json TEXT,
+                    receipt_hash TEXT,
+                    result_json TEXT
+                );
                 CREATE TRIGGER IF NOT EXISTS canonical_blobs_no_update
                 BEFORE UPDATE ON canonical_blobs
                 BEGIN SELECT RAISE(ABORT, 'canonical blobs are immutable'); END;
@@ -258,6 +267,272 @@ class SQLiteEventStore:
     ) -> AppendResult:
         """Append one event; sequence is assigned transactionally if omitted."""
         return self.append_many([event], expected_sequence=expected_sequence)[0]
+
+    def prepare_adapter_invocation(
+        self, invocation_id: str, project_id: str, request_hash: str,
+    ) -> dict[str, Any]:
+        """Durably reserve one stable adapter invocation before executing it."""
+        if not isinstance(invocation_id, str) or not invocation_id:
+            raise EventStoreError("invocation_id must be a non-empty string")
+        if not isinstance(project_id, str) or not project_id:
+            raise EventStoreError("project_id must be a non-empty string")
+        if not isinstance(request_hash, str) or len(request_hash) != 64 or any(ch not in "0123456789abcdef" for ch in request_hash):
+            raise EventStoreError("request_hash must be a SHA-256 digest")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM adapter_invocations WHERE invocation_id=?", (invocation_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO adapter_invocations (invocation_id, project_id, request_hash, state) "
+                    "VALUES (?, ?, ?, 'prepared')",
+                    (invocation_id, project_id, request_hash),
+                )
+                state = "prepared"
+            else:
+                if row["project_id"] != project_id or row["request_hash"] != request_hash:
+                    raise IdempotencyConflict(f"adapter invocation {invocation_id!r} was reused with a different request")
+                state = row["state"]
+            conn.execute("COMMIT")
+            return {"invocationId": invocation_id, "projectId": project_id, "requestHash": request_hash, "state": state}
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def start_adapter_invocation(self, invocation_id: str) -> dict[str, Any]:
+        """Mark a prepared invocation as dispatched; executing invocations are never auto-replayed."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM adapter_invocations WHERE invocation_id=?", (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
+            dispatched = row["state"] == "prepared"
+            if dispatched:
+                conn.execute(
+                    "UPDATE adapter_invocations SET state='executing' WHERE invocation_id=?",
+                    (invocation_id,),
+                )
+                state = "executing"
+            else:
+                state = row["state"]
+            conn.execute("COMMIT")
+            return {
+                "invocationId": invocation_id, "projectId": row["project_id"],
+                "requestHash": row["request_hash"], "state": state, "started": dispatched,
+            }
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def stage_adapter_receipt(self, invocation_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+        """Persist a validated canonical receipt batch before importing it into project history."""
+        if not isinstance(events, list) or not events:
+            raise EventStoreError("adapter receipt must contain at least one event")
+        normalized = []
+        project_ids = set()
+        for event in events:
+            if not isinstance(event, dict) or "sequence" in event:
+                raise EventStoreError("staged adapter events must be objects without assigned sequences")
+            candidate = dict(event)
+            project_ids.add(candidate.get("projectId"))
+            candidate["sequence"] = 1
+            self._validate(candidate)
+            candidate.pop("sequence")
+            normalized.append(candidate)
+        if len(project_ids) != 1 or not all(isinstance(value, str) for value in project_ids):
+            raise EventStoreError("adapter receipt events must belong to one project")
+        receipt_json = self._canonical_json({"events": normalized})
+        receipt_hash = hashlib.sha256(receipt_json.encode("utf-8")).hexdigest()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM adapter_invocations WHERE invocation_id=?", (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
+            if row["project_id"] != next(iter(project_ids)):
+                raise EventStoreError("adapter receipt project does not match its invocation")
+            if row["state"] in {"receipt_staged", "imported"}:
+                if row["receipt_hash"] != receipt_hash:
+                    raise IdempotencyConflict(f"adapter invocation {invocation_id!r} returned a changed receipt")
+            elif row["state"] == "executing":
+                conn.execute(
+                    "UPDATE adapter_invocations SET state='receipt_staged', receipt_json=?, receipt_hash=? "
+                    "WHERE invocation_id=?",
+                    (receipt_json, receipt_hash, invocation_id),
+                )
+            else:
+                raise EventStoreError("adapter receipt cannot be staged before invocation dispatch")
+            conn.execute("COMMIT")
+            return self.get_adapter_invocation(invocation_id)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def commit_adapter_receipt(self, invocation_id: str) -> list[AppendResult]:
+        """Atomically append a staged receipt and mark its invocation imported."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM adapter_invocations WHERE invocation_id=?", (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
+            if row["state"] == "imported":
+                saved = json.loads(row["result_json"])
+                results = [
+                    AppendResult(item["event"], item["sequence"], item["recordHash"], True)
+                    for item in saved
+                ]
+                conn.execute("COMMIT")
+                return results
+            if row["state"] != "receipt_staged" or row["receipt_json"] is None:
+                raise EventStoreError(f"adapter invocation {invocation_id!r} has no staged receipt to import")
+            receipt_json = row["receipt_json"]
+            if hashlib.sha256(receipt_json.encode("utf-8")).hexdigest() != row["receipt_hash"]:
+                raise IntegrityFailure(f"staged adapter receipt {invocation_id!r} failed its content hash")
+            events = json.loads(receipt_json)["events"]
+            results: list[AppendResult] = []
+            for event in events:
+                candidate = dict(event)
+                project_id = candidate["projectId"]
+                event_id = candidate["eventId"]
+                idempotency_key = candidate["idempotencyKey"]
+                previous = conn.execute(
+                    "SELECT sequence, event_id, event_json, record_hash FROM canonical_events "
+                    "WHERE project_id=? AND idempotency_key=?",
+                    (project_id, idempotency_key),
+                ).fetchone()
+                if previous is not None:
+                    stored_event = json.loads(previous["event_json"])
+                    if previous["event_id"] != event_id or candidate != {k: v for k, v in stored_event.items() if k != "sequence"}:
+                        raise IdempotencyConflict(f"idempotency key {idempotency_key!r} was reused with different content")
+                    results.append(AppendResult(stored_event, previous["sequence"], previous["record_hash"], True))
+                    continue
+                last = conn.execute(
+                    "SELECT sequence, record_hash FROM canonical_events WHERE project_id=? ORDER BY sequence DESC LIMIT 1",
+                    (project_id,),
+                ).fetchone()
+                sequence = 1 if last is None else last["sequence"] + 1
+                candidate["sequence"] = sequence
+                self._validate(candidate)
+                previous_hash = ZERO_HASH if last is None else last["record_hash"]
+                event_json = self._canonical_json(candidate)
+                record_hash = self._record_hash(previous_hash, event_json)
+                conn.execute(
+                    "INSERT INTO canonical_events "
+                    "(project_id, sequence, event_id, idempotency_key, event_json, previous_hash, record_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (project_id, sequence, event_id, idempotency_key, event_json, previous_hash, record_hash),
+                )
+                results.append(AppendResult(candidate, sequence, record_hash, False))
+            result_json = self._canonical_json([{
+                "event": item.event, "sequence": item.sequence, "recordHash": item.record_hash,
+            } for item in results])
+            conn.execute(
+                "UPDATE adapter_invocations SET state='imported', result_json=? WHERE invocation_id=?",
+                (result_json, invocation_id),
+            )
+            conn.execute("COMMIT")
+            return results
+        except sqlite3.IntegrityError as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise EventStoreError(f"adapter receipt uniqueness constraint failed: {exc}") from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def list_adapter_invocations(self, project_id: str) -> list[dict[str, Any]]:
+        """List adapter receipt states without exposing staged output contents."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT invocation_id, project_id, request_hash, state, receipt_hash "
+                "FROM adapter_invocations WHERE project_id=? ORDER BY invocation_id",
+                (project_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [{
+            "invocationId": row["invocation_id"],
+            "projectId": row["project_id"],
+            "requestHash": row["request_hash"],
+            "state": row["state"],
+            "receiptHash": row["receipt_hash"],
+        } for row in rows]
+
+    def reconcile_staged_adapter_receipts(self, project_id: str) -> list[str]:
+        """Import persisted canonical receipts before run recovery closes active runs."""
+        staged = [
+            item["invocationId"] for item in self.list_adapter_invocations(project_id)
+            if item["state"] == "receipt_staged"
+        ]
+        for invocation_id in staged:
+            self.commit_adapter_receipt(invocation_id)
+        return staged
+
+    def mark_ambiguous_adapter_invocations(self, project_id: str) -> list[str]:
+        """Mark dispatched calls with no durable receipt as ambiguous during recovery."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT invocation_id FROM adapter_invocations WHERE project_id=? AND state='executing'",
+                (project_id,),
+            ).fetchall()
+            invocation_ids = [row["invocation_id"] for row in rows]
+            conn.executemany(
+                "UPDATE adapter_invocations SET state='ambiguous' WHERE invocation_id=?",
+                [(invocation_id,) for invocation_id in invocation_ids],
+            )
+            conn.execute("COMMIT")
+            return invocation_ids
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def get_adapter_invocation(self, invocation_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM adapter_invocations WHERE invocation_id=?", (invocation_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            "invocationId": row["invocation_id"],
+            "projectId": row["project_id"],
+            "requestHash": row["request_hash"],
+            "state": row["state"],
+            "receiptHash": row["receipt_hash"],
+            "receipt": None if row["receipt_json"] is None else json.loads(row["receipt_json"]),
+            "results": None if row["result_json"] is None else json.loads(row["result_json"]),
+        }
 
     def put_blob(self, content: str | bytes) -> tuple[str, str]:
         raw = content.encode("utf-8") if isinstance(content, str) else content

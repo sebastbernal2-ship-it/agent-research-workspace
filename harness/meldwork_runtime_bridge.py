@@ -7,6 +7,7 @@ and the repository's receipt parser/sanitizer remains the canonical ingress.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -51,6 +52,72 @@ class MeldworkAgenticXRuntimeBridge:
         correlation_id: str | None = None,
         run_ids_by_agent: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        if run_ids_by_agent is not None and not isinstance(run_ids_by_agent, dict):
+            raise MeldworkRuntimeError("run_ids_by_agent must be a worker-to-run mapping")
+        run_metadata: dict[str, dict[str, Any]] = {}
+        effective_correlation_id = correlation_id
+        invocation_id: str | None = None
+        if run_ids_by_agent is not None:
+            if (
+                not run_ids_by_agent
+                or set(run_ids_by_agent) - {"codex", "hermes"}
+                or any(not isinstance(run_id, str) or not run_id for run_id in run_ids_by_agent.values())
+                or len(set(run_ids_by_agent.values())) != len(run_ids_by_agent)
+            ):
+                raise MeldworkRuntimeError("run_ids_by_agent must map known workers to unique non-empty run IDs")
+            state = Projector(self.event_store).replay(project_id)
+            start_events = {
+                event["payload"]["runId"]: event
+                for event in self.event_store.verified_events(project_id)
+                if event["eventType"] == "run.started"
+            }
+            correlations = set()
+            for worker_kind, run_id in run_ids_by_agent.items():
+                run = state["agentRuns"].get(run_id)
+                start_event = start_events.get(run_id)
+                if (
+                    run is None or run["status"] != "running" or run["workId"] != work_id
+                    or run["agent"].get("actorId") != f"agent.{worker_kind}" or start_event is None
+                ):
+                    raise MeldworkRuntimeError(f"worker {worker_kind!r} is not assigned an active canonical run")
+                run_metadata[worker_kind] = {
+                    "runId": run_id,
+                    "startedAt": run["startedAt"],
+                    "startEventId": start_event["eventId"],
+                }
+                correlations.add(start_event["correlationId"])
+            if len(correlations) != 1:
+                raise MeldworkRuntimeError("Meldwork worker runs must share a correlation ID")
+            run_correlation_id = next(iter(correlations))
+            if correlation_id is not None and correlation_id != run_correlation_id:
+                raise MeldworkRuntimeError("Meldwork correlation ID does not match canonical worker runs")
+            effective_correlation_id = run_correlation_id
+            invocation_descriptor = {
+                "projectId": project_id,
+                "workId": work_id,
+                "correlationId": run_correlation_id,
+                "runIdsByAgent": dict(sorted(run_ids_by_agent.items())),
+            }
+            request_hash = hashlib.sha256(
+                SQLiteEventStore._canonical_json(invocation_descriptor).encode("utf-8")
+            ).hexdigest()
+            invocation_id = f"inv.meldwork.{request_hash}"
+            invocation = self.event_store.prepare_adapter_invocation(
+                invocation_id, project_id, request_hash,
+            )
+            if invocation["state"] in {"receipt_staged", "imported"}:
+                results = self.event_store.commit_adapter_receipt(invocation_id)
+                return self._report(results, invocation_id=invocation_id)
+            if invocation["state"] in {"executing", "ambiguous"}:
+                raise MeldworkRuntimeError(
+                    f"adapter invocation {invocation_id} is ambiguous; inspect its durable receipt before any retry"
+                )
+            dispatch = self.event_store.start_adapter_invocation(invocation_id)
+            if not dispatch["started"]:
+                raise MeldworkRuntimeError(
+                    f"adapter invocation {invocation_id} was claimed by another dispatcher; inspect its receipt"
+                )
+
         with tempfile.TemporaryDirectory(prefix="meldwork-runtime-bridge-") as home:
             env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             try:
@@ -87,45 +154,6 @@ class MeldworkAgenticXRuntimeBridge:
             node=self.node,
             timeout=min(self.timeout, 10.0),
         )
-        if run_ids_by_agent is not None and not isinstance(run_ids_by_agent, dict):
-            raise MeldworkRuntimeError("run_ids_by_agent must be a worker-to-run mapping")
-        run_metadata: dict[str, dict[str, Any]] = {}
-        effective_correlation_id = correlation_id
-        if run_ids_by_agent is not None:
-            if (
-                not run_ids_by_agent
-                or set(run_ids_by_agent) - {"codex", "hermes"}
-                or any(not isinstance(run_id, str) or not run_id for run_id in run_ids_by_agent.values())
-                or len(set(run_ids_by_agent.values())) != len(run_ids_by_agent)
-            ):
-                raise MeldworkRuntimeError("run_ids_by_agent must map known workers to unique non-empty run IDs")
-            state = Projector(self.event_store).replay(project_id)
-            start_events = {
-                event["payload"]["runId"]: event
-                for event in self.event_store.verified_events(project_id)
-                if event["eventType"] == "run.started"
-            }
-            correlations = set()
-            for worker_kind, run_id in run_ids_by_agent.items():
-                run = state["agentRuns"].get(run_id)
-                start_event = start_events.get(run_id)
-                if (
-                    run is None or run["status"] != "running" or run["workId"] != work_id
-                    or run["agent"].get("actorId") != f"agent.{worker_kind}" or start_event is None
-                ):
-                    raise MeldworkRuntimeError(f"worker {worker_kind!r} is not assigned an active canonical run")
-                run_metadata[worker_kind] = {
-                    "runId": run_id,
-                    "startedAt": run["startedAt"],
-                    "startEventId": start_event["eventId"],
-                }
-                correlations.add(start_event["correlationId"])
-            if len(correlations) != 1:
-                raise MeldworkRuntimeError("Meldwork worker runs must share a correlation ID")
-            run_correlation_id = next(iter(correlations))
-            if correlation_id is not None and correlation_id != run_correlation_id:
-                raise MeldworkRuntimeError("Meldwork correlation ID does not match canonical worker runs")
-            effective_correlation_id = run_correlation_id
         invocation_counts: dict[tuple[str, str], int] = {}
         events: list[dict[str, Any]] = []
         for invocation in invocations:
@@ -192,14 +220,31 @@ class MeldworkAgenticXRuntimeBridge:
                 raise MeldworkRuntimeError(
                     f"V4 receipt rejected for {phase}/{actor_kind}: {exc}"
                 ) from exc
-        results: list[AppendResult] = self.event_store.append_many(events)
-        return {
-            "runId": response.get("runId"),
-            "taskId": response.get("taskId"),
-            "orchestrationPhase": response["orchestrationPhase"],
-            "agentMessages": response.get("messages", []),
-            "invocationCount": len(invocations),
+        if invocation_id is not None:
+            self.event_store.stage_adapter_receipt(invocation_id, events)
+            results = self.event_store.commit_adapter_receipt(invocation_id)
+        else:
+            results = self.event_store.append_many(events)
+        return self._report(
+            results, invocation_id=invocation_id, response=response,
+            invocation_count=len(invocations),
+        )
+
+    @staticmethod
+    def _report(
+        results: list[AppendResult], *, invocation_id: str | None,
+        response: dict[str, Any] | None = None, invocation_count: int | None = None,
+    ) -> dict[str, Any]:
+        report = {
+            "runId": None if response is None else response.get("runId"),
+            "taskId": None if response is None else response.get("taskId"),
+            "orchestrationPhase": "completed" if response is None else response["orchestrationPhase"],
+            "agentMessages": [] if response is None else response.get("messages", []),
+            "invocationCount": len(results) if invocation_count is None else invocation_count,
             "eventSequences": [result.sequence for result in results],
             "eventIds": [result.event["eventId"] for result in results],
             "duplicateEvents": [result.duplicate for result in results],
         }
+        if invocation_id is not None:
+            report["invocationId"] = invocation_id
+        return report

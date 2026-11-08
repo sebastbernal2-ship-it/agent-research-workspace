@@ -14,7 +14,7 @@ Research and development for a project-first collaborative AI workspace.
 - [Meldwork V1.0.9 source review](spikes/meldwork-review/README.md) — V4 collaboration behavior, isolated Linux test results, platform boundary, and dependency-audit warning.
 - [GitHub issue register](tracking/README.md) — owners, dependencies, blockers, and the recommended sequence for remaining work.
 - [Local harness prototype](harness/README.md) — canonical SQLite event store, project-scoped inbox, reusable DAG coordinator, parent-linked agent runs, and an offline end-to-end run across AG2, AgenticX, and Meldwork adapters.
-- [Orchestration/recovery contract](design/ORCHESTRATION_CONTRACT.md) — adapter callback, verification, retry, pause, cancellation, parent-run, and crash-recovery semantics; explicitly documents missing outbox/exactly-once guarantees.
+- [Orchestration/recovery contract](design/ORCHESTRATION_CONTRACT.md) — adapter callback, verification, retry, pause, cancellation, parent-run, and crash-recovery semantics; documents the canonical receipt journal and remaining adapter-outbox/exactly-once gaps.
 - [Security threat model](security/THREAT_MODEL.md) — trust boundaries, abuse cases, current gaps, and release gates; not a security approval.
 - [Alignment memory prototype](alignment/README.md) — synthetic, provenance-first conformance checks kept separate from project charter, permissions, and private profile data.
 - [ADR-0001](decisions/ADR-0001-canonical-control-plane-and-adapters.md) — why the control plane is canonical and how candidate runtimes stay replaceable.

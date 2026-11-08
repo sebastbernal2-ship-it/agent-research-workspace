@@ -288,6 +288,81 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(replayed["agentRuns"][run["runId"]]["outputEventIds"], [message["eventId"]])
         self.assertTrue(self.store.verify("project.alpha"))
 
+    def test_artifact_derivation_records_registered_inputs_and_evidence(self):
+        self.create_project()
+        work = self.create_work("work.derivation", "Derive an output")
+        input_content = b"source artifact bytes"
+        input_ref, input_hash = self.store.put_blob(input_content)
+        input_record = {
+            "recordType": "artifact", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "artifactId": "artifact.input",
+            "workId": work["workId"], "name": "input.txt", "mediaType": "text/plain",
+            "sha256": input_hash, "byteSize": len(input_content), "storageRef": input_ref,
+            "createdBy": VP, "createdAt": NOW,
+        }
+        self.event("artifact.registered", {
+            "artifactId": input_record["artifactId"], "workId": work["workId"],
+            "sha256": input_hash, "recordHash": self.store.put_record(input_record),
+        }, actor=VP)
+
+        source_content = b"evidence source bytes"
+        source_hash = hashlib.sha256(source_content).hexdigest()
+        self.store.put_blob(source_content)
+        evidence = {
+            "recordType": "evidence", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "evidenceId": "evidence.input",
+            "workId": work["workId"], "claimText": "The source supports the derived result.",
+            "stance": "supports",
+            "source": {"uri": "https://example.test/evidence", "title": "Synthetic evidence", "retrievedAt": NOW, "contentHash": source_hash},
+            "createdBy": VP, "createdAt": NOW,
+        }
+        self.event("evidence.registered", {
+            "evidenceId": evidence["evidenceId"], "workId": work["workId"],
+            "stance": evidence["stance"], "sourceHash": source_hash,
+            "recordHash": self.store.put_record(evidence),
+        }, actor=VP)
+
+        output_content = b"derived output bytes"
+        output_ref, output_hash = self.store.put_blob(output_content)
+        output = {
+            "recordType": "artifact", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "artifactId": "artifact.derived",
+            "workId": work["workId"], "name": "output.txt", "mediaType": "text/plain",
+            "sha256": output_hash, "byteSize": len(output_content), "storageRef": output_ref,
+            "createdBy": VP, "createdAt": NOW,
+            "inputArtifactIds": [input_record["artifactId"]],
+            "evidenceIds": [evidence["evidenceId"]],
+        }
+        self.event("artifact.registered", {
+            "artifactId": output["artifactId"], "workId": work["workId"],
+            "sha256": output_hash, "inputArtifactIds": output["inputArtifactIds"],
+            "evidenceIds": output["evidenceIds"], "recordHash": self.store.put_record(output),
+        }, actor=VP)
+        replayed = Projector(self.store).replay("project.alpha")
+        self.assertEqual(replayed["artifacts"]["artifact.derived"]["inputArtifactIds"], ["artifact.input"])
+        self.assertEqual(replayed["artifacts"]["artifact.derived"]["evidenceIds"], ["evidence.input"])
+
+    def test_artifact_derivation_rejects_missing_input_reference(self):
+        self.create_project()
+        work = self.create_work("work.missing-input", "Reject missing provenance")
+        content = b"derived without a registered input"
+        storage_ref, digest = self.store.put_blob(content)
+        artifact = {
+            "recordType": "artifact", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "artifactId": "artifact.invalid-derived",
+            "workId": work["workId"], "name": "output.txt", "mediaType": "text/plain",
+            "sha256": digest, "byteSize": len(content), "storageRef": storage_ref,
+            "createdBy": VP, "createdAt": NOW,
+            "inputArtifactIds": ["artifact.not-registered"],
+        }
+        self.event("artifact.registered", {
+            "artifactId": artifact["artifactId"], "workId": work["workId"],
+            "sha256": digest, "inputArtifactIds": artifact["inputArtifactIds"],
+            "recordHash": self.store.put_record(artifact),
+        }, actor=VP)
+        with self.assertRaisesRegex(ProjectionError, "missing or unrelated input"):
+            Projector(self.store).replay("project.alpha")
+
     def test_replay_rejects_running_work_with_incomplete_dependencies(self):
         self.create_project()
         dependency = self.create_work("work.dependency", "Prerequisite")

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -102,19 +103,19 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
             stderr=b"",
         )
         bridge = MeldworkAgenticXRuntimeBridge(self.store)
-        original_append_many = self.store.append_many
-        append_calls = 0
+        original_commit_receipt = self.store.commit_adapter_receipt
+        commit_calls = 0
 
-        def commit_then_lose_response(events, **kwargs):
-            nonlocal append_calls
-            result = original_append_many(events, **kwargs)
-            append_calls += 1
-            if append_calls == 1:
+        def commit_then_lose_response(invocation_id):
+            nonlocal commit_calls
+            result = original_commit_receipt(invocation_id)
+            commit_calls += 1
+            if commit_calls == 1:
                 raise RuntimeError("simulated crash after canonical commit")
             return result
 
-        with patch("harness.meldwork_runtime_bridge.run_bounded_subprocess", return_value=runtime_result), patch.object(
-            self.store, "append_many", side_effect=commit_then_lose_response,
+        with patch("harness.meldwork_runtime_bridge.run_bounded_subprocess", return_value=runtime_result) as runtime_call, patch.object(
+            self.store, "commit_adapter_receipt", side_effect=commit_then_lose_response,
         ):
             arguments = {
                 "project_id": "project.meldwork",
@@ -128,17 +129,7 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
             retry_report = bridge.run(**arguments)
 
         self.assertEqual(retry_report["duplicateEvents"], [True])
-        self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 1)
-        changed_response = json.loads(json.dumps(response))
-        changed_response["invocations"][0]["text"] = "A conflicting output must not replace the accepted result."
-        with patch(
-            "harness.meldwork_runtime_bridge.run_bounded_subprocess",
-            return_value=SimpleNamespace(
-                returncode=0, stdout=json.dumps(changed_response).encode("utf-8"), stderr=b"",
-            ),
-        ):
-            with self.assertRaises(IdempotencyConflict):
-                bridge.run(**arguments)
+        self.assertEqual(runtime_call.call_count, 1, "an imported invocation must not re-execute the adapter")
         self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 1)
         finished = ledger.finish(
             "project.meldwork", run["runId"], terminal_status="succeeded", actor=actor,
@@ -146,6 +137,37 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
         )
         self.assertEqual(finished["outputEventIds"], retry_report["eventIds"])
         self.assertTrue(self.store.verify("project.meldwork"))
+
+    def test_ambiguous_dispatched_invocation_is_never_automatically_reexecuted(self):
+        actor = {"actorType": "agent", "actorId": "agent.codex", "role": "specialist"}
+        run = RunLedger(self.store, clock=lambda: "2026-04-16T12:00:00Z").start(
+            "project.meldwork", "work.meldwork", run_id="run.meldwork.ambiguous", agent=actor,
+            adapter={"name": "meldwork-agenticx", "version": "test"},
+            context_hash="e" * 64, correlation_id="run.meldwork.ambiguous-team",
+            occurred_at="2026-04-16T12:00:00Z",
+        )
+        descriptor = {
+            "projectId": "project.meldwork", "workId": "work.meldwork",
+            "correlationId": "run.meldwork.ambiguous-team",
+            "runIdsByAgent": {"codex": run["runId"]},
+        }
+        request_hash = hashlib.sha256(
+            SQLiteEventStore._canonical_json(descriptor).encode("utf-8")
+        ).hexdigest()
+        invocation_id = f"inv.meldwork.{request_hash}"
+        self.store.prepare_adapter_invocation(invocation_id, "project.meldwork", request_hash)
+        self.store.start_adapter_invocation(invocation_id)
+
+        bridge = MeldworkAgenticXRuntimeBridge(self.store)
+        with patch("harness.meldwork_runtime_bridge.run_bounded_subprocess") as runtime_call:
+            with self.assertRaisesRegex(MeldworkRuntimeError, "is ambiguous"):
+                bridge.run(
+                    project_id="project.meldwork", work_id="work.meldwork",
+                    correlation_id="run.meldwork.ambiguous-team",
+                    run_ids_by_agent={"codex": run["runId"]},
+                )
+        runtime_call.assert_not_called()
+        self.assertEqual(self.store.list_adapter_invocations("project.meldwork")[0]["state"], "executing")
 
     def test_v4_proposal_challenge_synthesis_map_to_canonical_events(self):
         proposal = request(

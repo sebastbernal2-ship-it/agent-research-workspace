@@ -95,6 +95,74 @@ class SQLiteEventStoreTests(unittest.TestCase):
         self.assertEqual([event["eventId"] for event in self.store.events("project.alpha")], [events[0]["eventId"]])
         self.assertTrue(self.store.verify("project.alpha"))
 
+    def test_adapter_receipt_is_durable_and_import_is_atomic_idempotent(self):
+        invocation = self.store.prepare_adapter_invocation(
+            "invocation.test", "project.alpha", "b" * 64,
+        )
+        self.assertEqual(invocation["state"], "prepared")
+        self.assertEqual(self.store.start_adapter_invocation("invocation.test")["state"], "executing")
+        self.store.stage_adapter_receipt("invocation.test", initial_events())
+
+        reopened = SQLiteEventStore(self.path)
+        self.assertEqual(reopened.get_adapter_invocation("invocation.test")["state"], "receipt_staged")
+        committed = reopened.commit_adapter_receipt("invocation.test")
+        self.assertEqual([item.sequence for item in committed], [1, 2])
+        self.assertTrue(all(not item.duplicate for item in committed))
+        self.assertEqual(self.store.get_adapter_invocation("invocation.test")["state"], "imported")
+
+        retry = self.store.commit_adapter_receipt("invocation.test")
+        self.assertEqual([item.sequence for item in retry], [1, 2])
+        self.assertTrue(all(item.duplicate for item in retry))
+        self.assertEqual(len(self.store.events("project.alpha")), 2)
+        self.assertTrue(self.store.verify("project.alpha"))
+
+    def test_adapter_receipt_cannot_be_replaced_after_staging(self):
+        invocation_id = "invocation.immutable-receipt"
+        self.store.prepare_adapter_invocation(invocation_id, "project.alpha", "a" * 64)
+        self.store.start_adapter_invocation(invocation_id)
+        original = initial_events()
+        self.store.stage_adapter_receipt(invocation_id, original)
+        changed = initial_events()
+        changed[0]["payload"] = {
+            "name": "Changed after staging", "charterHash": HASH, "recordHash": HASH,
+        }
+        with self.assertRaises(IdempotencyConflict):
+            self.store.stage_adapter_receipt(invocation_id, changed)
+        self.assertEqual(self.store.get_adapter_invocation(invocation_id)["state"], "receipt_staged")
+        self.assertEqual([item.sequence for item in self.store.commit_adapter_receipt(invocation_id)], [1, 2])
+
+    def test_only_one_concurrent_dispatcher_claims_an_invocation(self):
+        self.store.prepare_adapter_invocation("invocation.claim", "project.alpha", "9" * 64)
+        peer = SQLiteEventStore(self.path)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(pool.map(
+                lambda store: store.start_adapter_invocation("invocation.claim"),
+                [self.store, peer],
+            ))
+        self.assertEqual(sum(claim["started"] for claim in claims), 1)
+        self.assertEqual(self.store.get_adapter_invocation("invocation.claim")["state"], "executing")
+
+    def test_adapter_invocation_with_no_receipt_is_not_replayed_or_committed(self):
+        self.store.prepare_adapter_invocation("invocation.ambiguous", "project.alpha", "c" * 64)
+        self.store.start_adapter_invocation("invocation.ambiguous")
+        reopened = SQLiteEventStore(self.path)
+        self.assertEqual(reopened.start_adapter_invocation("invocation.ambiguous")["state"], "executing")
+        with self.assertRaisesRegex(EventStoreError, "no staged receipt"):
+            reopened.commit_adapter_receipt("invocation.ambiguous")
+        self.assertEqual(reopened.events("project.alpha"), [])
+
+    def test_adapter_receipt_batch_rolls_back_fully_on_import_conflict(self):
+        invocation_id = "invocation.rollback"
+        self.store.prepare_adapter_invocation(invocation_id, "project.alpha", "d" * 64)
+        self.store.start_adapter_invocation(invocation_id)
+        batch = initial_events()
+        batch[1]["eventId"] = batch[0]["eventId"]
+        self.store.stage_adapter_receipt(invocation_id, batch)
+        with self.assertRaises(EventStoreError):
+            self.store.commit_adapter_receipt(invocation_id)
+        self.assertEqual(self.store.events("project.alpha"), [])
+        self.assertEqual(self.store.get_adapter_invocation(invocation_id)["state"], "receipt_staged")
+
     def test_reused_idempotency_key_with_changed_content_fails(self):
         event = initial_events()[0]
         self.store.append(event)

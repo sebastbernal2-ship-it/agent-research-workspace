@@ -168,6 +168,7 @@ class RunLedger:
         if terminal_status not in _TERMINAL_STATUSES:
             raise ValueError("terminal_status must be succeeded, failed, cancelled, or interrupted")
         supplied_output_ids = None if output_artifact_ids is None else list(output_artifact_ids)
+        self.store.reconcile_staged_adapter_receipts(project_id)
         state = self.control.projector.replay(project_id)
         old = state["agentRuns"].get(run_id)
         if old is None:
@@ -269,7 +270,9 @@ class RunLedger:
         return active_ids
 
     def recover_interrupted(self, project_id: str, *, occurred_at: str | None = None) -> list[str]:
-        """Close runs left active by a process restart; never retry work implicitly."""
+        """Import durable adapter receipts, then close runs left active by restart."""
+        self.store.reconcile_staged_adapter_receipts(project_id)
+        self.store.mark_ambiguous_adapter_invocations(project_id)
         state = self.control.projector.replay(project_id)
         active_ids = [
             run_id for run_id, run in reversed(list(state["agentRuns"].items()))

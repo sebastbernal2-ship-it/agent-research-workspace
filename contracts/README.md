@@ -18,7 +18,7 @@ This folder starts issue [#2](https://github.com/sebastbernal2-ship-it/agent-res
 - explicit capability grant snapshots scoped to project/work, agent, capability, opaque resource IDs, approver and expiry, with immutable revocation events;
 - agent run with adapter/version, context hash, grants, status, usage, and canonical output message/artifact/evidence references; optional `parentRunId` records delegation lineage, which replay checks against an active parent and shared correlation ID;
 - separate blocking/nonblocking human question and answer record;
-- immutable artifact metadata and claim-linked evidence record; run attribution, source hashes, content blobs, and run-finished output references are cross-checked during replay;
+- immutable artifact metadata and claim-linked evidence record; run attribution, source hashes, content blobs, input-artifact/evidence derivation links, and run-finished output references are cross-checked during replay;
 - append-only event envelope with sequence, actor, idempotency/correlation/causation refs, closed event/payload vocabulary, and content hashes that point to full immutable project/work/run/question/artifact/evidence snapshots where state must be reconstructed.
 
 ## Validate
@@ -28,11 +28,11 @@ python3 -m pip install -r contracts/requirements-test.txt
 python3 -m unittest discover -s contracts/tests -v
 ```
 
-Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet. Optional `parentRunId`, message `runId`, and run output-reference fields were added while v0.1 is still an unpublished draft; older snapshots omit them and remain valid. Freeze/release requires versioned compatibility handling, not silent post-release schema edits.
+Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet. Optional `parentRunId`, message `runId`, run output-reference fields, and artifact input/evidence lineage fields were added while v0.1 is still an unpublished draft; older snapshots omit them and remain valid. Freeze/release requires versioned compatibility handling, not silent post-release schema edits.
 
 ## Explicitly incomplete
 
-- A SQLite reference store and deterministic projector now enforce event ordering/idempotency, snapshot hashes, selected cross-record references, replay, restart/export, and ordinary append-only behavior. This is still a single-host prototype, not a production transactional service.
+- A SQLite reference store and deterministic projector enforce event ordering/idempotency, snapshot hashes, selected cross-record references, replay, restart/export, and append-only behavior. A local adapter-invocation journal stages canonical receipt batches and atomically imports them with their imported state, but it is not a distributed transaction or externally effecting adapter outbox. This is still a single-host prototype, not a production transactional service.
 - A local capability-authority prototype enforces exact project/work/agent/action/resource and expiry scope, plus user-actor grant/revocation and replay tests. It is not an authenticated identity service, is not wired to actual tools/adapters, and is not an OS sandbox or security approval. Schema migrations, retention/deletion, multi-process stress/race behavior, crash-consistency fault injection, and broader dependency-graph rules remain open.
 - `eventPayload` is a closed v0.1 union; schema changes require a new compatible version/migration decision, not adding arbitrary fields.
 - The user-alignment ledger is a separate workstream (#10); no personal profile fields are included here.
