@@ -108,6 +108,64 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(state["workItems"]["work.dependent"]["status"], "ready")
         self.assertNotIn("run.dependent", state["agentRuns"])
 
+    def test_parent_child_runs_are_canonical_and_parent_cannot_finish_first(self):
+        self.start_run("run.parent")
+        child = self.ledger.start(
+            PROJECT_ID, WORK_ID, run_id="run.child", agent=VP,
+            adapter={"name": "nested-test-runtime", "version": "0.1"},
+            context_hash=hashlib.sha256(b"child context").hexdigest(),
+            correlation_id="run.team", parent_run_id="run.parent", occurred_at=NOW,
+        )
+        self.assertEqual(child["parentRunId"], "run.parent")
+        with self.assertRaisesRegex(ControlPlaneError, "child runs are active"):
+            self.ledger.finish(
+                PROJECT_ID, "run.parent", terminal_status="succeeded", actor=SPECIALIST, occurred_at=NOW,
+            )
+        self.ledger.finish(
+            PROJECT_ID, "run.child", terminal_status="succeeded", actor=VP, occurred_at=NOW,
+        )
+        self.ledger.finish(
+            PROJECT_ID, "run.parent", terminal_status="succeeded", actor=SPECIALIST, occurred_at=NOW,
+        )
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"]["run.child"]["parentRunId"], "run.parent")
+        self.assertEqual(state["agentRuns"]["run.parent"]["status"], "succeeded")
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
+    def test_recovery_closes_nested_runs_leaf_first(self):
+        self.start_run("run.parent")
+        self.ledger.start(
+            PROJECT_ID, WORK_ID, run_id="run.child", agent=VP,
+            adapter={"name": "nested-test-runtime", "version": "0.1"},
+            context_hash="f" * 64, correlation_id="run.team", parent_run_id="run.parent",
+            occurred_at=NOW,
+        )
+        self.assertEqual(
+            self.ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW),
+            ["run.child", "run.parent"],
+        )
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"]["run.child"]["status"], "interrupted")
+        self.assertEqual(state["agentRuns"]["run.parent"]["status"], "interrupted")
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
+    def test_child_run_requires_active_parent_and_matching_correlation(self):
+        with self.assertRaisesRegex(ControlPlaneError, "active before"):
+            self.ledger.start(
+                PROJECT_ID, WORK_ID, run_id="run.orphan", agent=SPECIALIST,
+                adapter={"name": "test-agent-runtime", "version": "0.1"},
+                context_hash="d" * 64, correlation_id="run.team", parent_run_id="run.missing",
+                occurred_at=NOW,
+            )
+        self.start_run("run.parent")
+        with self.assertRaisesRegex(ControlPlaneError, "same correlation ID"):
+            self.ledger.start(
+                PROJECT_ID, WORK_ID, run_id="run.wrong-correlation", agent=VP,
+                adapter={"name": "test-agent-runtime", "version": "0.1"},
+                context_hash="e" * 64, correlation_id="run.other", parent_run_id="run.parent",
+                occurred_at=NOW,
+            )
+
     def test_unenforced_grants_fail_without_starting_an_extra_run(self):
         self.start_run()
         with self.assertRaisesRegex(ControlPlaneError, "does not authorize capability"):

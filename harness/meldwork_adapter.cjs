@@ -58,6 +58,7 @@ function toCanonicalEvent(request) {
   const projectId = requireString(request.projectId, 'projectId', 128)
   const workId = requireString(request.workId, 'workId', 128)
   const sourceReceiptId = requireString(request.sourceReceiptId, 'sourceReceiptId', 256)
+  const runId = request.runId == null ? null : requireString(request.runId, 'runId', 128)
   const occurredAt = requireString(request.occurredAt, 'occurredAt', 40)
   const actor = request.actor
   if (!actor || typeof actor !== 'object' || Array.isArray(actor)) throw new Error('invalid actor')
@@ -105,6 +106,7 @@ function toCanonicalEvent(request) {
       workId,
       threadId,
       messageType: MESSAGE_TYPE_BY_PHASE[phase],
+      ...(runId ? { runId } : {}),
       contentRef: `blob.${contentHash}`,
       contentHash,
       visibleTo: [...new Set([...request.visibleTo, actorId])].sort(),

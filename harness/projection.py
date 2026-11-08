@@ -96,6 +96,7 @@ class Projector:
     def replay_snapshot(self, project_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Return projected state and the exact verified events used to build it."""
         events = self.store.verified_events(project_id)
+        run_start_events: dict[str, dict[str, Any]] = {}
         state: dict[str, Any] = {
             "project": None,
             "workItems": {},
@@ -238,6 +239,18 @@ class Projector:
                     raise ProjectionError("discussion content blob is missing or not UTF-8") from exc
                 if payload["workId"] not in state["workItems"]:
                     raise ProjectionError(f"message references unknown work item {payload['workId']!r}")
+                run_id = payload.get("runId")
+                if run_id is not None:
+                    run = state["agentRuns"].get(run_id)
+                    if (
+                        run is None or run["status"] != "running"
+                        or run["workId"] != payload["workId"] or run["agent"] != event["actor"]
+                    ):
+                        raise ProjectionError("message run attribution does not match an active assigned run")
+                if any(artifact_id not in state["artifacts"] for artifact_id in payload.get("artifactIds", [])):
+                    raise ProjectionError("message references an artifact not yet registered")
+                if any(evidence_id not in state["evidence"] for evidence_id in payload.get("evidenceIds", [])):
+                    raise ProjectionError("message references evidence not yet registered")
                 state["messages"].append({
                     "eventId": event["eventId"],
                     "sequence": event["sequence"],
@@ -247,6 +260,7 @@ class Projector:
                     "actor": event["actor"],
                     "content": content,
                     "contentHash": payload["contentHash"],
+                    **({"runId": run_id} if run_id is not None else {}),
                     "visibleTo": payload["visibleTo"],
                     "occurredAt": event["occurredAt"],
                 })
@@ -260,21 +274,62 @@ class Projector:
                     raise ProjectionError("run.started payload does not match run record")
                 if run["agent"] != event["actor"]:
                     raise ProjectionError("run.started actor does not match the assigned agent")
-                if run["adapter"] != payload["adapter"] or run["contextHash"] != payload["contextHash"] or run["capabilityGrantIds"] != payload["capabilityGrantIds"]:
+                if (
+                    run["adapter"] != payload["adapter"]
+                    or run["contextHash"] != payload["contextHash"]
+                    or run["capabilityGrantIds"] != payload["capabilityGrantIds"]
+                    or run.get("parentRunId") != payload.get("parentRunId")
+                ):
                     raise ProjectionError("run.started metadata does not match run record")
+                parent_run_id = run.get("parentRunId")
+                if parent_run_id is not None:
+                    parent = state["agentRuns"].get(parent_run_id)
+                    parent_event = run_start_events.get(parent_run_id)
+                    if parent is None or parent["status"] != "running":
+                        raise ProjectionError("child run requires a previously started active parent")
+                    if parent_event is None or parent_event["correlationId"] != event["correlationId"]:
+                        raise ProjectionError("parent and child runs must share a correlation ID")
                 state["agentRuns"][run_id] = run
+                run_start_events[run_id] = event
 
             elif event_type == "run.finished":
                 run_id = payload["runId"]
                 old = state["agentRuns"].get(run_id)
                 if old is None:
                     raise ProjectionError(f"run {run_id!r} was not started")
+                active_children = [
+                    child_id for child_id, child in state["agentRuns"].items()
+                    if child.get("parentRunId") == run_id and child["status"] == "running"
+                ]
+                if active_children:
+                    raise ProjectionError(f"parent run finished before its child runs: {active_children}")
                 new = self._load_record(payload["recordHash"], "agent_run", project_id)
                 if new["runId"] != run_id or new["workId"] != old["workId"] or new["status"] != payload["terminalStatus"]:
                     raise ProjectionError("run.finished payload does not match terminal run record")
                 if event["actor"] != old["agent"]:
                     raise ProjectionError("run.finished actor does not match the assigned agent")
-                self._check_same_identity(old, new, ("projectId", "runId", "workId", "agent", "adapter", "contextHash", "capabilityGrantIds", "startedAt"))
+                expected_event_ids = [
+                    message["eventId"] for message in state["messages"]
+                    if message.get("runId") == run_id
+                ]
+                expected_artifact_ids = [
+                    artifact_id for artifact_id, artifact in state["artifacts"].items()
+                    if artifact.get("runId") == run_id
+                ]
+                expected_evidence_ids = [
+                    evidence_id for evidence_id, evidence in state["evidence"].items()
+                    if evidence.get("runId") == run_id
+                ]
+                if (
+                    new.get("outputEventIds", []) != expected_event_ids
+                    or payload.get("eventIds", []) != expected_event_ids
+                    or new.get("outputArtifactIds", []) != expected_artifact_ids
+                    or payload.get("artifactIds", []) != expected_artifact_ids
+                    or new.get("outputEvidenceIds", []) != expected_evidence_ids
+                    or payload.get("evidenceIds", []) != expected_evidence_ids
+                ):
+                    raise ProjectionError("run.finished output references do not match registered run outputs")
+                self._check_same_identity(old, new, ("projectId", "runId", "workId", "parentRunId", "agent", "adapter", "contextHash", "capabilityGrantIds", "startedAt"))
                 state["agentRuns"][run_id] = new
 
             elif event_type == "human.question_opened":
@@ -404,6 +459,16 @@ class Projector:
                     raise ProjectionError("artifact.registered payload does not match artifact record")
                 if artifact["workId"] not in state["workItems"]:
                     raise ProjectionError("artifact references unknown work item")
+                if artifact["createdBy"] != event["actor"]:
+                    raise ProjectionError("artifact creator does not match registration actor")
+                run_id = artifact.get("runId")
+                if run_id is not None:
+                    run = state["agentRuns"].get(run_id)
+                    if (
+                        run is None or run["status"] != "running"
+                        or run["workId"] != artifact["workId"] or run["agent"] != artifact["createdBy"]
+                    ):
+                        raise ProjectionError("artifact run provenance does not match an active assigned run")
                 if not artifact["storageRef"].startswith("blob.") or artifact["storageRef"][5:] != artifact["sha256"]:
                     raise ProjectionError("artifact storage reference does not match its content hash")
                 try:
@@ -419,8 +484,25 @@ class Projector:
                 evidence = self._load_record(payload["recordHash"], "evidence", project_id)
                 if evidence_id in state["evidence"] or evidence["evidenceId"] != evidence_id or evidence["workId"] != payload["workId"] or evidence["stance"] != payload["stance"]:
                     raise ProjectionError("evidence.registered payload does not match evidence record")
-                if evidence["source"].get("contentHash") != payload["sourceHash"] or evidence["workId"] not in state["workItems"]:
+                source_hash = evidence["source"].get("contentHash")
+                if source_hash != payload["sourceHash"] or evidence["workId"] not in state["workItems"]:
                     raise ProjectionError("evidence source hash or work reference is inconsistent")
+                try:
+                    source_content = self.store.get_blob(source_hash)
+                except KeyError as exc:
+                    raise ProjectionError("evidence source content is missing from canonical storage") from exc
+                if hashlib.sha256(source_content).hexdigest() != source_hash:
+                    raise ProjectionError("evidence source content does not match its hash")
+                if evidence["createdBy"] != event["actor"]:
+                    raise ProjectionError("evidence creator does not match registration actor")
+                run_id = evidence.get("runId")
+                if run_id is not None:
+                    run = state["agentRuns"].get(run_id)
+                    if (
+                        run is None or run["status"] != "running"
+                        or run["workId"] != evidence["workId"] or run["agent"] != evidence["createdBy"]
+                    ):
+                        raise ProjectionError("evidence run provenance does not match an active assigned run")
                 state["evidence"][evidence_id] = evidence
 
             else:

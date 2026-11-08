@@ -16,9 +16,9 @@ This folder starts issue [#2](https://github.com/sebastbernal2-ship-it/agent-res
 - revisioned project charter (goals, non-goals, acceptance criteria);
 - hierarchical work item with owner role, dependencies, scoped capability-grant references, budgets and acceptance criteria;
 - explicit capability grant snapshots scoped to project/work, agent, capability, opaque resource IDs, approver and expiry, with immutable revocation events;
-- agent run with adapter/version, context hash, grants, status and usage;
+- agent run with adapter/version, context hash, grants, status, usage, and canonical output message/artifact/evidence references; optional `parentRunId` records delegation lineage, which replay checks against an active parent and shared correlation ID;
 - separate blocking/nonblocking human question and answer record;
-- immutable artifact metadata and claim-linked evidence record;
+- immutable artifact metadata and claim-linked evidence record; run attribution, source hashes, content blobs, and run-finished output references are cross-checked during replay;
 - append-only event envelope with sequence, actor, idempotency/correlation/causation refs, closed event/payload vocabulary, and content hashes that point to full immutable project/work/run/question/artifact/evidence snapshots where state must be reconstructed.
 
 ## Validate
@@ -28,7 +28,7 @@ python3 -m pip install -r contracts/requirements-test.txt
 python3 -m unittest discover -s contracts/tests -v
 ```
 
-Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet.
+Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet. Optional `parentRunId`, message `runId`, and run output-reference fields were added while v0.1 is still an unpublished draft; older snapshots omit them and remain valid. Freeze/release requires versioned compatibility handling, not silent post-release schema edits.
 
 ## Explicitly incomplete
 

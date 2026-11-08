@@ -2,11 +2,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from harness.event_store import SQLiteEventStore
+from harness.event_store import IdempotencyConflict, SQLiteEventStore
 from harness.meldwork_bridge import MeldworkReceiptBridge, MeldworkBridgeError
 from harness.meldwork_runtime_bridge import MeldworkAgenticXRuntimeBridge, MeldworkRuntimeError
 from harness.projection import Projector
+from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
 
 
@@ -60,6 +63,89 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(MeldworkRuntimeError, "output limit"):
             bridge.run(project_id="project.meldwork", work_id="work.meldwork")
         self.assertEqual(len(self.store.events("project.meldwork")), 2)
+
+    def test_runtime_commit_response_loss_retries_same_run_outputs_once(self):
+        actor = {"actorType": "agent", "actorId": "agent.codex", "role": "specialist"}
+        ledger = RunLedger(self.store, clock=lambda: "2026-04-16T12:00:00Z")
+        run = ledger.start(
+            "project.meldwork", "work.meldwork", run_id="run.meldwork.outbox", agent=actor,
+            adapter={"name": "meldwork-v4", "version": "test"},
+            context_hash="f" * 64, correlation_id="run.meldwork.team",
+            occurred_at="2026-04-16T12:00:00Z",
+        )
+        response = {
+            "orchestrationPhase": "completed",
+            "invocationCount": 1,
+            "runId": "candidate-private-run",
+            "taskId": "candidate-private-task",
+            "invocations": [{
+                "sourceReceiptId": "volatile-candidate-receipt",
+                "phase": "proposal",
+                "agentKind": "codex",
+                "text": "A deterministic synthetic proposal.",
+                "collaboration": {
+                    "version": 1,
+                    "phase": "proposal",
+                    "summary": "A synthetic proposal for retry reconciliation.",
+                    "capabilities": ["synthetic review"],
+                    "intendedWork": ["inspect the synthetic claim"],
+                    "deliverables": ["review note"],
+                    "dependencies": [],
+                },
+                "occurredAt": "2026-04-16T12:00:01Z",
+                "operationId": "volatile-operation-id",
+            }],
+        }
+        runtime_result = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(response).encode("utf-8"),
+            stderr=b"",
+        )
+        bridge = MeldworkAgenticXRuntimeBridge(self.store)
+        original_append_many = self.store.append_many
+        append_calls = 0
+
+        def commit_then_lose_response(events, **kwargs):
+            nonlocal append_calls
+            result = original_append_many(events, **kwargs)
+            append_calls += 1
+            if append_calls == 1:
+                raise RuntimeError("simulated crash after canonical commit")
+            return result
+
+        with patch("harness.meldwork_runtime_bridge.run_bounded_subprocess", return_value=runtime_result), patch.object(
+            self.store, "append_many", side_effect=commit_then_lose_response,
+        ):
+            arguments = {
+                "project_id": "project.meldwork",
+                "work_id": "work.meldwork",
+                "correlation_id": "run.meldwork.team",
+                "run_ids_by_agent": {"codex": run["runId"]},
+            }
+            with self.assertRaisesRegex(RuntimeError, "after canonical commit"):
+                bridge.run(**arguments)
+            self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 1)
+            retry_report = bridge.run(**arguments)
+
+        self.assertEqual(retry_report["duplicateEvents"], [True])
+        self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 1)
+        changed_response = json.loads(json.dumps(response))
+        changed_response["invocations"][0]["text"] = "A conflicting output must not replace the accepted result."
+        with patch(
+            "harness.meldwork_runtime_bridge.run_bounded_subprocess",
+            return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(changed_response).encode("utf-8"), stderr=b"",
+            ),
+        ):
+            with self.assertRaises(IdempotencyConflict):
+                bridge.run(**arguments)
+        self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 1)
+        finished = ledger.finish(
+            "project.meldwork", run["runId"], terminal_status="succeeded", actor=actor,
+            occurred_at="2026-04-16T12:00:02Z",
+        )
+        self.assertEqual(finished["outputEventIds"], retry_report["eventIds"])
+        self.assertTrue(self.store.verify("project.meldwork"))
 
     def test_v4_proposal_challenge_synthesis_map_to_canonical_events(self):
         proposal = request(

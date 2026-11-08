@@ -34,6 +34,7 @@ class CanonicalAG2Mirror(BaseHubListener):
         actors_by_ag2_id: dict[str, dict[str, str]],
         message_types_by_ag2_id: dict[str, str],
         correlation_id: str | None = None,
+        run_ids_by_ag2_id: dict[str, str] | None = None,
     ) -> None:
         self.event_store = event_store
         self.project_id = project_id
@@ -41,6 +42,7 @@ class CanonicalAG2Mirror(BaseHubListener):
         self.actors_by_ag2_id = actors_by_ag2_id
         self.message_types_by_ag2_id = message_types_by_ag2_id
         self.correlation_id = correlation_id
+        self.run_ids_by_ag2_id = run_ids_by_ag2_id or {}
         self.errors: list[str] = []
         self.mirrored_envelope_ids: dict[str, str] = {}
 
@@ -54,6 +56,8 @@ class CanonicalAG2Mirror(BaseHubListener):
             actor = self.actors_by_ag2_id.get(envelope.sender_id)
             if actor is None:
                 raise ValueError(f"unmapped AG2 sender {envelope.sender_id!r}")
+            if self.run_ids_by_ag2_id and envelope.sender_id not in self.run_ids_by_ag2_id:
+                raise ValueError(f"AG2 sender {envelope.sender_id!r} has no canonical run assignment")
 
             visible_to: list[str] = []
             if envelope.audience is None:
@@ -99,6 +103,7 @@ class CanonicalAG2Mirror(BaseHubListener):
                     "messageType": message_type,
                     "contentRef": content_ref,
                     "contentHash": content_hash,
+                    **({"runId": self.run_ids_by_ag2_id[envelope.sender_id]} if envelope.sender_id in self.run_ids_by_ag2_id else {}),
                     "visibleTo": visible_to,
                 },
             }

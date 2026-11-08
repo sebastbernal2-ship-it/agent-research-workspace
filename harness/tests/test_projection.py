@@ -8,6 +8,7 @@ from pathlib import Path
 from harness.control_plane import ProjectControlPlane
 from harness.event_store import IntegrityFailure, SQLiteEventStore
 from harness.projection import Projector, ProjectionError
+from harness.run_ledger import RunLedger
 
 
 NOW = "2026-04-16T12:00:00Z"
@@ -227,6 +228,66 @@ class ProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(IntegrityFailure, "blob hash mismatch"):
             Projector(self.store).replay("project.alpha")
 
+    def test_run_outputs_preserve_artifact_evidence_and_message_provenance(self):
+        self.create_project()
+        work = self.create_work("work.outputs", "Persist attributable outputs")
+        ledger = RunLedger(self.store, clock=lambda: NOW)
+        run = ledger.start(
+            "project.alpha", work["workId"], run_id="run.outputs", agent=VP,
+            adapter={"name": "test-adapter", "version": "1"},
+            context_hash="a" * 64, correlation_id="trace.test", occurred_at=NOW,
+        )
+
+        artifact_content = b"artifact from this run"
+        storage_ref, artifact_hash = self.store.put_blob(artifact_content)
+        artifact = {
+            "recordType": "artifact", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "artifactId": "artifact.run-output",
+            "workId": work["workId"], "name": "result.txt", "mediaType": "text/plain",
+            "sha256": artifact_hash, "byteSize": len(artifact_content), "storageRef": storage_ref,
+            "createdBy": VP, "runId": run["runId"], "createdAt": NOW, "reviewStatus": "unreviewed",
+        }
+        self.event("artifact.registered", {
+            "artifactId": artifact["artifactId"], "workId": work["workId"],
+            "sha256": artifact_hash, "recordHash": self.store.put_record(artifact),
+        }, actor=VP)
+
+        source_content = b"synthetic source excerpt"
+        source_hash = hashlib.sha256(source_content).hexdigest()
+        self.store.put_blob(source_content)
+        evidence = {
+            "recordType": "evidence", "schemaVersion": "0.1",
+            "projectId": "project.alpha", "evidenceId": "evidence.run-output",
+            "workId": work["workId"], "claimText": "The reviewed synthetic claim is supported.",
+            "stance": "supports",
+            "source": {"uri": "https://example.test/source", "title": "Synthetic source", "retrievedAt": NOW, "contentHash": source_hash},
+            "createdBy": VP, "runId": run["runId"], "createdAt": NOW, "reviewStatus": "unreviewed",
+        }
+        self.event("evidence.registered", {
+            "evidenceId": evidence["evidenceId"], "workId": work["workId"],
+            "stance": evidence["stance"], "sourceHash": source_hash,
+            "recordHash": self.store.put_record(evidence),
+        }, actor=VP)
+
+        message_content = "The artifact and evidence support the result."
+        message_ref, message_hash = self.store.put_blob(message_content)
+        message = self.event("discussion.message_added", {
+            "workId": work["workId"], "threadId": "thread.outputs", "messageType": "evidence",
+            "runId": run["runId"], "contentRef": message_ref, "contentHash": message_hash,
+            "artifactIds": [artifact["artifactId"]], "evidenceIds": [evidence["evidenceId"]],
+            "visibleTo": [VP["actorId"]],
+        }, actor=VP)
+        finished = ledger.finish(
+            "project.alpha", run["runId"], terminal_status="succeeded", actor=VP, occurred_at=NOW,
+        )
+        self.assertEqual(finished["outputArtifactIds"], [artifact["artifactId"]])
+        self.assertEqual(finished["outputEvidenceIds"], [evidence["evidenceId"]])
+        self.assertEqual(finished["outputEventIds"], [message["eventId"]])
+        replayed = Projector(self.store).replay("project.alpha")
+        self.assertEqual(replayed["messages"][0]["runId"], run["runId"])
+        self.assertEqual(replayed["agentRuns"][run["runId"]]["outputEventIds"], [message["eventId"]])
+        self.assertTrue(self.store.verify("project.alpha"))
+
     def test_replay_rejects_running_work_with_incomplete_dependencies(self):
         self.create_project()
         dependency = self.create_work("work.dependency", "Prerequisite")
@@ -367,7 +428,10 @@ class ProjectorTests(unittest.TestCase):
             "runId": run["runId"], "terminalStatus": "failed", "recordHash": failed_hash,
         }, actor=run["agent"])
 
-        source_hashes = ["b" * 64, "c" * 64]
+        source_contents = [b"synthetic source one", b"synthetic source two"]
+        source_hashes = [hashlib.sha256(content).hexdigest() for content in source_contents]
+        for content in source_contents:
+            self.store.put_blob(content)
         stances = ["supports", "contradicts"]
         for index, (source_hash, stance) in enumerate(zip(source_hashes, stances), start=1):
             evidence = {

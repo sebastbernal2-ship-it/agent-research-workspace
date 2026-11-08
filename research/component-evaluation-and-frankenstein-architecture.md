@@ -2,7 +2,7 @@
 
 **Status:** Initial research proposal, updated by isolated spikes and a local adapter prototype. AgenticX 0.6.5 and AG2 1.0.0 were installed/tested separately; Meldwork V1.0.9 source and selected Node suites were tested on Linux. Local AG2, AgenticX subprocess, and Meldwork Node V4 paths now connect to a synthetic canonical store in deterministic tests; no product deployment or real model calls. See the [AgenticX](../spikes/agenticx-runtime/README.md), [AG2](../spikes/ag2-collaboration/README.md), [Meldwork](../spikes/meldwork-review/README.md), and [harness](../harness/README.md) reports.
 
-**Purpose:** Evaluate Meldwork and AgenticX in distinct roles, compare better candidates for specific layers, and define how to integrate only what passes.
+**Purpose:** Evaluate Meldwork and AgenticX in distinct roles, compare better candidates for specific layers, and define how to integrate only what passes. The current capability-by-capability reuse decision is in the [Frankenstein component matrix](FRANKENSTEIN_COMPONENT_MATRIX.md); that matrix distinguishes existing deterministic adapter evidence from source-only candidates and lists the next validation gates.
 
 ## Thesis
 
