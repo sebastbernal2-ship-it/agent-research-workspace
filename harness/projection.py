@@ -90,6 +90,11 @@ class Projector:
             finished.update(chain)
 
     def replay(self, project_id: str) -> dict[str, Any]:
+        state, _ = self.replay_snapshot(project_id)
+        return state
+
+    def replay_snapshot(self, project_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Return projected state and the exact verified events used to build it."""
         events = self.store.verified_events(project_id)
         state: dict[str, Any] = {
             "project": None,
@@ -435,4 +440,4 @@ class Projector:
                 if grant_id not in state["workItems"][work_id]["capabilityGrantIds"]:
                     raise ProjectionError(f"capability grant {grant_id!r} is missing its work-item reference")
         state["_eventSequence"] = events[-1]["sequence"] if events else 0
-        return state
+        return state, events

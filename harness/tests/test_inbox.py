@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from harness.event_store import SQLiteEventStore
 from harness.inbox import InboxApplication, InboxForbidden, InboxNotFound, InboxReadModel
@@ -74,7 +75,8 @@ class InboxReadModelTests(unittest.TestCase):
         self.assertEqual(normal[0]["workIds"], ["work.inbox"])
 
     def test_read_model_is_project_scoped_and_etag_tracks_answer_and_resume(self):
-        before = self.inbox.get_question("project.inbox", "question.normal")
+        with patch.object(self.store, "events", side_effect=AssertionError("detail must use one verified snapshot")):
+            before = self.inbox.get_question("project.inbox", "question.normal")
         self.control.answer_question(
             "project.inbox", "question.normal", "Use the current scope.", actor=USER,
             occurred_at="2026-04-16T12:01:00Z",

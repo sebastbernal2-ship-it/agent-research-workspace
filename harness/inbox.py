@@ -73,13 +73,13 @@ class InboxReadModel:
         return [self._summary(question, state["workItems"]) for question in questions]
 
     def get_question(self, project_id: str, question_id: str) -> dict[str, Any]:
-        state = self.projector.replay(project_id)
+        state, events = self.projector.replay_snapshot(project_id)
         question = state["questions"].get(question_id)
         if question is None:
             raise InboxNotFound(f"question {question_id!r} is not in project {project_id!r}")
         summary = self._summary(question, state["workItems"])
         history = []
-        for event in self.store.events(project_id):
+        for event in events:
             payload = event["payload"]
             if payload.get("questionId") == question_id or payload.get("supersededByQuestionId") == question_id:
                 history.append({
