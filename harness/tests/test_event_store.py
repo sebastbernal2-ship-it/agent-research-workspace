@@ -76,6 +76,13 @@ class SQLiteEventStoreTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_shared_memory_store_persists_across_internal_connections(self):
+        memory_store = SQLiteEventStore(":memory:")
+        first = memory_store.append(initial_events()[0])
+        self.assertEqual(first.sequence, 1)
+        self.assertEqual(memory_store.events("project.alpha"), [first.event])
+        self.assertTrue(memory_store.verify("project.alpha"))
+
     def test_assigns_sequence_and_retries_idempotently(self):
         event = initial_events()[0]
         first = self.store.append(event)

@@ -199,13 +199,17 @@ class RunLedgerTests(unittest.TestCase):
         self.store.start_adapter_invocation("invocation.staged")
         self.store.stage_adapter_receipt("invocation.staged", [message_event])
 
-        self.assertEqual(self.ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW), [run["runId"]])
-        state = Projector(self.store).replay(PROJECT_ID)
+        backup_path = self.store.backup_to(Path(self.temp.name) / "canonical-backup.sqlite3")
+        reopened = SQLiteEventStore(backup_path)
+        recovered_ledger = RunLedger(reopened, clock=lambda: NOW)
+        self.assertEqual(recovered_ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW), [run["runId"]])
+        state = Projector(reopened).replay(PROJECT_ID)
         self.assertEqual(state["agentRuns"][run["runId"]]["status"], "interrupted")
         self.assertEqual(state["agentRuns"][run["runId"]]["outputEventIds"], ["event.staged.message"])
         self.assertEqual(state["messages"][0]["content"], "Durably staged output.")
-        self.assertEqual(self.store.list_adapter_invocations(PROJECT_ID)[0]["state"], "imported")
-        self.assertTrue(self.store.verify(PROJECT_ID))
+        self.assertEqual(reopened.list_adapter_invocations(PROJECT_ID)[0]["state"], "imported")
+        self.assertEqual(self.store.list_adapter_invocations(PROJECT_ID)[0]["state"], "receipt_staged")
+        self.assertTrue(reopened.verify(PROJECT_ID))
 
     def test_recovery_closes_nested_runs_leaf_first(self):
         self.start_run("run.parent")

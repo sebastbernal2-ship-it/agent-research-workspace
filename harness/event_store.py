@@ -11,6 +11,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -57,7 +58,17 @@ class SQLiteEventStore:
 
     def __init__(self, path: str | Path):
         self.path = str(path)
-        if self.path != ":memory:":
+        self._uri = self.path == ":memory:"
+        self._connect_target = (
+            f"file:canonical-{uuid4().hex}?mode=memory&cache=shared"
+            if self._uri else self.path
+        )
+        self._memory_keeper: sqlite3.Connection | None = None
+        if self._uri:
+            self._memory_keeper = sqlite3.connect(
+                self._connect_target, uri=True, timeout=30, isolation_level=None,
+            )
+        else:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         Draft202012Validator.check_schema(schema)
@@ -65,7 +76,9 @@ class SQLiteEventStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        conn = sqlite3.connect(
+            self._connect_target, timeout=30, isolation_level=None, uri=self._uri,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 30000")
@@ -571,6 +584,58 @@ class SQLiteEventStore:
         finally:
             conn.close()
         return [json.loads(row["event_json"]) for row in rows]
+
+    def backup_to(self, destination: str | Path) -> Path:
+        """Create and verify a consistent SQLite snapshot including blobs and receipt journals."""
+        destination_path = Path(destination).resolve()
+        if self.path != ":memory:" and destination_path == Path(self.path).resolve():
+            raise EventStoreError("backup destination must differ from the live database")
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        source = self._connect()
+        target = sqlite3.connect(str(destination_path), timeout=30, isolation_level=None)
+        try:
+            source.backup(target)
+            result = target.execute("PRAGMA integrity_check").fetchone()
+            if result is None or result[0] != "ok":
+                raise IntegrityFailure(f"SQLite backup failed integrity_check: {None if result is None else result[0]}")
+        finally:
+            target.close()
+            source.close()
+
+        snapshot = SQLiteEventStore(destination_path)
+        project_ids = snapshot._project_ids()
+        for project_id in project_ids:
+            snapshot.verified_events(project_id)
+        conn = snapshot._connect()
+        try:
+            blobs = conn.execute("SELECT content_hash, content FROM canonical_blobs").fetchall()
+            invocations = conn.execute(
+                "SELECT invocation_id, state, receipt_json, receipt_hash FROM adapter_invocations"
+            ).fetchall()
+        finally:
+            conn.close()
+        for blob in blobs:
+            if hashlib.sha256(bytes(blob["content"])).hexdigest() != blob["content_hash"]:
+                raise IntegrityFailure(f"backup contains corrupt blob {blob['content_hash']}")
+        for invocation in invocations:
+            if invocation["state"] in {"receipt_staged", "imported"}:
+                receipt_json = invocation["receipt_json"]
+                if (
+                    receipt_json is None
+                    or hashlib.sha256(receipt_json.encode("utf-8")).hexdigest() != invocation["receipt_hash"]
+                ):
+                    raise IntegrityFailure(
+                        f"backup contains corrupt adapter receipt {invocation['invocation_id']}"
+                    )
+        return destination_path
+
+    def _project_ids(self) -> set[str]:
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT DISTINCT project_id FROM canonical_events").fetchall()
+        finally:
+            conn.close()
+        return {row["project_id"] for row in rows}
 
     def export_jsonl(self, project_id: str) -> str:
         conn = self._connect()
