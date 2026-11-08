@@ -19,9 +19,9 @@ The workspace needs distinct project homes with charter, work/dependency status,
 
 ## Recommendation
 
-Build a **small, project-first custom UI against a versioned service contract**, rather than forking Open WebUI or LibreChat now. Reuse established, permissively licensed components where useful; keep third-party chat products optional and isolated. Do not add or share their internal databases. Start with a local, mock-backed project list/detail, work status, VP chat shell, and separate inbox. The UI prototype must not be network-exposed or imply that fake identity/access checks are real security.
+Build a **small, project-first custom UI against a versioned service contract**, rather than forking Open WebUI or LibreChat now. Reuse established, permissively licensed components where useful; keep third-party chat products optional and isolated. Do not add or share their internal databases. A first framework-neutral, mock-backed prototype now exists at [`../ui/prototype/`](../ui/prototype/), with project overview, work, VP chat, separate inbox, agent/model assignments, and evidence screens. It has no backend or persistence and must not be exposed or treated as security.
 
-Before choosing a frontend framework, run a tiny accessibility/responsive prototype spike (React/Vite versus Svelte/Vite) against the same mock API and project/inbox screens. Select based on implementation friction, keyboard/mobile behavior, maintenance, and how cleanly it talks to our service—not on model-provider breadth. FastAPI is a reasonable Python service candidate, but it is not selected yet; first define API auth, command/idempotency, and error semantics.
+The first prototype is plain HTML/CSS/JavaScript so the product navigation and interaction model can be reviewed before selecting React, Svelte, or another stack. A later small framework spike should compare implementation friction, keyboard/mobile behavior, maintenance, and API fit. FastAPI is a reasonable Python service candidate, but it is not selected yet; first define API auth, command/idempotency, and error semantics.
 
 ## Gates before adoption
 

@@ -17,7 +17,8 @@ Research and development for a project-first collaborative AI workspace.
 - [Alignment memory prototype](alignment/README.md) — synthetic, provenance-first conformance checks kept separate from project charter, permissions, and private profile data.
 - [ADR-0001](decisions/ADR-0001-canonical-control-plane-and-adapters.md) — why the control plane is canonical and how candidate runtimes stay replaceable.
 - [Inbox API/UI contract](design/INBOX_API.md) — proposed separation of project VP conversation and approval inbox; no HTTP service is implemented yet.
-- [UI foundation evaluation](design/UI_FOUNDATION_EVALUATION.md) — first-pass source/license review; recommends a custom project-first UI prototype, not a selected production framework.
+- [UI foundation evaluation](design/UI_FOUNDATION_EVALUATION.md) — first-pass source/license review and provisional custom-UI recommendation.
+- [Offline UI prototype](ui/prototype/README.md) — mock project overview, work, separate inbox, VP chat, agent/model routing, and evidence; no backend or persistence.
 - [Model routing contract](design/MODEL_ROUTING.md) — offline profile/adapter design and approval gates for local and remote models.
 
 This repository is separate from `pi-harness`; experiments and development should happen here unless explicitly agreed otherwise.

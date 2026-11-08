@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f6f8">
+    <meta name="description" content="Offline mockup of a project-first AI workspace.">
+    <title>Northstar · Project workspace prototype</title>
+    <link rel="stylesheet" href="app.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="demo-banner" role="status">
+      <span class="demo-dot" aria-hidden="true"></span>
+      Offline prototype · synthetic project data · no models, service, or persistence connected
+    </div>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Workspace navigation">
+        <a class="brand" href="#overview" aria-label="Northstar workspace home" data-view="overview">
+          <span class="brand-mark" aria-hidden="true">N</span>
+          <span><strong>northstar</strong><small>AI workspace</small></span>
+        </a>
+
+        <div class="workspace-label">WORKSPACE</div>
+        <button class="workspace-switcher" type="button" aria-label="Current workspace: Personal workspace">
+          <span class="workspace-avatar" aria-hidden="true">S</span>
+          <span class="switcher-copy"><strong>Personal workspace</strong><small>1 project</small></span>
+          <span class="chevron" aria-hidden="true">⌄</span>
+        </button>
+
+        <div class="sidebar-section-label">YOUR PROJECTS</div>
+        <button class="project-switcher active-project" type="button" data-view="overview">
+          <span class="project-icon" aria-hidden="true">✳</span>
+          <span class="switcher-copy"><strong>Northstar research</strong><small>Active · updated just now</small></span>
+        </button>
+
+        <nav class="project-nav" aria-label="Northstar research">
+          <button class="nav-item selected" type="button" data-view="overview" aria-current="page"><span aria-hidden="true">▦</span>Overview</button>
+          <button class="nav-item" type="button" data-view="work"><span aria-hidden="true">☷</span>Work <span class="nav-count">6</span></button>
+          <button class="nav-item" type="button" data-view="conversation"><span aria-hidden="true">◌</span>VP conversation</button>
+          <button class="nav-item" type="button" data-view="inbox"><span aria-hidden="true">◇</span>Inbox <span class="nav-count attention">2</span></button>
+          <button class="nav-item" type="button" data-view="agents"><span aria-hidden="true">✳</span>Agents &amp; models</button>
+          <button class="nav-item" type="button" data-view="evidence"><span aria-hidden="true">▤</span>Evidence</button>
+        </nav>
+
+        <div class="sidebar-spacer"></div>
+        <div class="sidebar-footer">
+          <span class="avatar user-avatar" aria-hidden="true">SB</span>
+          <span class="switcher-copy"><strong>Sebastian</strong><small>Local prototype</small></span>
+          <button class="icon-button" type="button" aria-label="Settings are unavailable in the prototype">···</button>
+        </div>
+      </aside>
+
+      <main class="main-area">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>Projects</span><span aria-hidden="true">/</span><strong>Northstar research</strong></div>
+          <div class="topbar-actions"><span class="local-pill"><span aria-hidden="true">●</span> Local demo</span><button class="icon-button" type="button" aria-label="Help is unavailable in the prototype">?</button></div>
+        </header>
+
+        <div class="page-content">
+          <section class="view" id="view-overview" aria-labelledby="overview-title">
+            <div class="page-heading">
+              <div>
+                <div class="eyebrow">PROJECT HOME <span class="status-dot" aria-hidden="true"></span> ACTIVE</div>
+                <h1 id="overview-title">Northstar research</h1>
+                <p class="subheading">A durable home for the work, decisions, and evidence behind this project.</p>
+              </div>
+              <div class="heading-actions"><button class="button button-secondary" type="button" data-view="conversation">Talk to VP <span aria-hidden="true">↗</span></button><button class="button button-primary" type="button" data-view="inbox">Review inbox <span class="button-count">2</span></button></div>
+            </div>
+
+            <div class="charter-card">
+              <div class="charter-icon" aria-hidden="true">✳</div>
+              <div class="charter-copy"><div class="card-kicker">PROJECT CHARTER <span class="muted">· revision 3</span></div><p>Design a trustworthy, extensible AI organization that can coordinate research and other project work, while keeping decisions, evidence, and permissions transparent.</p><button class="text-button" type="button" data-view="evidence">View goals &amp; acceptance criteria <span aria-hidden="true">→</span></button></div>
+              <div class="charter-owner"><span class="avatar vp-avatar" aria-hidden="true">VP</span><span><strong>Project VP</strong><small>Local Qwen profile · demo</small></span></div>
+            </div>
+
+            <div class="stats-grid" aria-label="Project summary">
+              <article class="stat-card"><div class="stat-label">WORK ITEMS <span aria-hidden="true">☷</span></div><div class="stat-value">6</div><div class="stat-note"><span class="green-text">3 in progress</span> · 1 blocked</div></article>
+              <article class="stat-card"><div class="stat-label">AGENT RUNS <span aria-hidden="true">✳</span></div><div class="stat-value">12</div><div class="stat-note">Last activity <time datetime="2026-11-08T10:42">18 min ago</time></div></article>
+              <article class="stat-card inbox-stat" tabindex="0" role="button" data-view="inbox" aria-label="2 open inbox questions">
+                <div class="stat-label">NEEDS YOUR INPUT <span aria-hidden="true">◇</span></div><div class="stat-value">2</div><div class="stat-note">One decision is blocking work <span aria-hidden="true">→</span></div>
+              </article>
+              <article class="stat-card"><div class="stat-label">EVIDENCE <span aria-hidden="true">▤</span></div><div class="stat-value">8</div><div class="stat-note">6 sources · 2 artifacts</div></article>
+            </div>
+
+            <div class="content-grid">
+              <section class="panel work-panel" aria-labelledby="work-heading">
+                <div class="panel-heading"><div><div class="card-kicker">PROJECT PLAN</div><h2 id="work-heading">Work in motion</h2></div><button class="text-button" type="button" data-view="work">All work <span aria-hidden="true">→</span></button></div>
+                <div class="work-list">
+                  <div class="work-row"><span class="work-state state-running" aria-label="Running"></span><div class="work-copy"><strong>Map candidate system foundations</strong><small>Research · 2 specialists</small></div><span class="work-status running-label">In progress</span></div>
+                  <div class="work-row"><span class="work-state state-waiting" aria-label="Waiting for your input"></span><div class="work-copy"><strong>Choose initial model-routing policy</strong><small>Decision · waiting on you</small></div><span class="work-status waiting-label">Needs input</span></div>
+                  <div class="work-row"><span class="work-state state-running" aria-label="Running"></span><div class="work-copy"><strong>Compare project-first UI foundations</strong><small>Evaluation · depends on system requirements</small></div><span class="work-status running-label">In progress</span></div>
+                  <div class="work-row"><span class="work-state state-complete" aria-label="Completed"></span><div class="work-copy"><strong>Define canonical project contracts</strong><small>Architecture · 4 evidence items</small></div><span class="work-status complete-label">Complete</span></div>
+                </div>
+              </section>
+
+              <section class="panel activity-panel" aria-labelledby="activity-heading">
+                <div class="panel-heading"><div><div class="card-kicker">LATEST</div><h2 id="activity-heading">Project activity</h2></div><button class="icon-button" type="button" aria-label="More activity options">···</button></div>
+                <ol class="activity-list">
+                  <li><span class="activity-icon icon-vp" aria-hidden="true">VP</span><div><strong>VP updated the UI evaluation</strong><p>Added licensing and project-fit notes.</p><time datetime="2026-11-08T10:42">18 min ago</time></div></li>
+                  <li><span class="activity-icon icon-agent" aria-hidden="true">R</span><div><strong>Research agent attached 2 sources</strong><p>Evidence added to the foundation review.</p><time datetime="2026-11-08T10:05">55 min ago</time></div></li>
+                  <li><span class="activity-icon icon-user" aria-hidden="true">SB</span><div><strong>You opened a new project</strong><p>The project charter is ready for review.</p><time datetime="2026-11-08T09:20">1 hr ago</time></div></li>
+                </ol>
+              </section>
+            </div>
+
+            <section class="panel inbox-preview" aria-labelledby="inbox-preview-heading">
+              <div class="panel-heading"><div class="inbox-heading-icon" aria-hidden="true">◇</div><div class="inbox-preview-title"><div class="card-kicker">SEPARATE FROM VP CHAT</div><h2 id="inbox-preview-heading">Your project inbox <span class="small-count">2 open</span></h2></div><button class="text-button" type="button" data-view="inbox">Open inbox <span aria-hidden="true">→</span></button></div>
+              <div class="question-preview"><span class="priority-mark" aria-hidden="true"></span><div class="question-copy"><strong>Which source policy should research use?</strong><p>Blocking · Research foundations · requested by Project VP</p></div><span class="question-time">Due tomorrow</span><button class="icon-button question-open" type="button" data-view="inbox" aria-label="Review source policy question">→</button></div>
+            </section>
+          </section>
+
+          <section class="view" id="view-work" aria-labelledby="work-view-title" hidden>
+            <div class="page-heading"><div><div class="eyebrow">PROJECT PLAN</div><h1 id="work-view-title">Work</h1><p class="subheading">A dependency-aware plan. Blocked work stays paused until its prerequisites are met.</p></div><button class="button button-primary" type="button" data-toast="Creating work items is not connected in this prototype.">＋ New work item</button></div>
+            <div class="work-toolbar"><span class="filter-chip active-filter">All <span>6</span></span><span class="filter-chip">In progress <span>3</span></span><span class="filter-chip">Blocked <span>1</span></span><span class="filter-chip">Complete <span>2</span></span><span class="toolbar-spacer"></span><span class="muted">Sorted by dependency order</span></div>
+            <section class="panel full-panel"><div class="work-list expanded-work-list">
+              <div class="work-row"><span class="work-state state-complete" aria-label="Completed"></span><div class="work-copy"><strong>Define canonical project contracts</strong><small>Architecture · owner: Control-plane orchestrator · 4 evidence items</small></div><span class="work-status complete-label">Complete</span><button class="row-more" type="button" aria-label="Work item options">···</button></div>
+              <div class="dependency-line" aria-hidden="true"></div>
+              <div class="work-row"><span class="work-state state-running" aria-label="Running"></span><div class="work-copy"><strong>Map candidate system foundations</strong><small>Research · depends on canonical contracts · 2 specialists</small></div><span class="work-status running-label">In progress</span><button class="row-more" type="button" aria-label="Work item options">···</button></div>
+              <div class="work-row"><span class="work-state state-waiting" aria-label="Waiting for your input"></span><div class="work-copy"><strong>Choose initial model-routing policy</strong><small>Decision · source policy question is open</small></div><span class="work-status waiting-label">Needs input</span><button class="row-more" type="button" aria-label="Work item options">···</button></div>
+              <div class="work-row"><span class="work-state state-blocked" aria-label="Blocked"></span><div class="work-copy"><strong>Run bounded collaboration pilot</strong><small>Evaluation · blocked by model selection and approval</small></div><span class="work-status blocked-label">Blocked</span><button class="row-more" type="button" aria-label="Work item options">···</button></div>
+              <div class="work-row"><span class="work-state state-running" aria-label="Running"></span><div class="work-copy"><strong>Compare project-first UI foundations</strong><small>Evaluation · candidate links requested</small></div><span class="work-status running-label">In progress</span><button class="row-more" type="button" aria-label="Work item options">···</button></div>
+            </div></section>
+          </section>
+
+          <section class="view" id="view-conversation" aria-labelledby="conversation-title" hidden>
+            <div class="page-heading"><div><div class="eyebrow">PROJECT VP · USER-INITIATED</div><h1 id="conversation-title">VP conversation</h1><p class="subheading">Discuss project direction here. Pending approvals stay in the separate inbox.</p></div><span class="model-pill"><span class="model-dot local-dot" aria-hidden="true"></span> Local Qwen · not connected</span></div>
+            <div class="chat-layout">
+              <section class="panel chat-panel" aria-label="Conversation with the project VP">
+                <div class="chat-context"><span class="context-mark" aria-hidden="true">✳</span><span><strong>Northstar project context</strong><small>Charter, work, and evidence · mock data</small></span><button class="text-button" type="button" data-view="inbox">Inbox <span class="button-count light-count">2</span></button></div>
+                <div class="chat-messages" id="chat-messages" aria-live="polite">
+                  <div class="date-divider"><span>Today · November 8</span></div>
+                  <div class="message user-message"><div class="message-avatar user-avatar" aria-hidden="true">SB</div><div><div class="message-meta"><strong>You</strong><time datetime="2026-11-08T10:20">10:20 AM</time></div><div class="message-bubble">Can we use different models for the VP and the orchestrators?</div></div></div>
+                  <div class="message vp-message"><div class="message-avatar vp-avatar" aria-hidden="true">VP</div><div><div class="message-meta"><strong>Project VP</strong><span class="model-tag">Local Qwen · mock</span><time datetime="2026-11-08T10:21">10:21 AM</time></div><div class="message-bubble">Yes. Model choice can be configured by project and role: for example, a local Qwen profile for the VP and separate remote profiles for orchestrators. The routing policy should be explicit, recorded per run, and independent from permissions. No provider is connected in this prototype.</div><div class="message-actions"><button class="text-button" type="button" data-toast="Copy is not connected in this prototype.">Copy</button><button class="text-button" type="button" data-toast="Feedback is not connected in this prototype.">Give feedback</button></div></div></div>
+                  <div class="conversation-note"><span aria-hidden="true">i</span> Questions that pause work are handled in <button class="inline-link" type="button" data-view="inbox">Project inbox</button>, not silently mixed into chat.</div>
+                </div>
+                <form class="chat-composer" id="chat-form"><label class="sr-only" for="chat-input">Message the project VP</label><textarea id="chat-input" rows="1" placeholder="Message your project VP…" maxlength="1000"></textarea><div class="composer-footer"><span>Mock conversation · messages are not saved</span><button class="send-button" type="submit" aria-label="Send message">↑</button></div></form>
+              </section>
+              <aside class="panel context-panel"><div class="card-kicker">PROJECT CONTEXT</div><h2>Northstar research</h2><p>Responses should align with the project charter and cite available evidence. This context is synthetic demo content.</p><div class="context-divider"></div><div class="context-meta"><span>Charter</span><strong>Revision 3</strong></div><div class="context-meta"><span>Active work</span><strong>3 items</strong></div><div class="context-meta"><span>Open questions</span><button class="inline-link" type="button" data-view="inbox">2 in inbox</button></div><button class="button button-secondary full-button" type="button" data-view="evidence">View project details</button></aside>
+            </div>
+          </section>
+
+          <section class="view" id="view-inbox" aria-labelledby="inbox-title" hidden>
+            <div class="page-heading"><div><div class="eyebrow">PROJECT DECISIONS</div><h1 id="inbox-title">Inbox <span class="heading-count">2</span></h1><p class="subheading">Questions and approvals that need your attention. Your answer is a durable project decision.</p></div><span class="inbox-scope"><span aria-hidden="true">✳</span> Northstar research</span></div>
+            <div class="inbox-tabs" role="tablist" aria-label="Inbox filter"><button class="inbox-tab active-tab" type="button" role="tab" aria-selected="true" data-inbox-filter="open">Open <span>2</span></button><button class="inbox-tab" type="button" role="tab" aria-selected="false" data-inbox-filter="resolved">Resolved <span>4</span></button></div>
+            <div class="inbox-layout" id="open-inbox">
+              <div class="question-list" role="list" aria-label="Open questions">
+                <button class="question-list-item chosen-question" type="button" data-question="sources" role="listitem" aria-current="true"><span class="question-list-mark high-mark" aria-hidden="true"></span><span class="question-list-copy"><strong>Which source policy should research use?</strong><small>Decision · blocks 2 work items</small><span class="question-list-meta">Project VP · due tomorrow</span></span><span class="question-chevron" aria-hidden="true">›</span></button>
+                <button class="question-list-item" type="button" data-question="scope" role="listitem"><span class="question-list-mark normal-mark" aria-hidden="true"></span><span class="question-list-copy"><strong>Should the UI include a global workspace view?</strong><small>Tradeoff · does not block work</small><span class="question-list-meta">UI orchestrator · due in 3 days</span></span><span class="question-chevron" aria-hidden="true">›</span></button>
+              </div>
+              <article class="panel question-detail" aria-labelledby="question-detail-title">
+                <div class="question-detail-top"><span class="priority-badge urgent-badge"><span aria-hidden="true">●</span> Blocking decision</span><button class="icon-button" type="button" aria-label="More question actions" data-toast="More actions are not connected.">···</button></div>
+                <div class="question-origin"><span class="avatar vp-avatar" aria-hidden="true">VP</span><span><strong>Project VP</strong><small>Asked 2 hours ago · source run <code>run.research-04</code></small></span></div>
+                <h2 id="question-detail-title">Which source policy should research use?</h2>
+                <p class="question-impact">This choice changes what evidence the research team can cite. Two downstream work items are paused until you decide.</p>
+                <div class="affected-work"><div class="detail-label">AFFECTED WORK · 2 PAUSED</div><div class="affected-row"><span class="work-state state-waiting" aria-hidden="true"></span><span>Map candidate system foundations</span></div><div class="affected-row"><span class="work-state state-blocked" aria-hidden="true"></span><span>Prepare comparison evidence</span></div></div>
+                <fieldset class="option-set"><legend class="detail-label">CHOOSE AN OPTION</legend><label class="option-card"><input type="radio" name="source-policy" value="peer-reviewed" checked><span class="option-radio" aria-hidden="true"></span><span><strong>Prioritize peer-reviewed and official sources</strong><small>Higher confidence; narrower coverage and slower research.</small></span></label><label class="option-card"><input type="radio" name="source-policy" value="broad"><span class="option-radio" aria-hidden="true"></span><span><strong>Include reputable technical reporting</strong><small>Broader coverage; claims must be clearly labeled and cross-checked.</small></span></label></fieldset>
+                <label class="detail-label clarification-label" for="answer-note">YOUR NOTE <span class="muted">· optional</span></label><textarea id="answer-note" class="answer-note" rows="2" placeholder="Add context or correct a premise…"></textarea>
+                <div class="answer-actions"><button class="button button-primary" type="button" data-dialog="answer-dialog">Confirm decision</button><button class="button button-quiet" type="button" data-dialog="clarify-dialog">Ask for clarification</button></div>
+                <button class="reject-link" type="button" data-dialog="reject-dialog">Reject this proposal</button>
+                <p class="persistence-note"><span aria-hidden="true">ⓘ</span> Demo only. These controls do not save decisions or resume work.</p>
+              </article>
+            </div>
+            <div class="panel resolved-panel" id="resolved-inbox" hidden><div class="resolved-heading"><span class="resolved-icon" aria-hidden="true">✓</span><div><h2>Resolved questions</h2><p>Past decisions remain in the project history.</p></div></div><div class="resolved-row"><strong>May we use synthetic data in adapter tests?</strong><span class="resolved-label">Answered · Oct 29</span></div><div class="resolved-row"><strong>Which project contract version should the pilot use?</strong><span class="resolved-label">Answered · Oct 24</span></div><p class="demo-caption">Sample history · synthetic data</p></div>
+          </section>
+
+          <section class="view" id="view-agents" aria-labelledby="agents-title" hidden>
+            <div class="page-heading"><div><div class="eyebrow">CONFIGURATION · DEMO ONLY</div><h1 id="agents-title">Agents &amp; models</h1><p class="subheading">Choose models by project role. Assignments are examples only; no provider is connected.</p></div><span class="connection-status"><span class="offline-dot" aria-hidden="true"></span> No providers connected</span></div>
+            <div class="notice-card"><span class="notice-icon" aria-hidden="true">i</span><p><strong>Model selection is not permission.</strong> A model assignment cannot grant tools, project access, or approval authority. Provider use also needs a separate data and budget approval.</p></div>
+            <div class="agent-grid">
+              <article class="panel agent-card"><div class="agent-card-head"><span class="agent-avatar vp-avatar">VP</span><span class="agent-role-label">PROJECT LEAD</span></div><h2>Project VP</h2><p>Talks with you, aligns work to the charter, and asks for decisions when needed.</p><div class="assignment-label">ASSIGNED PROFILE</div><div class="model-assignment"><span class="model-dot local-dot" aria-hidden="true"></span><span><strong>Local Qwen variant</strong><small>Ollama-compatible · not connected</small></span><span class="route-tag">LOCAL</span></div><div class="agent-footer"><span>Tools: none configured</span><button class="text-button" type="button" data-toast="Model changes are not connected in this prototype.">Edit</button></div></article>
+              <article class="panel agent-card"><div class="agent-card-head"><span class="agent-avatar orchestrator-avatar">OR</span><span class="agent-role-label">COORDINATION</span></div><h2>Orchestrators</h2><p>Plan work, delegate to specialists, compare results, and report progress.</p><div class="assignment-label">ASSIGNED PROFILE</div><div class="model-assignment"><span class="model-dot cloud-dot" aria-hidden="true"></span><span><strong>Codex profile</strong><small>Account terms and connection not reviewed</small></span><span class="route-tag remote-tag">REMOTE</span></div><div class="agent-footer"><span>Tools: per-work grant only</span><button class="text-button" type="button" data-toast="Model changes are not connected in this prototype.">Edit</button></div></article>
+              <article class="panel agent-card"><div class="agent-card-head"><span class="agent-avatar researcher-avatar">RE</span><span class="agent-role-label">SPECIALIST</span></div><h2>Research specialists</h2><p>Gather sources, challenge claims, and return cited evidence to the project.</p><div class="assignment-label">ASSIGNED PROFILE</div><div class="model-assignment"><span class="model-dot cloud-dot" aria-hidden="true"></span><span><strong>DeepSeek profile</strong><small>Remote data and budget approval required</small></span><span class="route-tag remote-tag">REMOTE</span></div><div class="agent-footer"><span>Tools: search not connected</span><button class="text-button" type="button" data-toast="Model changes are not connected in this prototype.">Edit</button></div></article>
+            </div>
+            <div class="panel routing-preview"><div class="panel-heading"><div><div class="card-kicker">ROUTING PRINCIPLE</div><h2>One project, different model profiles</h2></div><span class="mock-tag">MOCK CONFIG</span></div><div class="route-flow"><span class="route-node">User request</span><span class="route-arrow" aria-hidden="true">→</span><span class="route-node">Project role</span><span class="route-arrow" aria-hidden="true">→</span><span class="route-node route-node-local">VP · local profile</span><span class="route-node route-node-remote">Orchestrator · remote profile</span></div><p class="muted">No fallback between providers. A provider/model change cannot increase a role's capabilities.</p></div>
+          </section>
+
+          <section class="view" id="view-evidence" aria-labelledby="evidence-title" hidden>
+            <div class="page-heading"><div><div class="eyebrow">PROJECT KNOWLEDGE</div><h1 id="evidence-title">Evidence &amp; charter</h1><p class="subheading">Claims, sources, and artifacts stay attached to the project that produced them.</p></div><button class="button button-secondary" type="button" data-toast="Uploading evidence is not connected in this prototype.">＋ Add evidence</button></div>
+            <section class="panel charter-detail"><div class="panel-heading"><div><div class="card-kicker">PROJECT CHARTER · REVISION 3</div><h2>Goals &amp; acceptance criteria</h2></div><span class="charter-lock">Read-only demo</span></div><div class="charter-columns"><div><h3>Goals</h3><ul><li>Coordinate meaningful work across multiple agent roles.</li><li>Keep project state durable beyond any one chat.</li><li>Make evidence, permissions, and human decisions inspectable.</li></ul></div><div><h3>Non-goals</h3><ul><li>Claiming agent alignment from scripted tests.</li><li>Using model refusal behavior as the security boundary.</li><li>Mixing one project's private context into another.</li></ul></div></div></section>
+            <section class="panel evidence-panel"><div class="panel-heading"><div><div class="card-kicker">ATTACHED SOURCES</div><h2>Research evidence <span class="small-count">3 shown</span></h2></div><button class="text-button" type="button" data-toast="Evidence search is not connected in this prototype.">Search evidence</button></div><div class="evidence-row"><span class="evidence-type source-type">URL</span><div><strong>AG2 Network documentation</strong><p>Official documentation · reviewed for message routing and auth boundaries.</p><small>Added by Orchestrator · Nov 7</small></div><span class="evidence-confidence high-confidence">Verified source</span></div><div class="evidence-row"><span class="evidence-type artifact-type">PDF</span><div><strong>Candidate system comparison</strong><p>Artifact · 8 pages · SHA-256 recorded in canonical store (prototype)</p><small>Produced by Research work item · Nov 6</small></div><span class="evidence-confidence">Project artifact</span></div><div class="evidence-row"><span class="evidence-type note-type">NOTE</span><div><strong>Model-provider constraints</strong><p>Separate local inference cost from remote API spend and account terms.</p><small>Added by Project VP · Nov 5</small></div><span class="evidence-confidence">Claim · needs review</span></div></section>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <dialog class="action-dialog" id="answer-dialog" aria-labelledby="answer-dialog-title"><form method="dialog"><div class="dialog-icon success-icon" aria-hidden="true">✓</div><h2 id="answer-dialog-title">Confirm this decision?</h2><p>This would be recorded as a durable project decision and could resume the exact work listed. In this prototype, nothing is saved.</p><div class="dialog-actions"><button class="button button-secondary" value="cancel">Go back</button><button class="button button-primary" value="confirm" data-toast="Demo only: no decision was saved and no work was resumed.">Confirm in demo</button></div></form></dialog>
+    <dialog class="action-dialog" id="clarify-dialog" aria-labelledby="clarify-dialog-title"><form method="dialog"><div class="dialog-icon question-icon" aria-hidden="true">?</div><h2 id="clarify-dialog-title">Ask for clarification?</h2><p>Your note will not be sent. A real service should create a durable clarification request without pretending this is an answer.</p><div class="dialog-actions"><button class="button button-secondary" value="cancel">Go back</button><button class="button button-primary" value="confirm" data-toast="Demo only: clarification was not sent.">Continue</button></div></form></dialog>
+    <dialog class="action-dialog" id="reject-dialog" aria-labelledby="reject-dialog-title"><form method="dialog"><div class="dialog-icon warning-icon" aria-hidden="true">!</div><h2 id="reject-dialog-title">Reject this proposal?</h2><p>Rejecting would leave blocking work paused. The prototype will not write a decision or change project status.</p><div class="dialog-actions"><button class="button button-secondary" value="cancel">Go back</button><button class="button button-danger" value="confirm" data-toast="Demo only: proposal was not rejected.">Reject in demo</button></div></form></dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
