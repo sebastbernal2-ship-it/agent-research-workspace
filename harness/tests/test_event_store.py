@@ -126,6 +126,34 @@ class SQLiteEventStoreTests(unittest.TestCase):
         other["idempotencyKey"] = "idem.beta-created"
         self.assertEqual(self.store.append(other).sequence, 1)
 
+    def test_cross_instance_compare_and_swap_allows_only_one_stale_writer(self):
+        self.store.append(initial_events()[0])
+        peer = SQLiteEventStore(self.path)
+        candidates = [
+            make_event(
+                f"event.cas.{index}", f"idem.cas.{index}", "work.created",
+                {
+                    "workId": f"work.cas.{index}", "title": f"CAS {index}",
+                    "objective": "Compete on one expected project sequence.",
+                    "owner": AGENT, "recordHash": HASH,
+                },
+            )
+            for index in range(2)
+        ]
+
+        def attempt(args):
+            store, event = args
+            try:
+                return store.append(event, expected_sequence=1).event["eventId"]
+            except ConcurrentWriteConflict:
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(attempt, [(self.store, candidates[0]), (peer, candidates[1])]))
+        self.assertEqual(sum(outcome == "conflict" for outcome in outcomes), 1)
+        self.assertEqual(len(self.store.events("project.alpha")), 2)
+        self.assertTrue(self.store.verify("project.alpha"))
+
     def test_process_kill_mid_batch_recovers_without_partial_commit(self):
         signal_path = self.path.with_suffix(".inserted")
         child = r'''
