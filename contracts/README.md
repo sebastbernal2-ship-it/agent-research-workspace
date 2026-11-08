@@ -18,7 +18,7 @@ This folder starts issue [#2](https://github.com/sebastbernal2-ship-it/agent-res
 - explicit capability grant snapshots scoped to project/work, agent, capability, opaque resource IDs, approver and expiry, with immutable revocation events;
 - agent run with adapter/version, context hash, grants, status, usage, and canonical output message/artifact/evidence references; optional `parentRunId` records delegation lineage, which replay checks against an active parent and shared correlation ID;
 - separate blocking/nonblocking human question and answer record;
-- immutable artifact metadata and claim-linked evidence record; run attribution, source hashes, content blobs, input-artifact/evidence derivation links, and run-finished output references are cross-checked during replay;
+- immutable artifact metadata and claim-linked evidence record; run attribution, source hashes, content blobs, input-artifact/evidence derivation links, and run-finished output references are cross-checked during replay. `harness/evidence.py` provides a bounded registrar for already-retrieved bytes; it does not fetch sources or authenticate their claims;
 - append-only event envelope with sequence, actor, idempotency/correlation/causation refs, closed event/payload vocabulary, and content hashes that point to full immutable project/work/run/question/artifact/evidence snapshots where state must be reconstructed.
 
 ## Validate
