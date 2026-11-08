@@ -1,4 +1,5 @@
 import hashlib
+import multiprocessing
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,15 @@ from harness.durable_queue import QueueError, SQLiteWorkQueue
 from harness.event_store import SQLiteEventStore
 from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
+
+
+def _claim_in_process(database_path, worker_id, result_queue):
+    try:
+        queue = SQLiteWorkQueue(SQLiteEventStore(database_path))
+        claim = queue.claim_next(worker_id, now=175, lease_seconds=30)
+        result_queue.put((worker_id, None if claim is None else claim["leaseGeneration"], None))
+    except Exception as exc:  # Report child failure through the parent test process.
+        result_queue.put((worker_id, None, repr(exc)))
 
 
 PROJECT_ID = "project.queue"
@@ -75,6 +85,26 @@ class SQLiteWorkQueueTests(unittest.TestCase):
         winners = [claim for claim in claims if claim is not None]
         self.assertEqual(len(winners), 1)
         self.assertEqual(winners[0]["leaseGeneration"], 1)
+
+    def test_separate_processes_cannot_claim_the_same_job(self):
+        self.enqueue()
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        processes = [
+            context.Process(target=_claim_in_process, args=(str(self.path), f"process.{index}", results))
+            for index in range(2)
+        ]
+        for process in processes:
+            process.start()
+        reports = [results.get(timeout=20) for _ in processes]
+        for process in processes:
+            process.join(timeout=20)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+        self.assertTrue(all(error is None for _, _, error in reports), reports)
+        self.assertEqual(sum(generation is not None for _, generation, _ in reports), 1)
 
     def test_expired_lease_requires_explicit_recovery_before_requeue(self):
         self.enqueue()
