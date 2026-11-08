@@ -305,6 +305,7 @@ class OrganizationCoordinator:
                     )
                 raise
             except Exception as exc:
+                self.ledger.interrupt_active_descendants(task.project_id, task.run_id)
                 self.ledger.finish(
                     task.project_id, task.run_id, terminal_status="failed",
                     actor=task.actor,
@@ -321,6 +322,7 @@ class OrganizationCoordinator:
                     if question["status"] == "open" and task.work_id in question["workIds"]
                 )
                 if not linked_questions:
+                    self.ledger.interrupt_active_descendants(task.project_id, task.run_id)
                     self.ledger.finish(
                         task.project_id, task.run_id, terminal_status="failed", actor=task.actor,
                     )
@@ -329,11 +331,24 @@ class OrganizationCoordinator:
                         WorkflowStatus.FAILED, task.work_id, task.run_id,
                         detail="Adapter requested human input without a canonical inbox question.",
                     )
+                self.ledger.interrupt_active_descendants(task.project_id, task.run_id)
                 self.ledger.finish(
                     task.project_id, task.run_id, terminal_status="succeeded", actor=task.actor,
                 )
                 return WorkOutcome(
                     WorkflowStatus.WAITING_HUMAN, task.work_id, task.run_id, linked_questions,
+                )
+            unfinished_children = self.ledger.interrupt_active_descendants(
+                task.project_id, task.run_id,
+            )
+            if unfinished_children:
+                self.ledger.finish(
+                    task.project_id, task.run_id, terminal_status="failed", actor=task.actor,
+                )
+                self._fail_running_work(task, "Adapter returned with active delegated runs.")
+                return WorkOutcome(
+                    WorkflowStatus.FAILED, task.work_id, task.run_id,
+                    detail="Adapter returned while delegated runs were still active; they were interrupted.",
                 )
             self.ledger.finish(
                 task.project_id, task.run_id, terminal_status="succeeded", actor=task.actor,

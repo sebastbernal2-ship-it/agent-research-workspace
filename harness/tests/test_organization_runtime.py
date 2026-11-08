@@ -132,6 +132,44 @@ class OrganizationCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             occurred_at=NOW,
         )
 
+    async def test_adapter_failure_interrupts_active_child_before_failing_parent(self):
+        def fail_after_delegating(context):
+            self.ledger.start(
+                PROJECT_ID, WORK_ID, run_id="run.unfinished-child", agent=VERIFIER,
+                adapter={"name": "child-adapter", "version": "1"},
+                context_hash="b" * 64, correlation_id=context.correlation_id,
+                parent_run_id=context.run_id, occurred_at=NOW,
+            )
+            raise RuntimeError("parent adapter failed after delegation")
+
+        result = await self.coordinator.run_work(self.make_task("run.parent-fails", fail_after_delegating))
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(result.status, WorkflowStatus.FAILED)
+        self.assertEqual(state["agentRuns"]["run.unfinished-child"]["status"], "interrupted")
+        self.assertEqual(state["agentRuns"]["run.parent-fails"]["status"], "failed")
+        self.assertEqual(state["workItems"][WORK_ID]["status"], "failed")
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
+    async def test_successful_adapter_cannot_complete_with_active_child_run(self):
+        def leave_child_running(context):
+            self.ledger.start(
+                PROJECT_ID, WORK_ID, run_id="run.left-child-active", agent=VERIFIER,
+                adapter={"name": "child-adapter", "version": "1"},
+                context_hash="c" * 64, correlation_id=context.correlation_id,
+                parent_run_id=context.run_id, occurred_at=NOW,
+            )
+            self.write_output(context)
+            return ExecutionSignal.COMPLETED
+
+        result = await self.coordinator.run_work(self.make_task("run.parent-returns", leave_child_running))
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(result.status, WorkflowStatus.FAILED)
+        self.assertIn("still active", result.detail)
+        self.assertEqual(state["agentRuns"]["run.left-child-active"]["status"], "interrupted")
+        self.assertEqual(state["agentRuns"]["run.parent-returns"]["status"], "failed")
+        self.assertEqual(state["workItems"][WORK_ID]["status"], "failed")
+        self.assertTrue(self.store.verify(PROJECT_ID))
+
     async def test_blocking_question_prevents_start_then_inbox_answer_allows_completion(self):
         self.control.open_question(self.make_question("question.before-run"))
         calls = []
