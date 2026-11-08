@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
 from .control_plane import ControlPlaneError, ProjectControlPlane
+from .durable_queue import QueueError, SQLiteWorkQueue
 from .event_store import SQLiteEventStore
 from .projection import Projector
 from .run_ledger import RunLedger
@@ -87,6 +89,86 @@ class OrganizationCoordinator:
     def recover_project(self, project_id: str, *, occurred_at: str | None = None) -> tuple[str, ...]:
         """Mark abandoned active runs interrupted; never replay adapter work automatically."""
         return tuple(self.ledger.recover_interrupted(project_id, occurred_at=occurred_at))
+
+    async def run_queued(
+        self,
+        queue: SQLiteWorkQueue,
+        worker_id: str,
+        execution_factory: Callable[[dict[str, Any]], WorkExecution],
+        *,
+        lease_seconds: float = 60,
+        clock: Callable[[], float] = time.time,
+    ) -> WorkOutcome | None:
+        """Claim and execute one durable job using only trusted, re-registered callbacks.
+
+        The factory receives the persisted job (including its lease generation) and
+        must create a fresh run ID for this attempt. Callback code itself is never
+        deserialized from the queue.
+        """
+        job = queue.claim_next(worker_id, now=clock(), lease_seconds=lease_seconds)
+        if job is None:
+            return None
+        token = job["leaseToken"]
+        generation = job["leaseGeneration"]
+        try:
+            task = execution_factory(job)
+            if not isinstance(task, WorkExecution):
+                raise QueueError("execution factory must return a trusted WorkExecution")
+            if task.project_id != job["projectId"] or task.work_id != job["workId"]:
+                raise QueueError("resolved execution does not match its queued project/work assignment")
+            state = self.projector.replay(task.project_id)
+            if task.run_id in state["agentRuns"]:
+                raise QueueError("queued execution factory must supply a fresh run ID for each lease generation")
+        except Exception:
+            queue.abandon(
+                job["jobId"], worker_id, token, generation, now=clock(),
+            )
+            raise
+
+        stop_heartbeat = asyncio.Event()
+        interval = min(30.0, lease_seconds / 3)
+
+        async def heartbeat() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                    return
+                except asyncio.TimeoutError:
+                    try:
+                        queue.renew(
+                            job["jobId"], worker_id, token, generation,
+                            now=clock(), lease_seconds=lease_seconds,
+                        )
+                    except Exception:
+                        return
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            outcome = await self.run_work(task)
+        except asyncio.CancelledError:
+            try:
+                queue.release(job["jobId"], worker_id, token, generation, now=clock())
+            except QueueError:
+                pass
+            raise
+        except Exception:
+            queue.abandon(job["jobId"], worker_id, token, generation, now=clock())
+            raise
+        finally:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        if outcome.status == WorkflowStatus.COMPLETED:
+            queue.complete(job["jobId"], worker_id, token, generation, now=clock())
+        elif outcome.status == WorkflowStatus.RECOVERY_REQUIRED:
+            queue.abandon(job["jobId"], worker_id, token, generation, now=clock())
+        else:
+            queue.release(job["jobId"], worker_id, token, generation, now=clock())
+        return outcome
 
     def retry_work(
         self,

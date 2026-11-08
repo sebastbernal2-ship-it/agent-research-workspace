@@ -7,6 +7,9 @@ from pathlib import Path
 
 from harness.control_plane import ControlPlaneError
 from harness.durable_queue import QueueError, SQLiteWorkQueue
+from harness.organization_runtime import (
+    ExecutionSignal, OrganizationCoordinator, WorkflowStatus, WorkExecution,
+)
 from harness.event_store import SQLiteEventStore
 from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
@@ -161,3 +164,106 @@ class SQLiteWorkQueueTests(unittest.TestCase):
         )
         self.assertEqual(completed["state"], "completed")
         self.assertIsNone(completed["leaseToken"])
+
+
+class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "queued-runtime.sqlite3"
+        self.store = SQLiteEventStore(self.path)
+        self.control = seed_synthetic_project(
+            self.store, project_id=PROJECT_ID, work_id=WORK_ID, occurred_at=NOW,
+        )
+        self.queue = SQLiteWorkQueue(self.store)
+        self.queue.enqueue(
+            "job.runtime", PROJECT_ID, WORK_ID, {"executionKey": "offline"}, now=100,
+        )
+
+    async def asyncTearDown(self):
+        self.temp.cleanup()
+
+    async def test_coordinator_claims_runs_and_acknowledges_canonical_completion(self):
+        def resolve(job):
+            self.assertEqual(job["payload"]["executionKey"], "offline")
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.runtime.g{job['leaseGeneration']}", correlation_id="queue.integration",
+                actor=SPECIALIST, adapter={"name": "offline-queue-test", "version": "1"},
+                context_hash=hashlib.sha256(b"queue context").hexdigest(),
+                verification_actor=VP,
+                execute=lambda _: ExecutionSignal.COMPLETED,
+                verify=lambda _: True,
+            )
+
+        coordinator = OrganizationCoordinator(self.store)
+        outcome = await coordinator.run_queued(
+            self.queue, "worker.runtime", resolve, lease_seconds=10, clock=lambda: 200,
+        )
+        self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
+        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+        self.assertEqual(
+            self.queue.claim_next("worker.next", now=201, lease_seconds=10), None,
+        )
+
+    async def test_inbox_answer_resumes_persisted_job_with_a_fresh_run_generation(self):
+        coordinator = OrganizationCoordinator(self.store)
+
+        def resolve(job):
+            generation = job["leaseGeneration"]
+
+            def execute(context):
+                if generation == 1:
+                    self.control.open_question({
+                        "recordType": "human_question", "schemaVersion": "0.1",
+                        "projectId": PROJECT_ID, "questionId": "question.queued",
+                        "questionType": "clarification", "priority": "normal", "blocking": True,
+                        "requestedBy": VP, "workIds": [WORK_ID], "runId": context.run_id,
+                        "questionText": "May the queued work proceed?",
+                        "impact": "The worker needs the user's scope decision.",
+                        "options": [], "status": "open", "createdAt": NOW,
+                    })
+                    return ExecutionSignal.WAITING_HUMAN
+                return ExecutionSignal.COMPLETED
+
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.queued.g{generation}", correlation_id="queue.resume",
+                actor=SPECIALIST, adapter={"name": "offline-queue-test", "version": "1"},
+                context_hash=hashlib.sha256(f"attempt-{generation}".encode()).hexdigest(),
+                verification_actor=VP, execute=execute, verify=lambda _: True,
+            )
+
+        first = await coordinator.run_queued(
+            self.queue, "worker.runtime", resolve, lease_seconds=10, clock=lambda: 500,
+        )
+        self.assertEqual(first.status, WorkflowStatus.WAITING_HUMAN)
+        self.assertEqual(self.queue.get("job.runtime")["state"], "queued")
+        self.assertIsNone(self.queue.claim_next("worker.next", now=501, lease_seconds=10))
+
+        self.control.answer_question(
+            PROJECT_ID, "question.queued", "Proceed.", actor={
+                "actorType": "human", "actorId": "user.synthetic", "role": "user",
+            },
+        )
+        second = await coordinator.run_queued(
+            self.queue, "worker.next", resolve, lease_seconds=10, clock=lambda: 502,
+        )
+        self.assertEqual(second.status, WorkflowStatus.COMPLETED)
+        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+        state = coordinator.projector.replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"]["run.queued.g1"]["status"], "succeeded")
+        self.assertEqual(state["agentRuns"]["run.queued.g2"]["status"], "succeeded")
+
+    async def test_missing_trusted_execution_factory_enters_recovery_not_replay(self):
+        coordinator = OrganizationCoordinator(self.store)
+
+        def fail_resolution(_job):
+            raise LookupError("trusted adapter registration missing")
+
+        with self.assertRaisesRegex(LookupError, "registration missing"):
+            await coordinator.run_queued(
+                self.queue, "worker.runtime", fail_resolution,
+                lease_seconds=10, clock=lambda: 300,
+            )
+        self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
+        self.assertIsNone(self.queue.claim_next("worker.next", now=301, lease_seconds=10))

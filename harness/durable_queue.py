@@ -20,6 +20,7 @@ class QueueError(EventStoreError):
     """Invalid, conflicting, or stale durable queue operation."""
 
 
+MIN_LEASE_SECONDS = 1
 MAX_LEASE_SECONDS = 7 * 24 * 60 * 60
 
 
@@ -41,8 +42,10 @@ class SQLiteWorkQueue:
     @classmethod
     def _lease_seconds(cls, value: float) -> float:
         seconds = cls._positive(value, "lease_seconds")
-        if seconds > MAX_LEASE_SECONDS:
-            raise QueueError(f"lease_seconds cannot exceed {MAX_LEASE_SECONDS}")
+        if seconds < MIN_LEASE_SECONDS or seconds > MAX_LEASE_SECONDS:
+            raise QueueError(
+                f"lease_seconds must be between {MIN_LEASE_SECONDS} and {MAX_LEASE_SECONDS}"
+            )
         return seconds
 
     @staticmethod
@@ -236,7 +239,7 @@ class SQLiteWorkQueue:
             row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
             self._assert_lease(row, worker_id, lease_token, generation, now)
             state = self.projector.replay(row["project_id"])
-            target = "queued" if self._is_runnable(state, row["work_id"]) else "recovery_required"
+            target = self._post_lease_state(state, row["work_id"])
             conn.execute(
                 "UPDATE scheduled_work SET state=?, lease_owner=NULL, lease_token=NULL, "
                 "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
@@ -245,6 +248,37 @@ class SQLiteWorkQueue:
             released = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
             conn.execute("COMMIT")
             return self._decode(released)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def abandon(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        generation: int,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        """Move a leased job to explicit recovery after an unsafe/unexpected worker failure."""
+        now = self._positive(now, "now")
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            self._assert_lease(row, worker_id, lease_token, generation, now)
+            conn.execute(
+                "UPDATE scheduled_work SET state='recovery_required', lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
+                (now, job_id),
+            )
+            abandoned = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            conn.execute("COMMIT")
+            return self._decode(abandoned)
         except Exception:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -271,15 +305,7 @@ class SQLiteWorkQueue:
             if row["state"] != "recovery_required":
                 raise QueueError("job is not awaiting expired-lease recovery")
             state = self.projector.replay(row["project_id"])
-            work_status = state["workItems"].get(row["work_id"], {}).get("status")
-            if work_status == "completed":
-                target = "completed"
-            elif work_status == "failed":
-                target = "failed"
-            elif self._is_runnable(state, row["work_id"]):
-                target = "queued"
-            else:
-                target = "recovery_required"
+            target = self._post_lease_state(state, row["work_id"])
             conn.execute(
                 "UPDATE scheduled_work SET state=?, lease_owner=NULL, lease_token=NULL, "
                 "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
@@ -305,8 +331,26 @@ class SQLiteWorkQueue:
             raise QueueError(f"unknown scheduled job {job_id!r}")
         return self._decode(row)
 
+    @classmethod
+    def _post_lease_state(cls, state: dict[str, Any], work_id: str) -> str:
+        work = state["workItems"].get(work_id)
+        if work is None:
+            return "recovery_required"
+        if work["status"] == "completed":
+            return "completed"
+        if work["status"] in {"failed", "cancelled"}:
+            return "failed"
+        if work["status"] in {"running", "verifying"} or any(
+            run["workId"] == work_id and run["status"] == "running"
+            for run in state["agentRuns"].values()
+        ):
+            return "recovery_required"
+        return "queued"
+
     @staticmethod
     def _is_runnable(state: dict[str, Any], work_id: str) -> bool:
+        if state["project"] is None or state["project"]["status"] != "active":
+            return False
         work = state["workItems"].get(work_id)
         if work is None or work["status"] != "ready":
             return False

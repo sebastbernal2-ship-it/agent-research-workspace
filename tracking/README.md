@@ -8,6 +8,21 @@ Canonical live tracking is in the [GitHub issues](https://github.com/sebastberna
 - **Implementation/execution owners:** currently unassigned; do not infer ownership or notify/assign people until the project owner confirms contributors.
 - Status vocabulary: `VERIFIED` (specific test/evidence attached), `UNVERIFIED`, `BLOCKED` (named prerequisite), `REJECTED` (documented gate failure). Scripted fixtures never count as real-model quality evidence.
 
+## Harness completion epics
+
+The user requested six explicit completion issues. These are umbrella tracks; existing issues #2–#12 remain component-level work. Update this table and the matching GitHub issue checklists/comments after each verified implementation slice. Do not close an epic while an acceptance item is blocked or only prototyped.
+
+| Issue | Track | Status | Verified baseline / next gate |
+|---|---|---|---|
+| [#13](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/13) | Durable organization runtime | **IN PROGRESS** | `run_queued` now claims/heartbeats SQLite leases, resolves only trusted callbacks, and resumes blocked jobs after canonical readiness (including inbox answers) with fresh run generations. Persisted trusted callback registry, autonomous workers, authenticated/fenced leases, and broader recovery tests remain. |
+| [#14](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/14) | Authenticated identity, authorization, approvals | **NOT STARTED** | Fake identity/caller actors and prototype capability policy remain; select a real identity/session model and enforce membership/capabilities at service boundaries. |
+| [#15](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/15) | Worker isolation and external-effect recovery | **PARTIAL** | Bounded subprocesses and Meldwork canonical receipt journal are tested; no hardened sandbox or adapter-side outbox/effect guarantee. |
+| [#16](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/16) | Authenticated project UI/service | **PARTIAL** | Synthetic one-project loopback UI/inbox exists; multi-project product flows, real API/auth, VP interaction, and plan approvals remain. |
+| [#17](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/17) | Trusted evidence and bounded model workflows | **PARTIAL / GATED** | Caller-supplied evidence registration and offline routing contract exist; authorized fetching, authenticity/review, and approved provider/model pilot remain. |
+| [#18](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/18) | Migrations, deployment, and operations | **PARTIAL** | Verified SQLite backup/restore exists; migration dispatcher, storage/deployment decision, retention/security/monitoring, and recovery operations remain. |
+
+**Completion rule:** each issue closes only when its acceptance criteria pass with evidence and no unresolved prerequisite is mislabeled complete. Identity-provider choice, provider/model/spend/data scope, policy authorization, and production security review are explicit external gates—not silently assumed.
+
 ## Workstream register
 
 | Issue | Workstream | Current status / blocker | Depends on |
