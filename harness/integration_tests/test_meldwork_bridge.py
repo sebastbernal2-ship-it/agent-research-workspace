@@ -5,6 +5,7 @@ from pathlib import Path
 
 from harness.event_store import SQLiteEventStore
 from harness.meldwork_bridge import MeldworkReceiptBridge, MeldworkBridgeError
+from harness.meldwork_runtime_bridge import MeldworkAgenticXRuntimeBridge, MeldworkRuntimeError
 from harness.projection import Projector
 from harness.testing import seed_synthetic_project
 
@@ -39,6 +40,26 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def fake_node(self, body):
+        executable = Path(self.temp.name) / "fake-node"
+        executable.write_text("#!/usr/bin/env python3" + chr(10) + body, encoding="utf-8")
+        executable.chmod(0o755)
+        return str(executable)
+
+    def test_receipt_adapter_output_limit_fails_closed(self):
+        bridge = MeldworkReceiptBridge(self.store, node=self.fake_node("print('x' * 2100000)"))
+        with self.assertRaisesRegex(MeldworkBridgeError, "output limit"):
+            bridge.canonicalize({"synthetic": True})
+        self.assertEqual(len(self.store.events("project.meldwork")), 2)
+
+    def test_runtime_output_limit_fails_closed(self):
+        bridge = MeldworkAgenticXRuntimeBridge(
+            self.store, node=self.fake_node("print('x' * 2100000)"), timeout=10,
+        )
+        with self.assertRaisesRegex(MeldworkRuntimeError, "output limit"):
+            bridge.run(project_id="project.meldwork", work_id="work.meldwork")
+        self.assertEqual(len(self.store.events("project.meldwork")), 2)
 
     def test_v4_proposal_challenge_synthesis_map_to_canonical_events(self):
         proposal = request(

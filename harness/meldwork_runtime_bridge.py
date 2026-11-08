@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from .bounded_process import BoundedProcessOutputLimit, BoundedProcessTimeout, run_bounded_subprocess
 from .event_store import AppendResult, SQLiteEventStore
 from .meldwork_bridge import MeldworkBridgeError, MeldworkReceiptBridge
 
@@ -46,26 +46,27 @@ class MeldworkAgenticXRuntimeBridge:
         with tempfile.TemporaryDirectory(prefix="meldwork-runtime-bridge-") as home:
             env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             try:
-                result = subprocess.run(
+                result = run_bounded_subprocess(
                     [self.node, str(RUNTIME_SCRIPT)],
-                    text=True,
-                    capture_output=True,
-                    timeout=self.timeout,
+                    input_bytes=b"",
                     cwd=home,
                     env=env,
-                    check=False,
+                    timeout=self.timeout,
+                    stdout_limit=2_000_000,
+                    stderr_limit=16_000,
                 )
-            except subprocess.TimeoutExpired as exc:
+            except BoundedProcessTimeout as exc:
                 raise MeldworkRuntimeError("Meldwork/AgenticX runtime timed out") from exc
+            except BoundedProcessOutputLimit as exc:
+                raise MeldworkRuntimeError("Meldwork/AgenticX runtime exceeded its output limit") from exc
         if result.returncode != 0:
+            stderr = result.stderr[-4000:].decode("utf-8", errors="replace").strip()
             raise MeldworkRuntimeError(
-                f"Meldwork/AgenticX runtime failed: {result.stderr[-4000:].strip()}"
+                f"Meldwork/AgenticX runtime failed: {stderr}"
             )
-        if len(result.stdout.encode("utf-8")) > 2_000_000:
-            raise MeldworkRuntimeError("Meldwork/AgenticX runtime response exceeds 2 MB")
         try:
-            response = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
+            response = json.loads(result.stdout.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise MeldworkRuntimeError("Meldwork/AgenticX runtime returned malformed JSON") from exc
         if response.get("orchestrationPhase") != "completed":
             raise MeldworkRuntimeError("Meldwork V4 orchestration did not complete")

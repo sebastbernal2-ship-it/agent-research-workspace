@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,18 @@ class AgenticXSubprocessBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(AgenticXWorkerError, "exited 7"):
                 AgenticXSubprocessWorker(nonzero).run_task(
                     task_id="task.nonzero", description="test", scripted_result="result",
+                )
+
+    @unittest.skipUnless(os.name == "posix", "process-group cancellation is POSIX-specific")
+    def test_timeout_kills_worker_process_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spawner = self.fake_interpreter(
+                temp,
+                "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); time.sleep(20)",
+            )
+            with self.assertRaisesRegex(AgenticXWorkerError, "exceeded 0.1s timeout"):
+                AgenticXSubprocessWorker(spawner, timeout=0.1).run_task(
+                    task_id="task.tree-timeout", description="test", scripted_result="result",
                 )
 
     def test_worker_output_is_bounded(self):

@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from .bounded_process import BoundedProcessOutputLimit, BoundedProcessTimeout, run_bounded_subprocess
 from .event_store import AppendResult, SQLiteEventStore
 
 
@@ -37,25 +37,27 @@ class MeldworkReceiptBridge:
         with tempfile.TemporaryDirectory(prefix="meldwork-adapter-") as home:
             env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             try:
-                result = subprocess.run(
+                result = run_bounded_subprocess(
                     [self.node, str(ADAPTER_SCRIPT)],
-                    input=encoded,
-                    text=True,
-                    capture_output=True,
-                    timeout=self.timeout,
+                    input_bytes=encoded.encode("utf-8"),
                     cwd=home,
                     env=env,
-                    check=False,
+                    timeout=self.timeout,
+                    stdout_limit=2_000_000,
+                    stderr_limit=16_000,
                 )
-            except subprocess.TimeoutExpired as exc:
+            except BoundedProcessTimeout as exc:
                 raise MeldworkBridgeError("Meldwork receipt adapter timed out") from exc
+            except BoundedProcessOutputLimit as exc:
+                raise MeldworkBridgeError("Meldwork receipt adapter exceeded its output limit") from exc
         if result.returncode != 0:
-            raise MeldworkBridgeError(f"Meldwork receipt rejected: {result.stderr[-2000:].strip()}")
+            stderr = result.stderr[-2000:].decode("utf-8", errors="replace").strip()
+            raise MeldworkBridgeError(f"Meldwork receipt rejected: {stderr}")
         try:
-            response = json.loads(result.stdout)
+            response = json.loads(result.stdout.decode("utf-8"))
             event = response["event"]
             blob_content = response["blobContent"]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
             raise MeldworkBridgeError("Meldwork adapter returned malformed JSON") from exc
         if not isinstance(event, dict) or not isinstance(blob_content, str):
             raise MeldworkBridgeError("Meldwork adapter response has invalid types")
