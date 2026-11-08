@@ -127,6 +127,8 @@
         "runId": { "$ref": "#/$defs/id" },
         "workId": { "$ref": "#/$defs/id" },
         "parentRunId": { "$ref": "#/$defs/id" },
+        "queueJobId": { "$ref": "#/$defs/id" },
+        "leaseGeneration": { "type": "integer", "minimum": 1 },
         "agent": { "$ref": "#/$defs/actor" },
         "adapter": { "$ref": "#/$defs/adapter" },
         "providerClass": { "type": "string", "maxLength": 100 },
@@ -150,6 +152,10 @@
         "outputEventIds": { "$ref": "#/$defs/refList" },
         "startedAt": { "$ref": "#/$defs/timestamp" },
         "finishedAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "dependentRequired": {
+        "queueJobId": ["leaseGeneration"],
+        "leaseGeneration": ["queueJobId"]
       }
     },
     "question": {
@@ -286,7 +292,7 @@
         { "type": "object", "additionalProperties": false, "required": ["workId", "from", "to", "recordHash"], "properties": { "workId": { "$ref": "#/$defs/id" }, "from": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] }, "to": { "enum": ["proposed", "ready", "running", "blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"] }, "recordHash": { "$ref": "#/$defs/sha256" }, "reason": { "type": "string", "maxLength": 2000 } } },
         { "type": "object", "additionalProperties": false, "required": ["workId", "fromRevision", "toRevision", "recordHash"], "properties": { "workId": { "$ref": "#/$defs/id" }, "fromRevision": { "type": "integer", "minimum": 1 }, "toRevision": { "type": "integer", "minimum": 2 }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["workId", "threadId", "messageType", "contentRef", "contentHash", "visibleTo"], "properties": { "workId": { "$ref": "#/$defs/id" }, "threadId": { "$ref": "#/$defs/id" }, "messageType": { "enum": ["proposal", "question", "challenge", "evidence", "revision", "decision", "status"] }, "contentRef": { "$ref": "#/$defs/id" }, "contentHash": { "$ref": "#/$defs/sha256" }, "artifactIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "runId": { "$ref": "#/$defs/id" }, "visibleTo": { "$ref": "#/$defs/refList" } } },
-        { "type": "object", "additionalProperties": false, "required": ["runId", "workId", "adapter", "contextHash", "capabilityGrantIds", "recordHash"], "properties": { "runId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "parentRunId": { "$ref": "#/$defs/id" }, "adapter": { "$ref": "#/$defs/adapter" }, "contextHash": { "$ref": "#/$defs/sha256" }, "capabilityGrantIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
+        { "type": "object", "additionalProperties": false, "required": ["runId", "workId", "adapter", "contextHash", "capabilityGrantIds", "recordHash"], "properties": { "runId": { "$ref": "#/$defs/id" }, "workId": { "$ref": "#/$defs/id" }, "parentRunId": { "$ref": "#/$defs/id" }, "queueJobId": { "$ref": "#/$defs/id" }, "leaseGeneration": { "type": "integer", "minimum": 1 }, "adapter": { "$ref": "#/$defs/adapter" }, "contextHash": { "$ref": "#/$defs/sha256" }, "capabilityGrantIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } }, "dependentRequired": { "queueJobId": ["leaseGeneration"], "leaseGeneration": ["queueJobId"] } },
         { "type": "object", "additionalProperties": false, "required": ["runId", "terminalStatus", "recordHash"], "properties": { "runId": { "$ref": "#/$defs/id" }, "terminalStatus": { "enum": ["succeeded", "failed", "cancelled", "interrupted"] }, "artifactIds": { "$ref": "#/$defs/refList" }, "eventIds": { "$ref": "#/$defs/refList" }, "evidenceIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" }, "summaryRef": { "$ref": "#/$defs/id" } } },
         { "type": "object", "additionalProperties": false, "required": ["questionId", "questionType", "priority", "blocking", "workIds", "questionRef", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "questionType": { "enum": ["clarification", "approval", "permission", "budget", "tradeoff", "decision"] }, "priority": { "enum": ["low", "normal", "high", "urgent"] }, "blocking": { "type": "boolean" }, "workIds": { "$ref": "#/$defs/refList" }, "questionRef": { "$ref": "#/$defs/id" }, "recordHash": { "$ref": "#/$defs/sha256" } } },
         { "type": "object", "additionalProperties": false, "required": ["questionId", "answerRef", "resumedWorkIds", "recordHash"], "properties": { "questionId": { "$ref": "#/$defs/id" }, "answerRef": { "$ref": "#/$defs/id" }, "resumedWorkIds": { "$ref": "#/$defs/refList" }, "recordHash": { "$ref": "#/$defs/sha256" } } },

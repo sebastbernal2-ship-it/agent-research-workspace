@@ -46,6 +46,7 @@ class RunLedger:
         correlation_id: str | None = None,
         parent_run_id: str | None = None,
         occurred_at: str | None = None,
+        queue_lease: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(agent, dict) or agent.get("actorType") != "agent":
             raise ValueError("agent run assignment must name an agent actor")
@@ -60,6 +61,10 @@ class RunLedger:
         if work is None:
             raise ControlPlaneError(f"unknown work item {work_id!r}")
         existing = state["agentRuns"].get(run_id)
+        lease_identity = {} if queue_lease is None else {
+            "queueJobId": queue_lease.get("jobId"),
+            "leaseGeneration": queue_lease.get("leaseGeneration"),
+        }
         identity = {
             "projectId": project_id,
             "runId": run_id,
@@ -68,6 +73,7 @@ class RunLedger:
             "adapter": adapter,
             "contextHash": context_hash,
             "capabilityGrantIds": grants,
+            **lease_identity,
         }
         if existing is not None:
             if existing.get("parentRunId") != parent_run_id:
@@ -159,6 +165,7 @@ class RunLedger:
                 "runId": run_id,
                 "workId": work_id,
                 **({"parentRunId": parent_run_id} if parent_run_id is not None else {}),
+                **lease_identity,
                 "adapter": adapter,
                 "contextHash": context_hash,
                 "capabilityGrantIds": grants,
@@ -169,7 +176,9 @@ class RunLedger:
             correlation_id=effective_correlation_id,
         )
         events.append(event)
-        self.store.append_many(events, expected_sequence=state["_eventSequence"])
+        self.store.append_many(
+            events, expected_sequence=state["_eventSequence"], queue_lease=queue_lease,
+        )
         return self.control.projector.replay(project_id)["agentRuns"][run_id]
 
     def finish(

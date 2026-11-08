@@ -28,7 +28,7 @@ python3 -m pip install -r contracts/requirements-test.txt
 python3 -m unittest discover -s contracts/tests -v
 ```
 
-Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet. Optional `parentRunId`, message `runId`, run output-reference fields, and artifact input/evidence lineage fields were added while v0.1 is still an unpublished draft; older snapshots omit them and remain valid. Freeze/release requires versioned compatibility handling, not silent post-release schema edits.
+Migration and compatibility policy: [MIGRATION_POLICY.md](MIGRATION_POLICY.md). It is a design rule only; no version dispatcher or migration implementation exists yet. Optional `parentRunId`, queued-run `queueJobId`/`leaseGeneration`, message `runId`, run output-reference fields, and artifact input/evidence lineage fields were added while v0.1 is still an unpublished draft; older snapshots omit them and remain valid. Freeze/release requires versioned compatibility handling, not silent post-release schema edits.
 
 ## Explicitly incomplete
 

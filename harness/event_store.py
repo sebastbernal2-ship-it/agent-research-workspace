@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -194,11 +195,69 @@ class SQLiteEventStore:
             raise EventStoreError("events are stored in the append-only event table")
         return record
 
+    @staticmethod
+    def _assert_queue_lease(
+        conn: sqlite3.Connection,
+        events: list[dict[str, Any]],
+        lease: dict[str, Any],
+    ) -> None:
+        required = {"jobId", "workerId", "leaseToken", "leaseGeneration", "now"}
+        if not isinstance(lease, dict) or not required.issubset(lease):
+            raise EventStoreError("queue lease claim is incomplete")
+        if any(not isinstance(lease[key], str) or not lease[key] for key in ("jobId", "workerId", "leaseToken")):
+            raise EventStoreError("queue lease identity fields must be non-empty strings")
+        generation = lease["leaseGeneration"]
+        now = lease["now"]
+        if (
+            isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+            or isinstance(now, bool) or not isinstance(now, (int, float))
+            or not math.isfinite(now) or now <= 0
+        ):
+            raise EventStoreError("queue lease generation or validation time is invalid")
+        if any(not isinstance(event, dict) for event in events):
+            raise EventStoreError("queue-claimed event batches must contain event objects")
+        starts = [event for event in events if event.get("eventType") == "run.started"]
+        if len(starts) != 1:
+            raise EventStoreError("a queue lease must authorize exactly one run.started event")
+        start = starts[0]
+        payload = start.get("payload", {})
+        if not isinstance(payload, dict):
+            raise EventStoreError("queue-claimed run.started payload must be an object")
+        project_values = [event.get("projectId") for event in events]
+        if not all(isinstance(project_id, str) for project_id in project_values):
+            raise EventStoreError("queue-claimed event batches must be project-scoped")
+        project_ids = set(project_values)
+        if (
+            len(project_ids) != 1
+            or start.get("projectId") not in project_ids
+            or payload.get("queueJobId") != lease["jobId"]
+            or payload.get("leaseGeneration") != generation
+        ):
+            raise EventStoreError("run.started event does not match its queue lease claim")
+        row = conn.execute(
+            "SELECT project_id, work_id, state, lease_owner, lease_token, lease_generation, lease_expires_at "
+            "FROM scheduled_work WHERE job_id=?",
+            (lease["jobId"],),
+        ).fetchone()
+        if (
+            row is None
+            or row["project_id"] != start["projectId"]
+            or row["work_id"] != payload.get("workId")
+            or row["state"] != "leased"
+            or row["lease_owner"] != lease["workerId"]
+            or row["lease_token"] != lease["leaseToken"]
+            or row["lease_generation"] != generation
+            or row["lease_expires_at"] is None
+            or row["lease_expires_at"] <= now
+        ):
+            raise ConcurrentWriteConflict("queue lease expired or changed before canonical run start")
+
     def append_many(
         self,
         events: list[dict[str, Any]],
         *,
         expected_sequence: int | None = None,
+        queue_lease: dict[str, Any] | None = None,
     ) -> list[AppendResult]:
         """Append one logical batch atomically, assigning sequences under lock.
 
@@ -218,6 +277,8 @@ class SQLiteEventStore:
         results: list[AppendResult] = []
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if queue_lease is not None:
+                self._assert_queue_lease(conn, events, queue_lease)
             if expected_sequence is not None:
                 project_ids = {event.get("projectId") for event in events}
                 if len(project_ids) != 1 or not all(isinstance(project_id, str) for project_id in project_ids):

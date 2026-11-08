@@ -179,7 +179,14 @@ class OrganizationCoordinator:
 
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            outcome = await self.run_work(task)
+            outcome = await self.run_work(
+                task,
+                queue_lease={
+                    "jobId": job["jobId"], "workerId": worker_id,
+                    "leaseToken": token, "leaseGeneration": generation,
+                },
+                lease_clock=clock,
+            )
         except asyncio.CancelledError:
             try:
                 queue.release(job["jobId"], worker_id, token, generation, now=clock())
@@ -289,7 +296,13 @@ class OrganizationCoordinator:
             if outcome.status != WorkflowStatus.COMPLETED:
                 return tuple(outcomes)
 
-    async def run_work(self, task: WorkExecution) -> WorkOutcome:
+    async def run_work(
+        self,
+        task: WorkExecution,
+        *,
+        queue_lease: dict[str, Any] | None = None,
+        lease_clock: Callable[[], float] = time.time,
+    ) -> WorkOutcome:
         state = self.projector.replay(task.project_id)
         work = state["workItems"].get(task.work_id)
         if work is None:
@@ -408,6 +421,9 @@ class OrganizationCoordinator:
                 context_hash=task.context_hash,
                 correlation_id=task.correlation_id,
                 parent_run_id=task.parent_run_id,
+                queue_lease=None if queue_lease is None else {
+                    **queue_lease, "now": lease_clock(),
+                },
             )
             try:
                 signal = await self._invoke(task.execute, context)

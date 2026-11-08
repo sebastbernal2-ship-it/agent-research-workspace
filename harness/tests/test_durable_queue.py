@@ -11,7 +11,7 @@ from harness.durable_queue import QueueError, SQLiteWorkQueue
 from harness.organization_runtime import (
     ExecutionSignal, OrganizationCoordinator, WorkflowStatus, WorkExecution,
 )
-from harness.event_store import SQLiteEventStore
+from harness.event_store import ConcurrentWriteConflict, SQLiteEventStore
 from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
 
@@ -222,6 +222,9 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
         self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+        run = coordinator.projector.replay(PROJECT_ID)["agentRuns"]["run.runtime.g1"]
+        self.assertEqual(run["queueJobId"], "job.runtime")
+        self.assertEqual(run["leaseGeneration"], 1)
         self.assertEqual(
             self.queue.claim_next("worker.next", now=201, lease_seconds=10), None,
         )
@@ -319,6 +322,36 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 lease_seconds=10, clock=lambda: 350,
             )
         self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
+
+    async def test_stale_lease_cannot_start_run_after_a_new_generation_is_claimed(self):
+        old = self.queue.claim_next("worker.old", now=700, lease_seconds=10)
+        self.assertIsNone(self.queue.claim_next("worker.new", now=711, lease_seconds=10))
+        self.queue.recover_expired("job.runtime", now=712, attest_no_live_worker=True)
+        current = self.queue.claim_next("worker.new", now=713, lease_seconds=30)
+        ledger = RunLedger(self.store)
+        run_args = dict(
+            project_id=PROJECT_ID, work_id=WORK_ID, run_id="run.fenced", agent=SPECIALIST,
+            adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
+            occurred_at=NOW,
+        )
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "lease expired or changed"):
+            ledger.start(
+                **run_args,
+                queue_lease={
+                    "jobId": "job.runtime", "workerId": "worker.old",
+                    "leaseToken": old["leaseToken"], "leaseGeneration": 1, "now": 714,
+                },
+            )
+        self.assertNotIn("run.fenced", OrganizationCoordinator(self.store).projector.replay(PROJECT_ID)["agentRuns"])
+        started = ledger.start(
+            **run_args,
+            queue_lease={
+                "jobId": "job.runtime", "workerId": "worker.new",
+                "leaseToken": current["leaseToken"], "leaseGeneration": 2, "now": 714,
+            },
+        )
+        self.assertEqual(started["queueJobId"], "job.runtime")
+        self.assertEqual(started["leaseGeneration"], 2)
 
     async def test_expired_active_job_requires_run_recovery_and_explicit_retry(self):
         coordinator = OrganizationCoordinator(self.store)

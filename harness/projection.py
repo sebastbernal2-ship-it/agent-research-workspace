@@ -303,6 +303,8 @@ class Projector:
                     or run["contextHash"] != payload["contextHash"]
                     or run["capabilityGrantIds"] != payload["capabilityGrantIds"]
                     or run.get("parentRunId") != payload.get("parentRunId")
+                    or run.get("queueJobId") != payload.get("queueJobId")
+                    or run.get("leaseGeneration") != payload.get("leaseGeneration")
                 ):
                     raise ProjectionError("run.started metadata does not match run record")
                 parent_run_id = run.get("parentRunId")
