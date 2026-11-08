@@ -264,6 +264,11 @@ class ProjectControlPlane:
             ]
             if incomplete:
                 raise ControlPlaneError(f"work cannot start before dependencies complete: {incomplete}")
+        if new_status in {"completed", "failed", "cancelled"} and any(
+            run["workId"] == work_id and run["status"] == "running"
+            for run in state["agentRuns"].values()
+        ):
+            raise ControlPlaneError("work cannot enter a terminal state while agent runs are active")
         when = occurred_at or self.clock()
         updated = deepcopy(old)
         updated["revision"] += 1

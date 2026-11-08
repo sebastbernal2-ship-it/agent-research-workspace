@@ -456,6 +456,29 @@ class ProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectionError, "concurrent active root-run ownership"):
             Projector(self.store).replay("project.alpha")
 
+    def test_replay_rejects_terminal_work_status_with_active_run(self):
+        self.create_project()
+        work = self.create_work("work.active-terminal", "Keep active work open")
+        control = ProjectControlPlane(self.store)
+        running_work = control.transition_work(
+            "project.alpha", work["workId"], "running", actor=VP, reason="Start.",
+        )
+        agent = {"actorType": "agent", "actorId": "agent.active", "role": "specialist"}
+        run = {
+            "recordType": "agent_run", "schemaVersion": "0.1", "projectId": "project.alpha",
+            "runId": "run.active-terminal", "workId": work["workId"], "agent": agent,
+            "adapter": {"name": "test-adapter", "version": "1"}, "status": "running",
+            "contextHash": "b" * 64, "capabilityGrantIds": [], "startedAt": NOW,
+        }
+        record_hash = self.store.put_record(run)
+        self.event("run.started", {
+            "runId": run["runId"], "workId": work["workId"], "adapter": run["adapter"],
+            "contextHash": run["contextHash"], "capabilityGrantIds": [], "recordHash": record_hash,
+        }, actor=agent)
+        self.change_status(running_work, "completed")
+        with self.assertRaisesRegex(ProjectionError, "terminal state while agent runs are active"):
+            Projector(self.store).replay("project.alpha")
+
     def test_run_started_actor_must_match_assigned_agent(self):
         self.create_project()
         work = self.create_work("work.run-actor", "Check run attribution")

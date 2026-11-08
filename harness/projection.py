@@ -239,6 +239,11 @@ class Projector:
                     ]
                     if incomplete:
                         raise ProjectionError(f"work item {work_id!r} cannot run before dependencies complete: {incomplete}")
+                if payload["to"] in {"completed", "failed", "cancelled"} and any(
+                    run["workId"] == work_id and run["status"] == "running"
+                    for run in state["agentRuns"].values()
+                ):
+                    raise ProjectionError("work cannot enter a terminal state while agent runs are active")
                 new = self._load_record(payload["recordHash"], "work_item", project_id)
                 if new["workId"] != work_id or new["status"] != payload["to"] or new["revision"] != old["revision"] + 1:
                     raise ProjectionError("work status event does not match next work record revision")

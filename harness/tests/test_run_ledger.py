@@ -80,6 +80,19 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(len(active), 1)
         self.assertEqual(state["workItems"][WORK_ID]["status"], "running")
 
+    def test_work_cannot_be_completed_while_its_agent_run_is_active(self):
+        self.start_run()
+        initial_count = len(self.store.events(PROJECT_ID))
+        with self.assertRaisesRegex(ControlPlaneError, "agent runs are active"):
+            self.control.transition_work(PROJECT_ID, WORK_ID, "completed", actor=VP, occurred_at=NOW)
+        self.assertEqual(len(self.store.events(PROJECT_ID)), initial_count)
+        self.ledger.finish(
+            PROJECT_ID, "run.specialist", terminal_status="succeeded", actor=SPECIALIST, occurred_at=NOW,
+        )
+        self.control.transition_work(PROJECT_ID, WORK_ID, "verifying", actor=VP, occurred_at=NOW)
+        self.control.transition_work(PROJECT_ID, WORK_ID, "completed", actor=VP, occurred_at=NOW)
+        self.assertEqual(Projector(self.store).replay(PROJECT_ID)["workItems"][WORK_ID]["status"], "completed")
+
     def test_new_root_run_cannot_be_started_while_another_run_owns_work(self):
         self.start_run("run.active-owner")
         with self.assertRaisesRegex(ControlPlaneError, "another active run tree"):
