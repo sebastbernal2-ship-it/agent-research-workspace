@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from jsonschema import Draft202012Validator, FormatChecker
+from .schema_registry import SchemaRegistry, SchemaRegistryError
 
 
 ZERO_HASH = "0" * 64
@@ -71,9 +71,7 @@ class SQLiteEventStore:
             )
         else:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-        Draft202012Validator.check_schema(schema)
-        self._validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        self._schema_registry = SchemaRegistry(SCHEMA_PATH.parent.parent)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -162,10 +160,10 @@ class SQLiteEventStore:
         return hashlib.sha256((previous_hash + "\n" + event_json).encode("utf-8")).hexdigest()
 
     def validate_record(self, record: dict[str, Any]) -> None:
-        errors = sorted(self._validator.iter_errors(record), key=lambda err: list(err.path))
-        if errors:
-            detail = "; ".join(f"{list(err.path)}: {err.message}" for err in errors[:5])
-            raise EventStoreError(f"canonical record schema validation failed: {detail}")
+        try:
+            self._schema_registry.validate(record)
+        except SchemaRegistryError as exc:
+            raise EventStoreError(str(exc)) from exc
 
     def _validate(self, event: dict[str, Any]) -> None:
         self.validate_record(event)

@@ -76,6 +76,14 @@ class SQLiteEventStoreTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_unknown_schema_version_fails_closed(self):
+        self.assertEqual(self.store._schema_registry.versions, ("0.1",))
+        event = initial_events()[0]
+        event["schemaVersion"] = "9.9"
+        with self.assertRaisesRegex(EventStoreError, "unsupported canonical schema version"):
+            self.store.append(event)
+        self.assertEqual(self.store.events("project.alpha"), [])
+
     def test_shared_memory_store_persists_across_internal_connections(self):
         memory_store = SQLiteEventStore(":memory:")
         first = memory_store.append(initial_events()[0])

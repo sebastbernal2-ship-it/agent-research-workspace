@@ -1,6 +1,6 @@
 # Canonical record and schema migration policy
 
-Status: design decision for draft v0.1; no migration has been implemented yet.
+Status: design decision for draft v0.1; schema-version validation dispatch exists for v0.1, but no migration has been implemented.
 
 ## Compatibility rules
 
@@ -16,8 +16,8 @@ Status: design decision for draft v0.1; no migration has been implemented yet.
 ## v0.1 disposition
 
 - v0.1 is a draft and has no deployed user data. Its schema is closed (`additionalProperties: false`) and unknown sensitive fields are rejected.
-- The local SQLite prototype currently validates v0.1 only. It does not yet implement migration dispatch, compatibility readers, retention, or quarantine UX.
-- Before any production or private-data use, introduce a version-dispatch validator and a second-version migration test; do not mutate the current v0.1 schema to smuggle in changed semantics.
+- The local SQLite prototype uses an explicit schema registry and currently validates v0.1 only. It does not yet implement version-to-version migration dispatch, compatibility readers, retention, or quarantine UX.
+- Before any production or private-data use, add a second schema version and migration/compatibility tests; do not mutate the current v0.1 schema to smuggle in changed semantics.
 
 ## Required test matrix for the first migration
 
