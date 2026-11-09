@@ -26,6 +26,16 @@ def _claim_in_process(database_path, worker_id, result_queue):
         result_queue.put((worker_id, None, repr(exc)))
 
 
+def _append_with_lease_in_process(database_path, lease, now, event, result_queue):
+    try:
+        store = SQLiteEventStore(database_path)
+        with store.queued_write_context(lease, lambda: now):
+            store.append(event)
+        result_queue.put(None)
+    except Exception as exc:
+        result_queue.put(type(exc).__name__)
+
+
 PROJECT_ID = "project.queue"
 WORK_ID = "work.queue"
 NOW = "2026-04-16T12:00:00Z"
@@ -435,6 +445,16 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.queue.recover_expired("job.runtime", now=562, attest_no_live_worker=True)
         with self.assertRaisesRegex(ConcurrentWriteConflict, "requires its active execution lease context"):
             self.store.append(message("event.queue.output.after-fence"))
+        process_context = multiprocessing.get_context("spawn")
+        result_queue = process_context.Queue()
+        process = process_context.Process(
+            target=_append_with_lease_in_process,
+            args=(str(self.path), output_lease, 562, message("event.queue.output.detached-process"), result_queue),
+        )
+        process.start()
+        self.assertEqual(result_queue.get(timeout=20), "ConcurrentWriteConflict")
+        process.join(timeout=20)
+        self.assertEqual(process.exitcode, 0)
         ledger = RunLedger(self.store)
         with self.store.queued_write_context(output_lease, lambda: 562):
             with self.assertRaisesRegex(ConcurrentWriteConflict, "queue lease expired or changed"):
