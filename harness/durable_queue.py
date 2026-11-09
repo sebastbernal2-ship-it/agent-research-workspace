@@ -342,6 +342,8 @@ class SQLiteWorkQueue:
                 raise QueueError(f"unknown scheduled job {job_id!r}")
             if row["state"] != "recovery_required":
                 raise QueueError("job is not awaiting expired-lease recovery")
+            if now < row["updated_at"]:
+                raise QueueError("recovery time cannot precede the recorded lease-expiry observation")
             state = self.projector.replay(row["project_id"])
             target = self._post_lease_state(state, row["work_id"])
             conn.execute(

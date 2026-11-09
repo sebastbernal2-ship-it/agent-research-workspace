@@ -137,6 +137,10 @@ class SQLiteWorkQueueTests(unittest.TestCase):
         self.assertEqual(self.queue.get("job.first")["state"], "recovery_required")
         with self.assertRaisesRegex(QueueError, "explicit no-live-worker"):
             self.queue.recover_expired("job.first", now=212)
+        with self.assertRaisesRegex(QueueError, "cannot precede the recorded lease-expiry observation"):
+            self.queue.recover_expired(
+                "job.first", now=210, attest_no_live_worker=True,
+            )
         recovered = self.queue.recover_expired(
             "job.first", now=212, attest_no_live_worker=True,
         )
@@ -407,6 +411,43 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             Projector(self.store).replay(PROJECT_ID)["agentRuns"]["run.output.g1"]["status"], "interrupted",
         )
         self.assertEqual(len(self.store.events(PROJECT_ID)), 6)
+
+    async def test_queued_execution_rejects_canonical_write_after_expiry_before_recovery_poll(self):
+        coordinator = OrganizationCoordinator(self.store)
+        now = [700.0]
+
+        def execute(context):
+            now[0] = 711.0
+            self.control.open_question({
+                "recordType": "human_question", "schemaVersion": "0.1",
+                "projectId": PROJECT_ID, "questionId": "question.after-expiry",
+                "questionType": "clarification", "priority": "normal", "blocking": True,
+                "requestedBy": VP, "workIds": [WORK_ID], "runId": context.run_id,
+                "questionText": "Proceed?", "impact": "Must be gated.",
+                "options": [], "status": "open", "createdAt": NOW,
+            })
+            return ExecutionSignal.WAITING_HUMAN
+
+        def resolve(job):
+            descriptor = job["payload"]
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.expiry.g{job['leaseGeneration']}",
+                correlation_id=descriptor["correlationId"], actor=descriptor["actor"],
+                adapter=descriptor["adapter"], context_hash=descriptor["contextHash"],
+                verification_actor=descriptor["verificationActor"],
+                execute=execute, verify=lambda _: True,
+            )
+
+        with self.assertRaisesRegex(QueueError, "stale, expired"):
+            await coordinator.run_queued(
+                self.queue, "worker.expiring", resolve, lease_seconds=10,
+                clock=lambda: now[0],
+            )
+        self.assertNotIn("question.after-expiry", coordinator.projector.replay(PROJECT_ID)["questions"])
+        self.assertEqual(self.queue.get("job.runtime")["state"], "leased")
+        self.assertIsNone(self.queue.claim_next("worker.recovery", now=711, lease_seconds=10))
+        self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
 
     async def test_expired_active_job_requires_run_recovery_and_explicit_retry(self):
         coordinator = OrganizationCoordinator(self.store)

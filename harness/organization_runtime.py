@@ -179,14 +179,14 @@ class OrganizationCoordinator:
 
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            outcome = await self.run_work(
-                task,
-                queue_lease={
-                    "jobId": job["jobId"], "workerId": worker_id,
-                    "leaseToken": token, "leaseGeneration": generation,
-                },
-                lease_clock=clock,
-            )
+            lease_context = {
+                "jobId": job["jobId"], "workerId": worker_id,
+                "leaseToken": token, "leaseGeneration": generation,
+            }
+            with self.store.queued_write_context(lease_context, clock):
+                outcome = await self.run_work(
+                    task, queue_lease=lease_context, lease_clock=clock,
+                )
         except asyncio.CancelledError:
             try:
                 queue.release(job["jobId"], worker_id, token, generation, now=clock())

@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,6 +66,9 @@ class SQLiteEventStore:
             f"file:canonical-{uuid4().hex}?mode=memory&cache=shared"
             if self._uri else self.path
         )
+        self._queue_lease_context: ContextVar[dict[str, Any] | None] = ContextVar(
+            f"event_store_queue_lease_{id(self)}", default=None,
+        )
         self._memory_keeper: sqlite3.Connection | None = None
         if self._uri:
             self._memory_keeper = sqlite3.connect(
@@ -85,6 +90,17 @@ class SQLiteEventStore:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
         return conn
+
+    @contextmanager
+    def queued_write_context(self, lease: dict[str, Any], clock: Any):
+        """Require canonical writes in this execution context to carry its live lease fence."""
+        if not isinstance(lease, dict) or not callable(clock):
+            raise EventStoreError("queued write context requires lease data and a trusted clock")
+        token = self._queue_lease_context.set({**lease, "clock": clock})
+        try:
+            yield
+        finally:
+            self._queue_lease_context.reset(token)
 
     def _initialize(self) -> None:
         conn = self._connect()
@@ -256,32 +272,25 @@ class SQLiteEventStore:
         if any(not isinstance(event, dict) for event in events):
             raise EventStoreError("queue-claimed event batches must contain event objects")
         starts = [event for event in events if event.get("eventType") == "run.started"]
-        if len(starts) != 1:
-            raise EventStoreError("a queue lease must authorize exactly one run.started event")
-        start = starts[0]
-        payload = start.get("payload", {})
-        if not isinstance(payload, dict):
-            raise EventStoreError("queue-claimed run.started payload must be an object")
-        project_values = [event.get("projectId") for event in events]
-        if not all(isinstance(project_id, str) for project_id in project_values):
-            raise EventStoreError("queue-claimed event batches must be project-scoped")
-        project_ids = set(project_values)
-        if (
-            len(project_ids) != 1
-            or start.get("projectId") not in project_ids
-            or payload.get("queueJobId") != lease["jobId"]
-            or payload.get("leaseGeneration") != generation
-        ):
-            raise EventStoreError("run.started event does not match its queue lease claim")
+        if len(starts) > 1:
+            raise EventStoreError("a queue lease may authorize at most one run.started event per batch")
+        if starts:
+            start = starts[0]
+            payload = start.get("payload", {})
+            if not isinstance(payload, dict):
+                raise EventStoreError("queue-claimed run.started payload must be an object")
+            if payload.get("queueJobId") != lease["jobId"] or payload.get("leaseGeneration") != generation:
+                raise EventStoreError("run.started event does not match its queue lease claim")
         row = conn.execute(
             "SELECT project_id, work_id, state, lease_owner, lease_token, lease_generation, lease_expires_at "
             "FROM scheduled_work WHERE job_id=?",
             (lease["jobId"],),
         ).fetchone()
+        project_ids = {event.get("projectId") for event in events}
         if (
             row is None
-            or row["project_id"] != start["projectId"]
-            or row["work_id"] != payload.get("workId")
+            or (starts and (row["project_id"] != start["projectId"] or row["work_id"] != payload.get("workId")))
+            or any(project_id != row["project_id"] for project_id in project_ids)
             or row["state"] != "leased"
             or row["lease_owner"] != lease["workerId"]
             or row["lease_token"] != lease["leaseToken"]
@@ -289,7 +298,7 @@ class SQLiteEventStore:
             or row["lease_expires_at"] is None
             or row["lease_expires_at"] <= now
         ):
-            raise ConcurrentWriteConflict("queue lease expired or changed before canonical run start")
+            raise ConcurrentWriteConflict("queue lease expired or changed before canonical write")
 
     @staticmethod
     def _assert_active_run_fences(
@@ -372,7 +381,15 @@ class SQLiteEventStore:
                 "SELECT state, lease_generation FROM scheduled_work WHERE job_id=? AND project_id=?",
                 (fence["job_id"], project_id),
             ).fetchone()
-            if lease is None or lease["state"] != "leased" or lease["lease_generation"] != fence["lease_generation"]:
+            if (
+                lease is None or lease["state"] != "leased"
+                or lease["lease_generation"] != fence["lease_generation"]
+                or (
+                    queue_lease is not None
+                    and (fence["job_id"] != queue_lease.get("jobId")
+                         or fence["lease_generation"] != queue_lease.get("leaseGeneration"))
+                )
+            ):
                 raise ConcurrentWriteConflict("queued run lease was fenced before canonical output append")
 
     def append_many(
@@ -398,6 +415,17 @@ class SQLiteEventStore:
             raise EventStoreError("expected_sequence must be a nonnegative integer")
         conn = self._connect()
         results: list[AppendResult] = []
+        lease_context = self._queue_lease_context.get()
+        if lease_context is not None:
+            contextual_lease = {key: value for key, value in lease_context.items() if key != "clock"}
+            contextual_lease["now"] = lease_context["clock"]()
+            if queue_lease is not None and any(
+                queue_lease.get(key) != contextual_lease.get(key)
+                for key in ("jobId", "workerId", "leaseToken", "leaseGeneration")
+            ):
+                conn.close()
+                raise EventStoreError("explicit queue lease differs from the active execution lease")
+            queue_lease = contextual_lease
         try:
             conn.execute("BEGIN IMMEDIATE")
             queued_starts = [
@@ -479,6 +507,11 @@ class SQLiteEventStore:
                         ),
                     )
                 results.append(AppendResult(candidate, next_sequence, record_hash, False))
+            if lease_context is not None:
+                final_lease = {key: value for key, value in lease_context.items() if key != "clock"}
+                final_lease["now"] = lease_context["clock"]()
+                self._assert_queue_lease(conn, events, final_lease)
+                self._assert_active_run_fences(conn, events, final_lease)
             conn.execute("COMMIT")
             return results
         except sqlite3.IntegrityError as exc:
