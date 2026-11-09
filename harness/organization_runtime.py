@@ -439,7 +439,7 @@ class OrganizationCoordinator:
                 if current["status"] == "running":
                     self.control.transition_work(
                         task.project_id, task.work_id, "cancelled", actor=task.actor,
-                        reason="Adapter execution was cancelled.",
+                        reason="Adapter execution was cancelled.", run_id=task.run_id,
                     )
                 raise
             except Exception as exc:
@@ -506,6 +506,7 @@ class OrganizationCoordinator:
             self.control.transition_work(
                 task.project_id, task.work_id, "verifying", actor=task.verification_actor,
                 reason="Adapter output is canonical; begin the configured verification gate.",
+                run_id=task.run_id,
             )
         elif current_work["status"] != "verifying":
             return WorkOutcome(
@@ -523,6 +524,7 @@ class OrganizationCoordinator:
                 self.control.transition_work(
                     task.project_id, task.work_id, "cancelled", actor=task.verification_actor,
                     reason="Verification was cancelled after adapter output was persisted.",
+                    run_id=task.run_id,
                 )
             raise
         except Exception as exc:
@@ -539,7 +541,7 @@ class OrganizationCoordinator:
             )
         self.control.transition_work(
             task.project_id, task.work_id, "completed", actor=task.verification_actor,
-            reason="Configured verification gate passed.",
+            reason="Configured verification gate passed.", run_id=task.run_id,
         )
         return WorkOutcome(
             WorkflowStatus.COMPLETED, task.work_id, task.run_id,
@@ -551,7 +553,7 @@ class OrganizationCoordinator:
         if work["status"] == "running":
             self.control.transition_work(
                 task.project_id, task.work_id, "failed", actor=task.verification_actor,
-                reason=reason,
+                reason=reason, run_id=task.run_id,
             )
 
     def _fail_verifying_work(self, task: WorkExecution, reason: str) -> None:
@@ -559,7 +561,7 @@ class OrganizationCoordinator:
         if work["status"] == "verifying":
             self.control.transition_work(
                 task.project_id, task.work_id, "failed", actor=task.verification_actor,
-                reason=reason,
+                reason=reason, run_id=task.run_id,
             )
 
     @staticmethod

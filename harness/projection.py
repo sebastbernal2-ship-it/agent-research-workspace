@@ -239,6 +239,11 @@ class Projector:
                     ]
                     if incomplete:
                         raise ProjectionError(f"work item {work_id!r} cannot run before dependencies complete: {incomplete}")
+                run_id = payload.get("runId")
+                if run_id is not None:
+                    run = state["agentRuns"].get(run_id)
+                    if run is None or run["workId"] != work_id:
+                        raise ProjectionError("work status event run attribution does not match its work item")
                 if payload["to"] in {"completed", "failed", "cancelled"} and any(
                     run["workId"] == work_id and run["status"] == "running"
                     for run in state["agentRuns"].values()

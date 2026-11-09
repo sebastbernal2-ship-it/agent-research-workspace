@@ -140,6 +140,14 @@ class SQLiteEventStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS scheduled_work_one_open_per_work
                     ON scheduled_work(project_id, work_id)
                     WHERE state IN ('queued', 'leased', 'recovery_required');
+                CREATE TABLE IF NOT EXISTS queued_run_fences (
+                    project_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL,
+                    PRIMARY KEY(project_id, run_id)
+                );
                 CREATE TRIGGER IF NOT EXISTS canonical_blobs_no_update
                 BEFORE UPDATE ON canonical_blobs
                 BEGIN SELECT RAISE(ABORT, 'canonical blobs are immutable'); END;
@@ -148,6 +156,39 @@ class SQLiteEventStore:
                 BEGIN SELECT RAISE(ABORT, 'canonical blobs are immutable'); END;
                 """
             )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                historical = conn.execute(
+                    "SELECT project_id, event_json FROM canonical_events ORDER BY project_id, sequence"
+                ).fetchall()
+                for row in historical:
+                    event = json.loads(row["event_json"])
+                    payload = event.get("payload", {})
+                    if event.get("eventType") != "run.started" or "queueJobId" not in payload:
+                        continue
+                    if not {"runId", "workId", "queueJobId", "leaseGeneration"}.issubset(payload):
+                        raise IntegrityFailure("historical queued run start has incomplete fence metadata")
+                    binding = (
+                        row["project_id"], payload["runId"], payload["workId"],
+                        payload["queueJobId"], payload["leaseGeneration"],
+                    )
+                    existing = conn.execute(
+                        "SELECT work_id, job_id, lease_generation FROM queued_run_fences "
+                        "WHERE project_id=? AND run_id=?", binding[:2],
+                    ).fetchone()
+                    if existing is not None:
+                        if tuple(existing) != binding[2:]:
+                            raise IntegrityFailure("queued run fence metadata conflicts with canonical history")
+                    else:
+                        conn.execute(
+                            "INSERT INTO queued_run_fences "
+                            "(project_id, run_id, work_id, job_id, lease_generation) VALUES (?, ?, ?, ?, ?)",
+                            binding,
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             conn.close()
 
@@ -250,6 +291,90 @@ class SQLiteEventStore:
         ):
             raise ConcurrentWriteConflict("queue lease expired or changed before canonical run start")
 
+    @staticmethod
+    def _assert_active_run_fences(
+        conn: sqlite3.Connection,
+        events: list[dict[str, Any]],
+        queue_lease: dict[str, Any] | None = None,
+    ) -> None:
+        starts = {
+            event.get("payload", {}).get("runId"): event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("eventType") == "run.started"
+            and isinstance(event.get("payload"), dict)
+            and "queueJobId" in event["payload"]
+        }
+        run_work_refs: list[tuple[str, str, str | None]] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            run_id = payload.get("runId")
+            work_id = payload.get("workId")
+            if isinstance(run_id, str):
+                run_work_refs.append((event.get("projectId"), run_id, work_id if isinstance(work_id, str) else None))
+            record_hash = payload.get("recordHash")
+            question_ref = payload.get("questionRef")
+            referenced_hash = record_hash if isinstance(record_hash, str) else question_ref
+            if isinstance(referenced_hash, str) and event.get("eventType") in {
+                "artifact.registered", "evidence.registered", "human.question_opened",
+            }:
+                blob = conn.execute(
+                    "SELECT content FROM canonical_blobs WHERE content_hash=?", (referenced_hash,),
+                ).fetchone()
+                if blob is not None:
+                    try:
+                        record = json.loads(bytes(blob["content"]))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        record = None
+                    if isinstance(record, dict) and isinstance(record.get("runId"), str):
+                        record_work = record.get("workId")
+                        run_work_refs.append((
+                            event.get("projectId"), record["runId"],
+                            record_work if isinstance(record_work, str) else None,
+                        ))
+
+        for project_id, run_id, event_work_id in run_work_refs:
+            start_event = starts.get(run_id)
+            if start_event is not None:
+                start_payload = start_event["payload"]
+                if (
+                    queue_lease is None
+                    or start_payload.get("queueJobId") != queue_lease.get("jobId")
+                    or start_payload.get("leaseGeneration") != queue_lease.get("leaseGeneration")
+                    or (event_work_id is not None and event_work_id != start_payload.get("workId"))
+                ):
+                    raise EventStoreError("run output does not match its queued run-start lease")
+                continue
+            # Recovery may close an abandoned run after its lease has been fenced.
+            interrupted_finish = any(
+                event.get("eventType") == "run.finished"
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("runId") == run_id
+                and event["payload"].get("terminalStatus") == "interrupted"
+                for event in events if isinstance(event, dict)
+            )
+            if interrupted_finish:
+                continue
+            fence = conn.execute(
+                "SELECT work_id, job_id, lease_generation FROM queued_run_fences "
+                "WHERE project_id=? AND run_id=?",
+                (project_id, run_id),
+            ).fetchone()
+            if fence is None:
+                continue
+            if event_work_id is not None and event_work_id != fence["work_id"]:
+                raise EventStoreError("run output references work outside its queued lease assignment")
+            lease = conn.execute(
+                "SELECT state, lease_generation FROM scheduled_work WHERE job_id=? AND project_id=?",
+                (fence["job_id"], project_id),
+            ).fetchone()
+            if lease is None or lease["state"] != "leased" or lease["lease_generation"] != fence["lease_generation"]:
+                raise ConcurrentWriteConflict("queued run lease was fenced before canonical output append")
+
     def append_many(
         self,
         events: list[dict[str, Any]],
@@ -275,8 +400,17 @@ class SQLiteEventStore:
         results: list[AppendResult] = []
         try:
             conn.execute("BEGIN IMMEDIATE")
+            queued_starts = [
+                event for event in events
+                if isinstance(event, dict) and event.get("eventType") == "run.started"
+                and isinstance(event.get("payload"), dict)
+                and "queueJobId" in event["payload"]
+            ]
+            if queued_starts and queue_lease is None:
+                raise EventStoreError("queued run starts require an active queue lease claim")
             if queue_lease is not None:
                 self._assert_queue_lease(conn, events, queue_lease)
+            self._assert_active_run_fences(conn, events, queue_lease)
             if expected_sequence is not None:
                 project_ids = {event.get("projectId") for event in events}
                 if len(project_ids) != 1 or not all(isinstance(project_id, str) for project_id in project_ids):
@@ -335,6 +469,15 @@ class SQLiteEventStore:
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (project_id, next_sequence, event_id, idempotency_key, event_json, previous_hash, record_hash),
                 )
+                if candidate["eventType"] == "run.started" and "queueJobId" in candidate["payload"]:
+                    conn.execute(
+                        "INSERT INTO queued_run_fences "
+                        "(project_id, run_id, work_id, job_id, lease_generation) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            project_id, candidate["payload"]["runId"], candidate["payload"]["workId"],
+                            candidate["payload"]["queueJobId"], candidate["payload"]["leaseGeneration"],
+                        ),
+                    )
                 results.append(AppendResult(candidate, next_sequence, record_hash, False))
             conn.execute("COMMIT")
             return results
@@ -454,6 +597,8 @@ class SQLiteEventStore:
                 raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
             if row["project_id"] != next(iter(project_ids)):
                 raise EventStoreError("adapter receipt project does not match its invocation")
+            if row["state"] == "executing":
+                self._assert_active_run_fences(conn, normalized)
             if row["state"] in {"receipt_staged", "imported"}:
                 if row["receipt_hash"] != receipt_hash:
                     raise IdempotencyConflict(f"adapter invocation {invocation_id!r} returned a changed receipt")
@@ -687,16 +832,32 @@ class SQLiteEventStore:
 
         snapshot = SQLiteEventStore(destination_path)
         project_ids = snapshot._project_ids()
+        expected_fences: dict[tuple[str, str], tuple[str, str, int]] = {}
         for project_id in project_ids:
-            snapshot.verified_events(project_id)
+            for event in snapshot.verified_events(project_id):
+                payload = event.get("payload", {})
+                if event.get("eventType") == "run.started" and "queueJobId" in payload:
+                    expected_fences[(project_id, payload["runId"])] = (
+                        payload["workId"], payload["queueJobId"], payload["leaseGeneration"],
+                    )
         conn = snapshot._connect()
         try:
             blobs = conn.execute("SELECT content_hash, content FROM canonical_blobs").fetchall()
             invocations = conn.execute(
                 "SELECT invocation_id, state, receipt_json, receipt_hash FROM adapter_invocations"
             ).fetchall()
+            actual_fences = {
+                (row["project_id"], row["run_id"]): (
+                    row["work_id"], row["job_id"], row["lease_generation"],
+                )
+                for row in conn.execute(
+                    "SELECT project_id, run_id, work_id, job_id, lease_generation FROM queued_run_fences"
+                ).fetchall()
+            }
         finally:
             conn.close()
+        if actual_fences != expected_fences:
+            raise IntegrityFailure("backup queued-run fence table does not match canonical queued run starts")
         for blob in blobs:
             if hashlib.sha256(bytes(blob["content"])).hexdigest() != blob["content_hash"]:
                 raise IntegrityFailure(f"backup contains corrupt blob {blob['content_hash']}")

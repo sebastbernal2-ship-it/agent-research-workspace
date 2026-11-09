@@ -353,6 +353,50 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started["queueJobId"], "job.runtime")
         self.assertEqual(started["leaseGeneration"], 2)
 
+    async def test_stale_lease_cannot_append_run_attributed_output(self):
+        claim = self.queue.claim_next("worker.output", now=550, lease_seconds=10)
+        RunLedger(self.store).start(
+            PROJECT_ID, WORK_ID, run_id="run.output.g1", agent=SPECIALIST,
+            adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
+            occurred_at=NOW,
+            queue_lease={
+                "jobId": "job.runtime", "workerId": "worker.output",
+                "leaseToken": claim["leaseToken"], "leaseGeneration": 1, "now": 551,
+            },
+        )
+        content_ref, content_hash = self.store.put_blob("leased output")
+
+        def message(event_id):
+            return {
+                "recordType": "event", "schemaVersion": "0.1", "eventId": event_id,
+                "projectId": PROJECT_ID, "eventType": "discussion.message_added",
+                "actor": SPECIALIST, "occurredAt": NOW,
+                "causationId": None, "correlationId": "queue.integration",
+                "idempotencyKey": f"idem.{event_id}",
+                "payload": {
+                    "workId": WORK_ID, "threadId": "thread.queue", "messageType": "status",
+                    "contentRef": content_ref, "contentHash": content_hash,
+                    "runId": "run.output.g1", "visibleTo": ["agent.vp"],
+                },
+            }
+
+        self.store.append(message("event.queue.output.before-expiry"))
+        # Reopening reconstructs this operational fence from canonical run.started history.
+        conn = self.store._connect()
+        try:
+            conn.execute("DELETE FROM queued_run_fences")
+        finally:
+            conn.close()
+        self.store = SQLiteEventStore(self.path)
+        backup = self.path.with_name("queued-run-backup.sqlite3")
+        self.store.backup_to(backup)
+        self.assertEqual(SQLiteEventStore(backup).verified_events(PROJECT_ID)[-1]["eventId"], "event.queue.output.before-expiry")
+        self.assertIsNone(self.queue.claim_next("worker.new", now=561, lease_seconds=10))
+        self.queue.recover_expired("job.runtime", now=562, attest_no_live_worker=True)
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "lease was fenced"):
+            self.store.append(message("event.queue.output.after-fence"))
+        self.assertEqual(len(self.store.events(PROJECT_ID)), 5)
+
     async def test_expired_active_job_requires_run_recovery_and_explicit_retry(self):
         coordinator = OrganizationCoordinator(self.store)
         ledger = RunLedger(self.store)

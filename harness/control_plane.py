@@ -248,6 +248,7 @@ class ProjectControlPlane:
         actor: dict[str, str],
         reason: str = "",
         occurred_at: str | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         state = self.projector.replay(project_id)
         old = state["workItems"].get(work_id)
@@ -264,6 +265,10 @@ class ProjectControlPlane:
             ]
             if incomplete:
                 raise ControlPlaneError(f"work cannot start before dependencies complete: {incomplete}")
+        if run_id is not None:
+            run = state["agentRuns"].get(run_id)
+            if run is None or run["workId"] != work_id:
+                raise ControlPlaneError("work status run attribution must reference a run on that work item")
         if new_status in {"completed", "failed", "cancelled"} and any(
             run["workId"] == work_id and run["status"] == "running"
             for run in state["agentRuns"].values()
@@ -279,7 +284,11 @@ class ProjectControlPlane:
             project_id,
             "work.status_changed",
             actor,
-            {"workId": work_id, "from": old["status"], "to": new_status, "recordHash": record_hash, "reason": reason},
+            {
+                "workId": work_id, "from": old["status"], "to": new_status,
+                "recordHash": record_hash, "reason": reason,
+                **({"runId": run_id} if run_id is not None else {}),
+            },
             event_id=f"event.work.status.{work_id}.r{updated['revision']}",
             occurred_at=when,
         )
