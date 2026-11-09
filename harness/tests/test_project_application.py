@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from harness.capabilities import CapabilityAuthority
@@ -58,6 +59,19 @@ class ProjectApplicationTests(unittest.TestCase):
         with self.assertRaisesRegex(InboxForbidden, "membership"):
             self.app.get_project("project.other")
         self.assertEqual(self.membership.calls[-1][2], "project.read")
+
+    def test_work_creation_derives_creator_from_authenticated_principal(self):
+        record = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
+        record.update(
+            workId="work.created-through-application", title="Authenticated work",
+            revision=1, status="ready", createdBy=AGENT,
+        )
+        created = self.app.create_work(PROJECT_ID, record)
+        self.assertEqual(created["createdBy"], USER)
+        event = self.store.events(PROJECT_ID)[-1]
+        self.assertEqual(event["eventType"], "work.created")
+        self.assertEqual(event["actor"], USER)
+        self.assertEqual(self.membership.calls[-1][2], "work.create")
 
     def test_command_actor_comes_from_injected_principal(self):
         revised = self.app.revise_work(

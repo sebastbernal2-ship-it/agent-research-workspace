@@ -49,6 +49,14 @@ class ProjectApplication:
         state = self.projector.replay(project_id)
         return list(state["workItems"].values())
 
+    def create_work(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        actor = self._authorize(project_id, "work.create")
+        if not isinstance(record, dict) or record.get("projectId") != project_id:
+            raise ValueError("work item must target the authorized project")
+        work = dict(record)
+        work["createdBy"] = actor
+        return self.control.create_work(work, actor=actor)
+
     def revise_project_charter(
         self, project_id: str, charter: dict[str, Any], *, occurred_at: str | None = None,
     ) -> dict[str, Any]:
