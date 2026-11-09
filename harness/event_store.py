@@ -164,6 +164,12 @@ class SQLiteEventStore:
                     lease_generation INTEGER NOT NULL,
                     PRIMARY KEY(project_id, run_id)
                 );
+                CREATE TABLE IF NOT EXISTS queued_adapter_invocation_fences (
+                    invocation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL
+                );
                 CREATE TRIGGER IF NOT EXISTS canonical_blobs_no_update
                 BEFORE UPDATE ON canonical_blobs
                 BEGIN SELECT RAISE(ABORT, 'canonical blobs are immutable'); END;
@@ -565,6 +571,46 @@ class SQLiteEventStore:
         """Append one event; sequence is assigned transactionally if omitted."""
         return self.append_many([event], expected_sequence=expected_sequence)[0]
 
+    def _bind_adapter_invocation_lease(
+        self,
+        conn: sqlite3.Connection,
+        invocation_id: str,
+        project_id: str,
+        lease_context: dict[str, Any] | None,
+    ) -> None:
+        existing = conn.execute(
+            "SELECT project_id, job_id, lease_generation FROM queued_adapter_invocation_fences "
+            "WHERE invocation_id=?",
+            (invocation_id,),
+        ).fetchone()
+        if lease_context is None:
+            if existing is not None:
+                raise ConcurrentWriteConflict("queued adapter dispatch requires its active execution lease context")
+            return
+        lease = {key: value for key, value in lease_context.items() if key != "clock"}
+        lease["now"] = lease_context["clock"]()
+        if not isinstance(lease.get("jobId"), str) or not lease["jobId"]:
+            raise EventStoreError("queued adapter lease is missing its job identity")
+        job = conn.execute(
+            "SELECT project_id, state, lease_owner, lease_token, lease_generation, lease_expires_at "
+            "FROM scheduled_work WHERE job_id=?",
+            (lease["jobId"],),
+        ).fetchone()
+        if job is None or job["project_id"] != project_id:
+            raise ConcurrentWriteConflict("adapter invocation project does not match the active queue lease")
+        self._assert_queue_lease(conn, [], lease)
+        if existing is not None and (
+            existing["project_id"] != project_id
+            or existing["job_id"] != lease["jobId"]
+            or existing["lease_generation"] != lease["leaseGeneration"]
+        ):
+            raise ConcurrentWriteConflict("adapter invocation is already bound to a different lease")
+        conn.execute(
+            "INSERT OR IGNORE INTO queued_adapter_invocation_fences "
+            "(invocation_id, project_id, job_id, lease_generation) VALUES (?, ?, ?, ?)",
+            (invocation_id, project_id, lease["jobId"], lease["leaseGeneration"]),
+        )
+
     def prepare_adapter_invocation(
         self, invocation_id: str, project_id: str, request_hash: str,
     ) -> dict[str, Any]:
@@ -576,6 +622,7 @@ class SQLiteEventStore:
         if not isinstance(request_hash, str) or len(request_hash) != 64 or any(ch not in "0123456789abcdef" for ch in request_hash):
             raise EventStoreError("request_hash must be a SHA-256 digest")
         conn = self._connect()
+        lease_context = self._queue_lease_context.get()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -592,6 +639,9 @@ class SQLiteEventStore:
                 if row["project_id"] != project_id or row["request_hash"] != request_hash:
                     raise IdempotencyConflict(f"adapter invocation {invocation_id!r} was reused with a different request")
                 state = row["state"]
+            self._bind_adapter_invocation_lease(conn, invocation_id, project_id, lease_context)
+            if lease_context is not None:
+                self._bind_adapter_invocation_lease(conn, invocation_id, project_id, lease_context)
             conn.execute("COMMIT")
             return {"invocationId": invocation_id, "projectId": project_id, "requestHash": request_hash, "state": state}
         except Exception:
@@ -604,6 +654,7 @@ class SQLiteEventStore:
     def start_adapter_invocation(self, invocation_id: str) -> dict[str, Any]:
         """Mark a prepared invocation as dispatched; executing invocations are never auto-replayed."""
         conn = self._connect()
+        lease_context = self._queue_lease_context.get()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -611,6 +662,7 @@ class SQLiteEventStore:
             ).fetchone()
             if row is None:
                 raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
+            self._bind_adapter_invocation_lease(conn, invocation_id, row["project_id"], lease_context)
             dispatched = row["state"] == "prepared"
             if dispatched:
                 conn.execute(
@@ -620,6 +672,8 @@ class SQLiteEventStore:
                 state = "executing"
             else:
                 state = row["state"]
+            if lease_context is not None:
+                self._bind_adapter_invocation_lease(conn, invocation_id, row["project_id"], lease_context)
             conn.execute("COMMIT")
             return {
                 "invocationId": invocation_id, "projectId": row["project_id"],
@@ -668,6 +722,7 @@ class SQLiteEventStore:
                 raise EventStoreError(f"unknown adapter invocation {invocation_id!r}")
             if row["project_id"] != next(iter(project_ids)):
                 raise EventStoreError("adapter receipt project does not match its invocation")
+            self._bind_adapter_invocation_lease(conn, invocation_id, row["project_id"], lease_context)
             if row["state"] == "executing":
                 self._assert_active_run_fences(conn, normalized, queue_lease)
             if row["state"] in {"receipt_staged", "imported"}:
@@ -766,6 +821,8 @@ class SQLiteEventStore:
             if hashlib.sha256(receipt_json.encode("utf-8")).hexdigest() != row["receipt_hash"]:
                 raise IntegrityFailure(f"staged adapter receipt {invocation_id!r} failed its content hash")
             events = json.loads(receipt_json)["events"]
+            if not already_imported and lease_context is not None:
+                self._bind_adapter_invocation_lease(conn, invocation_id, row["project_id"], lease_context)
             if not already_imported:
                 if recovery_job_ids:
                     self._assert_recovery_receipt_fences(conn, events, recovery_job_ids)
@@ -1020,7 +1077,7 @@ class SQLiteEventStore:
         try:
             blobs = conn.execute("SELECT content_hash, content FROM canonical_blobs").fetchall()
             invocations = conn.execute(
-                "SELECT invocation_id, state, receipt_json, receipt_hash FROM adapter_invocations"
+                "SELECT invocation_id, project_id, state, receipt_json, receipt_hash FROM adapter_invocations"
             ).fetchall()
             actual_fences = {
                 (row["project_id"], row["run_id"]): (
@@ -1030,10 +1087,31 @@ class SQLiteEventStore:
                     "SELECT project_id, run_id, work_id, job_id, lease_generation FROM queued_run_fences"
                 ).fetchall()
             }
+            invocation_fences = conn.execute(
+                "SELECT invocation_id, project_id, job_id, lease_generation "
+                "FROM queued_adapter_invocation_fences"
+            ).fetchall()
+            queued_jobs = {
+                row["job_id"]: (row["project_id"], row["lease_generation"])
+                for row in conn.execute(
+                    "SELECT job_id, project_id, lease_generation FROM scheduled_work"
+                ).fetchall()
+            }
         finally:
             conn.close()
         if actual_fences != expected_fences:
             raise IntegrityFailure("backup queued-run fence table does not match canonical queued run starts")
+        invocation_projects = {row["invocation_id"]: row["project_id"] for row in invocations}
+        for fence in invocation_fences:
+            job = queued_jobs.get(fence["job_id"])
+            if (
+                invocation_projects.get(fence["invocation_id"]) != fence["project_id"]
+                or job is None or job[0] != fence["project_id"]
+                or job[1] < fence["lease_generation"]
+            ):
+                raise IntegrityFailure(
+                    f"backup queued adapter invocation fence is inconsistent for {fence['invocation_id']}"
+                )
         for blob in blobs:
             if hashlib.sha256(bytes(blob["content"])).hexdigest() != blob["content_hash"]:
                 raise IntegrityFailure(f"backup contains corrupt blob {blob['content_hash']}")

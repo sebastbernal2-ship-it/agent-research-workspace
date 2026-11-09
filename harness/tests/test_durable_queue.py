@@ -480,6 +480,21 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(self.store.events(PROJECT_ID)), 7)
 
+    async def test_adapter_dispatch_cannot_start_after_queue_lease_expiry(self):
+        lease = self.queue.claim_next("worker.dispatch", now=800, lease_seconds=10)
+        context = {
+            "jobId": "job.runtime", "workerId": "worker.dispatch",
+            "leaseToken": lease["leaseToken"], "leaseGeneration": 1,
+        }
+        with self.store.queued_write_context(context, lambda: 801):
+            self.store.prepare_adapter_invocation("invocation.expired-dispatch", PROJECT_ID, "b" * 64)
+        self.assertIsNone(self.queue.claim_next("worker.observe-expiry", now=811, lease_seconds=10))
+        with self.store.queued_write_context(context, lambda: 811):
+            with self.assertRaisesRegex(ConcurrentWriteConflict, "queue lease expired or changed"):
+                self.store.start_adapter_invocation("invocation.expired-dispatch")
+        invocation = self.store.get_adapter_invocation("invocation.expired-dispatch")
+        self.assertEqual(invocation["state"], "prepared")
+
     async def test_staged_receipt_import_requires_explicit_expired_lease_recovery(self):
         second_work = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
         second_work.update(
@@ -522,10 +537,13 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "leaseToken": second_claim["leaseToken"], "leaseGeneration": 1, "now": 651,
             },
         )
-        self.store.prepare_adapter_invocation("invocation.queued-receipt", PROJECT_ID, "a" * 64)
-        self.store.start_adapter_invocation("invocation.queued-receipt")
         with self.store.queued_write_context(output_lease, lambda: 652):
+            self.store.prepare_adapter_invocation("invocation.queued-receipt", PROJECT_ID, "a" * 64)
+            self.store.start_adapter_invocation("invocation.queued-receipt")
             self.store.stage_adapter_receipt("invocation.queued-receipt", [receipt_event])
+        backup_path = self.path.with_name("queued-invocation-backup.sqlite3")
+        self.store.backup_to(backup_path)
+        self.assertTrue(SQLiteEventStore(backup_path).verify(PROJECT_ID))
         self.assertIsNone(self.queue.claim_next("worker.recovery", now=661, lease_seconds=10))
         with self.assertRaisesRegex(ConcurrentWriteConflict, "requires its active execution lease context"):
             self.store.commit_adapter_receipt("invocation.queued-receipt")
