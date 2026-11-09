@@ -11,7 +11,7 @@ python3 -m pip install -r contracts/requirements-test.txt
 python3 -m ui.prototype.server
 ```
 
-Open <http://127.0.0.1:4173>. Stop the server with Ctrl-C. The service hard-binds to IPv4 loopback, accepts only its local host/origin, serves only the seeded synthetic project, disables CORS, bounds JSON requests, and requires a local-demo header for writes. It has **no real authentication** and is not a hardened or deployable service. Do not expose it through a LAN, tunnel, reverse proxy, or public host.
+Open <http://127.0.0.1:4173>. Stop the server with Ctrl-C. The service hard-binds to IPv4 loopback, accepts only its local host/origin, serves only the seeded synthetic project, disables CORS, bounds JSON requests, and requires a local-demo header for writes. Project summary reads now pass through `harness.ProjectApplication`, while inbox commands use `InboxApplication`; both receive the same fixed fake principal and demo allowlist. It has **no real authentication** and is not a hardened or deployable service. Do not expose it through a LAN, tunnel, reverse proxy, or public host.
 
 The SQLite database persists at `$XDG_STATE_HOME/northstar-ai-workspace-prototype/canonical.sqlite3`, or `~/.local/state/northstar-ai-workspace-prototype/canonical.sqlite3` when `XDG_STATE_HOME` is unset. Delete that demo directory while the server is stopped to reset the synthetic project. Startup refuses a database whose existing project is not the expected synthetic fixture.
 

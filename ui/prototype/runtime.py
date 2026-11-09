@@ -17,6 +17,7 @@ from harness.inbox import (
     PrincipalProvider,
 )
 from harness.projection import Projector
+from harness.project_application import ProjectApplication
 
 
 PROJECT_ID = "project.northstar"
@@ -60,11 +61,13 @@ class PrototypeRuntime:
         self._seed_if_empty()
         self.projector = Projector(self.store)
         self.inbox = InboxReadModel(self.store)
+        principal = LocalDemoPrincipal()
+        access_policy = SingleProjectDemoAccess()
         self.application = InboxApplication(
-            self.inbox,
-            self.control,
-            LocalDemoPrincipal(),
-            SingleProjectDemoAccess(),
+            self.inbox, self.control, principal, access_policy,
+        )
+        self.project_application = ProjectApplication(
+            self.control, principal, access_policy,
         )
 
     def _seed_if_empty(self) -> None:
@@ -200,9 +203,8 @@ class PrototypeRuntime:
         }
 
     def project_summary(self, project_id: str) -> dict[str, Any]:
-        self.application.authorize(project_id, "project.read")
+        project = self.project_application.get_project(project_id)
         state, events = self.projector.replay_snapshot(project_id)
-        project = state["project"]
         if project is None:
             raise InboxNotFound("project was not found")
         questions = list(state["questions"].values())
