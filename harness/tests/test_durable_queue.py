@@ -37,6 +37,14 @@ def _append_with_lease_in_process(database_path, lease, now, event, result_queue
         result_queue.put(type(exc).__name__)
 
 
+def _start_invocation_in_process(database_path, invocation_id, result_queue):
+    try:
+        SQLiteEventStore(database_path).start_adapter_invocation(invocation_id)
+        result_queue.put(None)
+    except Exception as exc:
+        result_queue.put(type(exc).__name__)
+
+
 PROJECT_ID = "project.queue"
 WORK_ID = "work.queue"
 NOW = "2026-04-16T12:00:00Z"
@@ -492,6 +500,16 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.store.queued_write_context(context, lambda: 811):
             with self.assertRaisesRegex(ConcurrentWriteConflict, "queue lease expired or changed"):
                 self.store.start_adapter_invocation("invocation.expired-dispatch")
+        process_context = multiprocessing.get_context("spawn")
+        result_queue = process_context.Queue()
+        process = process_context.Process(
+            target=_start_invocation_in_process,
+            args=(str(self.path), "invocation.expired-dispatch", result_queue),
+        )
+        process.start()
+        self.assertEqual(result_queue.get(timeout=20), "ConcurrentWriteConflict")
+        process.join(timeout=20)
+        self.assertEqual(process.exitcode, 0)
         invocation = self.store.get_adapter_invocation("invocation.expired-dispatch")
         self.assertEqual(invocation["state"], "prepared")
 
