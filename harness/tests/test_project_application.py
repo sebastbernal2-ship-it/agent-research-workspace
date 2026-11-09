@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from harness.capabilities import CapabilityAuthority
 from harness.control_plane import ProjectControlPlane
 from harness.event_store import SQLiteEventStore
 from harness.inbox import InboxForbidden
@@ -43,7 +44,10 @@ class ProjectApplicationTests(unittest.TestCase):
             self.store, project_id=PROJECT_ID, work_id=WORK_ID, occurred_at=NOW,
         )
         self.membership = Membership({PROJECT_ID})
-        self.app = ProjectApplication(self.control, Principal(USER), self.membership)
+        self.app = ProjectApplication(
+            self.control, Principal(USER), self.membership,
+            CapabilityAuthority(self.store, clock=lambda: NOW),
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -64,6 +68,24 @@ class ProjectApplicationTests(unittest.TestCase):
         self.assertEqual(event["eventType"], "work.revised")
         self.assertEqual(event["actor"], USER)
         self.assertEqual(self.membership.calls[-1][2], "work.revise")
+
+    def test_capability_approval_derives_authenticated_actor(self):
+        grant = self.app.grant_capability(PROJECT_ID, {
+            "recordType": "capability_grant", "schemaVersion": "0.1",
+            "projectId": PROJECT_ID, "grantId": "grant.application",
+            "revision": 1,
+            "subject": {"actorType": "agent", "actorId": "agent.researcher", "role": "specialist"},
+            "workIds": [WORK_ID], "capability": "source.fetch",
+            "resourceIds": ["resource.public"], "grantedBy": AGENT,
+            "createdAt": NOW, "expiresAt": "2026-04-17T12:00:00Z", "status": "active",
+        })
+        self.assertEqual(grant["grantedBy"], USER)
+        revoked = self.app.revoke_capability(
+            PROJECT_ID, "grant.application", reason="Scope no longer needed.", occurred_at=NOW,
+        )
+        self.assertEqual(revoked["revokedBy"], USER)
+        self.assertEqual(self.membership.calls[-2][2], "capability.grant")
+        self.assertEqual(self.membership.calls[-1][2], "capability.revoke")
 
     def test_agent_principal_and_unapproved_transitions_fail_closed(self):
         self.app.principal_provider = Principal(AGENT)

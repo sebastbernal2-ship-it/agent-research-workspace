@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .capabilities import CapabilityAuthority
 from .control_plane import ProjectControlPlane
 from .inbox import InboxForbidden, PrincipalProvider, ProjectAccessPolicy
 from .projection import Projector
@@ -21,11 +22,13 @@ class ProjectApplication:
         control_plane: ProjectControlPlane,
         principal_provider: PrincipalProvider,
         access_policy: ProjectAccessPolicy,
+        capability_authority: CapabilityAuthority | None = None,
     ):
         self.control = control_plane
         self.projector = Projector(control_plane.store)
         self.principal_provider = principal_provider
         self.access_policy = access_policy
+        self.capabilities = capability_authority or CapabilityAuthority(control_plane.store)
 
     def _authorize(self, project_id: str, action: str) -> dict[str, str]:
         actor = self.principal_provider.current_actor()
@@ -65,6 +68,29 @@ class ProjectApplication:
         actor = self._authorize(project_id, "work.revise")
         return self.control.revise_work(
             project_id, work_id, changes, actor=actor, occurred_at=occurred_at,
+        )
+
+    def grant_capability(
+        self, project_id: str, record: dict[str, Any],
+    ) -> dict[str, Any]:
+        actor = self._authorize(project_id, "capability.grant")
+        if not isinstance(record, dict) or record.get("projectId") != project_id:
+            raise ValueError("capability grant must target the authorized project")
+        approved = dict(record)
+        approved["grantedBy"] = actor
+        return self.capabilities.grant(approved, actor=actor)
+
+    def revoke_capability(
+        self,
+        project_id: str,
+        grant_id: str,
+        *,
+        reason: str,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        actor = self._authorize(project_id, "capability.revoke")
+        return self.capabilities.revoke(
+            project_id, grant_id, actor=actor, reason=reason, occurred_at=occurred_at,
         )
 
     def transition_work(
