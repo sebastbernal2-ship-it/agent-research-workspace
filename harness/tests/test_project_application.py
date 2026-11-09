@@ -5,7 +5,7 @@ from pathlib import Path
 
 from harness.capabilities import CapabilityAuthority
 from harness.control_plane import ProjectControlPlane
-from harness.event_store import SQLiteEventStore
+from harness.event_store import ConcurrentWriteConflict, SQLiteEventStore
 from harness.inbox import InboxForbidden
 from harness.project_application import ProjectApplication
 from harness.testing import seed_synthetic_project
@@ -74,6 +74,32 @@ class ProjectApplicationTests(unittest.TestCase):
         with self.assertRaisesRegex(InboxForbidden, "membership"):
             self.app.list_evidence(PROJECT_ID)
 
+    def test_work_approval_binds_to_current_revision_and_rejects_replay(self):
+        record = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
+        record.update(
+            workId="work.needs-approval", title="Approval-bound work", revision=1,
+            status="proposed", createdAt=NOW, updatedAt=NOW,
+        )
+        self.app.create_work(PROJECT_ID, record)
+        approved = self.app.transition_work(
+            PROJECT_ID, "work.needs-approval", "ready", reason="Approved exact revision.",
+            expected_revision=1, occurred_at=NOW,
+        )
+        self.assertEqual(approved["status"], "ready")
+        approval_event = self.store.events(PROJECT_ID)[-1]
+        self.assertEqual(approval_event["actor"], USER)
+        self.assertEqual(approval_event["payload"]["from"], "proposed")
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "stale revision"):
+            self.app.transition_work(
+                PROJECT_ID, "work.needs-approval", "ready", reason="Replay.",
+                expected_revision=1, occurred_at=NOW,
+            )
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "stale revision"):
+            self.control.transition_work(
+                PROJECT_ID, "work.needs-approval", "ready", actor=USER,
+                expected_revision=1, occurred_at=NOW,
+            )
+
     def test_work_creation_derives_creator_from_authenticated_principal(self):
         record = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
         record.update(
@@ -122,6 +148,7 @@ class ProjectApplicationTests(unittest.TestCase):
         self.app.principal_provider = Principal(USER)
         with self.assertRaisesRegex(ValueError, "only approve ready work or cancel"):
             self.app.transition_work(
-                PROJECT_ID, WORK_ID, "completed", reason="attempted approval", occurred_at=NOW,
+                PROJECT_ID, WORK_ID, "completed", reason="attempted approval",
+                expected_revision=1, occurred_at=NOW,
             )
         self.assertEqual(len(self.store.events(PROJECT_ID)), 2)

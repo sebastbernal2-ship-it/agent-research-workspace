@@ -10,6 +10,7 @@ from typing import Any
 
 from .capabilities import CapabilityAuthority
 from .control_plane import ProjectControlPlane
+from .event_store import ConcurrentWriteConflict
 from .inbox import InboxForbidden, PrincipalProvider, ProjectAccessPolicy
 from .projection import Projector
 
@@ -133,14 +134,22 @@ class ProjectApplication:
         new_status: str,
         *,
         reason: str,
+        expected_revision: int,
         occurred_at: str | None = None,
     ) -> dict[str, Any]:
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer")
         actions = {"ready": "work.approve", "cancelled": "work.cancel"}
         action = actions.get(new_status)
         if action is None:
             raise ValueError("users may only approve ready work or cancel work through this boundary")
         actor = self._authorize(project_id, action)
+        work = self.projector.replay(project_id)["workItems"].get(work_id)
+        if work is None:
+            raise KeyError(f"unknown work item {work_id!r}")
+        if work["revision"] != expected_revision:
+            raise ConcurrentWriteConflict("work approval/cancellation targets a stale revision")
         return self.control.transition_work(
             project_id, work_id, new_status, actor=actor,
-            reason=reason, occurred_at=occurred_at,
+            reason=reason, occurred_at=occurred_at, expected_revision=expected_revision,
         )

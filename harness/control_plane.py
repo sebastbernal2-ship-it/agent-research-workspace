@@ -7,7 +7,7 @@ from hashlib import sha256
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .event_store import EventStoreError, SQLiteEventStore
+from .event_store import ConcurrentWriteConflict, EventStoreError, SQLiteEventStore
 from .inbox import InboxReadModel
 from .projection import Projector, ProjectionError, WORK_STATUS_TRANSITIONS
 
@@ -249,11 +249,17 @@ class ProjectControlPlane:
         reason: str = "",
         occurred_at: str | None = None,
         run_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         state = self.projector.replay(project_id)
         old = state["workItems"].get(work_id)
         if old is None:
             raise ControlPlaneError(f"unknown work item {work_id!r}")
+        if expected_revision is not None:
+            if type(expected_revision) is not int or expected_revision < 1:
+                raise ValueError("expected_revision must be a positive integer")
+            if old["revision"] != expected_revision:
+                raise ConcurrentWriteConflict("work transition targets a stale revision")
         if old["status"] == new_status:
             return old
         if new_status not in _ALLOWED_WORK_TRANSITIONS.get(old["status"], set()):
