@@ -101,7 +101,12 @@ class OrganizationCoordinator:
         lease_seconds: float = 60,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        """Run a supervised local worker loop until asked to stop or an error occurs."""
+        """Run a supervised local worker loop until asked to stop or an error occurs.
+
+        A stop request prevents another claim but drains any job already claimed;
+        callers that need forced termination must cancel the task explicitly and
+        then follow the interrupted-run recovery procedure.
+        """
         if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)) or not 0.05 <= poll_interval <= 60:
             raise ValueError("poll_interval must be between 0.05 and 60 seconds")
         while not stop_event.is_set():
@@ -189,9 +194,13 @@ class OrganizationCoordinator:
                 )
         except asyncio.CancelledError:
             try:
-                queue.release(job["jobId"], worker_id, token, generation, now=clock())
+                queue.fail(job["jobId"], worker_id, token, generation, now=clock())
             except QueueError:
-                pass
+                # Lease loss or partial cancellation requires explicit recovery.
+                try:
+                    queue.abandon(job["jobId"], worker_id, token, generation, now=clock())
+                except QueueError:
+                    pass
             raise
         except Exception:
             queue.abandon(job["jobId"], worker_id, token, generation, now=clock())

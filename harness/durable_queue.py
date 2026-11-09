@@ -324,6 +324,46 @@ class SQLiteWorkQueue:
         finally:
             conn.close()
 
+    def fail(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        generation: int,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        """Close a leased job after canonical work is failed or cancelled."""
+        now = self._positive(now, "now")
+        conn = self.store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            self._assert_lease(row, worker_id, lease_token, generation, now)
+            state = self.projector.replay(row["project_id"])
+            work = state["workItems"].get(row["work_id"])
+            if work is None or work["status"] not in {"failed", "cancelled"}:
+                raise QueueError("a scheduled job can fail only after canonical work fails or is cancelled")
+            if any(
+                run["workId"] == row["work_id"] and run["status"] == "running"
+                for run in state["agentRuns"].values()
+            ):
+                raise QueueError("scheduled work still has active agent runs")
+            conn.execute(
+                "UPDATE scheduled_work SET state='failed', lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE job_id=?",
+                (now, job_id),
+            )
+            failed = conn.execute("SELECT * FROM scheduled_work WHERE job_id=?", (job_id,)).fetchone()
+            conn.execute("COMMIT")
+            return self._decode(failed)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def recover_expired(
         self,
         job_id: str,

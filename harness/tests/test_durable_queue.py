@@ -309,6 +309,79 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
 
+    async def test_forced_worker_cancellation_closes_canonical_cancelled_job(self):
+        started = asyncio.Event()
+
+        async def execute(_context):
+            started.set()
+            await asyncio.Event().wait()
+
+        def resolve(job):
+            descriptor = job["payload"]
+            return WorkExecution(
+                project_id=job["projectId"], work_id=job["workId"],
+                run_id=f"run.cancelled.{job['leaseGeneration']}",
+                correlation_id=descriptor["correlationId"], actor=descriptor["actor"],
+                adapter=descriptor["adapter"], context_hash=descriptor["contextHash"],
+                verification_actor=descriptor["verificationActor"], execute=execute,
+                verify=lambda _: True,
+            )
+
+        coordinator = OrganizationCoordinator(self.store)
+        worker = asyncio.create_task(coordinator.run_queued(
+            self.queue, "worker.cancel", resolve, lease_seconds=10,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        worker.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await worker
+        self.assertEqual(self.queue.get("job.runtime")["state"], "failed")
+        state = coordinator.projector.replay(PROJECT_ID)
+        self.assertEqual(state["workItems"][WORK_ID]["status"], "cancelled")
+        self.assertEqual(state["agentRuns"]["run.cancelled.1"]["status"], "cancelled")
+
+    async def test_worker_stop_drains_claimed_job_without_claiming_another(self):
+        second_work = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
+        second_work.update(
+            workId="work.queue.drain", title="Must remain queued after shutdown", revision=1,
+            status="ready", createdAt=NOW, updatedAt=NOW,
+        )
+        self.control.create_work(second_work)
+        self.queue.enqueue(
+            "job.runtime.drain", PROJECT_ID, "work.queue.drain", execution_descriptor(), now=101,
+        )
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        stop = asyncio.Event()
+
+        async def execute(_context):
+            started.set()
+            await finish.wait()
+            return ExecutionSignal.COMPLETED
+
+        def resolve(job):
+            descriptor = job["payload"]
+            return WorkExecution(
+                project_id=job["projectId"], work_id=job["workId"],
+                run_id=f"run.drain.{job['leaseGeneration']}",
+                correlation_id=descriptor["correlationId"], actor=descriptor["actor"],
+                adapter=descriptor["adapter"], context_hash=descriptor["contextHash"],
+                verification_actor=descriptor["verificationActor"],
+                execute=execute, verify=lambda _: True,
+            )
+
+        coordinator = OrganizationCoordinator(self.store)
+        worker = asyncio.create_task(coordinator.serve_queue(
+            self.queue, "worker.drain", resolve, stop,
+            poll_interval=0.05, lease_seconds=10,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        stop.set()
+        finish.set()
+        await asyncio.wait_for(worker, timeout=5)
+        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+        self.assertEqual(self.queue.get("job.runtime.drain")["state"], "queued")
+
     async def test_inbox_answer_resumes_persisted_job_with_a_fresh_run_generation(self):
         coordinator = OrganizationCoordinator(self.store)
 
