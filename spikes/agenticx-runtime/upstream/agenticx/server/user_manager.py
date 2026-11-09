@@ -1,0 +1,566 @@
+"""
+用户管理模块
+
+提供用户注册、登录验证和权限管理功能。
+使用 SQLite 存储用户数据。
+支持 JWT 生成与验证（需 PyJWT）。
+"""
+
+import logging
+import os
+import sqlite3
+import hashlib
+import secrets
+import json
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+#: 用户库文件名。位置的解析见 :func:`default_user_db_path`。
+_USER_DB_FILENAME = "users.db"
+
+try:
+    import jwt  # type: ignore
+    JWT_AVAILABLE = True
+except ImportError:
+    JWT_AVAILABLE = False
+
+
+class UserManager:
+    """用户管理器
+    
+    负责用户注册、登录验证和权限管理。
+    使用 SQLite 数据库存储用户信息。
+    """
+    
+    def __init__(self, db_path: Optional[str] = None, jwt_secret: Optional[str] = None):
+        """初始化用户管理器
+
+        Args:
+            db_path: SQLite 数据库文件路径；缺省走 :func:`default_user_db_path`
+            jwt_secret: JWT 签名密钥；缺省从 AGENTICX_JWT_SECRET 解析（见 jwt_secret.resolve_jwt_secret）
+        """
+        self.db_path = db_path or default_user_db_path()
+        self._jwt_secret_explicit = jwt_secret
+        self._jwt_secret: Optional[str] = None
+        self._init_database()
+
+    def _require_jwt_secret(self) -> str:
+        """Resolve and cache JWT signing secret (fail closed when unset)."""
+        if self._jwt_secret is None:
+            from agenticx.server.jwt_secret import resolve_jwt_secret
+
+            self._jwt_secret = resolve_jwt_secret(self._jwt_secret_explicit)
+        return self._jwt_secret
+    
+    def _init_database(self) -> None:
+        """初始化数据库表结构"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 用户表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                roles TEXT DEFAULT 'user',
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT
+            )
+        """)
+        
+        # 权限表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                resource TEXT NOT NULL,
+                action TEXT NOT NULL,
+                granted INTEGER DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                UNIQUE(user_id, resource, action)
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"[UserManager] Database initialized at {self.db_path}")
+    
+    def _hash_password(self, password: str) -> str:
+        """对密码进行哈希处理
+        
+        Args:
+            password: 原始密码
+            
+        Returns:
+            哈希后的密码
+        """
+        salt = secrets.token_hex(16)
+        password_hash = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt.encode('utf-8'),
+            100000
+        )
+        return f"{salt}:{password_hash.hex()}"
+    
+    def _verify_password(self, password: str, password_hash: str) -> bool:
+        """验证密码
+        
+        Args:
+            password: 原始密码
+            password_hash: 存储的哈希密码
+            
+        Returns:
+            密码是否正确
+        """
+        try:
+            salt, stored_hash = password_hash.split(':')
+            password_hash_check = hashlib.pbkdf2_hmac(
+                'sha256',
+                password.encode('utf-8'),
+                salt.encode('utf-8'),
+                100000
+            )
+            return password_hash_check.hex() == stored_hash
+        except Exception as e:
+            logger.error(f"[UserManager] Password verification error: {e}")
+            return False
+    
+    def register_user(
+        self,
+        email: str,
+        password: str,
+        username: Optional[str] = None,
+        roles: List[str] = None
+    ) -> Dict[str, Any]:
+        """注册新用户
+        
+        Args:
+            email: 用户邮箱
+            password: 用户密码
+            username: 用户名（可选，默认为邮箱前缀）
+            roles: 用户角色列表（可选，默认为 ['user']）
+            
+        Returns:
+            用户信息字典
+            
+        Raises:
+            ValueError: 如果邮箱已存在或参数无效
+        """
+        if not email or not password:
+            raise ValueError("Email and password are required")
+        
+        if len(password) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        
+        if username is None:
+            username = email.split("@")[0]
+        
+        if roles is None:
+            roles = ['user']
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # 检查邮箱是否已存在
+            cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+            if cursor.fetchone():
+                raise ValueError("Email already exists")
+            
+            # 创建用户
+            password_hash = self._hash_password(password)
+            created_at = datetime.now(timezone.utc).isoformat()
+            
+            cursor.execute("""
+                INSERT INTO users (email, username, password_hash, roles, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (email, username, password_hash, json.dumps(roles), created_at))
+            
+            user_id = cursor.lastrowid
+            
+            # 设置默认权限
+            self._set_default_permissions(cursor, user_id, roles)
+            
+            conn.commit()
+            
+            logger.info(f"[UserManager] User registered: {email}")
+            
+            return {
+                "id": user_id,
+                "email": email,
+                "username": username,
+                "roles": roles,
+                "is_active": True,
+                "created_at": created_at,
+            }
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            raise ValueError("Email already exists") from e
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"[UserManager] Registration error: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def _set_default_permissions(
+        self,
+        cursor: sqlite3.Cursor,
+        user_id: int,
+        roles: List[str]
+    ) -> None:
+        """设置用户默认权限
+        
+        Args:
+            cursor: 数据库游标
+            user_id: 用户ID
+            roles: 用户角色列表
+        """
+        # 默认权限：所有用户都可以访问自己的资源
+        default_permissions = [
+            ("projects", "read"),
+            ("projects", "write"),
+            ("chat", "read"),
+            ("chat", "write"),
+        ]
+        
+        # 管理员权限
+        if "admin" in roles:
+            admin_permissions = [
+                ("users", "read"),
+                ("users", "write"),
+                ("system", "read"),
+                ("system", "write"),
+            ]
+            default_permissions.extend(admin_permissions)
+        
+        for resource, action in default_permissions:
+            cursor.execute("""
+                INSERT OR IGNORE INTO permissions (user_id, resource, action, granted)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, resource, action, 1))
+    
+    def authenticate_user(self, email: str, password: str) -> Optional[Dict[str, Any]]:
+        """验证用户登录
+        
+        Args:
+            email: 用户邮箱
+            password: 用户密码
+            
+        Returns:
+            用户信息字典，如果验证失败返回 None
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT id, email, username, password_hash, roles, is_active
+                FROM users
+                WHERE email = ?
+            """, (email,))
+            
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"[UserManager] Login failed: email not found - {email}")
+                return None
+            
+            user_id, db_email, username, password_hash, roles_json, is_active = row
+            
+            if not is_active:
+                logger.warning(f"[UserManager] Login failed: user inactive - {email}")
+                return None
+            
+            if not self._verify_password(password, password_hash):
+                logger.warning(f"[UserManager] Login failed: invalid password - {email}")
+                return None
+            
+            roles = json.loads(roles_json) if roles_json else ['user']
+            
+            logger.info(f"[UserManager] User authenticated: {email}")
+            
+            return {
+                "id": user_id,
+                "email": db_email,
+                "username": username,
+                "roles": roles,
+                "is_active": True,
+            }
+        except Exception as e:
+            logger.error(f"[UserManager] Authentication error: {e}")
+            return None
+        finally:
+            conn.close()
+    
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """获取用户信息
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            用户信息字典，如果不存在返回 None
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT id, email, username, roles, is_active, created_at
+                FROM users
+                WHERE id = ?
+            """, (user_id,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            user_id, email, username, roles_json, is_active, created_at = row
+            roles = json.loads(roles_json) if roles_json else ['user']
+            
+            return {
+                "id": user_id,
+                "email": email,
+                "username": username,
+                "roles": roles,
+                "is_active": bool(is_active),
+                "created_at": created_at,
+            }
+        except Exception as e:
+            logger.error(f"[UserManager] Get user error: {e}")
+            return None
+        finally:
+            conn.close()
+    
+    def check_permission(
+        self,
+        user_id: int,
+        resource: str,
+        action: str
+    ) -> bool:
+        """检查用户权限
+        
+        Args:
+            user_id: 用户ID
+            resource: 资源名称
+            action: 操作名称
+            
+        Returns:
+            是否有权限
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # 检查用户角色
+            cursor.execute("SELECT roles FROM users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            
+            roles = json.loads(row[0]) if row[0] else []
+            
+            # 管理员拥有所有权限
+            if "admin" in roles:
+                return True
+            
+            # 检查具体权限
+            cursor.execute("""
+                SELECT granted FROM permissions
+                WHERE user_id = ? AND resource = ? AND action = ?
+            """, (user_id, resource, action))
+            
+            row = cursor.fetchone()
+            if row:
+                return bool(row[0])
+            
+            return False
+        except Exception as e:
+            logger.error(f"[UserManager] Permission check error: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def set_permission(
+        self,
+        user_id: int,
+        resource: str,
+        action: str,
+        granted: bool = True
+    ) -> bool:
+        """设置用户权限
+        
+        Args:
+            user_id: 用户ID
+            resource: 资源名称
+            action: 操作名称
+            granted: 是否授予权限
+            
+        Returns:
+            是否成功
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO permissions (user_id, resource, action, granted)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, resource, action, 1 if granted else 0))
+            
+            conn.commit()
+            logger.info(f"[UserManager] Permission set: user={user_id}, resource={resource}, action={action}, granted={granted}")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"[UserManager] Set permission error: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def update_user_roles(self, user_id: int, roles: List[str]) -> bool:
+        """更新用户角色
+        
+        Args:
+            user_id: 用户ID
+            roles: 新的角色列表
+            
+        Returns:
+            是否成功
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            updated_at = datetime.now(timezone.utc).isoformat()
+            cursor.execute("""
+                UPDATE users
+                SET roles = ?, updated_at = ?
+                WHERE id = ?
+            """, (json.dumps(roles), updated_at, user_id))
+            
+            conn.commit()
+            logger.info(f"[UserManager] User roles updated: user={user_id}, roles={roles}")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"[UserManager] Update roles error: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def generate_jwt(
+        self,
+        user_id: int,
+        email: str,
+        username: str,
+        roles: Optional[List[str]] = None,
+        tenant_id: Optional[str] = None,
+        expires_hours: float = 24.0,
+    ) -> Optional[str]:
+        """Generate JWT for authenticated user.
+
+        Args:
+            user_id: User ID
+            email: User email
+            username: Username
+            roles: User roles
+            tenant_id: Optional tenant ID for multi-tenant
+            expires_hours: Token expiry in hours
+
+        Returns:
+            JWT string, or None if PyJWT not installed
+        """
+        if not JWT_AVAILABLE:
+            logger.warning("PyJWT not installed. Install with: pip install agenticx[server]")
+            return None
+        secret = self._require_jwt_secret()
+        payload = {
+            "user_id": user_id,
+            "sub": str(user_id),
+            "email": email,
+            "username": username,
+            "roles": roles or ["user"],
+            "tenant_id": tenant_id,
+            "iat": datetime.now(timezone.utc),
+            "exp": datetime.now(timezone.utc) + timedelta(hours=expires_hours),
+        }
+        return jwt.encode(payload, secret, algorithm="HS256")
+
+    def verify_jwt(self, token: str) -> Optional[Dict[str, Any]]:
+        """Verify JWT and return payload.
+
+        Args:
+            token: JWT string
+
+        Returns:
+            Decoded payload dict, or None if invalid/expired/misconfigured
+        """
+        if not JWT_AVAILABLE:
+            return None
+        try:
+            secret = self._require_jwt_secret()
+        except RuntimeError as e:
+            logger.warning("JWT verify skipped: %s", e)
+            return None
+        try:
+            return jwt.decode(token, secret, algorithms=["HS256"])
+        except Exception as e:
+            logger.debug("JWT verify failed: %s", e)
+            return None
+
+
+# 全局用户管理器实例
+_user_manager: Optional[UserManager] = None
+
+
+def default_user_db_path() -> str:
+    """用户库的落盘位置。
+
+    原来的默认值是相对路径 ``"users.db"``——进程的 cwd 在哪就写到哪。换个目录启动服务，
+    用户看到的现象是「人全没了」（其实是又建了一个空库）；跑测试则会在仓库根目录留下
+    一个 users.db。同一份数据有几个副本、哪个是真的，全看当时是从哪个目录敲的命令。
+
+    优先级：环境变量 > cwd 里已有的老库 > ``~/.agenticx/users.db``。
+
+    中间那一档是给老部署留的：那儿要是已经躺着一个 users.db，就继续用它，不搬也不改。
+    直接改成新路径等于让他们的账号在升级后凭空消失——搬不搬由使用者决定，程序不替他
+    动数据。
+    """
+    override = str(os.environ.get("AGENTICX_USER_DB", "") or "").strip()
+    if override:
+        return override
+    legacy = Path.cwd() / _USER_DB_FILENAME
+    if legacy.exists():
+        logger.warning(
+            "[UserManager] 正在使用当前目录下的历史用户库 %s；"
+            "建议迁移到 ~/.agenticx/%s，否则换个目录启动服务就会读到另一个库。",
+            legacy,
+            _USER_DB_FILENAME,
+        )
+        return str(legacy)
+    target = Path.home() / ".agenticx" / _USER_DB_FILENAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return str(target)
+
+
+def get_user_manager(db_path: Optional[str] = None) -> UserManager:
+    """获取用户管理器实例（单例模式）
+    
+    Args:
+        db_path: 数据库文件路径；缺省走 :func:`default_user_db_path`
+        
+    Returns:
+        UserManager 实例
+    """
+    global _user_manager
+    if _user_manager is None:
+        _user_manager = UserManager(db_path)
+    return _user_manager

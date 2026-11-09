@@ -1,0 +1,378 @@
+:root {
+  --pixel-blast-primary: #d92f24;
+  --pixel-blast-secondary: #007d91;
+  --pixel-blast-tertiary: #ed512f;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  color-scheme: light;
+  /* Type scale. Nothing that has to be read goes below --text-xs; --text-2xs
+     is only for badges, tags and keyboard hints. */
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 22px;
+  --text-3xl: 28px;
+  /* PingFang SC stops at Semibold, so anything above 600 renders the same in
+     Chinese. Hierarchy comes from size and color, not from heavier weights. */
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --bg: #f3f6f8;
+  --sidebar: #e9eef1;
+  --surface: #f9fbfc;
+  --surface-raised: #ffffff;
+  --surface-hover: #edf2f4;
+  --surface-active: #e2e9ed;
+  --border: #d2dde2;
+  --border-strong: #b9c8cf;
+  --text: #26343c;
+  --text-soft: #50616a;
+  /* ≥4.5:1 on every light surface; small secondary text must stay readable. */
+  --muted: #5a6b75;
+  /* ≈3.3:1. Placeholders, disabled text and decorative icons only. */
+  --faint: #7d8d95;
+  --accent: #d45f52;
+  --accent-hover: #b94e45;
+  --accent-soft: #f7e3df;
+  --accent-contrast: #fffaf8;
+  /* Accent as text (≥4.5:1, also on --accent-soft) and as a filled button behind light text (≈4.6:1). */
+  --accent-text: #ad4840;
+  --accent-strong: #bd5047;
+  --accent-strong-hover: #a9463e;
+  --focus-ring: color-mix(in srgb, var(--accent) 72%, var(--surface-raised));
+  --scrollbar-thumb: rgb(38 52 60 / 0.22);
+  /* Status colors. The accent is for actions, selection and brand moments;
+     it never means "ready" or "done". */
+  --success: #2a7353;
+  --success-soft: #e6f4ec;
+  --warning: #9a5d08;
+  --warning-soft: #fdf1dc;
+  --danger: #b42318;
+  --danger-soft: #fdeceb;
+  --info: #2f6db3;
+  --info-soft: #e8f0fb;
+  --shadow: 0 12px 32px rgb(41 62 73 / 0.12);
+  --elev-1: 0 1px 2px rgb(32 48 58 / 0.06), 0 1px 1px rgb(32 48 58 / 0.04);
+  --elev-2: 0 4px 14px rgb(32 48 58 / 0.1), 0 1px 3px rgb(32 48 58 / 0.06);
+  --elev-3: 0 12px 30px rgb(32 48 58 / 0.14), 0 2px 6px rgb(32 48 58 / 0.06);
+  --radius-xs: 4px;
+  --radius-lg: 14px;
+  /* Layers, lowest to highest. */
+  --z-dropdown: 50;
+  --z-drawer: 60;
+  --z-overlay: 90;
+  --z-modal: 100;
+  --z-onboarding: 110;
+  --z-toast: 120;
+  --z-popover: 140;
+  --z-lightbox: 1000;
+  /* Motion. Enter with --ease-out, leave faster with --ease-in. */
+  --dur-press: 80ms;
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 240ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --shell-gradient: linear-gradient(145deg, #f1f8f7 0%, #e2efef 48%, #c9dde0 100%);
+  --onboarding-frame-gradient: linear-gradient(145deg, #dcefeb 0%, #9fc2ca 48%, #ddb5aa 100%);
+  --workspace-surface: #fbfcfd;
+  --workspace-shadow: 0 1px 2px rgb(41 62 73 / 0.08), 0 10px 28px rgb(41 62 73 / 0.08);
+  --radius-sm: 5px;
+  --radius: 8px;
+  --workspace-radius: 16px;
+  --shell-gutter: 10px;
+  --desktop-titlebar-height: 0px;
+  --sidebar-width: 276px;
+  --sidebar-collapsed-width: 68px;
+  --trace-panel-width: clamp(340px, 28vw, 520px);
+}
+
+:root[data-theme="dark"] {
+  --pixel-blast-primary: #ff836d;
+  --pixel-blast-secondary: #54f5ff;
+  --pixel-blast-tertiary: #ffa36f;
+  color-scheme: dark;
+  --bg: #111618;
+  --sidebar: #161c1e;
+  --surface: #1f2427;
+  --surface-raised: #262c2f;
+  --surface-hover: #2b3134;
+  --surface-active: #32393c;
+  --border: #3a4246;
+  --border-strong: #515b60;
+  --text: #e6ebed;
+  --text-soft: #c3cdd1;
+  --muted: #9aa6ab;
+  --faint: #808b90;
+  --accent: #d98568;
+  --accent-hover: #efa080;
+  --accent-soft: #3b2a24;
+  --accent-contrast: #1b110d;
+  --accent-text: #e2906f;
+  --accent-strong: #d98568;
+  --accent-strong-hover: #efa080;
+  --scrollbar-thumb: rgb(230 235 237 / 0.2);
+  --success: #6cc3a0;
+  --success-soft: #17302a;
+  --warning: #e0a54a;
+  --warning-soft: #35290f;
+  --danger: #f97066;
+  --danger-soft: #402326;
+  --info: #7fb0ea;
+  --info-soft: #172a40;
+  --shadow: 0 16px 42px rgb(0 0 0 / 0.42);
+  --elev-1: 0 1px 2px rgb(0 0 0 / 0.3);
+  --elev-2: 0 6px 18px rgb(0 0 0 / 0.32), 0 1px 3px rgb(0 0 0 / 0.24);
+  --elev-3: 0 14px 34px rgb(0 0 0 / 0.4), 0 2px 6px rgb(0 0 0 / 0.24);
+  /* The backdrop stays darker than the workspace card so the card reads as
+     raised, the same way it does in the light theme. */
+  --shell-gradient: linear-gradient(145deg, #1f292b 0%, #182124 48%, #111a1d 100%);
+  --onboarding-frame-gradient: linear-gradient(145deg, #4a696b 0%, #2e4751 52%, #775047 100%);
+  --workspace-surface: #1c2124;
+  --workspace-shadow: 0 0 0 1px rgb(255 255 255 / 0.05), 0 14px 34px rgb(0 0 0 / 0.32);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  margin: 0;
+  scrollbar-width: none;
+  scrollbar-color: transparent transparent;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+#app::-webkit-scrollbar,
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--text-md);
+  -webkit-font-smoothing: antialiased;
+}
+
+body.modal-open {
+  overflow: hidden;
+}
+
+body.trace-drawer-open {
+  overflow: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+button:disabled,
+input:disabled,
+textarea:disabled,
+select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.trace-panel-scroll,
+.settings-panel,
+.agent-home,
+.collapsed-group-menu-list,
+.trace-select-menu,
+.onboarding-slide > div,
+.trace-event-body pre {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+button svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+.app-shell {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  gap: var(--shell-gutter);
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: calc(var(--desktop-titlebar-height) + var(--shell-gutter)) var(--shell-gutter) var(--shell-gutter) 0;
+  overflow: hidden;
+  background: var(--shell-gradient);
+  color: var(--text);
+  transition: grid-template-columns 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.app-shell[data-platform="darwin"] {
+  --desktop-titlebar-height: 28px;
+}
+
+.app-shell[data-platform="darwin"]::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 2;
+  height: calc(var(--desktop-titlebar-height) + var(--shell-gutter));
+  -webkit-app-region: drag;
+}
+
+.app-shell.sidebar-collapsed {
+  grid-template-columns: var(--sidebar-collapsed-width) minmax(0, 1fr);
+}
+
+.app-shell.trace-panel-open {
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--trace-panel-width);
+}
+
+.app-shell.sidebar-collapsed.trace-panel-open {
+  grid-template-columns: var(--sidebar-collapsed-width) minmax(0, 1fr) var(--trace-panel-width);
+}
+
+.trace-panel-layer {
+  min-width: 0;
+  display: contents;
+}
+
+.run-trace-panel {
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 0;
+  border-left: 0;
+  border-radius: var(--workspace-radius);
+  background: var(--workspace-surface);
+  color: var(--text);
+  box-shadow: var(--workspace-shadow), -18px 0 38px rgb(41 62 73 / 0.09);
+}
+
+:root[data-theme="dark"] .run-trace-panel {
+  box-shadow: var(--workspace-shadow), -18px 0 42px rgb(0 0 0 / 0.28);
+}
+
+.trace-panel-scrim {
+  display: none;
+}
+
+.trace-panel-enter-active .run-trace-panel,
+.trace-panel-leave-active .run-trace-panel {
+  transition:
+    transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 0.16s ease-out;
+}
+
+.trace-panel-enter-from .run-trace-panel,
+.trace-panel-leave-to .run-trace-panel {
+  transform: translateX(24px);
+  opacity: 0;
+}
+
+.trace-panel-enter-active .trace-panel-scrim,
+.trace-panel-leave-active .trace-panel-scrim {
+  transition: opacity 0.18s ease-out;
+}
+
+.trace-panel-enter-from .trace-panel-scrim,
+.trace-panel-leave-to .trace-panel-scrim {
+  opacity: 0;
+}
+
+@media (min-width: 1180px) {
+  .trace-panel-leave-active {
+    position: fixed;
+    top: calc(var(--desktop-titlebar-height) + var(--shell-gutter));
+    right: var(--shell-gutter);
+    bottom: var(--shell-gutter);
+    z-index: 20;
+    display: block;
+    width: var(--trace-panel-width);
+    pointer-events: none;
+  }
+
+  .trace-panel-leave-active .run-trace-panel {
+    width: 100%;
+    height: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-shell,
+  .trace-panel-enter-active .run-trace-panel,
+  .trace-panel-leave-active .run-trace-panel,
+  .trace-panel-enter-active .trace-panel-scrim,
+  .trace-panel-leave-active .trace-panel-scrim {
+    transition: none;
+  }
+}
+
+.boot-state,
+.bridge-state {
+  grid-column: 1 / -1;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 32px;
+  text-align: center;
+}
+
+.boot-logo,
+.bridge-logo {
+  width: 74px;
+  height: 74px;
+  object-fit: contain;
+}
+
+.boot-state p,
+.bridge-state p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.bridge-state h1 {
+  margin: 4px 0 0;
+  font-size: var(--text-2xl);
+}

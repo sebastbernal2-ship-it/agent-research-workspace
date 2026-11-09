@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 680 318" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+      markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke"
+        stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="40" y="50" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="140" y="70" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="14" fill="#2C2C2A">概念割裂</text>
+  <text x="140" y="89" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">抽象各不相同，难复用</text>
+  <rect x="440" y="50" width="200" height="56" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+  <text x="540" y="70" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="14" fill="#2C2C2A">统一核心抽象</text>
+  <text x="540" y="89" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">学一次，处处复用</text>
+  <rect x="40" y="146" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="140" y="166" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="14" fill="#2C2C2A">难进生产</text>
+  <text x="140" y="185" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">缺监控、安全、隔离</text>
+  <rect x="440" y="146" width="200" height="56" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+  <text x="540" y="166" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="14" fill="#2C2C2A">生产级设计</text>
+  <text x="540" y="185" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">监控、安全、多租户内建</text>
+  <rect x="40" y="242" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="140" y="262" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="14" fill="#2C2C2A">供应商绑定</text>
+  <text x="140" y="281" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">模型与存储被写死</text>
+  <rect x="440" y="242" width="200" height="56" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+  <text x="540" y="262" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="14" fill="#2C2C2A">可插拔架构</text>
+  <text x="540" y="281" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">组件随需替换</text>
+  <rect x="290" y="146" width="100" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="340" y="174" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="15" fill="#2C2C2A">AgenticX</text>
+  <polyline points="240,90 285,160" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <polyline points="240,174 286,174" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <polyline points="240,258 285,188" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <polyline points="390,160 435,90" fill="none" stroke="#3B6D11" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <polyline points="390,174 435,174" fill="none" stroke="#3B6D11" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <polyline points="390,188 435,258" fill="none" stroke="#3B6D11" stroke-width="1.5" marker-end="url(#arrow)"/>
+</svg>

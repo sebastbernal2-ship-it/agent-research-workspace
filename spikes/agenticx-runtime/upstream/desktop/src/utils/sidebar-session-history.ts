@@ -1,0 +1,488 @@
+/** Pure helpers for left-sidebar session history (no React). */
+
+import { META_AGENT_DISPLAY_NAME } from "../constants/branding";
+import { isAutomationPaneAvatarId } from "./automation-pane";
+import { visibleMessagesForSession, type OwnedMessage } from "./message-ownership";
+
+export type SidebarSessionExecutionState = "idle" | "running" | "interrupted" | "failed";
+
+export type SidebarSessionRow = {
+  session_id: string;
+  avatar_id: string | null;
+  avatar_name?: string | null;
+  session_name: string | null;
+  updated_at: number;
+  created_at?: number;
+  pinned?: boolean;
+  archived?: boolean;
+  execution_state?: SidebarSessionExecutionState;
+  provider?: string;
+  model?: string;
+  session_mode?: "code_dev" | "daily_office";
+  parent_session_id?: string | null;
+};
+
+export type SidebarHistoryNode = {
+  row: SidebarSessionRow;
+  children: SidebarHistoryNode[];
+};
+
+export type SidebarSessionHistoryHint = {
+  activityAt: number;
+  running: boolean;
+};
+
+export type SidebarAutomationProgress = {
+  sessionId?: string | null;
+};
+
+/**
+ * Refresh the sidebar catalog after an automation run has a durable session.
+ * A queued notification has no durable session yet and is intentionally
+ * ignored. The mounted sidebar's existing polling reconciles the metadata.
+ */
+export function notifySidebarSessionCatalogChangedForAutomationProgress(
+  payload: SidebarAutomationProgress,
+  bump: () => void,
+): boolean {
+  if (!String(payload.sessionId ?? "").trim()) return false;
+  bump();
+  return true;
+}
+
+const PLACEHOLDER_SESSION_TITLES = new Set(
+  [
+    "微信会话",
+    "微信对话",
+    "微信聊天",
+    "飞书会话",
+    "飞书对话",
+    "新对话",
+    "新会话",
+    "new chat",
+    "new conversation",
+  ].map((s) => s.toLowerCase())
+);
+
+function sanitizeSessionDisplayText(input: string): string {
+  const raw = String(input || "");
+  if (!raw) return "";
+  const withReasoningLabel = raw
+    .replace(/<\s*think\s*>/gi, "思考：")
+    .replace(/<\s*\/\s*think\s*>/gi, "");
+  const compact = withReasoningLabel.replace(/\s+/g, " ").trim();
+  if (compact === "思考：") return "";
+  return compact;
+}
+
+function isPlaceholderSessionTitle(name: string): boolean {
+  const t = sanitizeSessionDisplayText(name).trim();
+  if (!t) return true;
+  const lower = t.toLowerCase();
+  if (PLACEHOLDER_SESSION_TITLES.has(lower)) return true;
+  if (t.startsWith("新会话") || t.startsWith("新对话")) return true;
+  if (lower.startsWith("new session") || lower.startsWith("new chat")) return true;
+  return false;
+}
+
+export function sidebarSessionLabel(
+  item: Pick<SidebarSessionRow, "session_id" | "session_name">,
+  opts?: { nestedChild?: boolean },
+): string {
+  let raw = sanitizeSessionDisplayText(item.session_name || "").trim();
+  if (opts?.nestedChild) {
+    raw = raw.replace(/\s*\(Fork\)\s*$/i, "").trim();
+  }
+  if (raw && !isPlaceholderSessionTitle(raw)) return raw;
+  const compact = item.session_id.replace(/-/g, "");
+  const hint = compact.slice(0, 8);
+  return hint ? `·${hint}` : item.session_id.slice(0, 6);
+}
+
+export function getSidebarSessionActivityTs(row: Pick<SidebarSessionRow, "updated_at" | "created_at">): number {
+  const updated = Number(row.updated_at ?? 0);
+  if (Number.isFinite(updated) && updated > 0) return updated;
+  const created = Number(row.created_at ?? 0);
+  return Number.isFinite(created) && created > 0 ? created : 0;
+}
+
+/** Relative activity label for sidebar history rows (unix seconds). */
+export function formatSidebarRelativeTime(tsSeconds: number, nowMs = Date.now()): string {
+  const ts = Number(tsSeconds);
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const diff = Math.max(0, nowMs / 1000 - ts);
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))} 个月前`;
+  return `${Math.floor(diff / (86400 * 365))} 年前`;
+}
+
+export function normalizeSidebarSessionRows(input: unknown): SidebarSessionRow[] {
+  if (!Array.isArray(input)) return [];
+  const rows: SidebarSessionRow[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const row = raw as Record<string, unknown>;
+    const sessionId = String(row.session_id ?? "").trim();
+    if (!sessionId) continue;
+    const avatarId = row.avatar_id == null ? null : String(row.avatar_id);
+    if (Boolean(row.archived)) continue;
+    const updatedAtRaw = Number(row.updated_at ?? 0);
+    const createdAtRaw = Number(row.created_at ?? updatedAtRaw);
+    const execRaw = String(row.execution_state ?? "idle").trim();
+    const execution_state: SidebarSessionExecutionState =
+      execRaw === "running" || execRaw === "interrupted" || execRaw === "failed"
+        ? execRaw
+        : "idle";
+    rows.push({
+      session_id: sessionId,
+      avatar_id: avatarId,
+      avatar_name: row.avatar_name == null ? null : String(row.avatar_name),
+      session_name: row.session_name == null ? null : String(row.session_name),
+      updated_at: Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : 0,
+      created_at: Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? createdAtRaw : undefined,
+      pinned: Boolean(row.pinned),
+      archived: Boolean(row.archived),
+      execution_state,
+      provider: typeof row.provider === "string" ? row.provider : "",
+      model: typeof row.model === "string" ? row.model : "",
+      session_mode:
+        row.session_mode === "code_dev" || row.session_mode === "daily_office"
+          ? row.session_mode
+          : undefined,
+      parent_session_id: (() => {
+        const parent = String(row.parent_session_id ?? "").trim();
+        return parent || undefined;
+      })(),
+    });
+  }
+  return sortSidebarSessionRows(rows);
+}
+
+/** Keep pin-first / activity-desc order after hint merge. */
+export function sortSidebarSessionRows(rows: SidebarSessionRow[]): SidebarSessionRow[] {
+  return [...rows].sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    const tsDiff = getSidebarSessionActivityTs(b) - getSidebarSessionActivityTs(a);
+    if (tsDiff !== 0) return tsDiff;
+    return b.session_id.localeCompare(a.session_id);
+  });
+}
+
+/**
+ * Merge optimistic send hints into listed rows.
+ * Once backend `updated_at` catches up, trust API `execution_state` (avoids stranded running).
+ */
+export function applySidebarSessionHistoryHints(
+  rows: readonly SidebarSessionRow[],
+  hints: Record<string, SidebarSessionHistoryHint>
+): SidebarSessionRow[] {
+  if (Object.keys(hints).length === 0) return [...rows];
+  const mapped = rows.map((item) => {
+    const hint = hints[item.session_id];
+    if (!hint) return item;
+    const apiActivity = Number(item.updated_at ?? 0);
+    const backendCaughtUp = apiActivity >= hint.activityAt - 2;
+    return {
+      ...item,
+      updated_at: Math.max(apiActivity, hint.activityAt),
+      execution_state:
+        !backendCaughtUp && hint.running
+          ? ("running" as const)
+          : item.execution_state ?? "idle",
+    };
+  });
+  return sortSidebarSessionRows(mapped);
+}
+
+export function resolveSidebarAvatarChipName(
+  row: Pick<SidebarSessionRow, "avatar_id" | "avatar_name">,
+  avatarNameById: Map<string, string>
+): string {
+  const aid = String(row.avatar_id ?? "").trim();
+  if (!aid) return META_AGENT_DISPLAY_NAME;
+  if (isAutomationPaneAvatarId(aid)) {
+    const fromRow = String(row.avatar_name ?? "").trim();
+    return fromRow || "定时任务";
+  }
+  if (aid.startsWith("group:")) {
+    // Prefer live group registry name so every session of the same group
+    // shares one chip (new sessions often omit avatar_name → used to show「群聊」).
+    const fromMap = String(avatarNameById.get(aid) ?? "").trim();
+    if (fromMap) return fromMap;
+    const fromRow = String(row.avatar_name ?? "").trim();
+    if (fromRow) return fromRow;
+    return "群聊";
+  }
+  const fromMap = avatarNameById.get(aid);
+  if (fromMap) return fromMap;
+  const fromRow = String(row.avatar_name ?? "").trim();
+  if (fromRow) return fromRow;
+  return aid.slice(0, 8);
+}
+
+/** Sidebar `activeAvatarId` only tracks real avatars — never group/automation pane ids. */
+export function activeAvatarIdForSidebarRow(avatarId: string | null | undefined): string | null {
+  const aid = String(avatarId ?? "").trim();
+  if (!aid) return null;
+  if (aid.startsWith("group:") || aid.startsWith("automation:")) return null;
+  return aid;
+}
+
+type SidebarPaneRef = {
+  id: string;
+  sessionId?: string;
+  avatarId?: string | null;
+};
+
+/**
+ * Resolve which pane should host a sidebar history open.
+ * Prefer an existing pane already bound to the session (avoids hijacking a
+ * same-avatar zombie pane), then fall back to avatar identity match.
+ */
+export function findPaneForSidebarSession(
+  panes: ReadonlyArray<SidebarPaneRef>,
+  row: Pick<SidebarSessionRow, "session_id" | "avatar_id">,
+  forcePaneId?: string
+): SidebarPaneRef | undefined {
+  if (forcePaneId) {
+    return panes.find((p) => p.id === forcePaneId);
+  }
+  const sid = String(row.session_id ?? "").trim();
+  const target = String(row.avatar_id ?? "").trim();
+  // Automation sessions are durable runs of a specific task. A session id can
+  // briefly be present in a regular pane while the run event is being handled;
+  // selecting by session first in that window would silently turn an old run
+  // into a Meta/Near conversation. Preserve the task identity when opening it.
+  if (isAutomationPaneAvatarId(target)) {
+    const bySessionAndAvatar = panes.find(
+      (p) =>
+        String(p.sessionId ?? "").trim() === sid &&
+        String(p.avatarId ?? "").trim() === target,
+    );
+    if (bySessionAndAvatar) return bySessionAndAvatar;
+    return panes.find((p) => String(p.avatarId ?? "").trim() === target);
+  }
+  if (sid) {
+    const bySession = panes.find((p) => String(p.sessionId ?? "").trim() === sid);
+    if (bySession) return bySession;
+  }
+  return panes.find((p) => String(p.avatarId ?? "").trim() === target);
+}
+
+/**
+ * Early-return is only safe when the pane already has *renderable* rows for
+ * this session. Raw `messages.length > 0` is insufficient: untagged / wrong
+ * `ownerSessionId` rows are filtered out and leave a blank chat (common on
+ * group panes after stream/reattach), while "open in new tab" still works
+ * because it bootstraps from disk into a fresh pane.
+ */
+export function sidebarSessionHasRenderableMessages(
+  messages: ReadonlyArray<OwnedMessage>,
+  sessionId: string
+): boolean {
+  return visibleMessagesForSession(messages, sessionId).length > 0;
+}
+
+export function startOfLocalDay(d = new Date()): number {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x.getTime() / 1000;
+}
+
+export type SidebarHistoryBuckets = {
+  pinned: SidebarSessionRow[];
+  today: SidebarSessionRow[];
+  earlier: SidebarSessionRow[];
+};
+
+/** Partition non-special rows into pinned / today / earlier. */
+export function bucketSidebarHistoryRows(
+  rows: readonly SidebarSessionRow[],
+  specialIds: ReadonlySet<string>,
+  nowSec = Date.now() / 1000
+): SidebarHistoryBuckets {
+  const todayStart = startOfLocalDay(new Date(nowSec * 1000));
+  const pinned: SidebarSessionRow[] = [];
+  const today: SidebarSessionRow[] = [];
+  const earlier: SidebarSessionRow[] = [];
+  for (const row of rows) {
+    if (specialIds.has(row.session_id)) continue;
+    if (row.pinned) {
+      pinned.push(row);
+      continue;
+    }
+    const ts = getSidebarSessionActivityTs(row);
+    if (ts >= todayStart) today.push(row);
+    else earlier.push(row);
+  }
+  return { pinned, today, earlier };
+}
+
+export function nestContinueSessionRows(
+  rows: readonly SidebarSessionRow[],
+): SidebarHistoryNode[] {
+  const list = [...rows];
+  const nodes = new Map<string, SidebarHistoryNode>();
+  for (const row of list) {
+    nodes.set(row.session_id, { row, children: [] });
+  }
+
+  const wouldCycle = (childId: string, parentId: string): boolean => {
+    let current = nodes.get(parentId);
+    let guard = 0;
+    while (current && guard < 16) {
+      if (current.row.session_id === childId) return true;
+      const next = String(current.row.parent_session_id ?? "").trim();
+      current = next ? nodes.get(next) : undefined;
+      guard += 1;
+    }
+    return false;
+  };
+
+  const attached = new Set<string>();
+  for (const row of list) {
+    const parent = String(row.parent_session_id ?? "").trim();
+    if (!parent || parent === row.session_id || !nodes.has(parent)) continue;
+    if (wouldCycle(row.session_id, parent)) continue;
+    nodes.get(parent)!.children.push(nodes.get(row.session_id)!);
+    attached.add(row.session_id);
+  }
+
+  const sortChildren = (items: SidebarHistoryNode[]) => {
+    items.sort((a, b) => {
+      const aTs = Number(a.row.created_at ?? a.row.updated_at ?? 0);
+      const bTs = Number(b.row.created_at ?? b.row.updated_at ?? 0);
+      if (aTs !== bTs) return aTs - bTs;
+      return a.row.session_id.localeCompare(b.row.session_id);
+    });
+    for (const item of items) sortChildren(item.children);
+  };
+
+  const roots = list
+    .filter((row) => !attached.has(row.session_id))
+    .map((row) => nodes.get(row.session_id)!);
+  for (const root of roots) sortChildren(root.children);
+  return roots;
+}
+
+export function flattenSidebarHistoryNodes(
+  nodes: readonly SidebarHistoryNode[],
+): SidebarSessionRow[] {
+  const out: SidebarSessionRow[] = [];
+  const walk = (node: SidebarHistoryNode) => {
+    out.push(node.row);
+    for (const child of node.children) walk(child);
+  };
+  for (const node of nodes) walk(node);
+  return out;
+}
+
+export function sidebarTreeActivityTs(node: SidebarHistoryNode): number {
+  return Math.max(
+    getSidebarSessionActivityTs(node.row),
+    ...node.children.map((child) => sidebarTreeActivityTs(child)),
+  );
+}
+
+export type SidebarHistoryNodeBuckets = {
+  pinned: SidebarHistoryNode[];
+  today: SidebarHistoryNode[];
+  earlier: SidebarHistoryNode[];
+};
+
+export function bucketSidebarHistoryNodes(
+  nodes: readonly SidebarHistoryNode[],
+  specialIds: ReadonlySet<string>,
+  nowSec = Date.now() / 1000,
+): SidebarHistoryNodeBuckets {
+  const todayStart = startOfLocalDay(new Date(nowSec * 1000));
+  const pinned: SidebarHistoryNode[] = [];
+  const today: SidebarHistoryNode[] = [];
+  const earlier: SidebarHistoryNode[] = [];
+  for (const node of nodes) {
+    if (specialIds.has(node.row.session_id)) continue;
+    if (node.row.pinned) {
+      pinned.push(node);
+      continue;
+    }
+    if (sidebarTreeActivityTs(node) >= todayStart) today.push(node);
+    else earlier.push(node);
+  }
+  return { pinned, today, earlier };
+}
+
+export function includeContinueSearchAncestors(
+  rows: readonly SidebarSessionRow[],
+  matched: ReadonlySet<string>,
+): SidebarSessionRow[] {
+  const byId = new Map(rows.map((row) => [row.session_id, row]));
+  const keep = new Set(matched);
+  for (const id of [...keep]) {
+    let current = byId.get(id);
+    let guard = 0;
+    while (current && guard < 16) {
+      const parent = String(current.parent_session_id ?? "").trim();
+      if (!parent || !byId.has(parent)) break;
+      keep.add(parent);
+      current = byId.get(parent);
+      guard += 1;
+    }
+  }
+  const childrenByParent = new Map<string, string[]>();
+  for (const row of rows) {
+    const parent = String(row.parent_session_id ?? "").trim();
+    if (!parent) continue;
+    const bucket = childrenByParent.get(parent) ?? [];
+    bucket.push(row.session_id);
+    childrenByParent.set(parent, bucket);
+  }
+  const addDescendants = (id: string) => {
+    for (const childId of childrenByParent.get(id) ?? []) {
+      if (keep.has(childId)) continue;
+      keep.add(childId);
+      addDescendants(childId);
+    }
+  };
+  for (const id of matched) addDescendants(id);
+  return rows.filter((row) => keep.has(row.session_id));
+}
+
+/** Filter key: `"all"` | `"__meta__"` | avatar_id | `group:<id>` */
+export function matchesSidebarAvatarFilter(
+  row: Pick<SidebarSessionRow, "avatar_id">,
+  filterAvatarId: string
+): boolean {
+  if (filterAvatarId === "all") return true;
+  const rowAid = String(row.avatar_id ?? "").trim();
+  if (filterAvatarId === "__meta__") return rowAid.length === 0;
+  return rowAid === String(filterAvatarId ?? "").trim();
+}
+
+export function parseDesktopBoundSessionId(bindings: Record<string, unknown> | undefined): string {
+  const desktop = bindings?.["_desktop"];
+  if (!desktop || typeof desktop !== "object") return "";
+  return String((desktop as Record<string, unknown>).session_id ?? "").trim();
+}
+
+export const SIDEBAR_HISTORY_PAGE_SIZE = 20;
+export const SIDEBAR_HISTORY_FILTER_KEY = "agx-sidebar-history-avatar-filter-v1";
+export const SIDEBAR_HISTORY_COLLAPSE_KEY = "agx-sidebar-history-collapse-v1";
+
+/** Loop-review IDs still needed for the currently visible sidebar rows. */
+export function sidebarLoopReviewFetchIds(
+  candidateIds: readonly string[],
+  alreadyFetched: ReadonlySet<string>,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of candidateIds) {
+    const id = String(raw || "").trim();
+    if (!id || seen.has(id) || alreadyFetched.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}

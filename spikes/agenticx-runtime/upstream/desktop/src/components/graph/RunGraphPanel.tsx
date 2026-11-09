@@ -1,0 +1,409 @@
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { i18n } from "../../i18n/i18n";
+import { Share2, X, RefreshCw } from "lucide-react";
+import type { ChatPane } from "../../store";
+import { useAppStore } from "../../store";
+import { isMetaLeaderAgentId } from "../../utils/display-name";
+import {
+  crewPhaseToGraphStatus,
+  resolveCrewSlots,
+  type CrewPhase,
+} from "../../utils/group-member-activity";
+import { GraphInterveneDock } from "./GraphInterveneDock";
+import {
+  buildInterveneBody,
+  EMPTY_PANE_GRAPH_STATE,
+  graphHasTaskNodes,
+  type GraphNodeSnapshot,
+  type GraphProjection,
+  type InterveneRequest,
+  type PaneGraphState,
+} from "./graph-types";
+import { agentIdFromNode, deriveRunningToolByAgent } from "./span-derive";
+import {
+  fetchGraphRun,
+  listGraphRunsForSession,
+  postGraphIntervene,
+  useGraphRunStore,
+} from "./useGraphRun";
+
+const RunGraphCanvas = lazy(() =>
+  import("./RunGraphCanvas").then((m) => ({ default: m.RunGraphCanvas })),
+);
+
+type Props = {
+  pane: ChatPane;
+  onClose: () => void;
+  tintColor?: string | null;
+  /** WorkPanel tab: hide duplicate title/close; tab bar owns chrome. */
+  embedded?: boolean;
+  groupAvatarIds?: string[];
+  groupActiveAgentIds?: string[];
+  groupActivityHint?: Record<string, string>;
+  groupMemberPhase?: Record<string, "waiting" | "failed">;
+};
+
+function overlayNodeStatus(
+  node: GraphNodeSnapshot,
+  phaseByAgent: Map<string, CrewPhase>,
+): GraphNodeSnapshot {
+  const aid = String(node.agent_id || agentIdFromNode(node.id) || "").trim();
+  if (!aid) return node;
+  const phase =
+    phaseByAgent.get(aid) ??
+    (isMetaLeaderAgentId(aid) ? phaseByAgent.get("__meta__") : undefined);
+  const mapped = crewPhaseToGraphStatus(phase ?? "idle");
+  if (!mapped) return node;
+  return { ...node, status: mapped };
+}
+
+function overlayCrewPhaseOnState(
+  state: PaneGraphState,
+  phaseByAgent: Map<string, CrewPhase>,
+): PaneGraphState {
+  if (phaseByAgent.size === 0) return state;
+  const nodes: Record<string, GraphNodeSnapshot> = {};
+  for (const [id, node] of Object.entries(state.nodes)) {
+    nodes[id] = overlayNodeStatus(node, phaseByAgent);
+  }
+  let projection: GraphProjection | null = state.projection;
+  if (projection) {
+    projection = {
+      ...projection,
+      agent_nodes: projection.agent_nodes.map((n) => overlayNodeStatus(n, phaseByAgent)),
+    };
+  }
+  return { ...state, nodes, projection };
+}
+
+export function RunGraphPanel({
+  pane,
+  onClose,
+  tintColor,
+  embedded = false,
+  groupAvatarIds = [],
+  groupActiveAgentIds = [],
+  groupActivityHint = {},
+  groupMemberPhase = {},
+}: Props) {
+  const { t } = useTranslation("workspace");
+  const apiBase = useAppStore((s) => s.apiBase);
+  const apiToken = useAppStore((s) => s.apiToken);
+  // Must use a stable empty object — `?? emptyPaneGraphState()` allocates every
+  // snapshot and trips React useSyncExternalStore into an infinite update loop.
+  const graphState = useGraphRunStore((s) => s.byPane[pane.id] ?? EMPTY_PANE_GRAPH_STATE);
+  const applySnapshot = useGraphRunStore((s) => s.applySnapshot);
+  const setSelected = useGraphRunStore((s) => s.setSelected);
+  const [busy, setBusy] = useState(false);
+  const [preferAgentView, setPreferAgentView] = useState(true);
+  const [forceBody, setForceBody] = useState<InterveneRequest | null>(null);
+  const [banner, setBanner] = useState<string | null>(null);
+  const groupId = useMemo(() => {
+    const avatarId = String(pane.avatarId || "").trim();
+    return avatarId.startsWith("group:") ? avatarId.slice("group:".length).trim() : "";
+  }, [pane.avatarId]);
+
+  const runId = pane.activeGraphRunId || graphState.runId;
+
+  const setActiveGraphRunId = useCallback(
+    (rid: string | null) => {
+      useAppStore.setState((s) => ({
+        panes: s.panes.map((row) =>
+          row.id === pane.id ? { ...row, activeGraphRunId: rid } : row,
+        ),
+      }));
+    },
+    [pane.id],
+  );
+
+  const refresh = useCallback(async () => {
+    if (!apiBase || !apiToken || !pane.sessionId) return;
+    try {
+      const runs = await listGraphRunsForSession(
+        apiBase,
+        apiToken,
+        pane.sessionId,
+        groupId,
+      );
+      const authorizedIds = new Set(runs.map((row) => row.run_id));
+      const rid = runId && authorizedIds.has(runId) ? runId : runs[0]?.run_id || null;
+      if (rid !== (pane.activeGraphRunId || null)) setActiveGraphRunId(rid);
+      if (!rid) {
+        useGraphRunStore.getState().resetPane(pane.id);
+        setBanner(null);
+        return;
+      }
+      const { run, projection } = await fetchGraphRun(
+        apiBase,
+        apiToken,
+        rid,
+        pane.sessionId,
+        groupId,
+      );
+      applySnapshot(pane.id, run, projection);
+      setBanner(null);
+    } catch (err) {
+      setBanner(err instanceof Error ? err.message : i18n.t("graph.loadFailed", { ns: "workspace" }));
+    }
+  }, [
+    apiBase,
+    apiToken,
+    applySnapshot,
+    groupId,
+    pane.activeGraphRunId,
+    pane.id,
+    pane.sessionId,
+    runId,
+    setActiveGraphRunId,
+  ]);
+
+  useEffect(() => {
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 4000);
+    return () => window.clearInterval(t);
+  }, [refresh]);
+
+  const selectedNodes: GraphNodeSnapshot[] = useMemo(() => {
+    const ids = graphState.selectedNodeIds;
+    const fromTasks = ids.map((id) => graphState.nodes[id]).filter(Boolean) as GraphNodeSnapshot[];
+    const fromAgents = (graphState.projection?.agent_nodes || []).filter((n) => ids.includes(n.id));
+    const map = new Map<string, GraphNodeSnapshot>();
+    for (const n of [...fromTasks, ...fromAgents]) map.set(n.id, n);
+    return [...map.values()];
+  }, [graphState.nodes, graphState.projection, graphState.selectedNodeIds]);
+
+  const intervene = useCallback(
+    async (body: InterveneRequest): Promise<{ ok: boolean; warnings: string[] }> => {
+      if (!apiBase || !apiToken || !runId) return { ok: false, warnings: [] };
+      setBusy(true);
+      try {
+        const res = await postGraphIntervene(
+          apiBase,
+          apiToken,
+          runId,
+          body,
+          pane.sessionId,
+          groupId,
+        );
+        if (res.status === 409) {
+          await refresh();
+          setBanner(i18n.t("graph.versionConflict", { ns: "workspace" }));
+          return { ok: false, warnings: ["version_conflict"] };
+        }
+        if (!res.ok) {
+          setBanner(res.error || i18n.t("graph.interveneFailed", { ns: "workspace" }));
+          return { ok: false, warnings: [] };
+        }
+        if (!res.warnings.includes("target_running")) {
+          await refresh();
+        }
+        return { ok: res.ok, warnings: res.warnings };
+      } finally {
+        setBusy(false);
+      }
+    },
+    [apiBase, apiToken, groupId, pane.sessionId, refresh, runId],
+  );
+
+  const runningToolByAgent = useMemo(
+    () => deriveRunningToolByAgent(graphState.toolStepsByNode),
+    [graphState.toolStepsByNode],
+  );
+  const crewPhaseByAgent = useMemo(() => {
+    const ids = ["__meta__", ...groupAvatarIds];
+    const slots = resolveCrewSlots({
+      avatarIds: ids,
+      messages: pane.messages ?? [],
+      activeAgentIds: groupActiveAgentIds,
+      activityHintById: groupActivityHint,
+      runningToolByAgent,
+      phaseOverrideById: groupMemberPhase,
+    });
+    const map = new Map<string, CrewPhase>();
+    for (const slot of slots) map.set(slot.agentId, slot.phase);
+    return map;
+  }, [
+    groupAvatarIds,
+    groupActiveAgentIds,
+    groupActivityHint,
+    groupMemberPhase,
+    pane.messages,
+    runningToolByAgent,
+  ]);
+  const displayState = useMemo(
+    () => overlayCrewPhaseOnState(graphState, crewPhaseByAgent),
+    [graphState, crewPhaseByAgent],
+  );
+
+  const hasRun = Boolean(runId && (Object.keys(graphState.nodes).length > 0 || graphState.projection));
+  // Presence / H2A·A2A social graphs are already expert nodes — hide the
+  // 专家/任务 toggle until a real Workforce task DAG exists.
+  const hasTaskNodes = useMemo(
+    () => graphHasTaskNodes(graphState.nodes),
+    [graphState.nodes],
+  );
+  // No tasks → show raw presence nodes (includes「你」); with tasks → honor toggle.
+  const effectivePreferAgentView = hasTaskNodes ? preferAgentView : false;
+
+  return (
+    <div
+      className="relative flex h-full min-h-0 w-full flex-col bg-[var(--shell-panel)]"
+      style={!embedded && tintColor ? { backgroundColor: tintColor } : undefined}
+    >
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-2.5 py-2">
+        {!embedded ? (
+          <>
+            <Share2 className="h-4 w-4 shrink-0 text-text-subtle" strokeWidth={1.8} />
+            <span className="text-[14px] font-medium text-text-strong">{t("graph.title")}</span>
+          </>
+        ) : null}
+        {hasTaskNodes ? (
+          <div
+            className={`inline-flex items-center gap-0.5 rounded-lg border border-border bg-surface-base p-0.5 ${
+              embedded ? "" : "ml-1"
+            }`}
+          >
+            <button
+              type="button"
+              className={`rounded-md px-2.5 py-1 text-[13px] font-medium transition ${
+                preferAgentView
+                  ? "bg-[var(--ui-btn-primary-bg)] text-white shadow-sm"
+                  : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+              }`}
+              onClick={() => setPreferAgentView(true)}
+              aria-pressed={preferAgentView}
+            >
+              {t("graph.experts")}
+            </button>
+            <button
+              type="button"
+              className={`rounded-md px-2.5 py-1 text-[13px] font-medium transition ${
+                !preferAgentView
+                  ? "bg-[var(--ui-btn-primary-bg)] text-white shadow-sm"
+                  : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+              }`}
+              onClick={() => setPreferAgentView(false)}
+              aria-pressed={!preferAgentView}
+            >
+              {t("graph.tasks")}
+            </button>
+          </div>
+        ) : null}
+        <button
+          type="button"
+          className={`rounded-md p-1.5 text-text-subtle hover:bg-surface-hover hover:text-text-strong ${
+            !hasTaskNodes && !embedded ? "ml-1" : ""
+          }`}
+          onClick={() => void refresh()}
+          title={t("graph.refresh")}
+          aria-label={t("graph.refreshAria")}
+        >
+          <RefreshCw className="h-4 w-4" strokeWidth={2} />
+        </button>
+        {!embedded ? (
+          <button
+            type="button"
+            className="ml-auto rounded p-1 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+            onClick={onClose}
+            title={t("graph.close")}
+            aria-label={t("graph.close")}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        ) : (
+          <div className="ml-auto" />
+        )}
+      </div>
+
+      {banner ? (
+        <div className="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-200">
+          {banner}
+        </div>
+      ) : null}
+
+      {hasRun && !hasTaskNodes ? (
+        <div className="shrink-0 border-b border-border px-2.5 py-1 text-[10px] leading-snug text-text-faint">
+          {t("graph.presenceHint")}
+        </div>
+      ) : null}
+
+      {!hasRun ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+          <Share2 className="h-8 w-8 text-text-faint" strokeWidth={1.4} />
+          <p className="text-[13px] text-text-subtle">{t("graph.empty")}</p>
+          <p className="text-[11px] leading-relaxed text-text-faint">
+            {t("graph.emptyHint")}
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="min-h-0 flex-1">
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center text-[12px] text-text-faint">
+                  {t("graph.loadingCanvas")}
+                </div>
+              }
+            >
+              <RunGraphCanvas
+                state={displayState}
+                preferAgentView={effectivePreferAgentView}
+                onSelectIds={(ids) => setSelected(pane.id, ids)}
+                onIntervene={intervene}
+                onRequestForceReassign={(body) => setForceBody(body)}
+              />
+            </Suspense>
+          </div>
+          <GraphInterveneDock
+            version={graphState.version}
+            selectedNodes={selectedNodes}
+            runStatus={graphState.status}
+            busy={busy}
+            onIntervene={async (body) => {
+              await intervene(body);
+            }}
+            onPauseRun={async () => {
+              await intervene(buildInterveneBody("pause", graphState.version, { payload: { scope: "run" } }));
+            }}
+            onResumeRun={async () => {
+              await intervene(buildInterveneBody("resume", graphState.version, { payload: { scope: "run" } }));
+            }}
+          />
+        </>
+      )}
+
+      {forceBody ? (
+        <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-sm rounded-lg border border-border bg-surface-card p-4 shadow-xl">
+            <p className="text-[13px] font-medium text-text-strong">{t("graph.reassignTitle")}</p>
+            <p className="mt-1 text-[12px] text-text-subtle">
+              {t("graph.reassignHint")}
+            </p>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded px-3 py-1.5 text-[12px] text-text-subtle hover:bg-surface-hover"
+                onClick={() => setForceBody(null)}
+              >
+                {t("cancel", { ns: "common" })}
+              </button>
+              <button
+                type="button"
+                className="rounded px-3 py-1.5 text-[12px] text-white"
+                style={{ background: "var(--ui-btn-primary-bg)" }}
+                onClick={() => {
+                  const body = forceBody;
+                  setForceBody(null);
+                  void intervene(body);
+                }}
+              >
+                {t("graph.confirmReassign")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}

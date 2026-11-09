@@ -1,0 +1,360 @@
+import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { ulid } from "ulid";
+import {
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  getSessionAuthFromCookies,
+  isAuthCookieSecure,
+} from "../../../../lib/session";
+import { refreshTokens } from "../../../../lib/auth-runtime";
+import { isChatSessionOwned } from "../../../../lib/chat-history";
+import { toChatHistoryContext } from "../../../../lib/chat-history-http";
+import { listAvailableModelsForUser } from "../../../../lib/admin-providers-reader";
+import { stripEmptyAssistantMessages } from "../../../../lib/chat-completion-sanitize";
+import { withCurrentTimeContext } from "../../../../lib/current-time";
+import { runWebSearchTurn } from "../../../../lib/web-search/tool-loop";
+import { loadTenantWebSearchConfig } from "../../../../lib/web-search/tenant-config";
+import { runDeepResearchTurn } from "../../../../lib/deep-research/orchestrator";
+import { resolvePortalLocaleFromCookies } from "../../../../lib/portal-locale";
+import { defaultArtifactStore } from "../../../../lib/deep-research/artifact-store";
+import { log } from "../../../../lib/observability/logger";
+import { withRequestLog } from "../../../../lib/observability/with-request-log";
+import { isPlatformFeatureAllowedForUser } from "../../../../lib/capability-packs-reader";
+import { applyAssignedSkillPrompt } from "../../../../lib/enterprise-skill-context";
+import type { PlatformFeature } from "@agenticx/config";
+
+function withSanitizedMessages(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) return body;
+  const cleaned = stripEmptyAssistantMessages(
+    body.messages as Array<{ role: string; content?: string | null; tool_calls?: unknown }>,
+  );
+  return {
+    ...body,
+    // Direct (non-web-search) turns still need clock grounding — same as Desktop/Kimi.
+    messages: withCurrentTimeContext(cleaned),
+  };
+}
+
+const GATEWAY_COMPLETIONS_URL =
+  process.env.GATEWAY_COMPLETIONS_URL ?? "http://127.0.0.1:8088/v1/chat/completions";
+
+/**
+ * Deep-research clarify alone can wait up to 5 minutes, then still needs plan/search
+ * time. Keep this above CLARIFY_TIMEOUT_MS in the deep-research orchestrator, and
+ * above TOTAL_BUDGET_MS (20m) plus headroom for network jitter.
+ */
+export const maxDuration = 1500;
+export const runtime = "nodejs";
+
+const FEATURE_DENIED_MESSAGE: Record<"web_search" | "deep_research", string> = {
+  web_search: "当前账号未开通联网搜索",
+  deep_research: "当前账号未开通深度研究",
+};
+
+/**
+ * 能力包已开始管这项功能、且这个人拿不到时拒绝。
+ *
+ * 查不动时放行：最可能的原因是租户还没跑迁移。没有任何包引用时
+ * isPlatformFeatureAllowedForUser 本身就是全员可用。查询出错也放行，
+ * 避免一次数据库抖动把全公司的搜索停掉。
+ */
+async function firstDeniedPlatformFeature(
+  userId: string,
+  email: string | undefined,
+  deptId: string | null | undefined,
+  feature: Extract<PlatformFeature, "web_search" | "deep_research">,
+): Promise<Response | null> {
+  const allowed = await isPlatformFeatureAllowedForUser(feature, userId, email, deptId).catch(
+    () => true,
+  );
+  if (allowed) return null;
+  return NextResponse.json(
+    { error: { code: "40303", message: FEATURE_DENIED_MESSAGE[feature] } },
+    { status: 403 },
+  );
+}
+
+export async function POST(request: Request) {
+  return withRequestLog("chat.completions", async (logCtx) => {
+  const auth = await getSessionAuthFromCookies();
+  if (!auth) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "40101",
+          message: "unauthorized",
+        },
+      },
+      { status: 401 }
+    );
+  }
+  const { session, accessToken } = auth;
+  let refreshToken = auth.refreshToken;
+
+  const chatSessionId = request.headers.get("x-chat-session-id")?.trim();
+  if (!chatSessionId) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "40001",
+          message: "missing chat session",
+        },
+      },
+      { status: 400 }
+    );
+  }
+
+  const traceId = logCtx.traceId;
+  logCtx.setUser({
+    userId: session.userId,
+    tenantId: session.tenantId,
+    sessionId: chatSessionId,
+  });
+
+  const ctx = toChatHistoryContext(session);
+  const owned = await isChatSessionOwned(ctx, chatSessionId);
+  if (!owned) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "40301",
+          message: "forbidden",
+        },
+      },
+      { status: 403 }
+    );
+  }
+
+  const rawBody = await request.text();
+  let providerHint = "";
+  let forwardBody = rawBody;
+  let focusedSkillId: string | null = null;
+  let enableWebSearch = false;
+  let enableDeepResearch = false;
+  let parsedBody: Record<string, unknown> | null = null;
+  // portal 把模型 id 编码为 "<provider>/<model>"；admin 配置好的 provider 与上游 endpoint 一一对应。
+  // gateway 用 model 字段查表，所以这里把 provider 拆出来放请求头，body.model 仅保留模型名。
+  try {
+    const parsed = JSON.parse(rawBody) as Record<string, unknown> & {
+      model?: string;
+      agenticx_web_search?: unknown;
+      agenticx_deep_research?: unknown;
+      agenticx_skill_id?: unknown;
+    };
+    enableWebSearch = parsed.agenticx_web_search === true;
+    enableDeepResearch = parsed.agenticx_deep_research === true;
+    focusedSkillId = typeof parsed.agenticx_skill_id === "string" ? parsed.agenticx_skill_id : null;
+    const {
+      agenticx_web_search: _stripWs,
+      agenticx_deep_research: _stripDr,
+      agenticx_skill_id: _stripSkill,
+      ...withoutFlag
+    } = parsed;
+    parsedBody = withoutFlag;
+
+    if (typeof parsed.model === "string" && parsed.model.includes("/")) {
+      // 服务端实时校验：用户/部门可见模型收窄后，禁止转发到已失效的模型（客户端未刷新前也不得放行）。
+      const effectiveModels = await listAvailableModelsForUser(session.userId, session.email, session.deptId ?? undefined);
+      const isVisible = effectiveModels.some((m) => m.id === parsed.model);
+      if (!isVisible) {
+        return NextResponse.json(
+          {
+            error: {
+              code: "40301",
+              message: "该模型已不在您的可见范围内，请刷新页面重新选择模型",
+            },
+          },
+          { status: 403 },
+        );
+      }
+
+      const [providerId, ...rest] = parsed.model.split("/");
+      const modelName = rest.join("/");
+      if (providerId && modelName) {
+        providerHint = providerId;
+        parsedBody = { ...withoutFlag, model: modelName };
+        forwardBody = JSON.stringify(parsedBody);
+      } else {
+        forwardBody = JSON.stringify(withoutFlag);
+      }
+    } else {
+      forwardBody = JSON.stringify(withoutFlag);
+    }
+  } catch {
+    // body 不是 JSON 时维持原样转发
+  }
+
+  logCtx.setMode(
+    enableDeepResearch ? "deep_research" : enableWebSearch ? "web_search" : "chat",
+  );
+
+  if (enableDeepResearch || enableWebSearch) {
+    const denied = await firstDeniedPlatformFeature(
+      session.userId,
+      session.email,
+      session.deptId,
+      enableDeepResearch ? "deep_research" : "web_search",
+    );
+    if (denied) return denied;
+  }
+
+  const gatewayHeaders: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${accessToken}`,
+    "x-tenant-id": session.tenantId,
+    "x-user-id": session.userId,
+    "x-dept-id": session.deptId ?? "",
+    "x-user-email": session.email,
+    "x-session-id": session.sessionId,
+    "x-agenticx-trace-id": traceId,
+    "x-agenticx-trace-step": "1",
+    "x-agenticx-trace-stage": "chat.answer",
+    ...(providerHint ? { "x-agenticx-provider": providerHint } : {}),
+  };
+
+  const withSkills = async (body: Record<string, unknown>) => {
+    const sanitized = withSanitizedMessages(body);
+    if (!Array.isArray(sanitized.messages)) return sanitized;
+    const messages = await applyAssignedSkillPrompt({
+      messages: sanitized.messages as Array<{ role: string; content?: string | null }>,
+      userId: session.userId,
+      email: session.email,
+      deptId: session.deptId,
+      focusedId: focusedSkillId,
+    });
+    return { ...sanitized, messages };
+  };
+
+  if (enableDeepResearch && parsedBody) {
+    const deepResearchRunId = ulid().toLowerCase();
+    logCtx.setRun(deepResearchRunId);
+    return runDeepResearchTurn(await withSkills(parsedBody), {
+      url: GATEWAY_COMPLETIONS_URL,
+      headers: gatewayHeaders,
+      signal: request.signal,
+      locale: await resolvePortalLocaleFromCookies(),
+      loadTenantConfig: () => loadTenantWebSearchConfig(session.tenantId),
+      artifactStore: defaultArtifactStore,
+      tenantId: session.tenantId,
+      userId: session.userId,
+      sessionId: chatSessionId,
+      runId: deepResearchRunId,
+      traceId,
+      refreshAccessToken: async () => {
+        if (!refreshToken) return null;
+        try {
+          const next = await refreshTokens(refreshToken);
+          refreshToken = next.refreshToken;
+          // Best-effort: attach rotated cookies on the (still-open) response.
+          // In-memory Bearer update for subsequent Gateway calls is what matters.
+          try {
+            const cookieStore = await cookies();
+            cookieStore.set(ACCESS_COOKIE, next.accessToken, {
+              httpOnly: true,
+              sameSite: "lax",
+              secure: isAuthCookieSecure(),
+              maxAge: next.expiresInSeconds,
+              path: "/",
+            });
+            cookieStore.set(REFRESH_COOKIE, next.refreshToken, {
+              httpOnly: true,
+              sameSite: "lax",
+              secure: isAuthCookieSecure(),
+              maxAge: 7 * 24 * 60 * 60,
+              path: "/",
+            });
+          } catch {
+            // Streaming responses may reject mid-flight cookie writes; ignore.
+          }
+          return { accessToken: next.accessToken };
+        } catch {
+          return null;
+        }
+      },
+    });
+  }
+
+  if (enableWebSearch && parsedBody) {
+    try {
+      return await runWebSearchTurn(await withSkills(parsedBody), {
+        url: GATEWAY_COMPLETIONS_URL,
+        headers: gatewayHeaders,
+        signal: request.signal,
+        loadTenantConfig: () => loadTenantWebSearchConfig(session.tenantId),
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "web search turn failed";
+      return NextResponse.json(
+        {
+          error: {
+            code: "50000",
+            message: `联网搜索对话失败：${detail}`,
+          },
+        },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (parsedBody) {
+    forwardBody = JSON.stringify(await withSkills(parsedBody));
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(GATEWAY_COMPLETIONS_URL, {
+      method: "POST",
+      headers: gatewayHeaders,
+      body: forwardBody,
+      signal: request.signal,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "gateway unreachable";
+    log("error", {
+      event: "chat.completions.gateway_unreachable",
+      trace_id: traceId,
+      error_message: detail,
+    });
+    return NextResponse.json(
+      {
+        error: {
+          code: "50301",
+          message: `Gateway 不可用（${GATEWAY_COMPLETIONS_URL}）：${detail}。请确认已执行 bash scripts/start-dev.sh 且 :8088 网关进程正常。`,
+          trace_id: traceId,
+        },
+      },
+      {
+        status: 503,
+        headers: { "x-agenticx-trace-id": traceId },
+      },
+    );
+  }
+
+  if (!upstream.ok) {
+    log("warn", {
+      event: "chat.completions.gateway_status",
+      trace_id: traceId,
+      status: upstream.status,
+    });
+    const errorBody = await upstream.text();
+    return new NextResponse(errorBody, {
+      status: upstream.status,
+      headers: {
+        "content-type": "application/json",
+        "x-agenticx-trace-id": traceId,
+      },
+    });
+  }
+
+  return new NextResponse(upstream.body, {
+    status: 200,
+    headers: {
+      "content-type": upstream.headers.get("content-type") ?? "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "x-agenticx-trace-id": traceId,
+    },
+  });
+  }, request);
+}

@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""Tool loop detection utilities for AgentRuntime.
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+
+@dataclass
+class LoopCheckResult:
+    stuck: bool
+    level: str
+    detector: str
+    message: str
+    nudge: Optional[str] = None
+
+
+class TurnSteerQueue:
+    """User follow-ups injected only at a round boundary.
+
+    Persistence happens before the text is returned for the model. A stop
+    discards anything not yet injected.
+    """
+
+    def __init__(self) -> None:
+        self._pending: List[str] = []
+
+    def enqueue(self, text: str) -> None:
+        cleaned = str(text or "").strip()
+        if cleaned:
+            self._pending.append(cleaned)
+
+    def discard(self) -> None:
+        self._pending.clear()
+
+    def drain(self, persist) -> List[str]:
+        """Persist each pending line. Failed writes stay queued."""
+
+        injected: List[str] = []
+        remaining: List[str] = []
+        for text in self._pending:
+            try:
+                ok = bool(persist(text))
+            except Exception:
+                ok = False
+            if ok:
+                injected.append(text)
+            else:
+                remaining.append(text)
+        self._pending = remaining
+        return injected
+
+
+class LoopDetector:
+    """Detect repeating tool call patterns with warning/critical levels."""
+
+    def __init__(
+        self,
+        *,
+        history_size: int = 30,
+        warning_threshold: int = 8,
+        critical_threshold: int = 15,
+    ) -> None:
+        self.history_size = max(8, history_size)
+        self.warning_threshold = max(3, warning_threshold)
+        self.critical_threshold = max(self.warning_threshold + 1, critical_threshold)
+        self._calls: Deque[Tuple[str, str]] = deque(maxlen=self.history_size)
+        self._progress_marks: Deque[bool] = deque(maxlen=self.history_size)
+        self._guard_rejections: Deque[str] = deque(maxlen=self.history_size)
+        self._last_success_fingerprint: Dict[str, str] = {}
+        self._last_result_digests: Dict[Tuple[str, str], str] = {}
+        self._file_edit_failures: Dict[str, int] = {}
+        self._latest_file_edit_failure: Optional[Tuple[str, str, int]] = None
+        self._plain_repeat_content: Optional[str] = None
+        self._plain_repeat_count = 0
+        self._length_truncation_count = 0
+
+    def reset(self) -> None:
+        """Clear per-turn detector state without changing configured thresholds."""
+        self._calls.clear()
+        self._progress_marks.clear()
+        self._guard_rejections.clear()
+        self._last_success_fingerprint.clear()
+        self._last_result_digests.clear()
+        self._file_edit_failures.clear()
+        self._latest_file_edit_failure = None
+        self._plain_repeat_content = None
+        self._plain_repeat_count = 0
+        self._length_truncation_count = 0
+
+    def note_assistant_round(
+        self,
+        content: str,
+        *,
+        had_tool_calls: bool,
+        length_truncated: bool = False,
+        tool_args_complete: bool = True,
+    ) -> Optional[LoopCheckResult]:
+        """Count identical plain answers, including empty ones, and length cuts.
+
+        A round that issued tool calls clears the plain-text streak. Incomplete
+        tool arguments cut off by the completion cap stop the turn instead of
+        treating the preamble as the answer.
+        """
+
+        if had_tool_calls:
+            self._plain_repeat_content = None
+            self._plain_repeat_count = 0
+        else:
+            text = content if isinstance(content, str) else str(content or "")
+            if self._plain_repeat_content == text:
+                self._plain_repeat_count += 1
+            else:
+                self._plain_repeat_content = text
+                self._plain_repeat_count = 1
+            if self._plain_repeat_count >= self.critical_threshold:
+                return LoopCheckResult(
+                    stuck=True,
+                    level="critical",
+                    detector="plain_repeat",
+                    message="连续相同正文，包含空回复。",
+                    nudge="请给出完整正文。",
+                )
+
+        if length_truncated and not tool_args_complete:
+            self._length_truncation_count += 1
+        else:
+            self._length_truncation_count = 0
+        if self._length_truncation_count >= self.critical_threshold:
+            return LoopCheckResult(
+                stuck=True,
+                level="critical",
+                detector="length_truncated_tools",
+                message="连续在工具参数处被长度截断。",
+                nudge=None,
+            )
+        return None
+
+    @staticmethod
+    def args_signature(arguments: Dict[str, Any]) -> str:
+        try:
+            return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(arguments)
+
+    @staticmethod
+    def fingerprint_from_result(result: str) -> str:
+        """Short ASCII-ish token fingerprint from a tool result body (paths/URLs)."""
+        if not result or not isinstance(result, str):
+            return ""
+        found: List[str] = []
+        blob = result[:6000]
+        for m in re.finditer(r"(https?://[^\s<]+|/[\w./+\-]{3,})", blob):
+            tok = m.group(0).rstrip(").,;'\"]")
+            if tok and tok not in found:
+                found.append(tok[:120])
+            if len(found) >= 4:
+                break
+        joined = "; ".join(found)
+        return joined[:256]
+
+    @staticmethod
+    def is_guard_rejection(result: str) -> bool:
+        text = str(result or "").strip().lower()
+        if not text.startswith("error"):
+            return False
+        return "guard rejected" in text or "安全策略拦截" in text
+
+    @staticmethod
+    def _file_edit_path(args_signature: str) -> str:
+        try:
+            parsed = json.loads(args_signature)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            path = str(parsed.get("path", "") or "").strip()
+            if path:
+                try:
+                    return str(Path(path).expanduser().resolve(strict=False))
+                except Exception:
+                    return path
+        return "(unknown path)"
+
+    @staticmethod
+    def _file_edit_error_code(result_text: Optional[str]) -> Optional[str]:
+        text = str(result_text or "").strip()
+        lower = text.lower()
+        if not lower.startswith("error:"):
+            return None
+        if "file_edit_stale_snapshot" in lower or "modified on disk" in lower:
+            return "file_edit_stale_snapshot"
+        if "file_edit_old_text_not_found" in lower or (
+            "old_text" in lower and "not found" in lower
+        ):
+            return "file_edit_old_text_not_found"
+        if "cannot be empty" in lower or "occurrence must be" in lower or "file not found" in lower:
+            return "file_edit_invalid_arguments"
+        if "write failed" in lower:
+            return "file_edit_write_failed"
+        return "file_edit_error"
+
+    def _record_file_edit_outcome(
+        self,
+        tool_name: str,
+        args_signature: str,
+        result_text: Optional[str],
+    ) -> None:
+        self._latest_file_edit_failure = None
+        if tool_name != "file_edit":
+            return
+        path = self._file_edit_path(args_signature)
+        error_code = self._file_edit_error_code(result_text)
+        if error_code is None:
+            self._file_edit_failures.pop(path, None)
+            return
+        count = self._file_edit_failures.get(path, 0) + 1
+        self._file_edit_failures[path] = count
+        self._latest_file_edit_failure = (path, error_code, count)
+
+    def has_seen_result(
+        self,
+        tool_name: str,
+        args_signature: str,
+        result_digest: str,
+    ) -> bool:
+        digest = str(result_digest or "").strip()
+        if not digest:
+            return False
+        return self._last_result_digests.get((tool_name, args_signature)) == digest
+
+    def record_call(
+        self,
+        tool_name: str,
+        args_signature: str,
+        *,
+        has_progress: bool,
+        result_fingerprint: Optional[str] = None,
+        result_text: Optional[str] = None,
+        result_digest: Optional[str] = None,
+    ) -> None:
+        self._calls.append((tool_name, args_signature))
+        self._progress_marks.append(bool(has_progress))
+        self._record_file_edit_outcome(tool_name, args_signature, result_text)
+        if result_text and self.is_guard_rejection(result_text):
+            self._guard_rejections.append(tool_name)
+        if result_fingerprint:
+            snap = result_fingerprint[:256]
+            if snap:
+                self._last_success_fingerprint[tool_name] = snap
+        digest = str(result_digest or "").strip()
+        if digest:
+            self._last_result_digests[(tool_name, args_signature)] = digest
+
+    def _nudge_for_tool(self, tool_name: str) -> Optional[str]:
+        fp = self._last_success_fingerprint.get(tool_name)
+        if not fp:
+            return None
+        text = (
+            f"同名工具「{tool_name}」最近一次成功产出含：{fp}。"
+            "若当前为重试怪圈，请先复用上一步结果而非忽略。"
+        )
+        return text[:200]
+
+    def _with_nudge(self, tool_name: str, result: LoopCheckResult) -> LoopCheckResult:
+        nudge = self._nudge_for_tool(tool_name)
+        if not nudge:
+            return result
+        return LoopCheckResult(
+            stuck=result.stuck,
+            level=result.level,
+            detector=result.detector,
+            message=result.message,
+            nudge=nudge,
+        )
+
+    def check(self) -> Optional[LoopCheckResult]:
+        for detector in (
+            self._detect_guard_rejection_loop,
+            self._detect_file_edit_failure,
+            self._detect_generic_repeat,
+            self._detect_ping_pong,
+            self._detect_no_progress,
+            self._detect_tool_saturation,
+        ):
+            result = detector()
+            if result is not None:
+                return result
+        return None
+
+    def _detect_file_edit_failure(self) -> Optional[LoopCheckResult]:
+        latest = self._latest_file_edit_failure
+        if latest is None:
+            return None
+        path, error_code, count = latest
+        if count >= 2:
+            return LoopCheckResult(
+                stuck=True,
+                level="critical",
+                detector="file_edit_failure",
+                message=(
+                    f"同一文件的 file_edit 已失败 {count} 次（{error_code}, path={path}）。"
+                    "已停止继续编辑，避免重复消耗；请基于当前文件内容重新规划后再试。"
+                ),
+            )
+        return LoopCheckResult(
+            stuck=True,
+            level="warning",
+            detector="file_edit_failure",
+            message=(
+                f"file_edit 首次失败（{error_code}, path={path}）。"
+                "下一步必须先用 file_read 读取目标范围，再根据当前内容构造最小补丁。"
+            ),
+            nudge=(
+                "上一次 file_edit 失败。先调用 file_read 刷新目标片段；"
+                "不要复用旧快照或原 old_text。"
+            ),
+        )
+
+    def _classify(self, count: int) -> str:
+        return "critical" if count >= self.critical_threshold else "warning"
+
+    def _detect_guard_rejection_loop(self) -> Optional[LoopCheckResult]:
+        threshold = 3
+        if len(self._guard_rejections) < threshold:
+            return None
+        tail = list(self._guard_rejections)[-threshold:]
+        tool_name = tail[-1]
+        if any(name != tool_name for name in tail):
+            return None
+        return LoopCheckResult(
+            stuck=True,
+            level="critical",
+            detector="guard_rejection",
+            message=(
+                f"工具 {tool_name} 已连续 {threshold} 次被安全策略拦截。"
+                "请停止 delete/create 绕路，向用户说明命中类别与建议改写方式。"
+            ),
+        )
+
+    def _detect_generic_repeat(self) -> Optional[LoopCheckResult]:
+        if len(self._calls) < self.warning_threshold:
+            return None
+        last = self._calls[-1]
+        repeat = 1
+        for idx in range(len(self._calls) - 2, -1, -1):
+            if self._calls[idx] != last:
+                break
+            repeat += 1
+        if repeat < self.warning_threshold:
+            return None
+        level = self._classify(repeat)
+        tool_name = last[0]
+        return self._with_nudge(
+            tool_name,
+            LoopCheckResult(
+                stuck=True,
+                level=level,
+                detector="generic_repeat",
+                message=f"检测到工具 {tool_name} 连续重复调用 {repeat} 次。",
+            ),
+        )
+
+    def _detect_ping_pong(self) -> Optional[LoopCheckResult]:
+        if len(self._calls) < self.warning_threshold:
+            return None
+        # Detect A/B alternating pattern on the tail.
+        tail = list(self._calls)[-self.critical_threshold :]
+        if len(tail) < self.warning_threshold:
+            return None
+        a, b = tail[-2], tail[-1]
+        if a == b:
+            return None
+        alt = 0
+        expected = b
+        for item in reversed(tail):
+            if item != expected:
+                break
+            alt += 1
+            expected = a if expected == b else b
+        if alt < self.warning_threshold:
+            return None
+        level = self._classify(alt)
+        tool_name = tail[-1][0]
+        return self._with_nudge(
+            tool_name,
+            LoopCheckResult(
+                stuck=True,
+                level=level,
+                detector="ping_pong",
+                message=f"检测到工具调用在两个模式间来回震荡（{alt} 步）。",
+            ),
+        )
+
+    def _detect_no_progress(self) -> Optional[LoopCheckResult]:
+        if len(self._progress_marks) < self.warning_threshold:
+            return None
+        streak = 0
+        for mark in reversed(self._progress_marks):
+            if mark:
+                break
+            streak += 1
+        if streak < self.warning_threshold:
+            return None
+        level = self._classify(streak)
+        tool_name = self._calls[-1][0]
+        return self._with_nudge(
+            tool_name,
+            LoopCheckResult(
+                stuck=True,
+                level=level,
+                detector="no_progress",
+                message=f"连续 {streak} 次工具调用未观察到进展（artifacts/scratchpad 未变化）。",
+            ),
+        )
+
+    def _detect_tool_saturation(self) -> Optional[LoopCheckResult]:
+        """Detect one tool dominating recent calls with little recorded progress."""
+        if len(self._calls) < self.warning_threshold:
+            return None
+        tail = list(self._calls)[-self.critical_threshold :]
+        progress_tail = list(self._progress_marks)[-self.critical_threshold :]
+        if len(tail) != len(progress_tail):
+            return None
+        tool_counts: Dict[str, int] = {}
+        for name, _ in tail:
+            tool_counts[name] = tool_counts.get(name, 0) + 1
+        for tool_name, count in tool_counts.items():
+            if count < self.warning_threshold:
+                continue
+            tool_indices = [i for i, (n, _) in enumerate(tail) if n == tool_name]
+            no_progress_count = sum(
+                1 for i in tool_indices if i < len(progress_tail) and not progress_tail[i]
+            )
+            if no_progress_count >= self.warning_threshold:
+                level = self._classify(no_progress_count)
+                return self._with_nudge(
+                    tool_name,
+                    LoopCheckResult(
+                        stuck=True,
+                        level=level,
+                        detector="tool_saturation",
+                        message=(
+                            f"工具 {tool_name} 在近期窗口内调用 {count} 次，其中 {no_progress_count} 次未观察到有效进展。"
+                        ),
+                    ),
+                )
+        return None

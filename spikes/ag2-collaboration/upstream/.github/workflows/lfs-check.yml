@@ -1,0 +1,20 @@
+name: "Git LFS Check"
+
+on: pull_request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref }}
+  cancel-in-progress: true
+permissions: {}
+jobs:
+  lfs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          lfs: true
+          persist-credentials: false
+      - name: "Check Git LFS files for consistency, if you see error like 'pointer: unexpectedGitObject ... should have been a pointer but was not', please install Git LFS locally, delete the problematic file, and then add it back again. This ensures it's properly tracked."
+        run: |
+          git lfs fsck

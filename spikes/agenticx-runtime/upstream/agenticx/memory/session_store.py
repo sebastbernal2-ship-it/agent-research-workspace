@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""SQLite persistence for runtime session states.
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+def default_session_db_path() -> Path:
+    """会话库位置，按**调用时**的 HOME 解析。
+
+    原来这里是一个模块级常量，import 的那一刻就把 Path.home() 定死了。测试里
+    tests/conftest.py 用 monkeypatch 把 HOME 指到沙箱，那是在用例开始时才生效的，而这个
+    模块早在收集阶段就 import 完——于是测试写出来的会话元数据全部落进开发者真实的
+    ~/.agenticx/memory/sessions.sqlite。
+
+    会话目录反倒没事：SessionManager 在实例化时才拼 ~/.agenticx/sessions，重定向拦得住。
+    于是症状很别扭——sqlite 里几百条记录，磁盘上没有对应目录，桌面端历史里就是一堆点不
+    开的空白对话，名字还都是 "hello"、"总结简历"、"执行一次并发任务" 这种测试固定串。
+    """
+    return Path.home() / ".agenticx" / "memory" / "sessions.sqlite"
+
+
+def __getattr__(name: str) -> Any:
+    # PEP 562：DEFAULT_SESSION_DB_PATH 不再是固化的模块常量，每次读都按当前 HOME 算。
+    # 仍然可以被 monkeypatch.setattr 覆盖（那会往模块 __dict__ 里塞值，走不到这里），
+    # 撤销时 monkeypatch 把它删掉，又回落到这个懒解析。
+    if name == "DEFAULT_SESSION_DB_PATH":
+        return default_session_db_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+_SCRATCHPAD_JSON_PREFIX = "\x1eagx-json-v1:"
+
+
+def _encode_scratchpad_value(value: Any) -> str:
+    """Encode one scratchpad value without losing JSON-compatible types."""
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return f"{_SCRATCHPAD_JSON_PREFIX}{payload}"
+
+
+def _decode_scratchpad_value(raw: str) -> Any:
+    """Decode typed values while preserving legacy unprefixed strings."""
+    if not raw.startswith(_SCRATCHPAD_JSON_PREFIX):
+        return raw
+    payload = raw[len(_SCRATCHPAD_JSON_PREFIX) :]
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return raw
+
+
+def session_fts_enabled() -> bool:
+    """Return True when session message FTS indexing/search is active (default: on)."""
+    v = os.environ.get("AGX_SESSION_FTS", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _sanitize_fts5_query(query: str) -> str:
+    """Sanitize user input for safe use in FTS5 MATCH queries (Hermes-aligned)."""
+    if not query or not query.strip():
+        return ""
+    _quoted_parts: list[str] = []
+
+    def _preserve_quoted(m: re.Match[str]) -> str:
+        _quoted_parts.append(m.group(0))
+        return f"\x00Q{len(_quoted_parts) - 1}\x00"
+
+    sanitized = re.sub(r'"[^"]*"', _preserve_quoted, query)
+
+    sanitized = re.sub(r'[+{}()\"^]', " ", sanitized)
+
+    sanitized = re.sub(r"\*+", "*", sanitized)
+    sanitized = re.sub(r"(^|\s)\*", r"\1", sanitized)
+
+    sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
+    sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
+
+    sanitized = re.sub(r"\b(\w+(?:-\w+)+)\b", r'"\1"', sanitized)
+
+    for i, quoted in enumerate(_quoted_parts):
+        sanitized = sanitized.replace(f"\x00Q{i}\x00", quoted)
+
+    return sanitized.strip()
+
+
+class SessionStore:
+    """Store todo/scratchpad/session summaries in SQLite."""
+
+    # Max summary rows retained per session. Bounds append growth while keeping
+    # enough history for the activity-recovery heuristic.
+    _SUMMARY_HISTORY_KEEP: int = 8
+
+    def __init__(self, db_path: Path | None = None) -> None:
+        # 走模块属性而不是直接调函数：monkeypatch.setattr(module, "DEFAULT_SESSION_DB_PATH", ...)
+        # 这种既有写法要继续生效。
+        import sys as _sys
+
+        _fallback = getattr(_sys.modules[__name__], "DEFAULT_SESSION_DB_PATH")
+        self.db_path = Path(db_path or _fallback).expanduser().resolve(strict=False)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        # busy_timeout is connection-scoped and must be set on every connection.
+        # Under WAL this lets a reader briefly wait out a concurrent writer's
+        # checkpoint instead of failing with "database is locked".
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.Error:
+            pass
+        return conn
+
+    def _enable_wal(self, conn: sqlite3.Connection) -> None:
+        """Switch the DB to WAL journaling so backfill writes don't block reads.
+
+        WAL is a persistent, file-level setting (only needs to be applied once)
+        that lets readers and a single writer proceed concurrently — measured
+        ~7x lower read p95 under the startup FTS backfill write burst vs the
+        default rollback journal. Best-effort: any failure falls back to the
+        existing journal mode rather than aborting startup.
+        """
+        try:
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if mode and str(mode[0]).lower() == "wal":
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            # Keep the previous journal mode; correctness is unaffected, only
+            # the read/write concurrency optimization is skipped.
+            pass
+
+    def _ensure_session_messages_fts_triggers(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='trigger' AND name LIKE 'session_messages_%'
+            """
+        ).fetchall()
+        existing = {str(r[0]) for r in rows}
+        if "session_messages_ai" not in existing:
+            conn.execute(
+                """
+                CREATE TRIGGER session_messages_ai AFTER INSERT ON session_messages BEGIN
+                    INSERT INTO session_messages_fts(rowid, content) VALUES (new.id, new.content);
+                END
+                """
+            )
+        if "session_messages_ad" not in existing:
+            conn.execute(
+                """
+                CREATE TRIGGER session_messages_ad AFTER DELETE ON session_messages BEGIN
+                    INSERT INTO session_messages_fts(session_messages_fts, rowid)
+                    VALUES('delete', old.id);
+                END
+                """
+            )
+        if "session_messages_bu" not in existing:
+            conn.execute(
+                """
+                CREATE TRIGGER session_messages_bu BEFORE UPDATE ON session_messages BEGIN
+                    INSERT INTO session_messages_fts(session_messages_fts, rowid)
+                    VALUES('delete', old.id);
+                END
+                """
+            )
+        if "session_messages_au" not in existing:
+            conn.execute(
+                """
+                CREATE TRIGGER session_messages_au AFTER UPDATE ON session_messages BEGIN
+                    INSERT INTO session_messages_fts(rowid, content) VALUES (new.id, new.content);
+                END
+                """
+            )
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn:
+            self._enable_wal(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS todos (
+                    session_id TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scratchpad (
+                    session_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_summaries (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            # session_summaries is append-only (one row per persist), so "load
+            # latest metadata for a session" must not full-scan + sort the whole
+            # table. Index (session_id, created_at) keeps that lookup cheap even
+            # as the table grows large.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ss_session_created "
+                "ON session_summaries(session_id, created_at)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp REAL,
+                    indexed_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sm_session ON session_messages(session_id)"
+            )
+            # Records which sessions the startup FTS backfill has already
+            # processed, INCLUDING sessions whose messages.json is empty and
+            # therefore produce zero session_messages rows. Without this a
+            # backfill that keys "already indexed" solely off session_messages
+            # rows re-processed every empty session on every restart, each doing
+            # a DELETE+commit write transaction that (under delete-journal mode)
+            # locked the DB and stalled the renderer's session-list reads.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_fts_backfill (
+                    session_id TEXT PRIMARY KEY,
+                    backfilled_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
+                    content,
+                    content='session_messages',
+                    content_rowid='id'
+                )
+                """
+            )
+            self._ensure_session_messages_fts_triggers(conn)
+            conn.commit()
+
+    async def save_todos(self, session_id: str, items: List[Dict[str, Any]]) -> None:
+        await asyncio.to_thread(self._save_todos_sync, session_id, items)
+
+    def _save_todos_sync(self, session_id: str, items: List[Dict[str, Any]]) -> None:
+        payload = json.dumps(items, ensure_ascii=False)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO todos (session_id, data, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, payload, now),
+            )
+            conn.commit()
+
+    async def load_todos(self, session_id: str) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._load_todos_sync, session_id)
+
+    def _load_todos_sync(self, session_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT data FROM todos WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                return []
+            try:
+                payload = json.loads(str(row["data"]))
+                return payload if isinstance(payload, list) else []
+            except Exception:
+                return []
+
+    async def save_scratchpad(self, session_id: str, data: Dict[str, Any]) -> None:
+        await asyncio.to_thread(self._save_scratchpad_sync, session_id, data)
+
+    def _save_scratchpad_sync(self, session_id: str, data: Dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        rows: list[tuple[str, str, str, str]] = []
+        for key, value in data.items():
+            normalized_key = str(key)
+            try:
+                encoded = _encode_scratchpad_value(value)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"Scratchpad value is not JSON serializable: key={normalized_key!r}"
+                ) from exc
+            rows.append((session_id, normalized_key, encoded, now))
+        with self._connect() as conn:
+            conn.execute("DELETE FROM scratchpad WHERE session_id = ?", (session_id,))
+            conn.executemany(
+                """
+                INSERT INTO scratchpad (session_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+
+    async def load_scratchpad(self, session_id: str) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._load_scratchpad_sync, session_id)
+
+    def _load_scratchpad_sync(self, session_id: str) -> Dict[str, Any]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM scratchpad WHERE session_id = ? ORDER BY key",
+                (session_id,),
+            ).fetchall()
+            return {
+                str(row["key"]): _decode_scratchpad_value(str(row["value"]))
+                for row in rows
+            }
+
+    async def save_session_summary(
+        self,
+        session_id: str,
+        summary: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        await asyncio.to_thread(self._save_session_summary_sync, session_id, summary, metadata or {})
+
+    def _save_session_summary_sync(
+        self,
+        session_id: str,
+        summary: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_summaries (id, session_id, summary, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    session_id,
+                    summary,
+                    json.dumps(metadata, ensure_ascii=False),
+                    now,
+                ),
+            )
+            # Bounded history: keep only the most recent rows per session. This was
+            # historically append-only and grew without bound (tens of thousands of
+            # rows for a few hundred sessions), turning the GROUP BY MAX(created_at)
+            # listing query into a full scan. We retain a small window so the
+            # activity-recovery heuristic (which inspects same-message-count history
+            # to pick the earliest real activity) still works, while preventing the
+            # unbounded growth that degraded the session list query.
+            conn.execute(
+                """
+                DELETE FROM session_summaries
+                WHERE session_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM session_summaries
+                    WHERE session_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                  )
+                """,
+                (session_id, session_id, self._SUMMARY_HISTORY_KEEP),
+            )
+            conn.commit()
+
+    async def search_session_summaries(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._search_session_summaries_sync, query, limit)
+
+    async def load_latest_session_metadata(self, session_id: str) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._load_latest_session_metadata_sync, session_id)
+
+    async def list_latest_sessions(self, limit: int = 500) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_latest_sessions_sync, limit)
+
+    async def purge_session(self, session_id: str) -> bool:
+        return await asyncio.to_thread(self._purge_session_sync, session_id)
+
+    async def session_exists(self, session_id: str) -> bool:
+        return await asyncio.to_thread(self._session_exists_sync, session_id)
+
+    async def index_session_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> int:
+        return await asyncio.to_thread(self._index_session_messages_sync, session_id, messages)
+
+    async def search_session_messages(
+        self,
+        query: str,
+        *,
+        role_filter: List[str] | None = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._search_session_messages_sync, query, role_filter, limit
+        )
+
+    @staticmethod
+    def _message_content_text(msg: Dict[str, Any]) -> str:
+        raw = msg.get("content")
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, list):
+            parts: List[str] = []
+            for item in raw:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    if item.get("type") in ("text", "input_text") and isinstance(
+                        item.get("text"), str
+                    ):
+                        parts.append(str(item["text"]))
+                    else:
+                        parts.append(json.dumps(item, ensure_ascii=False))
+                else:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        return str(raw)
+
+    @staticmethod
+    def _normalize_epoch_seconds(value: Any) -> float:
+        """Normalize message timestamps to Unix seconds (handles ms epoch values)."""
+        try:
+            ts = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if ts <= 0:
+            return 0.0
+        if ts > 1e11:
+            ts /= 1000.0
+        return ts
+
+    @classmethod
+    def _message_timestamp(cls, msg: Dict[str, Any]) -> float | None:
+        for key in ("timestamp", "created_at", "ts"):
+            v = msg.get(key)
+            if v is None:
+                continue
+            ts = cls._normalize_epoch_seconds(v)
+            if ts > 0:
+                return ts
+        return None
+
+    def _max_message_timestamps_sync(
+        self,
+        session_ids: List[str] | None = None,
+    ) -> Dict[str, float]:
+        """Return the latest indexed message timestamp per session (seconds)."""
+        with self._connect() as conn:
+            if session_ids:
+                ids = [str(sid or "").strip() for sid in session_ids if str(sid or "").strip()]
+                if not ids:
+                    return {}
+                placeholders = ",".join("?" for _ in ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT session_id, MAX(timestamp) AS last_ts
+                    FROM session_messages
+                    WHERE session_id IN ({placeholders})
+                    GROUP BY session_id
+                    """,
+                    ids,
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, MAX(timestamp) AS last_ts
+                    FROM session_messages
+                    GROUP BY session_id
+                    """
+                ).fetchall()
+        result: Dict[str, float] = {}
+        for row in rows:
+            sid = str(row["session_id"] or "").strip()
+            if not sid:
+                continue
+            ts = self._normalize_epoch_seconds(row["last_ts"])
+            if ts > 0:
+                result[sid] = ts
+        return result
+
+    def _recover_activity_from_summaries_bulk_sync(
+        self,
+        session_ids: List[str] | None = None,
+    ) -> Dict[str, float]:
+        """Infer last activity from summary rows with the fullest chat history."""
+        with self._connect() as conn:
+            if session_ids:
+                ids = [str(sid or "").strip() for sid in session_ids if str(sid or "").strip()]
+                if not ids:
+                    return {}
+                placeholders = ",".join("?" for _ in ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT session_id, metadata
+                    FROM session_summaries
+                    WHERE session_id IN ({placeholders})
+                    """,
+                    ids,
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT session_id, metadata FROM session_summaries"
+                ).fetchall()
+        per_session: Dict[str, tuple[int, list[float]]] = {}
+        for row in rows:
+            sid = str(row["session_id"] or "").strip()
+            if not sid:
+                continue
+            try:
+                meta = json.loads(str(row["metadata"] or "{}"))
+            except Exception:
+                continue
+            if not isinstance(meta, dict):
+                continue
+            try:
+                msg_count = int(meta.get("chat_messages") or 0)
+            except (TypeError, ValueError):
+                msg_count = 0
+            last_activity = self._normalize_epoch_seconds(meta.get("last_activity_at"))
+            updated_at = self._normalize_epoch_seconds(meta.get("updated_at"))
+            candidate = last_activity if last_activity > 0 else updated_at
+            if candidate <= 0:
+                continue
+            prev = per_session.get(sid)
+            if prev is None or msg_count > prev[0]:
+                per_session[sid] = (msg_count, [candidate])
+            elif msg_count == prev[0]:
+                prev[1].append(candidate)
+        result: Dict[str, float] = {}
+        for sid, (_count, candidates) in per_session.items():
+            if candidates:
+                result[sid] = min(candidates)
+        return result
+
+    def _index_session_messages_sync(self, session_id: str, messages: List[Dict[str, Any]]) -> int:
+        if not session_fts_enabled():
+            return 0
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        rows: List[tuple[Any, ...]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "") or "unknown").strip() or "unknown"
+            text = self._message_content_text(msg)
+            if len(text) > 200_000:
+                text = text[:200_000] + "\n... (truncated)"
+            ts = self._message_timestamp(msg)
+            rows.append((sid, role, text, ts, now))
+        with self._connect() as conn:
+            conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO session_messages (session_id, role, content, timestamp, indexed_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+            conn.commit()
+        return len(rows)
+
+    def _search_session_messages_sync(
+        self,
+        query: str,
+        role_filter: List[str] | None,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if not session_fts_enabled():
+            return []
+        raw_q = (query or "").strip()
+        if not raw_q:
+            return []
+        safe_q = _sanitize_fts5_query(raw_q)
+        if not safe_q:
+            return []
+        n = max(1, min(int(limit), 500))
+        roles: List[str] = []
+        if role_filter:
+            for r in role_filter:
+                t = str(r or "").strip().lower()
+                if t in {"user", "assistant", "tool", "system"}:
+                    roles.append(t)
+        where_role = ""
+        params: List[Any] = [safe_q]
+        if roles:
+            placeholders = ",".join("?" for _ in roles)
+            where_role = f" AND sm.role IN ({placeholders})"
+            params.extend(roles)
+        params.append(n)
+        sql = f"""
+            SELECT sm.id, sm.session_id, sm.role, sm.content, sm.timestamp,
+                   snippet(session_messages_fts, 0, '»', '«', '…', 40) AS snippet
+            FROM session_messages_fts
+            JOIN session_messages sm ON sm.id = session_messages_fts.rowid
+            WHERE session_messages_fts MATCH ?{where_role}
+            ORDER BY sm.timestamp DESC NULLS LAST, sm.id DESC
+            LIMIT ?
+        """
+        with self._connect() as conn:
+            try:
+                cur = conn.execute(sql, params)
+                fetched = cur.fetchall()
+            except sqlite3.OperationalError:
+                return []
+        out: List[Dict[str, Any]] = []
+        for row in fetched:
+            content_full = str(row["content"] or "")
+            preview = content_full if len(content_full) <= 800 else content_full[:800] + "…"
+            ctx_before, ctx_after = self._neighbor_context_sync(
+                conn=None,
+                session_id=str(row["session_id"]),
+                row_id=int(row["id"]),
+            )
+            out.append(
+                {
+                    "id": int(row["id"]),
+                    "session_id": str(row["session_id"]),
+                    "role": str(row["role"]),
+                    "snippet": str(row["snippet"] or ""),
+                    "content_preview": preview,
+                    "timestamp": row["timestamp"],
+                    "context_before": ctx_before,
+                    "context_after": ctx_after,
+                }
+            )
+        return out
+
+    def _search_session_messages_like_sync(
+        self,
+        query: str,
+        allowed_session_ids: frozenset[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Substring search in message bodies for allowed sessions (FTS fallback, CJK-friendly)."""
+        raw = (query or "").strip()
+        if not raw or not allowed_session_ids:
+            return []
+        if len(raw) > 500:
+            raw = raw[:500]
+        esc = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{esc}%"
+        n = max(1, min(int(limit), 400))
+        ids = [sid for sid in allowed_session_ids if sid]
+        out: List[Dict[str, Any]] = []
+        chunk_size = 80
+        with self._connect() as conn:
+            for i in range(0, len(ids), chunk_size):
+                part = ids[i : i + chunk_size]
+                if not part:
+                    break
+                placeholders = ",".join("?" * len(part))
+                sql = f"""
+                    SELECT id, session_id, role, content, timestamp
+                    FROM session_messages
+                    WHERE session_id IN ({placeholders}) AND content LIKE ? ESCAPE '\\'
+                    ORDER BY timestamp DESC NULLS LAST, id DESC
+                    LIMIT ?
+                """
+                try:
+                    cur = conn.execute(sql, (*part, pattern, n - len(out)))
+                except sqlite3.OperationalError:
+                    continue
+                for row in cur.fetchall():
+                    out.append(
+                        {
+                            "id": int(row["id"]),
+                            "session_id": str(row["session_id"]),
+                            "role": str(row["role"]),
+                            "content": str(row["content"] or ""),
+                            "timestamp": row["timestamp"],
+                        }
+                    )
+                    if len(out) >= n:
+                        return out
+        return out
+
+    async def backfill_from_sessions_root(
+        self,
+        sessions_root: Path | str,
+        *,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Scan ``sessions_root/<session_id>/messages.json`` and index all sessions
+        that are not yet in the FTS table.  Safe to call multiple times.
+
+        Args:
+            sessions_root: Path to ``~/.agenticx/sessions``.
+            overwrite: Re-index even if already indexed (default False).
+
+        Returns:
+            {"indexed": N, "skipped": M, "errors": K}
+        """
+        return await asyncio.to_thread(
+            self._backfill_from_sessions_root_sync, sessions_root, overwrite
+        )
+
+    def _backfill_from_sessions_root_sync(
+        self,
+        sessions_root: Path | str,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        if not session_fts_enabled():
+            return {"indexed": 0, "skipped": 0, "errors": 0, "reason": "fts_disabled"}
+        root = Path(sessions_root).expanduser().resolve(strict=False)
+        if not root.exists():
+            return {"indexed": 0, "skipped": 0, "errors": 0}
+        indexed = skipped = errors = 0
+        already_indexed_ids: set[str] = set()
+        if not overwrite:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT session_id FROM session_messages"
+                ).fetchall()
+                already_indexed_ids = {str(r[0]) for r in rows}
+                # Union with the explicit backfill-completion marker so empty
+                # sessions (zero session_messages rows) are only ever processed
+                # once, not re-scanned on every restart.
+                done_rows = conn.execute(
+                    "SELECT session_id FROM session_fts_backfill"
+                ).fetchall()
+                already_indexed_ids.update(str(r[0]) for r in done_rows)
+        now = datetime.now(timezone.utc).isoformat()
+        for session_dir in sorted(root.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            sid = session_dir.name
+            if not overwrite and sid in already_indexed_ids:
+                skipped += 1
+                continue
+            msgs_path = session_dir / "messages.json"
+            if not msgs_path.is_file():
+                skipped += 1
+                continue
+            try:
+                with msgs_path.open(encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if not isinstance(data, list):
+                    skipped += 1
+                    continue
+                messages = [m for m in data if isinstance(m, dict)]
+                self._index_session_messages_sync(sid, messages)
+                # Mark this session as backfilled regardless of how many rows it
+                # produced, so an empty/message-less session is not re-processed
+                # (and re-locking the DB) on the next startup.
+                self._mark_backfilled_sync(sid, now)
+                indexed += 1
+            except Exception:
+                errors += 1
+        return {"indexed": indexed, "skipped": skipped, "errors": errors}
+
+    def _mark_backfilled_sync(self, session_id: str, when: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_fts_backfill (session_id, backfilled_at) "
+                "VALUES (?, ?)",
+                (sid, when),
+            )
+            conn.commit()
+
+    def _neighbor_context_sync(
+        self,
+        conn: sqlite3.Connection | None,
+        session_id: str,
+        row_id: int,
+        window: int = 1,
+    ) -> tuple[str, str]:
+        """Load one message before/after by id order within the same session (lightweight context)."""
+        own = conn
+        close_own = False
+        if own is None:
+            own = self._connect()
+            close_own = True
+        try:
+            before = own.execute(
+                """
+                SELECT content FROM session_messages
+                WHERE session_id = ? AND id < ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, row_id, window),
+            ).fetchall()
+            after = own.execute(
+                """
+                SELECT content FROM session_messages
+                WHERE session_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (session_id, row_id, window),
+            ).fetchall()
+        finally:
+            if close_own:
+                own.close()
+        def _join(rows: List[sqlite3.Row]) -> str:
+            texts = [str(r["content"] or "") for r in rows]
+            merged = " \n---\n ".join(texts)
+            return merged if len(merged) <= 1200 else merged[:1200] + "…"
+
+        return _join(list(before)), _join(list(after))
+
+    def _load_latest_session_metadata_sync(self, session_id: str) -> Dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT metadata
+                FROM session_summaries
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return {}
+            try:
+                payload = json.loads(str(row["metadata"] or "{}"))
+            except Exception:
+                return {}
+            if not isinstance(payload, dict):
+                return {}
+            # Recover session_name from older rows if the latest one was
+            # corrupted (written as null by the old cleanup_expired bug).
+            if not str(payload.get("session_name") or "").strip():
+                recovered = self._recover_session_name_sync(conn, session_id)
+                if recovered:
+                    payload["session_name"] = recovered
+            return payload
+
+    @staticmethod
+    def _recover_session_name_sync(conn: Any, session_id: str) -> Optional[str]:
+        """Find the most recent non-null session_name from historical summary rows."""
+        rows = conn.execute(
+            """
+            SELECT metadata FROM session_summaries
+            WHERE session_id = ?
+            ORDER BY created_at DESC
+            """,
+            (session_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                meta = json.loads(str(row[0] or "{}"))
+            except Exception:
+                continue
+            if not isinstance(meta, dict):
+                continue
+            candidate = str(meta.get("session_name") or "").strip()
+            if candidate and candidate != "None":
+                return candidate
+        return None
+
+    def _list_latest_sessions_sync(
+        self,
+        limit: int = 500,
+        avatar_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        safe_limit = int(limit)
+        use_limit = safe_limit > 0
+        wanted = str(avatar_id or "").strip() or None
+        sql = """
+                    SELECT s.session_id, s.created_at, s.metadata
+                    FROM session_summaries AS s
+                    INNER JOIN (
+                        SELECT session_id, MAX(created_at) AS max_created_at
+                        FROM session_summaries
+                        GROUP BY session_id
+                    ) AS latest
+                      ON s.session_id = latest.session_id
+                     AND s.created_at = latest.max_created_at
+        """
+        params: list[Any] = []
+        if wanted is not None:
+            sql += " WHERE json_extract(s.metadata, '$.avatar_id') = ?"
+            params.append(wanted)
+        sql += " ORDER BY s.created_at DESC"
+        if use_limit:
+            sql += " LIMIT ?"
+            params.append(safe_limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            result: List[Dict[str, Any]] = []
+            needs_name_repair: List[int] = []  # indices in result that need fallback lookup
+            for row in rows:
+                metadata: Dict[str, Any] = {}
+                try:
+                    metadata = json.loads(str(row["metadata"] or "{}"))
+                except Exception:
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                if not str(metadata.get("session_name") or "").strip():
+                    needs_name_repair.append(len(result))
+                result.append(
+                    {
+                        "session_id": str(row["session_id"]),
+                        "created_at": str(row["created_at"]),
+                        "metadata": metadata,
+                    }
+                )
+            # Repair sessions whose latest row has a null/empty session_name by
+            # finding the most recent historical row that stored a real name.
+            # This recovers from the cleanup_expired bug that persisted name=null.
+            if needs_name_repair:
+                for idx in needs_name_repair:
+                    sid = result[idx]["session_id"]
+                    try:
+                        recovered = self._recover_session_name_sync(conn, sid)
+                        if recovered:
+                            result[idx]["metadata"]["session_name"] = recovered
+                    except Exception:
+                        pass
+            return result
+
+    def _list_all_session_ids_sync(self) -> set[str]:
+        """Cheap DISTINCT session_id set so filtered listings skip sqlite-backed dirs."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT session_id FROM session_summaries"
+            ).fetchall()
+            return {
+                str(row["session_id"]).strip()
+                for row in rows
+                if str(row["session_id"] or "").strip()
+            }
+
+    def _purge_session_sync(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        with self._connect() as conn:
+            c1 = conn.execute("DELETE FROM todos WHERE session_id = ?", (sid,)).rowcount
+            c2 = conn.execute("DELETE FROM scratchpad WHERE session_id = ?", (sid,)).rowcount
+            c3 = conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (sid,)).rowcount
+            c4 = conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,)).rowcount
+            conn.commit()
+        return (c1 + c2 + c3 + c4) > 0
+
+    def _session_exists_sync(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        with self._connect() as conn:
+            todos = conn.execute("SELECT 1 FROM todos WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+            if todos is not None:
+                return True
+            scratch = conn.execute("SELECT 1 FROM scratchpad WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+            if scratch is not None:
+                return True
+            summaries = conn.execute("SELECT 1 FROM session_summaries WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+            if summaries is not None:
+                return True
+            msgs = conn.execute("SELECT 1 FROM session_messages WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+            return msgs is not None
+
+    def _search_session_summaries_sync(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        q = f"%{query.strip()}%"
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, session_id, summary, metadata, created_at
+                FROM session_summaries
+                WHERE summary LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (q, max(1, int(limit))),
+            ).fetchall()
+            result: List[Dict[str, Any]] = []
+            for row in rows:
+                metadata: Dict[str, Any] = {}
+                try:
+                    metadata = json.loads(str(row["metadata"] or "{}"))
+                except Exception:
+                    metadata = {}
+                result.append(
+                    {
+                        "id": str(row["id"]),
+                        "session_id": str(row["session_id"]),
+                        "summary": str(row["summary"]),
+                        "metadata": metadata,
+                        "created_at": str(row["created_at"]),
+                    }
+                )
+            return result

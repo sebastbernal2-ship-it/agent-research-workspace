@@ -1,0 +1,694 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { i18n } from "../../i18n/i18n";
+import { createPortal } from "react-dom";
+import { ChevronRight, ExternalLink, Link2, Loader2, SquareArrowOutUpRight } from "lucide-react";
+
+import { nativeConnectorAvailability, resolveConnectedConnectorIds } from "../../../electron/native-connectors-core";
+import { CONNECTORS, type ConnectorId } from "../settings/connectors/connector-catalog";
+import { SettingsSwitch } from "../settings/SettingsSwitch";
+import { Modal } from "../ds/Modal";
+import { Toast } from "../ds/Toast";
+import { HoverTip } from "../ds/HoverTip";
+import { useAppStore } from "../../store";
+
+const DROPDOWN_WIDTH = 260;
+
+/** 与「更多操作」主菜单同顶同高并排，避免向下挡住滚到底 FAB / 输入区。 */
+function positionEmbeddedComposerFlyout(
+  triggerEl: HTMLElement,
+  flyoutWidth: number,
+): { top: number; left: number; maxHeight: number } {
+  const parent = triggerEl.closest(".agx-menu-pop");
+  const band = (parent ?? triggerEl).getBoundingClientRect();
+  const gap = 8;
+  let left = band.right + gap;
+  if (left + flyoutWidth > window.innerWidth - gap) {
+    left = band.left - flyoutWidth - gap;
+  }
+  left = Math.max(gap, Math.min(left, window.innerWidth - flyoutWidth - gap));
+  return {
+    top: band.top,
+    left,
+    maxHeight: Math.max(120, band.height),
+  };
+}
+
+type Props = {
+  /** Falls back to the global session id when the pane has not bound one yet. */
+  sessionId?: string;
+  /** True when rendered as a row inside「更多操作」vertical menu (full-width row + right flyout). */
+  embedded?: boolean;
+};
+
+type NativeId = "tencent-meeting" | "tapd" | "github" | "feishu" | "wecom" | "qqmail";
+
+/**
+ * Persistent「连接器」entry in the composer toolbar (replaces the previous
+ * decorative「更多」button). Matches WorkBuddy:
+ * - Popup list only shows truly connected connectors (with disconnect toggle).
+ * - 「选择更多连接器」jumps to Settings → 连接器 marketplace (same as「管理」).
+ */
+export function ConnectorsMenuButton({ sessionId, embedded = false }: Props) {
+  const { t } = useTranslation("workspace");
+  const mcpServers = useAppStore((state) => state.mcpServers);
+  const setMcpServers = useAppStore((state) => state.setMcpServers);
+  const globalSessionId = useAppStore((state) => state.sessionId);
+  const openSettings = useAppStore((state) => state.openSettings);
+  const effectiveSessionId = (sessionId || globalSessionId || "").trim();
+  const [tmeetConnected, setTmeetConnected] = useState(false);
+  const [githubConnected, setGithubConnected] = useState(false);
+  const [feishuConnected, setFeishuConnected] = useState(false);
+  const [wecomConnected, setWecomConnected] = useState(false);
+  const [qqmailConnected, setQqmailConnected] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [dropdownPos, setDropdownPos] = useState<
+    { left: number; top?: number; bottom?: number; maxHeight?: number } | null
+  >(null);
+  const [pendingId, setPendingId] = useState<NativeId | null>(null);
+  const [tmeetPhase, setTmeetPhase] = useState("");
+  const [tapdModalOpen, setTapdModalOpen] = useState(false);
+  const [tapdToken, setTapdToken] = useState("");
+  const [tapdError, setTapdError] = useState("");
+  const [toastOpen, setToastOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState("");
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  const showToast = useCallback((message: string) => {
+    setToastMessage(message);
+    setToastOpen(true);
+  }, []);
+
+  const refreshTmeet = useCallback(async () => {
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorStatus("tencent-meeting");
+      setTmeetConnected(result.connected);
+    } catch {
+      setTmeetConnected(false);
+    }
+  }, []);
+
+  const refreshGithub = useCallback(async () => {
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorStatus("github");
+      setGithubConnected(result.connected);
+    } catch {
+      setGithubConnected(false);
+    }
+  }, []);
+
+  const refreshFeishu = useCallback(async () => {
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorStatus("feishu");
+      setFeishuConnected(result.connected);
+    } catch {
+      setFeishuConnected(false);
+    }
+  }, []);
+
+  const refreshWecom = useCallback(async () => {
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorStatus("wecom");
+      setWecomConnected(result.connected);
+    } catch {
+      setWecomConnected(false);
+    }
+  }, []);
+
+  const refreshQqmail = useCallback(async () => {
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorStatus("qqmail");
+      setQqmailConnected(result.connected);
+    } catch {
+      setQqmailConnected(false);
+    }
+  }, []);
+
+  const refreshMcp = useCallback(async () => {
+    try {
+      const status = await window.agenticxDesktop.loadMcpStatus(effectiveSessionId);
+      if (status.ok && Array.isArray(status.servers)) {
+        setMcpServers(
+          status.servers.map((item) => ({
+            name: item.name,
+            connected: Boolean(item.connected),
+            command: item.command,
+            url: typeof item.url === "string" ? item.url : undefined,
+            transport: typeof item.transport === "string" ? item.transport : undefined,
+            connection_state: item.connection_state,
+            tool_count: typeof item.tool_count === "number" ? item.tool_count : undefined,
+            tool_names: Array.isArray(item.tool_names) ? (item.tool_names as string[]) : undefined,
+            error_detail: item.error_detail,
+            op_phase: typeof item.op_phase === "string" ? item.op_phase : undefined,
+            op_message: typeof item.op_message === "string" ? item.op_message : undefined,
+            op_updated_at: typeof item.op_updated_at === "number" ? item.op_updated_at : undefined,
+          })),
+        );
+      }
+    } catch {
+      // best-effort refresh; keep prior list on failure
+    }
+  }, [effectiveSessionId, setMcpServers]);
+
+  useEffect(() => {
+    void refreshTmeet();
+    return window.agenticxDesktop.onNativeConnectorTmeetProgress(({ phase }) => {
+      const ns = { ns: "workspace" as const };
+      const labels: Record<string, string> = {
+        installing: i18n.t("connectors.tmeetInstalling", ns),
+        opening_browser: i18n.t("connectors.tmeetOpening", ns),
+        waiting: i18n.t("connectors.tmeetWaiting", ns),
+        success: i18n.t("connectors.tmeetSuccess", ns),
+        disconnected: i18n.t("connectors.tmeetDisconnected", ns),
+        error: i18n.t("connectors.tmeetError", ns),
+      };
+      if (labels[phase]) setTmeetPhase(labels[phase]);
+      if (phase === "success" || phase === "disconnected" || phase === "error") {
+        void refreshTmeet();
+      }
+    });
+  }, [refreshTmeet]);
+
+  useEffect(() => {
+    void refreshGithub();
+    return window.agenticxDesktop.onNativeConnectorGithubProgress(({ phase }) => {
+      if (phase === "success" || phase === "disconnected" || phase === "error") {
+        void refreshGithub();
+      }
+    });
+  }, [refreshGithub]);
+
+  useEffect(() => {
+    void refreshFeishu();
+    return window.agenticxDesktop.onNativeConnectorFeishuProgress(({ phase }) => {
+      if (phase === "success" || phase === "disconnected" || phase === "error") {
+        void refreshFeishu();
+      }
+    });
+  }, [refreshFeishu]);
+
+  useEffect(() => {
+    void refreshWecom();
+    return window.agenticxDesktop.onNativeConnectorWecomProgress(({ phase }) => {
+      if (phase === "success" || phase === "disconnected" || phase === "error") {
+        void refreshWecom();
+      }
+    });
+  }, [refreshWecom]);
+
+  useEffect(() => {
+    void refreshQqmail();
+    return window.agenticxDesktop.onNativeConnectorQqmailProgress(({ phase }) => {
+      if (phase === "success" || phase === "disconnected" || phase === "error") {
+        void refreshQqmail();
+      }
+    });
+  }, [refreshQqmail]);
+
+  const tapdConnected = useMemo(
+    () => mcpServers.some((server) => server.name === "tapd" && server.connected),
+    [mcpServers],
+  );
+
+  const connectedIds = useMemo(
+    () =>
+      resolveConnectedConnectorIds(
+        tmeetConnected,
+        mcpServers,
+        githubConnected,
+        feishuConnected,
+        wecomConnected,
+        qqmailConnected,
+      ),
+    [feishuConnected, githubConnected, mcpServers, qqmailConnected, tmeetConnected, wecomConnected],
+  );
+
+  const connectedLabel = useMemo(
+    () =>
+      connectedIds
+        .map((id) => CONNECTORS.find((item) => item.id === id)?.name ?? id)
+        .join("、"),
+    [connectedIds],
+  );
+
+  const isConnectorConnected = useCallback(
+    (id: ConnectorId) => {
+      if (id === "tencent-meeting") return tmeetConnected;
+      if (id === "tapd") return tapdConnected;
+      if (id === "github") return githubConnected;
+      if (id === "feishu") return feishuConnected;
+      if (id === "wecom") return wecomConnected;
+      if (id === "qqmail") return qqmailConnected;
+      return false;
+    },
+    [feishuConnected, githubConnected, qqmailConnected, tapdConnected, tmeetConnected, wecomConnected],
+  );
+
+  /** WorkBuddy popup: only truly connected connectors. */
+  const visibleConnectors = useMemo(
+    () => CONNECTORS.filter((item) => isConnectorConnected(item.id)),
+    [isConnectorConnected],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (event: MouseEvent) => {
+      const target = event.target as Node;
+      const btn = btnRef.current;
+      const dropdown = document.getElementById("agx-connectors-menu-dropdown");
+      if (btn && btn.contains(target)) return;
+      if (dropdown && dropdown.contains(target)) return;
+      // Keep menu open while TAPD modal is up so state stays coherent.
+      if (tapdModalOpen) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open, tapdModalOpen]);
+
+  const handleOpen = () => {
+    if (btnRef.current) {
+      if (embedded) {
+        setDropdownPos(positionEmbeddedComposerFlyout(btnRef.current, DROPDOWN_WIDTH));
+      } else {
+        const rect = btnRef.current.getBoundingClientRect();
+        const left = Math.max(
+          8,
+          Math.min(rect.left, window.innerWidth - DROPDOWN_WIDTH - 8),
+        );
+        setDropdownPos({ bottom: window.innerHeight - rect.top + 6, left });
+      }
+    }
+    setOpen((prev) => !prev);
+  };
+
+  const goToSettings = () => {
+    setOpen(false);
+    openSettings("connectors");
+  };
+
+  const connectTencentMeeting = async () => {
+    if (pendingId) return;
+    setPendingId("tencent-meeting");
+    setTmeetPhase(i18n.t("connectors.tmeetPreparing", { ns: "workspace" }));
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorTmeetLogin();
+      await refreshTmeet();
+      if (!result.ok || !result.connected) {
+        showToast(result.error || i18n.t("connectors.tmeetIncomplete", { ns: "workspace" }));
+        return;
+      }
+      showToast(i18n.t("connectors.tmeetConnected", { ns: "workspace" }));
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingId(null);
+      setTmeetPhase("");
+    }
+  };
+
+  const disconnectTencentMeeting = async () => {
+    setPendingId("tencent-meeting");
+    try {
+      await window.agenticxDesktop.nativeConnectorTmeetLogout();
+      await refreshTmeet();
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const disconnectTapd = async () => {
+    if (!effectiveSessionId) return;
+    setPendingId("tapd");
+    try {
+      await window.agenticxDesktop.disconnectMcp({ sessionId: effectiveSessionId, name: "tapd" });
+      await refreshMcp();
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const disconnectGithub = async () => {
+    setPendingId("github");
+    try {
+      await window.agenticxDesktop.nativeConnectorGithubLogout();
+      await refreshGithub();
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const disconnectFeishu = async () => {
+    setPendingId("feishu");
+    try {
+      await window.agenticxDesktop.nativeConnectorFeishuLogout();
+      await refreshFeishu();
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const disconnectWecom = async () => {
+    setPendingId("wecom");
+    try {
+      await window.agenticxDesktop.nativeConnectorWecomLogout();
+      await refreshWecom();
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const disconnectQqmail = async () => {
+    setPendingId("qqmail");
+    try {
+      await window.agenticxDesktop.nativeConnectorQqmailLogout();
+      await refreshQqmail();
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const handleTapdConnect = async () => {
+    if (!tapdToken.trim()) {
+      setTapdError(i18n.t("connectors.tapdTokenRequired", { ns: "workspace" }));
+      return;
+    }
+    if (!effectiveSessionId) {
+      setTapdError(i18n.t("connectors.sessionNotReady", { ns: "workspace" }));
+      return;
+    }
+    setPendingId("tapd");
+    setTapdError("");
+    try {
+      const result = await window.agenticxDesktop.nativeConnectorTapdConfigure({
+        sessionId: effectiveSessionId,
+        accessToken: tapdToken,
+      });
+      if (!result.ok) {
+        setTapdError(result.error || i18n.t("connectors.tapdFailed", { ns: "workspace" }));
+        return;
+      }
+      setTapdToken("");
+      setTapdModalOpen(false);
+      await refreshMcp();
+      showToast(i18n.t("connectors.tapdConnected", { ns: "workspace" }));
+    } catch (error) {
+      setTapdError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  const handleConnectClick = (id: ConnectorId) => {
+    if (pendingId) return;
+    if (nativeConnectorAvailability(id) !== "available") {
+      showToast(i18n.t("connectors.notOpen", { ns: "workspace" }));
+      return;
+    }
+    if (id === "tencent-meeting") {
+      void connectTencentMeeting();
+      return;
+    }
+    if (id === "tapd") {
+      setTapdError("");
+      setTapdToken("");
+      setTapdModalOpen(true);
+      return;
+    }
+    if (id === "github") {
+      // Device Flow needs a one-time code UI — open Settings connectors page.
+      goToSettings();
+      return;
+    }
+    if (id === "feishu") {
+      // Two-phase Device Flow needs Settings Modal.
+      goToSettings();
+      return;
+    }
+    if (id === "wecom") {
+      // Bot ID/Secret form lives in Settings Modal.
+      goToSettings();
+      return;
+    }
+    if (id === "qqmail") {
+      // OAuth URL UI lives in Settings Modal (same as feishu).
+      goToSettings();
+      return;
+    }
+    showToast(i18n.t("connectors.notOpen", { ns: "workspace" }));
+  };
+
+  const handleToggle = (id: NativeId, next: boolean) => {
+    if (pendingId) return;
+    if (!next) {
+      if (id === "tencent-meeting") {
+        void disconnectTencentMeeting();
+        return;
+      }
+      if (id === "tapd") {
+        void disconnectTapd();
+        return;
+      }
+      if (id === "github") {
+        void disconnectGithub();
+        return;
+      }
+      if (id === "feishu") {
+        void disconnectFeishu();
+        return;
+      }
+      if (id === "wecom") {
+        void disconnectWecom();
+        return;
+      }
+      if (id === "qqmail") {
+        void disconnectQqmail();
+        return;
+      }
+      return;
+    }
+    // Toggle ON while disconnected — start connect flow (WorkBuddy-style).
+    handleConnectClick(id);
+  };
+
+  const dropdown =
+    open && dropdownPos
+      ? createPortal(
+          <div
+            id="agx-connectors-menu-dropdown"
+            style={{
+              left: dropdownPos.left,
+              width: DROPDOWN_WIDTH,
+              ...(dropdownPos.top != null
+                ? { top: dropdownPos.top, maxHeight: dropdownPos.maxHeight }
+                : { bottom: dropdownPos.bottom }),
+            }}
+            className="fixed z-[9999] flex flex-col overflow-hidden rounded-xl border border-border bg-surface-panel shadow-xl backdrop-blur-md"
+          >
+            <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
+              <span className="text-[12px] font-semibold text-text-strong">{t("connectors.title")}</span>
+              <button
+                type="button"
+                className="text-[11px] text-text-faint transition hover:text-text-strong"
+                onClick={goToSettings}
+              >
+                {t("connectors.manage")}
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+              {visibleConnectors.length === 0 ? (
+                <div className="px-2 py-4 text-center text-[12px] text-text-faint">
+                  {t("connectors.empty")}
+                </div>
+              ) : (
+                visibleConnectors.map((item) => {
+                  const isImplemented = nativeConnectorAvailability(item.id) === "available";
+                  const connected = isConnectorConnected(item.id);
+                  const busy = pendingId === item.id;
+                  // WorkBuddy: connected → toggle; not connected →「连接」inline action.
+                  const showToggle = isImplemented && connected;
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-left transition hover:bg-surface-hover"
+                    >
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md border border-border bg-white">
+                        <img src={item.iconSrc} alt="" className="h-4 w-4 object-contain" draggable={false} />
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-text-strong">
+                        {item.name}
+                      </span>
+                      {busy ? (
+                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-text-faint" aria-hidden />
+                      ) : showToggle ? (
+                        <SettingsSwitch
+                          checked
+                          size="sm"
+                          aria-label={t("connectors.disconnectAria", { name: item.name })}
+                          onChange={(next) => handleToggle(item.id as NativeId, next)}
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="flex shrink-0 items-center gap-1 text-[12px] font-medium text-emerald-400 transition hover:text-emerald-300"
+                          onClick={() => handleConnectClick(item.id)}
+                        >
+                          <Link2 className="h-3.5 w-3.5" aria-hidden />
+                          {t("connectors.connect")}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+            <div className="shrink-0 border-t border-border p-1.5">
+              <button
+                type="button"
+                className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-surface-card px-2 py-2 text-[12px] font-medium text-text-muted transition hover:bg-surface-hover hover:text-text-strong"
+                onClick={goToSettings}
+              >
+                <SquareArrowOutUpRight className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                {t("connectors.chooseMore")}
+              </button>
+            </div>
+            {pendingId === "tencent-meeting" && tmeetPhase ? (
+              <div className="border-t border-border px-3 py-2 text-[11px] text-text-muted" role="status">
+                {tmeetPhase}
+              </div>
+            ) : null}
+          </div>,
+          document.body,
+        )
+      : null;
+
+  const embeddedRow = (
+    <button
+      ref={btnRef}
+      type="button"
+      role="menuitem"
+      className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-text-standard transition-colors hover:bg-surface-hover"
+      aria-label={t("connectors.title")}
+      aria-expanded={open}
+      onClick={handleOpen}
+    >
+      <Link2 className="h-[15px] w-[15px] shrink-0 text-text-muted" aria-hidden />
+      <span className="flex-1">{t("connectors.title")}</span>
+      {connectedIds.length > 0 ? (
+        <span className="text-[11px] text-text-faint">{t("connectors.connectedCount", { count: connectedIds.length })}</span>
+      ) : null}
+      <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-faint" aria-hidden />
+    </button>
+  );
+
+  const toolbarButton = (
+    <button
+      ref={btnRef}
+      type="button"
+      className={`relative flex h-7 shrink-0 items-center justify-center rounded-lg text-text-muted transition hover:bg-surface-hover hover:text-text-strong ${
+        connectedIds.length > 0 ? "min-w-[2rem] px-1" : "w-7"
+      }`}
+      title={connectedIds.length > 0 ? t("connectors.connectedWith", { names: connectedLabel }) : t("connectors.title")}
+      aria-label={connectedIds.length > 0 ? t("connectors.connectedAria", { names: connectedLabel }) : t("connectors.title")}
+      aria-expanded={open}
+      onClick={handleOpen}
+    >
+      {connectedIds.length > 0 ? (
+        <span className="flex items-center">
+          {connectedIds.map((id, index) => {
+            const item = CONNECTORS.find((connector) => connector.id === id);
+            if (!item) return null;
+            return (
+              <span
+                key={id}
+                className={`flex h-5 w-5 items-center justify-center overflow-hidden rounded-full border-2 border-surface-card bg-white shadow-sm ${
+                  index > 0 ? "-ml-1.5" : ""
+                }`}
+              >
+                <img src={item.iconSrc} alt="" className="h-3.5 w-3.5 object-contain" draggable={false} />
+              </span>
+            );
+          })}
+        </span>
+      ) : (
+        <Link2 className="h-3.5 w-3.5" aria-hidden />
+      )}
+    </button>
+  );
+
+  return (
+    <>
+      {embedded ? (
+        embeddedRow
+      ) : connectedIds.length > 0 ? (
+        <HoverTip label={t("connectors.connectedWith", { names: connectedLabel })}>{toolbarButton}</HoverTip>
+      ) : (
+        toolbarButton
+      )}
+      {dropdown}
+
+      <Modal
+        open={tapdModalOpen}
+        title={t("connectors.connectTapd")}
+        onClose={pendingId === "tapd" ? undefined : () => setTapdModalOpen(false)}
+        panelClassName="w-[min(480px,94vw)] bg-surface-panel"
+        footer={
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              className="rounded-md border border-border px-3 py-2 text-xs text-text-muted hover:bg-surface-hover"
+              disabled={pendingId === "tapd"}
+              onClick={() => setTapdModalOpen(false)}
+            >
+              {t("cancel", { ns: "common" })}
+            </button>
+            <button
+              type="button"
+              className="rounded-md bg-btnPrimary px-4 py-2 text-xs font-medium text-btnPrimary-text hover:bg-btnPrimary-hover disabled:opacity-50"
+              disabled={pendingId === "tapd" || !tapdToken.trim()}
+              onClick={() => void handleTapdConnect()}
+            >
+              {pendingId === "tapd" ? t("connectors.connecting") : t("connectors.saveAndConnect")}
+            </button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-text-muted">{t("connectors.tapdHint")}</p>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1.5 text-xs text-text-muted hover:text-text-strong"
+            onClick={() => void window.agenticxDesktop.openExternal("https://open.tapd.cn/")}
+          >
+            {t("connectors.howToGetToken")}
+            <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+          </button>
+          <label className="block space-y-1.5">
+            <span className="text-xs font-medium text-text-strong">
+              {t("connectors.patLabel")} <span className="text-rose-400">*</span>
+            </span>
+            <input
+              type="password"
+              autoComplete="off"
+              autoFocus
+              className="w-full rounded-lg border border-border bg-surface-card px-3 py-2.5 text-sm text-text-strong outline-none focus:border-text-faint"
+              value={tapdToken}
+              disabled={pendingId === "tapd"}
+              onChange={(event) => setTapdToken(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void handleTapdConnect();
+              }}
+            />
+          </label>
+          {tapdError ? (
+            <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+              {tapdError}
+            </div>
+          ) : null}
+        </div>
+      </Modal>
+
+      <Toast open={toastOpen} message={toastMessage} onClose={() => setToastOpen(false)} />
+    </>
+  );
+}

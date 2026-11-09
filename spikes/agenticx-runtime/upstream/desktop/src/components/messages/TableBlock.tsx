@@ -1,0 +1,106 @@
+import type { ReactNode } from "react";
+import { useContext, useRef, useState } from "react";
+import { Copy, Check, Download, FileText } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { HoverTip } from "../ds/HoverTip";
+import { MarkdownContext } from "./markdown-components";
+import {
+  extractTableRows,
+  rowsToCsv,
+  rowsToMarkdown,
+  rowsToTsv,
+  triggerBlobDownload,
+} from "../../utils/markdown-table-export";
+
+type Props = {
+  children: ReactNode;
+  className?: string;
+};
+
+export function TableBlock({ children, className, ...rest }: Props & Record<string, unknown>) {
+  const { t } = useTranslation("chat");
+  const { isStreaming } = useContext(MarkdownContext);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const [copied, setCopied] = useState<"tsv" | "md" | null>(null);
+
+  const readRows = () => {
+    if (!tableRef.current) return [] as string[][];
+    return extractTableRows(tableRef.current);
+  };
+
+  const copyText = async (kind: "tsv" | "md", text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(kind);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      // Clipboard may be unavailable in some Electron contexts.
+    }
+  };
+
+  const handleCopyTsv = async () => {
+    const rows = readRows();
+    if (rows.length === 0) return;
+    await copyText("tsv", rowsToTsv(rows));
+  };
+
+  const handleCopyMarkdown = async () => {
+    const rows = readRows();
+    if (rows.length === 0) return;
+    await copyText("md", rowsToMarkdown(rows));
+  };
+
+  const handleDownload = () => {
+    const rows = readRows();
+    if (rows.length === 0) return;
+    const csv = rowsToCsv(rows);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    triggerBlobDownload(blob, `table-${Date.now()}.csv`);
+  };
+
+  return (
+    <div className="flex w-full justify-center">
+      <div className="agx-table-block group/table my-2 w-fit max-w-full overflow-hidden rounded-xl border border-border bg-surface-panel">
+      <div className="flex h-8 shrink-0 items-center justify-between border-b border-border bg-surface-hover/50 px-3 text-xs text-text-faint">
+        <span className="text-[11px] font-medium tracking-wide text-text-muted">{t("table.label")}</span>
+        {!isStreaming && (
+          <div className="flex items-center gap-1 text-text-faint">
+            <HoverTip label={t("table.copyTable")}>
+              <button
+                type="button"
+                onClick={() => void handleCopyTsv()}
+                className="flex items-center justify-center rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+              >
+                {copied === "tsv" ? <Check size={12} className="text-green-500" /> : <Copy size={12} />}
+              </button>
+            </HoverTip>
+            <HoverTip label={t("table.copyMarkdown")}>
+              <button
+                type="button"
+                onClick={() => void handleCopyMarkdown()}
+                className="flex items-center justify-center rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+              >
+                {copied === "md" ? <Check size={12} className="text-green-500" /> : <FileText size={12} />}
+              </button>
+            </HoverTip>
+            <HoverTip label={t("table.downloadCsv")}>
+              <button
+                type="button"
+                onClick={handleDownload}
+                className="flex items-center justify-center rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+              >
+                <Download size={12} />
+              </button>
+            </HoverTip>
+          </div>
+        )}
+      </div>
+      <div className="max-w-full overflow-x-auto">
+        <table ref={tableRef} className={className} {...rest}>
+          {children}
+        </table>
+      </div>
+      </div>
+    </div>
+  );
+}

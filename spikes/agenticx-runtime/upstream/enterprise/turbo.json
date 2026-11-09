@@ -1,0 +1,70 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"],
+      "env": ["NODE_ENV", "NEXT_PUBLIC_*"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "env": [
+        "ADMIN_CONSOLE_LOGIN_EMAIL",
+        "ADMIN_CONSOLE_LOGIN_PASSWORD",
+        "AUTH_DEV_OWNER_PASSWORD",
+        "AUTH_JWT_PRIVATE_KEY",
+        "AUTH_JWT_PUBLIC_KEY",
+        "ENABLE_DEV_BOOTSTRAP",
+        "DEFAULT_TENANT_ID",
+        "DEFAULT_DEPT_ID",
+        "NEXT_PUBLIC_SSO_PROVIDERS",
+        "SSO_DEFAULT_ROLE_CODES",
+        "SSO_JIT_ROLE_ALLOWLIST",
+        "SSO_RETURN_TO_ALLOWLIST",
+        "SSO_STATE_SIGNING_SECRET",
+        "SSO_OIDC_DEFAULT_ISSUER",
+        "SSO_OIDC_DEFAULT_CLIENT_ID",
+        "SSO_OIDC_DEFAULT_CLIENT_SECRET",
+        "SSO_OIDC_DEFAULT_REDIRECT_URI",
+        "SSO_OIDC_DEFAULT_ADMIN_REDIRECT_URI",
+        "SSO_OIDC_DEFAULT_SCOPES",
+        "SSO_OIDC_DEFAULT_CLAIM_EMAIL",
+        "SSO_OIDC_DEFAULT_CLAIM_NAME",
+        "SSO_OIDC_DEFAULT_CLAIM_DEPT",
+        "SSO_OIDC_DEFAULT_CLAIM_ROLES",
+        "SSO_OIDC_DEFAULT_CLAIM_EXTERNAL_ID",
+        "SSO_PROVIDER_SECRET_KEY",
+        "SSO_SAML_DISABLED",
+        "SSO_DEV_INSECURE_REDIRECT_ALLOWLIST",
+        "NEXT_PUBLIC_SSO_REDIRECT_ORIGIN_ALLOWLIST",
+        "SSO_REDIRECT_REQUIRE_ISSUER_ORIGIN_MATCH",
+        "DATABASE_URL",
+        "GATEWAY_INTERNAL_TOKEN",
+        "GATEWAY_INTERNAL_TOKEN_FILE",
+        "GATEWAY_BASE_URL",
+        "GATEWAY_INTERNAL_BASE_URL",
+        "GATEWAY_COMPLETIONS_URL",
+        "GATEWAY_REMOTE_PROVIDERS_URL",
+        "GATEWAY_REMOTE_QUOTA_CONFIG_URL",
+        "GATEWAY_REMOTE_POLICY_SNAPSHOT_URL",
+        "GATEWAY_REMOTE_CHANNELS_URL"
+      ]
+    },
+    "lint": {
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

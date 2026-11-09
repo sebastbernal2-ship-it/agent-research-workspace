@@ -1,0 +1,330 @@
+import type { Message } from "../store";
+import { isOrphanFormattedToolResultMessage } from "./orphan-formatted-tool";
+import { isEphemeralConfirmReceiptMessage } from "./noisy-chat-messages";
+import { mapLoadedSessionMessage, type LoadedSessionMessage } from "./session-message-map";
+import { assistantVisibleBodyForUi } from "./assistant-output";
+import {
+  canonicalizeUserReferenceMentions,
+  stableAttachmentSetIdentity,
+} from "./reference-attachment";
+
+const norm = (s: unknown) => String(s ?? "").trim();
+const contentKey = (role: string, content: unknown) => `${role}::${norm(content)}`;
+const reconciliationContentKey = (message: Message) =>
+  message.role === "user"
+    ? `user::${canonicalizeUserReferenceMentions(
+        String(message.content ?? ""),
+        message.attachments,
+      ).trim()}`
+    : contentKey(message.role, message.content);
+const userRowsMatch = (memory: Message, disk: Message) => {
+  if (reconciliationContentKey(memory) !== reconciliationContentKey(disk)) {
+    return false;
+  }
+  const memoryAttachments = stableAttachmentSetIdentity(memory.attachments);
+  const diskAttachments = stableAttachmentSetIdentity(disk.attachments);
+  if (!memoryAttachments.key || !diskAttachments.key) return true;
+  if (!memoryAttachments.strong || !diskAttachments.strong) return false;
+  return memoryAttachments.key === diskAttachments.key;
+};
+const clientTurnId = (message: Message) =>
+  String(message.metadata?.client_turn_id ?? "").trim();
+
+/**
+ * Compare canonical visible bodies so live streamed rows (with think/followups
+ * tags) reconcile with disk rows that already store the sanitized final body.
+ */
+const assistantBodyKey = (content: unknown) =>
+  assistantVisibleBodyForUi(String(content ?? "")).trim();
+
+/** Fingerprint for reasoning-only mid-turn rows (empty body + reasoning text). */
+const assistantReasoningKey = (message: Pick<Message, "reasoning">) =>
+  norm(message.reasoning).slice(0, 2048);
+
+const toolCallIdOf = (message: Message) => String(message.toolCallId ?? "").trim();
+
+/**
+ * Group-workflow narration is intentionally UI-only: it explains who is being
+ * assigned/reviewed without polluting the agents' durable conversation context.
+ * These rows therefore have no disk counterpart, but their live position among
+ * persisted member replies is still authoritative.
+ */
+const isTransientTimelineRow = (message: Message) =>
+  String(message.metadata?.kind ?? "").trim() === "group_workflow_event";
+
+const TERMINAL_TOOL_STATUSES = new Set<NonNullable<Message["toolStatus"]>>([
+  "done",
+  "error",
+  "cancelled",
+]);
+
+/**
+ * Disk terminal status wins over a stale live `running`/`pending` card.
+ * Live streams often keep args-only rows as running after the server already
+ * persisted the result; preferring memory here left orphan "正在调用" rows.
+ */
+function resolveMergedToolStatus(
+  diskStatus: Message["toolStatus"],
+  memoryStatus: Message["toolStatus"],
+): Message["toolStatus"] {
+  if (diskStatus && TERMINAL_TOOL_STATUSES.has(diskStatus)) return diskStatus;
+  if (memoryStatus && TERMINAL_TOOL_STATUSES.has(memoryStatus)) return memoryStatus;
+  return memoryStatus ?? diskStatus;
+}
+
+function overlayMemoryEnrichment(diskRow: Message, memory: Message): Message {
+  return {
+    ...diskRow,
+    id: memory.id,
+    timestamp:
+      typeof diskRow.timestamp === "number" && diskRow.timestamp > 0
+        ? diskRow.timestamp
+        : memory.timestamp,
+    attachments: memory.attachments ?? diskRow.attachments,
+    toolStreamLines: memory.toolStreamLines ?? diskRow.toolStreamLines,
+    suggestedQuestions: memory.suggestedQuestions ?? diskRow.suggestedQuestions,
+    references: memory.references ?? diskRow.references,
+    searchedQueries: memory.searchedQueries ?? diskRow.searchedQueries,
+    reasoning: memory.reasoning ?? diskRow.reasoning,
+    reasoningSeconds: memory.reasoningSeconds ?? diskRow.reasoningSeconds,
+    provider: (diskRow.provider || "").trim() || memory.provider,
+    model: (diskRow.model || "").trim() || memory.model,
+    usage: diskRow.usage ?? memory.usage,
+    modelSelection: diskRow.modelSelection ?? memory.modelSelection,
+    toolStatus: resolveMergedToolStatus(diskRow.toolStatus, memory.toolStatus),
+    toolElapsedSec: memory.toolElapsedSec ?? diskRow.toolElapsedSec,
+    metadata: memory.metadata ?? diskRow.metadata,
+  };
+}
+
+/**
+ * Reconcile in-memory rows (uid ids, streaming enrichments) with disk history.
+ * Output follows disk chronological order; unmatched in-memory tail rows append last.
+ */
+export function mergeSessionMessagesTail(
+  existing: Message[],
+  diskRows: LoadedSessionMessage[],
+  sessionId: string
+): Message[] {
+  if (!diskRows.length) return existing;
+  const mapped = diskRows.map((row, idx) => mapLoadedSessionMessage(row, sessionId, idx));
+  if (!existing.length) return mapped;
+
+  const memoryById = new Map(existing.map((m) => [m.id, m]));
+  const consumedMemory = new Set<Message>();
+
+  const findMemoryMatch = (diskRow: Message): Message | null => {
+    const diskClientTurnId =
+      diskRow.role === "user" ? clientTurnId(diskRow) : "";
+    if (diskClientTurnId) {
+      const byClientTurn = existing.find(
+        (memory) =>
+          !consumedMemory.has(memory) &&
+          memory.role === "user" &&
+          clientTurnId(memory) === diskClientTurnId,
+      );
+      if (byClientTurn) {
+        consumedMemory.add(byClientTurn);
+        return byClientTurn;
+      }
+    }
+    // Live tool cards keep JSON args as content while disk stores the result
+    // body — content equality never hits. Align on toolCallId first.
+    const diskToolCallId = diskRow.role === "tool" ? toolCallIdOf(diskRow) : "";
+    if (diskToolCallId) {
+      const byToolCallId = existing.find(
+        (memory) =>
+          !consumedMemory.has(memory) &&
+          memory.role === "tool" &&
+          toolCallIdOf(memory) === diskToolCallId,
+      );
+      if (byToolCallId) {
+        consumedMemory.add(byToolCallId);
+        return byToolCallId;
+      }
+    }
+    if (!diskClientTurnId) {
+      const byId = memoryById.get(diskRow.id);
+      if (byId && !consumedMemory.has(byId)) {
+        consumedMemory.add(byId);
+        return byId;
+      }
+    }
+    const diskBody =
+      diskRow.role === "assistant" ? assistantBodyKey(diskRow.content) : "";
+    const diskReasoning =
+      diskRow.role === "assistant" ? assistantReasoningKey(diskRow) : "";
+    // Live preserveStreamReasoning rows are content "" + reasoning. Disk mid-turn
+    // rows look the same after our persist fix — body equality never hits, so
+    // without a reasoning match they were appended after the final answer as a
+    // duplicate "思考了 N 秒" stack.
+    if (diskRow.role === "assistant" && !diskBody && diskReasoning) {
+      const byReasoning = existing.find(
+        (memory) =>
+          !consumedMemory.has(memory) &&
+          memory.role === "assistant" &&
+          !assistantBodyKey(memory.content) &&
+          assistantReasoningKey(memory) === diskReasoning,
+      );
+      if (byReasoning) {
+        consumedMemory.add(byReasoning);
+        return byReasoning;
+      }
+    }
+    for (const memory of existing) {
+      if (consumedMemory.has(memory)) continue;
+      if (memory.role !== diskRow.role) continue;
+      const memoryClientTurnId =
+        memory.role === "user" ? clientTurnId(memory) : "";
+      if (
+        diskClientTurnId &&
+        memoryClientTurnId &&
+        memoryClientTurnId !== diskClientTurnId
+      ) {
+        continue;
+      }
+      const exactMatch =
+        norm(diskRow.content).length > 0 &&
+        (diskRow.role === "user"
+          ? userRowsMatch(memory, diskRow)
+          : reconciliationContentKey(memory) === reconciliationContentKey(diskRow));
+      const bodyMatch =
+        diskRow.role === "assistant" &&
+        diskBody.length > 0 &&
+        assistantBodyKey(memory.content) === diskBody;
+      if (!exactMatch && !bodyMatch) continue;
+      consumedMemory.add(memory);
+      return memory;
+    }
+    return null;
+  };
+
+  const out: Message[] = [];
+  const outputRowByMemory = new Map<Message, Message>();
+  const placedAssistantBodies = new Set<string>();
+  const placedReasoningKeys = new Set<string>();
+  const placedToolCallIds = new Set<string>();
+  for (const diskRow of mapped) {
+    const memory = findMemoryMatch(diskRow);
+    const row = memory ? overlayMemoryEnrichment(diskRow, memory) : diskRow;
+    out.push(row);
+    if (memory) outputRowByMemory.set(memory, row);
+    if (row.role === "assistant") {
+      const body = assistantBodyKey(row.content);
+      if (body) placedAssistantBodies.add(body);
+      const reasoningKey = assistantReasoningKey(row);
+      if (reasoningKey) placedReasoningKeys.add(reasoningKey);
+    }
+    if (row.role === "tool") {
+      const callId = toolCallIdOf(row);
+      if (callId) placedToolCallIds.add(callId);
+    }
+  }
+
+  const transientTimelineRows: Message[] = [];
+
+  // Append in-memory rows that disk hasn't persisted yet (缺失自愈), but never
+  // re-append an assistant row whose body already appears above — those are the
+  // accumulated duplicate "思考了 N 秒" copies left by earlier failed merges.
+  // Same for reasoning-only mid-turn rows (empty body + reasoning fingerprint).
+  // Also never re-append a live tool card whose toolCallId already landed from
+  // disk (stale running args-only rows used to appear after the final answer).
+  //
+  // UI-only group workflow rows are handled separately below. Appending those
+  // as a tail made a correctly streamed timeline flip into "final answer first,
+  // assignment/decomposition afterwards" every time disk reconciliation ran.
+  for (const memory of existing) {
+    if (consumedMemory.has(memory)) continue;
+    if (isOrphanFormattedToolResultMessage(memory)) continue;
+    if (isEphemeralConfirmReceiptMessage(memory)) continue;
+    if (memory.role === "assistant") {
+      const body = assistantBodyKey(memory.content);
+      if (body && placedAssistantBodies.has(body)) continue;
+      const reasoningKey = assistantReasoningKey(memory);
+      if (reasoningKey && placedReasoningKeys.has(reasoningKey)) continue;
+      if (body) placedAssistantBodies.add(body);
+      if (reasoningKey) placedReasoningKeys.add(reasoningKey);
+    }
+    if (memory.role === "tool") {
+      const callId = toolCallIdOf(memory);
+      if (callId && placedToolCallIds.has(callId)) continue;
+    }
+    if (isTransientTimelineRow(memory)) {
+      transientTimelineRows.push(memory);
+      continue;
+    }
+    out.push(memory);
+    outputRowByMemory.set(memory, memory);
+  }
+
+  // Reinsert each transient row immediately before the next durable row that
+  // followed it in the live array. This preserves causal SSE order without
+  // weakening the general rule that disk chronology is authoritative. When a
+  // transient row has no later durable anchor it genuinely belongs at the tail.
+  for (const transient of transientTimelineRows) {
+    const memoryIndex = existing.indexOf(transient);
+    let nextOutput: Message | undefined;
+    for (let idx = memoryIndex + 1; idx < existing.length; idx += 1) {
+      const candidate = outputRowByMemory.get(existing[idx]);
+      if (candidate) {
+        nextOutput = candidate;
+        break;
+      }
+    }
+    if (!nextOutput) {
+      out.push(transient);
+      continue;
+    }
+    const insertAt = out.indexOf(nextOutput);
+    if (insertAt < 0) out.push(transient);
+    else out.splice(insertAt, 0, transient);
+  }
+
+  return retainUnpersistedLiveUserTurns(existing, out);
+}
+
+/**
+ * Disk snapshots lag composer echoes. A full replace / mid-await merge that
+ * captured `existing` a tick too early would drop those user rows while the
+ * SSE assistants stay — the transcript looks like the queries vanished until
+ * a later session-switch reload. Re-insert any live user turn whose
+ * `client_turn_id` is not already in `next`, keeping live order.
+ */
+export function retainUnpersistedLiveUserTurns(
+  live: Message[],
+  next: Message[],
+): Message[] {
+  const nextTurnIds = new Set<string>();
+  for (const row of next) {
+    if (row.role !== "user") continue;
+    const turnId = clientTurnId(row);
+    if (turnId) nextTurnIds.add(turnId);
+  }
+  const missing: Message[] = [];
+  for (const row of live) {
+    if (row.role !== "user") continue;
+    const turnId = clientTurnId(row);
+    if (!turnId || nextTurnIds.has(turnId)) continue;
+    missing.push(row);
+    nextTurnIds.add(turnId);
+  }
+  if (missing.length === 0) return next;
+
+  const out = [...next];
+  for (const user of missing) {
+    const liveAt = live.indexOf(user);
+    let insertAt = out.length;
+    for (let i = liveAt - 1; i >= 0; i -= 1) {
+      const prev = live[i];
+      const pos = out.findIndex(
+        (row) => row === prev || (row.id && prev.id && row.id === prev.id),
+      );
+      if (pos >= 0) {
+        insertAt = pos + 1;
+        break;
+      }
+    }
+    out.splice(insertAt, 0, user);
+  }
+  return out;
+}

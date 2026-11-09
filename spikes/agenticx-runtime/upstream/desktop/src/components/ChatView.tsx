@@ -1,0 +1,3080 @@
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from "react";
+import { useTranslation } from "react-i18next";
+import { i18n } from "../i18n/i18n";
+import { useAppStore, type Message, type QueuedMessage } from "../store";
+import { formatModelOptionLabel } from "../utils/model-display";
+import { collectSelectableModelOptions, isModelSelectable } from "../utils/model-options";
+import { SubAgentPanel } from "./SubAgentPanel";
+import { interruptOnInterimResult, interruptTtsOnUserSpeech } from "../voice/interrupt";
+import { speak } from "../voice/tts";
+import {
+  appendDictationText,
+  cancelDictation,
+  startDictation,
+  type SttPhase,
+} from "../voice/stt";
+import { useVoicePushToTalk } from "../hooks/useVoicePushToTalk";
+import { VoicePttOverlay } from "./VoicePttOverlay";
+import { CommandPalette } from "./CommandPalette";
+import { QuickActions } from "./QuickActions";
+import { ShortcutHints } from "./ShortcutHints";
+import { createPhase1Registry } from "../core/command-registry";
+import { RUN_MODE_CYCLE } from "../constants/confirm-strategy-options";
+import {
+  ccBridgeSendToolProgressLabel,
+  parseCcBridgeModeFromPayload,
+  type CcBridgeSessionModeHint,
+} from "../utils/cc-bridge-ui";
+import { formatWbBridgeSendToolResult } from "../utils/wb-bridge-ui";
+import { KeybindingsPanel } from "./KeybindingsPanel";
+import {
+  mapLoadedSessionMessage,
+  type LoadedSessionMessage,
+} from "../utils/session-message-map";
+import {
+  assistantVisibleBodyForUi,
+  buildCommittedAssistantPatch,
+  normalizeFinalAssistantPayload,
+  shouldReuseLastAssistantRow,
+} from "../utils/assistant-output";
+import { MessageRenderer, renderToolMessageExtras } from "./messages/MessageRenderer";
+import { MarkdownContext } from "./messages/markdown-components";
+import { requestChatHttpLink } from "../utils/chat-external-link";
+import { openExternalUrl } from "../utils/open-external";
+import { WidgetFlowRewriteStatusLine } from "./messages/ContextNoticeLine";
+import { extractPartialShowWidgetArgs } from "./messages/show-widget-partial";
+import { groupConsecutiveToolMessages, shouldHoldToolGroupProgress, type GroupedChatRow } from "./messages/group-tool-messages";
+import { resolveProcessFoldRange } from "./messages/react-work-fold";
+import {
+  buildClarificationMessageExtras,
+  findRunningClarificationToolMessage,
+} from "../utils/clarification-inline";
+import {
+  isEphemeralStopErrorText,
+  isInterruptedAssistantPlaceholder,
+} from "../utils/noisy-chat-messages";
+import { isStreamToolLabelOnlyText, shouldSkipFormattedToolResultFallback } from "../utils/orphan-formatted-tool";
+import { HOOK_BLOCK_RE } from "../utils/hook-block-message";
+import { expandMessagesToTopLevelRows } from "./messages/react-blocks";
+import { shouldHideStreamOverlay, shouldShowMidTurnStreamActivity } from "../utils/stream-overlay-policy";
+import {
+  announceDesktopTaskComplete,
+  isDesktopWindowFocusedAndVisible,
+  shouldAnnounceTaskComplete,
+} from "../utils/desktop-task-notify";
+import { flushSubAgentLiveOutput } from "../utils/subagent-live-output";
+import { resolveSubAgentOutputPaths } from "../utils/subagent-output-files";
+import { TurnToolGroupCard } from "./messages/TurnToolGroupCard";
+import { ReactWorkCollapse } from "./messages/ReactWorkCollapse";
+import { messagePlainTextForClipboard } from "../utils/markdown-copy-format";
+import { buildCompactionNoticeText } from "../utils/context-notice";
+import { StallRecoveryCard } from "./messages/StallRecoveryCard";
+import { StallWaitChip } from "./messages/StallWaitChip";
+import { parseStallWaitPayload, type StallWaitInfo } from "../utils/stall-wait-chip";
+import {
+  isDoubleEnterWithinWindow,
+  shouldEnqueueOnResend,
+  shouldShowStopButton,
+  type SessionExecutionState,
+} from "../utils/streaming-stop-policy";
+import {
+  CHANNEL_C_GRACE_MS,
+  stallDetectSilenceMs,
+  lastTurnHasCompletedAssistantReply,
+  lastTurnHasToolActivity,
+  shouldAllowStallAutoNudge,
+  shouldTriggerIncompleteEndStall,
+} from "../utils/task-stall-policy";
+import {
+  continueSessionUrl,
+  inferContinueReason,
+  type ContinueReason,
+  type ContinueSource,
+} from "../utils/session-continue";
+import { shouldDropDuplicateUserSend, type SendDedupeEntry } from "../utils/send-dedupe";
+import { ImBubble } from "./messages/ImBubble";
+import { TerminalLine } from "./messages/TerminalLine";
+import { CleanBlock } from "./messages/CleanBlock";
+import { MessageQueuePanel } from "./messages/MessageQueuePanel";
+import {
+  accumulateReferenceTurn,
+  applyFinalReferencePayload,
+  referenceExtrasFromTurn,
+} from "../utils/search-reference-sse";
+import { mergeSearchedQueries, type SearchReference } from "../types/search-references";
+
+const SEARCH_REFERENCE_TOOLS = new Set(["web_search", "knowledge_search"]);
+const EMPTY_QUEUE: QueuedMessage[] = [];
+
+/** Matches {@link useAppStore.getState().updateMessageByToolCallId} `patch` argument. */
+type ToolCallStreamPatch = Partial<
+  Pick<Message, "content" | "toolStatus" | "toolElapsedSec" | "toolResultPreview" | "toolStreamLines" | "inlineConfirm">
+> & { appendStreamLine?: string };
+
+type Props = {
+  onOpenConfirm: (
+    requestId: string,
+    question: string,
+    diff?: string,
+    agentId?: string,
+    context?: Record<string, unknown>
+  ) => Promise<boolean>;
+  onOpenClarification?: (
+    requestId: string,
+    prompt: string,
+    options: string[],
+    allowFreeText: boolean,
+    agentId?: string,
+    context?: Record<string, unknown>
+  ) => Promise<{ answerText: string; selectedOptions: string[] } | null>;
+  onSubmitClarification?: (
+    requestId: string,
+    answer: { answerText: string; selectedOptions: string[] },
+    sessionId?: string,
+    agentId?: string
+  ) => Promise<boolean> | boolean;
+  mode?: "pro" | "lite";
+};
+
+const statusDot: Record<string, string> = {
+  idle: "bg-emerald-400",
+  listening: "bg-cyan-400 animate-pulse",
+  processing: "bg-amber-400 animate-spin"
+};
+
+
+function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { content: string; silent: boolean } {
+  const toolName = String(toolNameRaw ?? "").trim() || "tool";
+  const resultText = String(resultRaw ?? "");
+  if (toolName === "check_resources") {
+    return { content: "", silent: true };
+  }
+  if (toolName === "show_widget") {
+    return { content: resultText, silent: false };
+  }
+  if (toolName === "delegate_to_avatar") {
+    try {
+      const parsed = JSON.parse(resultText) as Record<string, unknown>;
+      const delegated = Boolean(parsed.delegated);
+      const avatarName = String(parsed.avatar_name ?? "");
+      const delegationId = String(parsed.delegation_id ?? parsed.agent_id ?? "").trim();
+      if (delegated) {
+        return {
+          content: `🤝 已委派给 ${avatarName || "分身"}${delegationId ? `\nID: ${delegationId}` : ""}`,
+          silent: false,
+        };
+      }
+    } catch {
+      // Fall through to generic formatter.
+    }
+  }
+  if (toolName === "spawn_subagent") {
+    try {
+      const parsed = JSON.parse(resultText) as Record<string, unknown>;
+      const agentId = String(parsed.agent_id ?? "").trim();
+      const name = String(parsed.name ?? (agentId || "subagent"));
+      const role = String(parsed.role ?? "worker");
+      const provider = String(parsed.provider ?? "").trim();
+      const model = String(parsed.model ?? "").trim();
+      const task = String(parsed.task ?? "").replace(/\s+/g, " ").trim();
+      const modelLabel = provider && model ? ` · ${provider}/${model}` : "";
+      const taskPreview = task ? `\n任务: ${task.slice(0, 140)}${task.length > 140 ? "…" : ""}` : "";
+      return {
+        content: `🚀 已启动子智能体: ${name} (${role})${modelLabel}${agentId ? `\nID: ${agentId}` : ""}${taskPreview}`,
+        silent: false,
+      };
+    } catch {
+      // Fall through to generic formatter.
+    }
+  }
+  if (toolName === "todo_write") {
+    const cleaned = resultText.replace(/\s+\n/g, "\n").trim();
+    if (/^\[[ xX]\]/m.test(cleaned)) {
+      return { content: `🗂 任务清单更新\n${cleaned}`, silent: false };
+    }
+  }
+  if (toolName === "cc_bridge_send") {
+    try {
+      const parsed = JSON.parse(resultText) as Record<string, unknown>;
+      const mode = String(parsed.mode ?? "headless");
+      const ok = Boolean(parsed.ok);
+      const interactive = Boolean(parsed.interactive);
+      const pr = String(parsed.parsed_response ?? "").trim();
+      const conf = Number(parsed.parse_confidence ?? 0);
+      if (mode === "visible_tui") {
+        if (interactive && ok) {
+          return {
+            content:
+              "✅ 已发送到 Claude Code（Visible TUI）。请继续在右侧「claude-code」终端交互；如出现权限提示，直接在终端内按键确认。",
+            silent: false,
+          };
+        }
+        if (pr && ok) {
+          return {
+            content: `✅ Claude Code（Visible TUI，解析置信度 ${Math.round(Math.min(1, conf) * 100)}%）\n\n${pr}`,
+            silent: false,
+          };
+        }
+        const tail = String(parsed.tail ?? "").slice(0, 900);
+        return {
+          content: `⏳ Visible TUI：${ok ? "本轮已结束" : "未完成或解析置信度较低"}。请在右侧「claude-code」内嵌交互终端查看；若未自动连接，请确认 cc-bridge 已启动且配置 token 有效。\n${tail ? `\n---\n${tail}` : ""}`,
+          silent: false,
+        };
+      }
+    } catch {
+      // fall through
+    }
+  }
+  if (toolName === "wb_bridge_send") {
+    const formatted = formatWbBridgeSendToolResult(resultText);
+    if (formatted) {
+      return { content: formatted, silent: false };
+    }
+  }
+  if (toolName === "wb_bridge_describe") {
+    const formatted = formatWbBridgeSendToolResult(resultText);
+    if (formatted) return { content: formatted, silent: false };
+  }
+  if (toolName === "query_subagent_status") {
+    try {
+      const parsed = JSON.parse(resultText) as Record<string, unknown>;
+      const one = parsed?.subagent as Record<string, unknown> | undefined;
+      if (one) {
+        const name = String(one.name ?? one.agent_id ?? "subagent");
+        const status = String(one.status ?? "unknown");
+        const action = String(one.current_action ?? "").trim();
+        return {
+          content: `📡 状态快照: ${name} = ${status}${action ? ` · ${action}` : ""}`,
+          silent: false,
+        };
+      }
+      const rows = Array.isArray(parsed?.subagents) ? (parsed.subagents as Array<Record<string, unknown>>) : [];
+      if (rows.length > 0) {
+        const counts = rows.reduce<Record<string, number>>((acc, row) => {
+          const s = String(row.status ?? "unknown");
+          acc[s] = (acc[s] ?? 0) + 1;
+          return acc;
+        }, {});
+        const summary = Object.entries(counts)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(" ");
+        return { content: `📡 状态快照: ${rows.length} 个子智能体 (${summary})`, silent: false };
+      }
+    } catch {
+      // Fall through to generic formatter.
+    }
+  }
+  const isError = /^\s*ERROR:/i.test(resultText);
+  const isBenignTodoConflict =
+    toolName === "todo_write" && /only one task can be in_progress/i.test(resultText);
+
+  if (isBenignTodoConflict) {
+    return {
+      content: "🧭 任务清单同步中：系统会自动收敛为单一进行中任务，无需操作。",
+      silent: false,
+    };
+  }
+  if (isError) {
+    return { content: `⚠️ ${toolName} 提示: ${resultText}`, silent: false };
+  }
+  if (!resultText.trim()) {
+    return { content: "", silent: true };
+  }
+  return { content: `✅ ${toolName} 结果: ${resultText}`, silent: false };
+}
+
+
+function deriveToolStatusFromResult(resultRaw: unknown): "done" | "error" {
+  const t =
+    typeof resultRaw === "string"
+      ? resultRaw
+      : (() => {
+          try {
+            return JSON.stringify(resultRaw ?? "");
+          } catch {
+            return String(resultRaw ?? "");
+          }
+        })();
+  if (/^\s*ERROR:/i.test(t)) return "error";
+  const m = t.match(/exit_code=(\d+)/);
+  if (m && m[1] !== "0") return "error";
+  // Hook-blocked tool calls should be treated as errors, not done
+  if (HOOK_BLOCK_RE.test(t)) return "error";
+  return "done";
+}
+
+function serializeToolResultRaw(resultRaw: unknown): string {
+  if (typeof resultRaw === "string") return resultRaw;
+  try {
+    return JSON.stringify(resultRaw ?? "", null, 2);
+  } catch {
+    return String(resultRaw ?? "");
+  }
+}
+
+function buildToolCallLivePreview(toolNameRaw: unknown, argsRaw: unknown): string | null {
+  const toolName = String(toolNameRaw ?? "").trim();
+  const args = (argsRaw ?? {}) as Record<string, unknown>;
+  if (toolName === "file_write") {
+    const path = String(args.path ?? "").trim();
+    const content = String(args.content ?? "");
+    if (!content.trim()) return null;
+    const preview = content.slice(0, 1200);
+    return `# file_write: ${path || "(unknown path)"}\n${preview}${content.length > 1200 ? "\n... (truncated)" : ""}`;
+  }
+  if (toolName === "file_edit") {
+    const path = String(args.path ?? "").trim();
+    const newText = String(args.new_text ?? "");
+    if (!newText.trim()) return null;
+    const preview = newText.slice(0, 1200);
+    return `# file_edit: ${path || "(unknown path)"}\n${preview}${newText.length > 1200 ? "\n... (truncated)" : ""}`;
+  }
+  return null;
+}
+
+function ModelBadge({ provider, model }: { provider?: string; model?: string }) {
+  const providers = useAppStore((s) => s.settings.providers);
+  if (!model) return null;
+  const entry = provider ? providers[provider] : undefined;
+  const label = provider ? formatModelOptionLabel(provider, model, entry) : model;
+  return (
+    <span className="mb-1 inline-block rounded bg-surface-card px-1.5 py-0.5 text-[10px] text-text-subtle">
+      {label}
+    </span>
+  );
+}
+
+function isThinkingPlaceholderText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return /^[\s⏳….·.]+$/.test(trimmed);
+}
+
+function normalizeStreamText(text: string): string {
+  return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+function StreamingThinkingIndicator() {
+  const { t } = useTranslation("chat");
+  return (
+    <div className="flex items-center gap-2">
+      <span className="relative inline-flex h-3 w-3">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400/50" />
+        <span className="relative inline-flex h-3 w-3 animate-pulse rounded-full bg-cyan-300" />
+      </span>
+      <span className="text-xs font-medium tracking-wide text-cyan-200/90">{t("status.deepThinking")}</span>
+    </div>
+  );
+}
+
+function MessageActions({
+  msg,
+  onCopy,
+  onRetry,
+  onReanswer,
+}: {
+  msg: Message;
+  onCopy: () => void;
+  onRetry: () => void;
+  onReanswer: () => void;
+}) {
+  const { t } = useTranslation("chat");
+  if (msg.role !== "assistant") return null;
+  return (
+    <div className="mt-3 flex items-center gap-3 text-[11px] text-text-faint pb-3">
+      <button className="transition hover:text-text-muted" onClick={onCopy} title={t("actions.copy")}>
+        {t("actions.copy")}
+      </button>
+      <button className="transition hover:text-text-muted" onClick={onRetry} title={t("actions.retry")}>
+        {t("actions.retry")}
+      </button>
+      <button className="transition hover:text-cyan-400" onClick={onReanswer} title={t("actions.reanswer")}>
+        {t("actions.reanswerAt")}
+      </button>
+    </div>
+  );
+}
+
+export function ChatView({ onOpenConfirm, onOpenClarification, onSubmitClarification, mode = "pro" }: Props) {
+  const { t } = useTranslation("chat");
+  const chatHttpLinkMarkdown = useMemo(
+    () => ({
+      onHttpLinkClick: (url: string) => {
+        requestChatHttpLink(url, () => openExternalUrl(url));
+      },
+    }),
+    [],
+  );
+  const apiBase = useAppStore((s) => s.apiBase);
+  const sessionId = useAppStore((s) => s.sessionId);
+  const apiToken = useAppStore((s) => s.apiToken);
+  const messages = useAppStore((s) => s.messages);
+  const status = useAppStore((s) => s.status);
+  const addMessage = useAppStore((s) => s.addMessage);
+  const mergeLastMessageByRole = useAppStore((s) => s.mergeLastMessageByRole);
+  const updateMessageByToolCallId = useAppStore((s) => s.updateMessageByToolCallId);
+  const insertMessageAfter = useAppStore((s) => s.insertMessageAfter);
+  const setStatus = useAppStore((s) => s.setStatus);
+  const openSettings = useAppStore((s) => s.openSettings);
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
+  const agxAccount = useAppStore((s) => s.agxAccount);
+  const setAgxAccount = useAppStore((s) => s.setAgxAccount);
+  const activeProvider = useAppStore((s) => s.activeProvider);
+  const activeModel = useAppStore((s) => s.activeModel);
+  const setActiveModel = useAppStore((s) => s.setActiveModel);
+  const userMode = useAppStore((s) => s.userMode);
+  const setUserMode = useAppStore((s) => s.setUserMode);
+  const planMode = useAppStore((s) => s.planMode);
+  const setPlanMode = useAppStore((s) => s.setPlanMode);
+  const commandPaletteOpen = useAppStore((s) => s.commandPaletteOpen);
+  const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
+  const keybindingsPanelOpen = useAppStore((s) => s.keybindingsPanelOpen);
+  const setKeybindingsPanelOpen = useAppStore((s) => s.setKeybindingsPanelOpen);
+  const runMode = useAppStore((s) => s.runMode);
+  const setRunMode = useAppStore((s) => s.setRunMode);
+  const clearMessages = useAppStore((s) => s.clearMessages);
+  const subAgents = useAppStore((s) => s.subAgents);
+  const selectedSubAgent = useAppStore((s) => s.selectedSubAgent);
+  const setSessionId = useAppStore((s) => s.setSessionId);
+  const setActiveAvatarId = useAppStore((s) => s.setActiveAvatarId);
+  const avatars = useAppStore((s) => s.avatars);
+  const chatStyle = useAppStore((s) => s.chatStyle);
+  const liteQueueKey = "lite-pane";
+  const queuedMessages = useAppStore((s) => s.pendingMessages[liteQueueKey] ?? EMPTY_QUEUE);
+  const enqueuePaneMessage = useAppStore((s) => s.enqueuePaneMessage);
+  const takePendingMessage = useAppStore((s) => s.takePendingMessage);
+  const removePendingMessage = useAppStore((s) => s.removePendingMessage);
+  const editPendingMessage = useAppStore((s) => s.editPendingMessage);
+  const addSubAgent = useAppStore((s) => s.addSubAgent);
+  const updateSubAgent = useAppStore((s) => s.updateSubAgent);
+  const addSubAgentEvent = useAppStore((s) => s.addSubAgentEvent);
+  const setSelectedSubAgent = useAppStore((s) => s.setSelectedSubAgent);
+  const [input, setInput] = useState("");
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceTranscribing, setVoiceTranscribing] = useState(false);
+  const [voiceInputHint, setVoiceInputHint] = useState("");
+  const dictationSessionRef = useRef<{ stop: () => void; cancel: () => void } | null>(null);
+  useEffect(() => {
+    return () => {
+      dictationSessionRef.current?.cancel();
+      dictationSessionRef.current = null;
+      cancelDictation();
+    };
+  }, []);
+  const [streaming, setStreaming] = useState(false);
+  const [streamedAssistantText, setStreamedAssistantText] = useState("");
+  const [widgetFlowRewriting, setWidgetFlowRewriting] = useState(false);
+  const [streamReferences, setStreamReferences] = useState<SearchReference[]>([]);
+  const [streamSearchedQueries, setStreamSearchedQueries] = useState<string[]>([]);
+  const [streamingModel, setStreamingModel] = useState<{ provider: string; model: string } | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [headerModelPickerOpen, setHeaderModelPickerOpen] = useState(false);
+  const [reanswerTarget, setReanswerTarget] = useState<string | null>(null);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState("");
+  const [keybindingsOpen, setKeybindingsOpen] = useState(false);
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [history, setHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const listRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const streamTextRef = useRef("");
+  const streamRafRef = useRef<number | null>(null);
+  const streamCommittedRef = useRef(false);
+  /** Text last committed at a tool_call boundary; avoids duplicating the same assistant bubble at stream end. */
+  const lastMidStreamAssistantCommitRef = useRef<string | null>(null);
+  const abortedByUserRef = useRef(false);
+  const activeRequestIdRef = useRef(0);
+  const lastUserSendDedupeRef = useRef<SendDedupeEntry | null>(null);
+  const modelBtnRef = useRef<HTMLButtonElement | null>(null);
+  const imeComposingRef = useRef(false);
+  const lastComposerEnterAtRef = useRef(0);
+  const polledEventSeenRef = useRef<Record<string, Set<string>>>({});
+  const subAgentsRef = useRef(subAgents);
+  const subAgentStatusRef = useRef<Record<string, string>>({});
+  const ccBridgeLastSessionModeRef = useRef<CcBridgeSessionModeHint>("");
+  const pendingToolResultPatchesRef = useRef<Record<string, ToolCallStreamPatch>>({});
+  const [stallState, setStallState] = useState<"none" | "stall">("none");
+  const [sessionExecutionState, setSessionExecutionState] = useState<SessionExecutionState>("idle");
+  const [sseActive, setSseActive] = useState(false);
+  const [stallTick, setStallTick] = useState(0);
+  const [stallDetectSeconds, setStallDetectSeconds] = useState(90);
+  const [stallNudgeConfig, setStallNudgeConfig] = useState({
+    stall_auto_nudge_enabled: false,
+    stall_auto_nudge_after_seconds: 120,
+    stall_auto_nudge_max_per_session: 2,
+  });
+  const [stallWait, setStallWait] = useState<StallWaitInfo | null>(null);
+  const [autoNudgeCount, setAutoNudgeCount] = useState(0);
+  const autoNudgeTriggeredRef = useRef<Record<string, number>>({});
+  const autoNudgeBucketRef = useRef<Record<string, number>>({});
+  const lastProgressAtRef = useRef(0);
+  const sessionEnteredAtRef = useRef(0);
+  const settings = useAppStore((s) => s.settings);
+  const isLite = mode === "lite";
+  const applyUserMode = useCallback(
+    async (nextMode: "pro" | "lite") => {
+      setUserMode(nextMode);
+      const nextModeValue = nextMode === "lite" ? "ask" : "allowlist";
+      setRunMode(nextModeValue);
+      if (nextMode === "lite") setPlanMode(false);
+      setCommandPaletteOpen(false);
+      setKeybindingsPanelOpen(false);
+      await window.agenticxDesktop.saveUserMode(nextMode);
+      await window.agenticxDesktop.saveRunMode(nextModeValue);
+    },
+    [setUserMode, setRunMode, setPlanMode, setCommandPaletteOpen, setKeybindingsPanelOpen]
+  );
+
+  const deferredCommandQuery = useDeferredValue(commandQuery);
+  const registry = useMemo(
+    () =>
+      createPhase1Registry({
+        openSettings,
+        openModelPicker: () => setHeaderModelPickerOpen(true),
+        openKeybindings: () => setKeybindingsOpen(true),
+        clearMessages,
+        togglePlanMode: () => {
+          const next = !planMode;
+          setPlanMode(next);
+          return next;
+        },
+        toggleUserMode: async () => {
+          const nextMode = userMode === "pro" ? "lite" : "pro";
+          await applyUserMode(nextMode);
+        },
+        cycleRunMode: async () => {
+          const idx = RUN_MODE_CYCLE.indexOf(runMode);
+          const next = RUN_MODE_CYCLE[(idx + 1) % RUN_MODE_CYCLE.length] ?? "ask";
+          setRunMode(next);
+          await window.agenticxDesktop.saveRunMode(next);
+          return next;
+        },
+        addAssistantMessage: (content) => addMessage("assistant", content, "meta"),
+      }),
+    [
+      openSettings,
+      clearMessages,
+      userMode,
+      addMessage,
+      planMode,
+      setPlanMode,
+      runMode,
+      setRunMode,
+      applyUserMode,
+    ]
+  );
+  const commandResults = useMemo(
+    () => registry.search(deferredCommandQuery, userMode),
+    [registry, deferredCommandQuery, userMode]
+  );
+
+  const canSend = useMemo(() => !!(apiBase && sessionId), [apiBase, sessionId]);
+
+  const stallModelOptions = useMemo(
+    () => collectSelectableModelOptions(settings.providers),
+    [settings.providers],
+  );
+
+  const currentModelLabel = useMemo(() => {
+    if (!activeModel) return t("model.unselected");
+    if (!activeProvider) return activeModel;
+    if (!isModelSelectable(activeProvider, activeModel, settings.providers)) return t("model.unselected");
+    const entry = settings.providers[activeProvider];
+    return formatModelOptionLabel(activeProvider, activeModel, entry);
+  }, [activeModel, activeProvider, settings.providers, t]);
+
+  const showStopButton = shouldShowStopButton({
+    streaming,
+    streamingSessionId: sessionId || "",
+    currentSessionId: sessionId || "",
+    executionState: sessionExecutionState,
+  });
+
+  const recordProgressActivity = useCallback(() => {
+    lastProgressAtRef.current = Date.now();
+    setStallState((prev) => (prev === "stall" ? "none" : prev));
+  }, []);
+
+  useEffect(() => {
+    void window.agenticxDesktop.loadRuntimeConfig().then((r) => {
+      if (!r?.ok) return;
+      const sec = Number(r.stall_detect_silence_seconds ?? 90);
+      if (Number.isFinite(sec)) {
+        setStallDetectSeconds(Math.max(30, Math.min(300, Math.round(sec))));
+      }
+      setStallNudgeConfig({
+        stall_auto_nudge_enabled: Boolean(r.stall_auto_nudge_enabled),
+        stall_auto_nudge_after_seconds: Math.max(
+          30,
+          Math.min(300, Number(r.stall_auto_nudge_after_seconds ?? 120) || 120),
+        ),
+        stall_auto_nudge_max_per_session: Math.max(
+          1,
+          Math.min(5, Number(r.stall_auto_nudge_max_per_session ?? 2) || 2),
+        ),
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    sessionEnteredAtRef.current = Date.now();
+    setAutoNudgeCount(autoNudgeTriggeredRef.current[sessionId] ?? 0);
+    void window.agenticxDesktop.listSessions(undefined).then((r) => {
+      if (!r.ok) return;
+      const row = (r.sessions ?? []).find((s) => s.session_id === sessionId);
+      setSessionExecutionState((row?.execution_state ?? "idle") as SessionExecutionState);
+    });
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    const evaluate = async () => {
+      const lastProgress = lastProgressAtRef.current;
+      const now = Date.now();
+      const silentMs = lastProgress > 0 ? now - lastProgress : 0;
+      let execState: SessionExecutionState = sessionExecutionState;
+      try {
+        const r = await window.agenticxDesktop.listSessions(undefined);
+        if (cancelled || !r.ok) return;
+        const row = (r.sessions ?? []).find((s) => s.session_id === sessionId);
+        if (row?.execution_state) {
+          execState = row.execution_state as SessionExecutionState;
+          setSessionExecutionState(execState);
+        }
+      } catch {
+        /* ignore */
+      }
+      const graceMs = now - sessionEnteredAtRef.current;
+      const stallSilenceMs = stallDetectSilenceMs(stallDetectSeconds);
+      const channelA = sseActive && lastProgress > 0 && silentMs >= stallSilenceMs;
+      const channelB =
+        !sseActive &&
+        execState === "running" &&
+        lastProgress > 0 &&
+        silentMs >= stallSilenceMs;
+      const channelC =
+        graceMs >= CHANNEL_C_GRACE_MS &&
+        shouldTriggerIncompleteEndStall(execState, sseActive, messages, graceMs);
+      if (channelA || channelB || channelC) {
+        setStallState("stall");
+        return;
+      }
+      if (
+        stallState === "stall" &&
+        (lastTurnHasCompletedAssistantReply(messages) || silentMs < stallSilenceMs)
+      ) {
+        setStallState("none");
+      }
+    };
+    void evaluate();
+    const timer = window.setInterval(() => {
+      setStallTick((t) => t + 1);
+      void evaluate();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [messages, sessionExecutionState, sessionId, sseActive, stallDetectSeconds, stallState]);
+
+  const visibleMessages = useMemo(
+    () =>
+      messages.filter(
+        (item) =>
+          (!item.agentId || item.agentId === "meta")
+          && !isInterruptedAssistantPlaceholder(item)
+      ),
+    [messages]
+  );
+  const groupedVisibleMessages = useMemo(
+    () => groupConsecutiveToolMessages(visibleMessages),
+    [visibleMessages]
+  );
+  const topLevelRowsIm = useMemo(
+    () => (chatStyle === "im" ? expandMessagesToTopLevelRows(visibleMessages) : null),
+    [chatStyle, visibleMessages]
+  );
+  const hideStreamOverlayAsDuplicate = useMemo(
+    () => shouldHideStreamOverlay(streaming, streamedAssistantText || "", visibleMessages),
+    [streaming, streamedAssistantText, visibleMessages],
+  );
+  const midTurnStreamActivity = shouldShowMidTurnStreamActivity(
+    streaming,
+    hideStreamOverlayAsDuplicate,
+  );
+  const streamAssistantMessage = useMemo((): Message => {
+    return {
+      id: "__stream__",
+      role: "assistant",
+      content: streamedAssistantText || "",
+      references: streamReferences.length > 0 ? streamReferences : undefined,
+      searchedQueries: streamSearchedQueries.length > 0 ? streamSearchedQueries : undefined,
+      provider: streamingModel?.provider,
+      model: streamingModel?.model,
+    };
+  }, [
+    streamedAssistantText,
+    streamReferences,
+    streamSearchedQueries,
+    streamingModel?.provider,
+    streamingModel?.model,
+  ]);
+
+  const modelLabel = activeModel
+    ? (activeProvider ? `${activeProvider} / ${activeModel}` : activeModel)
+    : t("model.unselectedLong");
+  const voiceStatusLabel =
+    status === "listening"
+      ? t("status.listening")
+      : status === "processing"
+        ? t("status.thinkingStatus")
+        : "";
+  const runModeDisplay =
+    runMode === "ask"
+      ? t("composer.runModeAsk")
+      : runMode === "allowlist"
+        ? t("composer.runModeAllowlist")
+        : t("composer.runModeAuto");
+  const selectedSubAgentName = useMemo(() => {
+    if (!selectedSubAgent) return "";
+    return subAgents.find((item) => item.id === selectedSubAgent)?.name ?? selectedSubAgent;
+  }, [selectedSubAgent, subAgents]);
+  const composerPlaceholder = !canSend
+    ? t("composer.placeholderConnecting")
+    : isLite
+      ? selectedSubAgent
+        ? t("composer.placeholderSubagentLite", { name: selectedSubAgentName })
+        : streaming
+          ? t("composer.placeholderStreaming")
+          : t("composer.placeholderLite")
+      : planMode
+        ? t("composer.placeholderPlan")
+        : selectedSubAgent
+          ? t("composer.placeholderSubagent", { name: selectedSubAgentName })
+          : streaming
+            ? t("composer.placeholderStreaming")
+            : t("composer.placeholderPro");
+
+  const scrollToBottom = () => {
+    requestAnimationFrame(() => {
+      if (listRef.current) {
+        listRef.current.scrollTop = listRef.current.scrollHeight;
+      }
+    });
+  };
+
+  const cancelStreamRenderFrame = () => {
+    if (streamRafRef.current !== null) {
+      window.cancelAnimationFrame(streamRafRef.current);
+      streamRafRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [visibleMessages]);
+
+  useEffect(() => {
+    if (subAgents.length > 0) {
+      setPanelOpen(true);
+    }
+  }, [subAgents.length]);
+
+  useEffect(() => {
+    subAgentsRef.current = subAgents;
+    const next: Record<string, string> = {};
+    for (const item of subAgents) next[item.id] = item.status;
+    subAgentStatusRef.current = next;
+  }, [subAgents]);
+
+  useEffect(() => {
+    ccBridgeLastSessionModeRef.current = "";
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!commandPaletteOpen || isLite) return;
+    setCommandOpen(true);
+    setCommandQuery("");
+    setCommandPaletteOpen(false);
+  }, [commandPaletteOpen, setCommandPaletteOpen, isLite]);
+
+  useEffect(() => {
+    if (!keybindingsPanelOpen || isLite) return;
+    setKeybindingsOpen(true);
+    setKeybindingsPanelOpen(false);
+  }, [keybindingsPanelOpen, setKeybindingsPanelOpen, isLite]);
+
+  useEffect(() => {
+    if (isLite) return;
+    try {
+      const raw = localStorage.getItem("agx.desktop.inputHistory");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as string[];
+      if (Array.isArray(parsed)) setHistory(parsed.slice(0, 100));
+    } catch {
+      // ignore parse errors
+    }
+  }, [isLite]);
+
+  const pushHistory = (value: string) => {
+    if (!value.trim() || value.trim().startsWith("/")) {
+      setHistoryIndex(-1);
+      return;
+    }
+    setHistory((prev) => {
+      const dedup = prev.filter((item) => item !== value);
+      const next = [value, ...dedup].slice(0, 100);
+      try {
+        localStorage.setItem("agx.desktop.inputHistory", JSON.stringify(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+    setHistoryIndex(-1);
+  };
+
+  const openDelegatedAvatarSession = useCallback(
+    async (agentId: string) => {
+      const sub = useAppStore.getState().subAgents.find((item) => item.id === agentId);
+      const targetSessionId = (sub?.sessionId ?? "").trim();
+      if (!targetSessionId) return false;
+
+      const matchedAvatar = avatars.find((item) => item.name === (sub?.name ?? ""));
+      if (matchedAvatar?.id) setActiveAvatarId(matchedAvatar.id);
+      setSessionId(targetSessionId);
+      setSelectedSubAgent(null);
+
+      try {
+        const result = await window.agenticxDesktop.loadSessionMessages(targetSessionId);
+        clearMessages();
+        if (result.ok && Array.isArray(result.messages)) {
+          for (const [index, item] of result.messages.entries()) {
+            const mapped = mapLoadedSessionMessage(
+              item as LoadedSessionMessage,
+              targetSessionId,
+              index,
+              targetSessionId,
+            );
+            addMessage(
+              mapped.role,
+              mapped.content,
+              mapped.agentId,
+              mapped.provider,
+              mapped.model,
+              mapped.attachments,
+              {
+                avatarName: mapped.avatarName,
+                avatarUrl: mapped.avatarUrl,
+                quotedMessageId: mapped.quotedMessageId,
+                quotedContent: mapped.quotedContent,
+                timestamp: mapped.timestamp,
+                forwardedHistory: mapped.forwardedHistory,
+                references: mapped.references,
+                searchedQueries: mapped.searchedQueries,
+                metadata: mapped.metadata,
+                suggestedQuestions: mapped.suggestedQuestions,
+                toolCallId: mapped.toolCallId,
+                toolName: mapped.toolName,
+                toolArgs: mapped.toolArgs,
+                toolStatus: mapped.toolStatus,
+                toolElapsedSec: mapped.toolElapsedSec,
+                toolResultPreview: mapped.toolResultPreview,
+                toolGroupId: mapped.toolGroupId,
+                toolStreamLines: mapped.toolStreamLines,
+                clarificationPrompt: mapped.clarificationPrompt,
+                clarificationSuspended: mapped.clarificationSuspended,
+                actionConfirmation: mapped.actionConfirmation,
+                inlineConfirm: mapped.inlineConfirm,
+              },
+            );
+            if (mapped.reasoning || mapped.reasoningSeconds != null) {
+              mergeLastMessageByRole(mapped.role, {
+                ...(mapped.reasoning ? { reasoning: mapped.reasoning } : {}),
+                ...(mapped.reasoningSeconds != null
+                  ? { reasoningSeconds: mapped.reasoningSeconds }
+                  : {}),
+              });
+            }
+          }
+        }
+      } catch {
+        clearMessages();
+      }
+      return true;
+    },
+    [
+      avatars,
+      setActiveAvatarId,
+      setSessionId,
+      setSelectedSubAgent,
+      clearMessages,
+      addMessage,
+      mergeLastMessageByRole,
+    ]
+  );
+
+  const syncSubAgents = useCallback(async () => {
+    if (!apiBase || !sessionId) return;
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/subagents/status?session_id=${encodeURIComponent(sessionId)}`,
+        { headers: { "x-agx-desktop-token": apiToken } }
+      );
+      if (!resp.ok) return;
+      const data = await resp.json() as {
+        ok?: boolean;
+        subagents?: Array<{
+          agent_id: string;
+          name?: string;
+          role?: string;
+          provider?: string;
+          model?: string;
+          task?: string;
+          status?: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
+          result_summary?: string;
+          error_text?: string;
+          recent_events?: Array<{ type?: string; data?: Record<string, unknown> }>;
+        }>;
+      };
+      if (!Array.isArray(data.subagents)) return;
+      for (const item of data.subagents) {
+        const id = item.agent_id;
+        if (!id) continue;
+        const currentSubs = subAgentsRef.current;
+        const exists = currentSubs.some((s) => s.id === id);
+        if (!exists) {
+          addSubAgent({
+            id,
+            name: item.name ?? id,
+            role: item.role ?? "worker",
+            provider: item.provider ?? undefined,
+            model: item.model ?? undefined,
+            task: item.task ?? "",
+          });
+        }
+        const status = item.status ?? "running";
+        const prevStatus = subAgentStatusRef.current[id];
+        subAgentStatusRef.current[id] = status;
+        const currentAction =
+          status === "completed"
+            ? (item.result_summary
+                ? i18n.t("notice.completedViewSummary", { ns: "chat" })
+                : i18n.t("notice.completed", { ns: "chat" }))
+            : status === "failed"
+              ? (item.error_text || i18n.t("notice.execError", { ns: "chat" }))
+              : status === "cancelled"
+                ? i18n.t("notice.interrupted", { ns: "chat" })
+                : i18n.t("notice.running", { ns: "chat" });
+        const existing = currentSubs.find((s) => s.id === id);
+        updateSubAgent(id, {
+          status,
+          currentAction,
+          provider: item.provider ?? existing?.provider,
+          model: item.model ?? existing?.model,
+        });
+
+        const transitionedToTerminal =
+          prevStatus !== status && (status === "completed" || status === "failed" || status === "cancelled");
+        if (transitionedToTerminal) {
+          const statusLabel =
+            status === "completed"
+              ? i18n.t("notice.completed", { ns: "chat" })
+              : status === "cancelled"
+                ? i18n.t("notice.interrupted", { ns: "chat" })
+                : i18n.t("notice.execFailed", { ns: "chat" });
+          const summaryText =
+            status === "completed"
+              ? (item.result_summary || i18n.t("notice.taskEnded", { ns: "chat" }))
+              : status === "cancelled"
+                ? i18n.t("notice.interrupted", { ns: "chat" })
+                : (item.error_text || i18n.t("notice.execFailed", { ns: "chat" }));
+          addMessage("tool", `📌 ${item.name ?? id} (${id}) ${statusLabel}\n${summaryText}`, "meta");
+        }
+
+        const seen = polledEventSeenRef.current[id] ?? new Set<string>();
+        polledEventSeenRef.current[id] = seen;
+        const recentEvents = Array.isArray(item.recent_events) ? item.recent_events : [];
+        for (const evt of recentEvents) {
+          const evtType = String(evt?.type ?? "");
+          const evtData = (evt?.data ?? {}) as Record<string, unknown>;
+          const signature = `${evtType}:${JSON.stringify(evtData)}`;
+          if (seen.has(signature)) continue;
+          seen.add(signature);
+          if (seen.size > 300) {
+            const first = seen.values().next().value as string | undefined;
+            if (first) seen.delete(first);
+          }
+          const SILENT_TOOLS = new Set(["check_resources"]);
+          let content = "";
+          if (evtType === "tool_call") {
+            if (SILENT_TOOLS.has(String(evtData.name ?? ""))) continue;
+            const toolName = String(evtData.name ?? "tool");
+            const toolArgs = evtData.arguments ?? {};
+            content = `🔧 ${toolName}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+            const livePreview = buildToolCallLivePreview(toolName, toolArgs);
+            if (livePreview) {
+              const sub = useAppStore.getState().subAgents.find((item) => item.id === id);
+              const prev = sub?.liveOutput ?? "";
+              updateSubAgent(id, { liveOutput: `${prev}${prev ? "\n\n" : ""}${livePreview}`.slice(-12000) });
+            }
+          } else if (evtType === "tool_result") {
+            const result = typeof evtData.result === "string" ? evtData.result : JSON.stringify(evtData.result ?? {});
+            const formatted = formatToolResultMessage(evtData.name, result);
+            if (formatted.silent) continue;
+            content = formatted.content;
+            const toolName = String(evtData.name ?? "");
+            if (toolName === "file_write" || toolName === "file_edit") {
+              const sub = useAppStore.getState().subAgents.find((item) => item.id === id);
+              const prev = sub?.liveOutput ?? "";
+              updateSubAgent(id, { liveOutput: `${prev}\n\n# ${toolName} applied`.slice(-12000) });
+            }
+          } else if (evtType === "error") {
+            content = `❌ ${String(evtData.text ?? i18n.t("notice.execError", { ns: "chat" }))}`;
+          } else if (evtType === "confirm_required") {
+            content = `⏸ ${i18n.t("notice.waitingConfirm", { ns: "chat" })}: ${String(evtData.question ?? i18n.t("notice.confirmQuestion", { ns: "chat" }))}`;
+          } else if (typeof evtData.text === "string" && evtData.text.trim()) {
+            content = evtData.text;
+          } else {
+            content = `${evtType || "event"}: ${JSON.stringify(evtData)}`;
+          }
+          addSubAgentEvent(id, { type: evtType || "event", content });
+        }
+      }
+    } catch {
+      // silent
+    }
+  }, [apiBase, sessionId, apiToken, addSubAgent, updateSubAgent, addMessage, addSubAgentEvent]);
+
+  useEffect(() => {
+    if (!apiBase || !sessionId) return;
+    const hasAnySubagent = subAgentsRef.current.length > 0;
+    void syncSubAgents();
+    const interval = hasAnySubagent ? 2000 : 5000;
+    const timer = window.setInterval(() => void syncSubAgents(), interval);
+    return () => window.clearInterval(timer);
+  }, [apiBase, sessionId, syncSubAgents, subAgents.length]);
+
+  const onCancelSubAgent = async (agentId: string) => {
+    if (!apiBase || !sessionId) return;
+    updateSubAgent(agentId, { status: "cancelled", currentAction: "用户请求中断..." });
+    try {
+      const resp = await fetch(`${apiBase}/api/subagent/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+        body: JSON.stringify({ session_id: sessionId, agent_id: agentId })
+      });
+      if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
+      addSubAgentEvent(agentId, { type: "cancel", content: "已发送中断请求" });
+    } catch (err) {
+      updateSubAgent(agentId, { status: "cancelled", currentAction: "中断请求失败（后端未找到该任务）" });
+      addSubAgentEvent(agentId, { type: "error", content: `中断请求失败: ${String(err)}` });
+    }
+  };
+
+  const onRetrySubAgent = async (agentId: string) => {
+    if (!apiBase || !sessionId) return;
+    const sub = subAgents.find((item) => item.id === agentId);
+    updateSubAgent(agentId, {
+      status: "pending",
+      currentAction: "正在重试...",
+      resultSummary: "",
+      resultFile: undefined,
+      liveOutput: "",
+      outputFiles: [],
+      // Reset activity log so the retry starts clean instead of stacking events.
+      events: [],
+    });
+    try {
+      const resp = await fetch(`${apiBase}/api/subagent/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+        body: JSON.stringify({
+          session_id: sessionId,
+          agent_id: agentId,
+          // Send the (possibly edited) task so backend re-runs with the latest
+          // instruction instead of the original one.
+          ...(sub?.task?.trim() ? { task: sub.task.trim() } : {}),
+          ...(sub?.provider ? { provider: sub.provider } : {}),
+          ...(sub?.model ? { model: sub.model } : {}),
+        }),
+      });
+      if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
+      addSubAgentEvent(agentId, { type: "retry", content: "已发送重试请求" });
+      addMessage("tool", `🔁 已请求重试子智能体 ${agentId}`, "meta");
+    } catch (err) {
+      updateSubAgent(agentId, { status: "failed", currentAction: "重试失败" });
+      addSubAgentEvent(agentId, { type: "error", content: `重试失败: ${String(err)}` });
+    }
+  };
+
+  const changeSubAgentModel = async (agentId: string, provider: string, model: string) => {
+    if (!apiBase || !sessionId) return;
+    updateSubAgent(agentId, { provider, model });
+    try {
+      const resp = await fetch(`${apiBase}/api/subagent/model`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+        body: JSON.stringify({
+          session_id: sessionId,
+          agent_id: agentId,
+          provider,
+          model,
+        }),
+      });
+      if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
+      addSubAgentEvent(agentId, {
+        type: "model_changed",
+        content: `已切换模型：${formatModelOptionLabel(provider, model, settings.providers[provider])}`,
+      });
+    } catch (err) {
+      addSubAgentEvent(agentId, { type: "error", content: `切换模型失败: ${String(err)}` });
+    }
+  };
+
+  const toggleSubAgentChat = (agentId: string) => {
+    if (selectedSubAgent === agentId) {
+      setSelectedSubAgent(null);
+      return;
+    }
+    const sub = subAgents.find((item) => item.id === agentId);
+    const isDelegation =
+      agentId.startsWith("dlg-") ||
+      !!(sub?.sessionId && sub?.events?.some((evt) => evt.type.startsWith("delegation")));
+    if (isDelegation) {
+      void openDelegatedAvatarSession(agentId);
+      return;
+    }
+    setSelectedSubAgent(agentId);
+  };
+
+  const sendChat = async (
+    userText: string,
+    opts?: {
+      provider?: string;
+      model?: string;
+      insertAfterId?: string;
+      agentId?: string;
+      forceSend?: boolean;
+      continuation?: { reason: ContinueReason; source: ContinueSource };
+    }
+  ) => {
+    const isContinuation = !!opts?.continuation;
+    if ((!userText && !isContinuation) || !apiBase || !sessionId) return;
+    if (!isContinuation && !opts?.forceSend) {
+      const now = Date.now();
+      if (
+        shouldDropDuplicateUserSend(
+          lastUserSendDedupeRef.current,
+          sessionId,
+          userText,
+          now,
+        )
+      ) {
+        return;
+      }
+      lastUserSendDedupeRef.current = {
+        sessionId,
+        text: String(userText ?? "").trim(),
+        at: now,
+      };
+    }
+
+    if (
+      !isContinuation &&
+      shouldEnqueueOnResend({ isStreamRunActive: streaming, forceSend: opts?.forceSend })
+    ) {
+      enqueuePaneMessage(liteQueueKey, {
+        id: crypto.randomUUID(),
+        text: userText,
+        sessionId,
+        attachments: [],
+        contextFiles: [],
+        timestamp: Date.now(),
+      });
+      setInput("");
+      return;
+    }
+
+    if (streaming && opts?.forceSend) {
+      abortedByUserRef.current = true;
+      const partial = streamTextRef.current.trim();
+      const partialCommitted =
+        !!partial && !isThinkingPlaceholderText(partial) && !streamCommittedRef.current;
+      if (partialCommitted) {
+        addMessage("assistant", streamTextRef.current, "meta", activeProvider, activeModel);
+        streamCommittedRef.current = true;
+      }
+      try {
+        await window.agenticxDesktop.interruptSession?.(sessionId);
+      } catch (err) {
+        console.warn("[ChatView] barge-in interrupt failed:", err);
+      }
+      useAppStore.getState().cancelInFlightLiteTools(sessionId);
+      abortRef.current?.abort();
+      addMessage("tool", "已中断上一轮生成，开始处理新消息", "meta");
+      streamTextRef.current = "";
+      cancelStreamRenderFrame();
+      setStreamedAssistantText("");
+      setWidgetFlowRewriting(false);
+      setStreamReferences([]);
+      setStreamSearchedQueries([]);
+      setStreamingModel(null);
+      setStatus("idle");
+      setStreaming(false);
+
+      // Close the prior user turn with "（已中断）" so the next request does
+      // not arrive at the backend with two consecutive unanswered user
+      // messages (the model would otherwise answer both).
+      if (!partialCommitted) {
+        const interruptedNote = "（已中断）";
+        addMessage("assistant", interruptedNote, "meta", activeProvider, activeModel);
+        try {
+          await fetch(`${apiBase}/api/session/messages/append`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-agx-desktop-token": apiToken,
+            },
+            body: JSON.stringify({
+              session_id: sessionId,
+              messages: [
+                {
+                  role: "assistant",
+                  content: interruptedNote,
+                  metadata: { source: "barge-in" },
+                },
+              ],
+            }),
+          });
+        } catch (err) {
+          console.warn("[ChatView] append interrupted placeholder failed:", err);
+        }
+      }
+    }
+    const reqProvider = opts?.provider ?? activeProvider;
+    const reqModel = opts?.model ?? activeModel;
+    const targetAgentId = (opts?.agentId ?? "meta").trim() || "meta";
+    const effectiveUserText =
+      userMode === "pro" && planMode && targetAgentId === "meta"
+        ? `你现在处于计划模式。请只输出可执行计划与风险，不要调用工具，不要执行操作。\n\n用户需求：${userText}`
+        : userText;
+    const clientTurnId = isContinuation ? "" : crypto.randomUUID();
+    const requestId = activeRequestIdRef.current + 1;
+    activeRequestIdRef.current = requestId;
+    const isCurrentRequest = () => activeRequestIdRef.current === requestId;
+    let insertAfterCursor = opts?.insertAfterId;
+    const appendAssistantMessage = (
+      content: string,
+      extras?: Partial<Pick<Message, "suggestedQuestions" | "references" | "searchedQueries">>,
+    ) => {
+      if (insertAfterCursor) {
+        insertAfterCursor = insertMessageAfter(insertAfterCursor, {
+          role: "assistant",
+          content,
+          agentId: "meta",
+          provider: reqProvider,
+          model: reqModel,
+          ...extras,
+        });
+        return;
+      }
+      addMessage("assistant", content, "meta", reqProvider, reqModel, undefined, extras);
+    };
+    const commitCurrentStreamIfNeeded = () => {
+      const raw = streamTextRef.current.trim();
+      // Trim trailing colon ("：" or ":") that model writes just before calling a tool.
+      const partial = raw.replace(/[：:]\s*$/, "").trimEnd();
+      if (
+        !partial ||
+        isThinkingPlaceholderText(partial) ||
+        isStreamToolLabelOnlyText(partial) ||
+        streamCommittedRef.current
+      ) {
+        return false;
+      }
+      appendAssistantMessage(partial);
+      streamCommittedRef.current = true;
+      lastMidStreamAssistantCommitRef.current = partial;
+      return true;
+    };
+    const scheduleStreamTextUpdate = (nextText: string) => {
+      streamTextRef.current = nextText;
+      if (!isCurrentRequest()) return;
+      if (streamRafRef.current !== null) return;
+      streamRafRef.current = window.requestAnimationFrame(() => {
+        streamRafRef.current = null;
+        if (isCurrentRequest()) setStreamedAssistantText(streamTextRef.current);
+      });
+    };
+    const resetStreamSegment = () => {
+      streamTextRef.current = "";
+      cancelStreamRenderFrame();
+      if (isCurrentRequest()) setStreamedAssistantText("");
+      pendingToolResultPatchesRef.current = {};
+      streamCommittedRef.current = false;
+    };
+
+    if (!opts?.insertAfterId && !isContinuation) {
+      setInput("");
+      if (targetAgentId === "meta") {
+        addMessage(
+          "user",
+          userText,
+          "meta",
+          undefined,
+          undefined,
+          undefined,
+          { metadata: { client_turn_id: clientTurnId } },
+        );
+      } else {
+        addSubAgentEvent(targetAgentId, { type: "user", content: userText });
+        addMessage("tool", `🗣 发送给 ${selectedSubAgentName || targetAgentId}: ${userText}`, "meta");
+      }
+    }
+
+    setStatus("processing");
+    setStreaming(true);
+    setSseActive(true);
+    setSessionExecutionState("running");
+    recordProgressActivity();
+    cancelStreamRenderFrame();
+    setStreamedAssistantText("");
+    setWidgetFlowRewriting(false);
+    setStreamReferences([]);
+    setStreamSearchedQueries([]);
+    setStreamingModel(reqModel ? { provider: reqProvider, model: reqModel } : null);
+    streamTextRef.current = "";
+    streamCommittedRef.current = false;
+    lastMidStreamAssistantCommitRef.current = null;
+    abortedByUserRef.current = false;
+    const abortController = new AbortController();
+    abortRef.current = abortController;
+    const showWidgetDeltaTimers = new Map<string, number>();
+    const showWidgetDeltaPending = new Map<
+      string,
+      { argumentsRaw: string; title?: string; widgetCode?: string }
+    >();
+    const flushShowWidgetDelta = (toolCallId: string) => {
+      const pending = showWidgetDeltaPending.get(toolCallId);
+      showWidgetDeltaPending.delete(toolCallId);
+      const timer = showWidgetDeltaTimers.get(toolCallId);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        showWidgetDeltaTimers.delete(toolCallId);
+      }
+      if (!pending) return;
+      const partialPayload = {
+        argumentsRaw: pending.argumentsRaw,
+        title: pending.title,
+        widgetCode: pending.widgetCode,
+      };
+      const partialToolArgs = pending.title ? { title: pending.title } : undefined;
+      const merged = updateMessageByToolCallId(toolCallId, {
+        toolName: "show_widget",
+        toolStatus: "running",
+        ...(partialToolArgs ? { toolArgs: partialToolArgs } : {}),
+        toolArgsPartial: partialPayload,
+      });
+      if (merged) return;
+      const globalMsgs = useAppStore.getState().messages;
+      const lastMsg = globalMsgs.length ? globalMsgs[globalMsgs.length - 1] : undefined;
+      const toolGroupId =
+        lastMsg?.role === "tool" && lastMsg.toolGroupId
+          ? lastMsg.toolGroupId
+          : crypto.randomUUID();
+      addMessage("tool", "", "meta", undefined, undefined, undefined, {
+        toolCallId,
+        toolName: "show_widget",
+        toolStatus: "running",
+        toolGroupId,
+        ...(partialToolArgs ? { toolArgs: partialToolArgs } : {}),
+        toolArgsPartial: partialPayload,
+      });
+    };
+    const scheduleShowWidgetDelta = (
+      toolCallId: string,
+      nextPartial: { argumentsRaw: string; title?: string; widgetCode?: string }
+    ) => {
+      const prev = showWidgetDeltaPending.get(toolCallId);
+      if (prev && nextPartial.argumentsRaw.length < prev.argumentsRaw.length) {
+        return;
+      }
+      showWidgetDeltaPending.set(toolCallId, nextPartial);
+      if (showWidgetDeltaTimers.has(toolCallId)) return;
+      const timer = window.setTimeout(() => flushShowWidgetDelta(toolCallId), 100);
+      showWidgetDeltaTimers.set(toolCallId, timer);
+    };
+
+    const turnRefsSnapshot = {
+      references: [] as SearchReference[],
+      queries: [] as string[],
+    };
+
+    let full = "";
+    let receivedFinalEvent = false;
+
+    try {
+      const body: Record<string, unknown> = { session_id: sessionId, user_input: effectiveUserText };
+      body.keep_runtime_after_disconnect = true;
+      if (!isContinuation) body.client_turn_id = clientTurnId;
+      if (reqProvider) body.provider = reqProvider;
+      if (reqModel) body.model = reqModel;
+      if (targetAgentId !== "meta") body.agent_id = targetAgentId;
+      if (!isContinuation) {
+        useAppStore.getState().startConfirmRun(String(sessionId ?? ""), "");
+      }
+      const resp = isContinuation && opts?.continuation
+        ? await fetch(continueSessionUrl(apiBase, sessionId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+            body: JSON.stringify({
+              reason: opts.continuation.reason,
+              source: opts.continuation.source,
+              suppress_user_echo: true,
+            }),
+            signal: abortController.signal,
+          })
+        : await fetch(`${apiBase}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+            body: JSON.stringify(body),
+            signal: abortController.signal,
+          });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const reader = resp.body?.getReader();
+      const decoder = new TextDecoder();
+      if (!reader) { if (isCurrentRequest()) { setStatus("idle"); setStreaming(false); } return; }
+
+      let cumulativeFull = "";
+      let pendingSuggestedQuestions: string[] = [];
+      let pendingFinalTurnTerminal = false;
+      let pendingFinalTerminalReason: string | undefined;
+      let pendingReferences: SearchReference[] = [];
+      let pendingSearchedQueries: string[] = [];
+      const syncTurnRefsSnapshot = () => {
+        turnRefsSnapshot.references = pendingReferences;
+        turnRefsSnapshot.queries = pendingSearchedQueries;
+      };
+      let buffer = "";
+      while (true) {
+        if (!isCurrentRequest()) return;
+        const { value: chunk, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(chunk, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          const line = frame.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          try {
+            const payload = JSON.parse(line.slice(6));
+            const eventAgentId = payload.data?.agent_id ?? "meta";
+            if (payload.type === "continuation_notice") {
+              const noticeText = String(payload.data?.text ?? "").trim();
+              if (noticeText) {
+                addMessage("tool", noticeText, "meta", undefined, undefined, undefined, {
+                  metadata: {
+                    kind: "continuation_notice",
+                    source: payload.data?.source,
+                    reason: payload.data?.reason,
+                    continuation_round: payload.data?.continuation_round,
+                  },
+                });
+              }
+              continue;
+            }
+            if (payload.type === "continuation_rejected") {
+              continue;
+            }
+            if (payload.type === "tool_progress") {
+              if (!isCurrentRequest()) continue;
+              recordProgressActivity();
+              const progressPhase = String(payload.data?.phase ?? "");
+              if (progressPhase === "stall_patient_wait") {
+                const info = parseStallWaitPayload(payload.data, Date.now());
+                if (info) setStallWait(info);
+                continue;
+              }
+              if (progressPhase === "stall_patient_recovered") {
+                setStallWait(null);
+                continue;
+              }
+              const name = String(payload.data?.name ?? "tool");
+              const sec = Number(payload.data?.elapsed_seconds ?? 0);
+              const outputLine = payload.data?.line as string | undefined;
+              const progressCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (eventAgentId === "meta" && progressCallId) {
+                const patch: ToolCallStreamPatch = {
+                  toolStatus: "running",
+                };
+                if (Number.isFinite(sec)) patch.toolElapsedSec = sec;
+                if (outputLine !== undefined) patch.appendStreamLine = String(outputLine);
+                updateMessageByToolCallId(progressCallId, patch);
+                continue;
+              }
+              if (outputLine !== undefined && eventAgentId === "meta" && !progressCallId) {
+                continue;
+              }
+              if (eventAgentId === "meta") {
+                continue;
+              }
+              if (name === "cc_bridge_send") {
+                updateSubAgent(eventAgentId, {
+                  currentAction: ccBridgeSendToolProgressLabel(sec, ccBridgeLastSessionModeRef.current),
+                });
+              } else {
+                updateSubAgent(eventAgentId, {
+                  currentAction: Number.isFinite(sec) ? `${name} 执行中… (${sec}s)` : `${name} 执行中…`,
+                });
+              }
+              continue;
+            }
+            if (payload.type === "token") {
+              if (eventAgentId !== "meta") { addSubAgentEvent(eventAgentId, { type: "token", content: "生成中..." }); continue; }
+              recordProgressActivity();
+              const rawToken = String(payload.data?.text ?? "");
+              // Strip backend-emitted ⏳ waiting placeholder from streamed tokens.
+              const tokenText = rawToken.replace(/⏳\s*/g, "");
+              if (!tokenText) continue;
+              full += tokenText;
+              cumulativeFull += tokenText;
+              setStallWait(null);
+              setWidgetFlowRewriting(false);
+              scheduleStreamTextUpdate(full);
+            }
+            if (payload.type === "tool_call") {
+              setStallWait(null);
+              setWidgetFlowRewriting(false);
+              const toolNameStr = String(payload.data?.name ?? "tool");
+              const toolArgs = (payload.data?.arguments ?? payload.data?.args ?? {}) as Record<string, unknown>;
+              const toolCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (SEARCH_REFERENCE_TOOLS.has(toolNameStr)) {
+                const q = String(toolArgs.query ?? "").trim();
+                if (q) pendingSearchedQueries = mergeSearchedQueries(pendingSearchedQueries, [q]);
+              }
+              if (eventAgentId === "meta" && toolNameStr === "cc_bridge_start") {
+                const modeHint = parseCcBridgeModeFromPayload(toolArgs);
+                if (modeHint === "headless") {
+                  ccBridgeLastSessionModeRef.current = "headless";
+                } else if (modeHint === "visible_tui") {
+                  ccBridgeLastSessionModeRef.current = "visible_tui";
+                }
+              }
+              const SILENT_TOOLS_SSE = new Set(["check_resources"]);
+              if (!SILENT_TOOLS_SSE.has(toolNameStr)) {
+                if (eventAgentId === "meta") {
+                  const globalMsgs = useAppStore.getState().messages;
+                  const lastMsg = globalMsgs.length ? globalMsgs[globalMsgs.length - 1] : undefined;
+                  const toolGroupId =
+                    lastMsg?.role === "tool" && lastMsg.toolGroupId
+                      ? lastMsg.toolGroupId
+                      : crypto.randomUUID();
+                  const rawArgs = JSON.stringify(toolArgs);
+                  const content =
+                    rawArgs.length > 80_000 ? `${rawArgs.slice(0, 80_000)}\n… (truncated)` : rawArgs;
+                  if (toolNameStr === "request_clarification") {
+                    const clarifyExtras = toolCallId
+                      ? buildClarificationMessageExtras(toolArgs, toolCallId, toolGroupId, sessionId)
+                      : null;
+                    if (clarifyExtras) {
+                      addMessage(
+                        "tool",
+                        clarifyExtras.clarificationPrompt?.prompt ?? content,
+                        "meta",
+                        undefined,
+                        undefined,
+                        undefined,
+                        clarifyExtras,
+                      );
+                      full = "";
+                      resetStreamSegment();
+                      scheduleStreamTextUpdate("");
+                      continue;
+                    }
+                  }
+                  full = "";
+                  resetStreamSegment();
+                  if (toolCallId) {
+                    const merged = updateMessageByToolCallId(toolCallId, {
+                      content,
+                      toolName: toolNameStr,
+                      toolArgs,
+                      toolStatus: "running",
+                    });
+                    if (!merged) {
+                      addMessage("tool", content, "meta", undefined, undefined, undefined, {
+                        toolCallId,
+                        toolName: toolNameStr,
+                        toolArgs,
+                        toolStatus: "running",
+                        toolGroupId,
+                      });
+                    }
+                    const pendingPatch = pendingToolResultPatchesRef.current[toolCallId];
+                    if (pendingPatch) {
+                      updateMessageByToolCallId(toolCallId, pendingPatch);
+                      delete pendingToolResultPatchesRef.current[toolCallId];
+                    }
+                  } else {
+                    const legacy = `\u{1F527} ${toolNameStr}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+                    addMessage("tool", legacy, "meta");
+                  }
+                } else {
+                  flushSubAgentLiveOutput(eventAgentId);
+                  const legacy = `\u{1F527} ${toolNameStr}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+                  updateSubAgent(eventAgentId, { status: "running", currentAction: `调用工具 ${toolNameStr}` });
+                  addSubAgentEvent(eventAgentId, { type: "tool_call", content: legacy });
+                  const livePreview = buildToolCallLivePreview(toolNameStr, toolArgs);
+                  if (livePreview) {
+                    const sub = useAppStore.getState().subAgents.find((item) => item.id === eventAgentId);
+                    const prev = sub?.liveOutput ?? "";
+                    updateSubAgent(eventAgentId, { liveOutput: `${prev}${prev ? "\n\n" : ""}${livePreview}`.slice(-12000) });
+                  }
+                }
+              }
+            }
+            if (payload.type === "tool_call_delta") {
+              if (eventAgentId !== "meta") continue;
+              const toolNameStr = String(payload.data?.name ?? "").trim();
+              if (toolNameStr !== "show_widget") continue;
+              const toolCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (!toolCallId) continue;
+              const argumentsRaw = String(payload.data?.arguments_raw ?? "");
+              const partial = extractPartialShowWidgetArgs(argumentsRaw);
+              if (!partial) continue;
+              scheduleShowWidgetDelta(toolCallId, {
+                argumentsRaw,
+                title: partial.title || undefined,
+                widgetCode: partial.widgetCode || undefined,
+              });
+              continue;
+            }
+            if (payload.type === "tool_result") {
+              const toolName = payload.data?.name ?? "tool";
+              if (SEARCH_REFERENCE_TOOLS.has(String(toolName))) {
+                const accumulated = accumulateReferenceTurn(
+                  pendingReferences,
+                  pendingSearchedQueries,
+                  payload.data,
+                );
+                pendingReferences = accumulated.references;
+                pendingSearchedQueries = accumulated.queries;
+                syncTurnRefsSnapshot();
+                if (isCurrentRequest()) {
+                  setStreamReferences([...pendingReferences]);
+                  setStreamSearchedQueries([...pendingSearchedQueries]);
+                }
+              }
+              let resultObjForCc: Record<string, unknown> | null = null;
+              const resultRaw = payload.data?.result;
+              if (typeof resultRaw === "string") {
+                try {
+                  const parsed = JSON.parse(resultRaw);
+                  resultObjForCc = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+                } catch {
+                  resultObjForCc = null;
+                }
+              } else if (resultRaw && typeof resultRaw === "object") {
+                resultObjForCc = resultRaw as Record<string, unknown>;
+              }
+              if (eventAgentId === "meta" && toolName === "cc_bridge_start" && resultObjForCc) {
+                const hint = parseCcBridgeModeFromPayload(resultObjForCc);
+                if (hint) {
+                  ccBridgeLastSessionModeRef.current = hint;
+                }
+              }
+              const formatted = formatToolResultMessage(toolName, resultRaw);
+              if (formatted.silent) continue;
+              const resultCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              const rawContent = serializeToolResultRaw(resultRaw);
+              const preview = formatted.content.replace(/\s+/g, " ").trim().slice(0, 160);
+              const mergedStatus = payload.data?.is_error === true
+                ? "error"
+                : deriveToolStatusFromResult(resultRaw);
+              if (eventAgentId === "meta") {
+                const resultPatch = {
+                  content: rawContent,
+                  toolStatus: mergedStatus,
+                  toolResultPreview: preview,
+                  toolStreamLines: [],
+                };
+                let merged = resultCallId
+                  ? updateMessageByToolCallId(resultCallId, resultPatch)
+                  : false;
+                if (!merged) {
+                  const fallbackCallId = [...useAppStore.getState().messages]
+                    .reverse()
+                    .find(
+                      (mm) =>
+                        mm.role === "tool" &&
+                        Boolean(mm.toolCallId) &&
+                        (mm.toolStatus === "running" || mm.toolStatus === "pending") &&
+                        (!toolName || (mm.toolName ?? "") === String(toolName))
+                    )?.toolCallId;
+                  if (fallbackCallId) {
+                    merged = updateMessageByToolCallId(fallbackCallId, resultPatch);
+                  }
+                }
+                if (!merged && resultCallId) {
+                  pendingToolResultPatchesRef.current[resultCallId] = resultPatch;
+                  merged = true;
+                }
+                if (!merged && !shouldSkipFormattedToolResultFallback(formatted.content, rawContent)) {
+                  addMessage("tool", rawContent || formatted.content, "meta", undefined, undefined, undefined, {
+                    toolCallId: resultCallId || undefined,
+                    toolName: String(toolName || "").trim() || undefined,
+                    toolStatus: mergedStatus,
+                    toolResultPreview: preview,
+                  });
+                }
+              } else {
+                addSubAgentEvent(eventAgentId, { type: "tool_result", content: formatted.content });
+                if (toolName === "file_write" || toolName === "file_edit") {
+                  const sub = useAppStore.getState().subAgents.find((item) => item.id === eventAgentId);
+                  const prev = sub?.liveOutput ?? "";
+                  updateSubAgent(eventAgentId, { liveOutput: `${prev}\n\n# ${toolName} applied`.slice(-12000) });
+                }
+              }
+              if (
+                eventAgentId === "meta" &&
+                toolName === "cc_bridge_send" &&
+                resultObjForCc &&
+                resultObjForCc.mode === "visible_tui" &&
+                resultObjForCc.ok === true &&
+                String(resultObjForCc.parsed_response ?? "").trim().length > 0
+              ) {
+                addMessage("assistant", String(resultObjForCc.parsed_response), "meta", activeProvider, activeModel);
+              }
+            }
+            if (payload.type === "confirm_required") {
+              if (!isCurrentRequest()) continue;
+              if (eventAgentId !== "meta") {
+                updateSubAgent(eventAgentId, { status: "awaiting_confirm", currentAction: "等待你的确认" });
+                addSubAgentEvent(eventAgentId, {
+                  type: "confirm_required",
+                  content: payload.data?.question ?? "等待确认",
+                });
+              }
+              const rawConfirmContext =
+                payload.data?.context && typeof payload.data.context === "object"
+                  ? (payload.data.context as Record<string, unknown>)
+                  : {};
+              const ok = await onOpenConfirm(
+                payload.data?.id ?? "",
+                payload.data?.question ?? "是否确认执行？",
+                payload.data?.context?.diff,
+                eventAgentId,
+                { ...rawConfirmContext, session_id: sessionId },
+              );
+              if (!isCurrentRequest()) continue;
+              await fetch(`${apiBase}/api/confirm`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+                body: JSON.stringify({ session_id: sessionId, request_id: payload.data?.id, approved: ok, agent_id: eventAgentId })
+              });
+            }
+            if (payload.type === "confirm_response") {
+              if (eventAgentId !== "meta") {
+                const approved = !!payload.data?.approved;
+                updateSubAgent(eventAgentId, {
+                  status: approved ? "running" : "cancelled",
+                  currentAction: approved ? "确认通过，继续执行" : "确认拒绝，已取消",
+                });
+                addSubAgentEvent(eventAgentId, {
+                  type: "confirm_response",
+                  content: approved ? "确认通过" : "确认拒绝",
+                });
+              }
+            }
+            if (payload.type === "clarification_required") {
+              if (!isCurrentRequest()) continue;
+              const clarifyReqId = String(payload.data?.id ?? "");
+              const clarifyPrompt = String(payload.data?.prompt ?? "");
+              const clarifyOptions = Array.isArray(payload.data?.options)
+                ? (payload.data.options as string[]).map((o) => String(o)).filter(Boolean)
+                : [];
+              const clarifyAllowFreeText = payload.data?.allow_free_text !== false;
+              if (eventAgentId !== "meta") {
+                updateSubAgent(eventAgentId, {
+                  status: "awaiting_input",
+                  currentAction: "等待你的输入",
+                  pendingClarification: clarifyReqId
+                    ? {
+                        requestId: clarifyReqId,
+                        prompt: clarifyPrompt,
+                        options: clarifyOptions,
+                        allowFreeText: clarifyAllowFreeText,
+                        agentId: eventAgentId,
+                        sessionId,
+                        context: payload.data?.context,
+                      }
+                    : undefined,
+                });
+                addSubAgentEvent(eventAgentId, {
+                  type: "clarification_required",
+                  content: clarifyPrompt || "等待输入",
+                });
+                if (onOpenClarification && clarifyReqId) {
+                  const answer = await onOpenClarification(
+                    clarifyReqId,
+                    clarifyPrompt,
+                    clarifyOptions,
+                    clarifyAllowFreeText,
+                    eventAgentId,
+                    payload.data?.context,
+                  );
+                  if (!isCurrentRequest()) continue;
+                  await fetch(`${apiBase}/api/clarify`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+                    body: JSON.stringify({
+                      session_id: sessionId,
+                      request_id: clarifyReqId,
+                      agent_id: eventAgentId,
+                      answer_text: answer?.answerText ?? "",
+                      selected_options: answer?.selectedOptions ?? [],
+                    }),
+                  });
+                }
+              } else if (clarifyReqId && clarifyPrompt) {
+                const clarifyContext = payload.data?.context;
+                const running = findRunningClarificationToolMessage(useAppStore.getState().messages);
+                const promptPayload = {
+                  requestId: clarifyReqId,
+                  prompt: clarifyPrompt,
+                  options: clarifyOptions,
+                  allowFreeText: clarifyAllowFreeText,
+                  agentId: "meta",
+                  sessionId,
+                  context: clarifyContext,
+                };
+                const metaPatch = {
+                  content: clarifyPrompt,
+                  clarificationPrompt: promptPayload,
+                  metadata: {
+                    kind: "clarification",
+                    request_id: clarifyReqId,
+                    prompt: clarifyPrompt,
+                    options: clarifyOptions,
+                    allow_free_text: clarifyAllowFreeText,
+                    context: clarifyContext,
+                  },
+                };
+                if (running?.toolCallId) {
+                  updateMessageByToolCallId(running.toolCallId, metaPatch);
+                } else {
+                  const dup = useAppStore.getState().messages.some(
+                    (m) => m.clarificationPrompt?.requestId === clarifyReqId,
+                  );
+                  if (!dup) {
+                    addMessage("tool", clarifyPrompt, "meta", undefined, undefined, undefined, {
+                      toolName: "request_clarification",
+                      toolStatus: "running",
+                      toolArgs: {
+                        prompt: clarifyPrompt,
+                        options: clarifyOptions,
+                        allow_free_text: clarifyAllowFreeText,
+                        context: clarifyContext,
+                      },
+                      clarificationPrompt: promptPayload,
+                      metadata: metaPatch.metadata,
+                    });
+                  }
+                }
+              }
+            }
+            if (payload.type === "clarification_response") {
+              if (eventAgentId !== "meta") {
+                updateSubAgent(eventAgentId, {
+                  status: "running",
+                  currentAction: "已收到回复，继续执行",
+                  pendingClarification: undefined,
+                });
+                addSubAgentEvent(eventAgentId, {
+                  type: "clarification_response",
+                  content: "已收到用户回复",
+                });
+              }
+            }
+            if (payload.type === "clarification_suspended") {
+              if (eventAgentId !== "meta") {
+                updateSubAgent(eventAgentId, {
+                  status: "running",
+                  currentAction: "无人值守，提问已挂起",
+                  pendingClarification: undefined,
+                });
+              }
+            }
+            if (payload.type === "final") {
+              setStallWait(null);
+              if (eventAgentId !== "meta") {
+                flushSubAgentLiveOutput(eventAgentId);
+                updateSubAgent(eventAgentId, { status: "completed", currentAction: "已完成" });
+                addSubAgentEvent(eventAgentId, { type: "final", content: payload.data?.text ?? "" });
+                continue;
+              }
+              receivedFinalEvent = true;
+              const normalizedFinal = normalizeFinalAssistantPayload(
+                payload.data?.text,
+                payload.data?.suggested_questions,
+                payload.data?.turn_terminal,
+                payload.data?.terminal_reason,
+              );
+              pendingSuggestedQuestions = normalizedFinal.suggestedQuestions;
+              pendingFinalTurnTerminal = normalizedFinal.turnTerminal;
+              pendingFinalTerminalReason = normalizedFinal.terminalReason;
+              const appliedRefs = applyFinalReferencePayload(
+                pendingReferences,
+                pendingSearchedQueries,
+                payload.data,
+              );
+              pendingReferences = appliedRefs.references;
+              pendingSearchedQueries = appliedRefs.queries;
+              syncTurnRefsSnapshot();
+              if (isCurrentRequest()) {
+                setStreamReferences([...pendingReferences]);
+                setStreamSearchedQueries([...pendingSearchedQueries]);
+              }
+              const finalText = normalizedFinal.text;
+              if (finalText.trim()) {
+                // Authoritative replacement — never concatenate malformed stream residue.
+                full = finalText;
+                cumulativeFull = finalText;
+              } else if (!assistantVisibleBodyForUi(full).trim()) {
+                full = "";
+                cumulativeFull = "";
+                pendingSuggestedQuestions = [];
+              }
+              scheduleStreamTextUpdate(full);
+            }
+            if (payload.type === "subagent_started") {
+              const subId = payload.data?.agent_id;
+              if (subId) {
+                const isDelegation = Boolean(payload.data?.delegation);
+                addSubAgent({
+                  id: subId,
+                  name: payload.data?.name ?? subId,
+                  role: payload.data?.role ?? (isDelegation ? "delegated avatar" : "worker"),
+                  provider: payload.data?.provider ?? undefined,
+                  model: payload.data?.model ?? undefined,
+                  task: payload.data?.task ?? "",
+                  sessionId: isDelegation ? sessionId : (typeof payload.data?.avatar_session_id === "string" ? payload.data.avatar_session_id : undefined),
+                });
+                updateSubAgent(subId, {
+                  status: "running",
+                  currentAction: isDelegation ? "委派执行中" : "执行中",
+                });
+                addSubAgentEvent(
+                  subId,
+                  {
+                    type: isDelegation ? "delegation_started" : "started",
+                    content: isDelegation ? `已委派给 ${payload.data?.name ?? subId}` : "已启动",
+                  }
+                );
+              }
+            }
+            if (payload.type === "subagent_progress") { const subId = payload.data?.agent_id; if (subId) { updateSubAgent(subId, { currentAction: payload.data?.text ?? "执行中" }); addSubAgentEvent(subId, { type: "progress", content: payload.data?.text ?? "执行中" }); } }
+            if (payload.type === "subagent_checkpoint") {
+              const subId = payload.data?.agent_id;
+              if (subId) {
+                updateSubAgent(subId, { status: "running", currentAction: payload.data?.text ?? "阶段检查点" });
+                addSubAgentEvent(subId, { type: "checkpoint", content: payload.data?.text ?? "阶段检查点" });
+              }
+            }
+            if (payload.type === "subagent_paused") {
+              // FR-2: dedicated "paused" status (was previously misreported as "failed").
+              const subId = payload.data?.agent_id;
+              if (subId) {
+                const round = Number(payload.data?.round ?? 0) || 0;
+                const maxRounds = Number(payload.data?.max_rounds ?? 0) || 0;
+                const baseText = String(payload.data?.text ?? "已暂停").trim();
+                const roundLabel = round && maxRounds ? `（触顶 ${round}/${maxRounds} 轮）` : "";
+                const display = `${baseText}${roundLabel}`;
+                updateSubAgent(subId, { status: "paused", currentAction: display });
+                addSubAgentEvent(subId, { type: "paused", content: display });
+              }
+            }
+            if (payload.type === "compaction") {
+              // FR-3: surface auto-compaction so users can see it in real time.
+              const count = Number(payload.data?.compacted_count ?? 0) || 0;
+              const reactive = Boolean(payload.data?.reactive);
+              const note = buildCompactionNoticeText(count, reactive);
+              addMessage("tool", note, eventAgentId || "meta", undefined, undefined, undefined, {
+                noticeKind: reactive ? "compaction_reactive" : "compaction_proactive",
+              });
+            }
+            if (payload.type === "subagent_completed") {
+              const subId = payload.data?.agent_id;
+              if (subId) {
+                flushSubAgentLiveOutput(subId);
+                const isDelegation = Boolean(payload.data?.delegation);
+                const summary =
+                  typeof payload.data?.summary === "string" ? payload.data.summary : undefined;
+                const resultFile =
+                  typeof payload.data?.result_file === "string" && payload.data.result_file
+                    ? payload.data.result_file
+                    : undefined;
+                updateSubAgent(subId, {
+                  status: "completed",
+                  currentAction: isDelegation ? "委派完成" : "已完成",
+                  resultSummary: summary,
+                  resultFile,
+                  outputFiles: resolveSubAgentOutputPaths(summary, { resultFile }),
+                  sessionId: typeof payload.data?.avatar_session_id === "string" ? payload.data.avatar_session_id : undefined,
+                });
+                addSubAgentEvent(subId, {
+                  type: isDelegation ? "delegation_completed" : "completed",
+                  content: payload.data?.summary ?? (isDelegation ? "委派完成" : "完成"),
+                });
+              }
+            }
+            if (payload.type === "subagent_error") {
+              const subId = payload.data?.agent_id;
+              if (subId) {
+                flushSubAgentLiveOutput(subId);
+                const isDelegation = Boolean(payload.data?.delegation);
+                updateSubAgent(subId, {
+                  status: payload.data?.status === "cancelled" ? "cancelled" : "failed",
+                  currentAction: payload.data?.text ?? "执行异常",
+                  sessionId: typeof payload.data?.avatar_session_id === "string" ? payload.data.avatar_session_id : undefined,
+                });
+                addSubAgentEvent(subId, {
+                  type: isDelegation ? "delegation_error" : "error",
+                  content: payload.data?.text ?? "执行异常",
+                });
+              }
+            }
+            if (payload.type === "error") {
+              setStallWait(null);
+              const errText = String(payload.data?.text ?? "未知错误");
+              const severity = String(payload.data?.severity ?? "").trim();
+              const detector = String(payload.data?.detector ?? "").trim();
+              if (
+                eventAgentId === "meta"
+                && detector === "widget_flow_guard"
+                && payload.data?.action === "discard_stream"
+              ) {
+                full = "";
+                cancelStreamRenderFrame();
+                scheduleStreamTextUpdate("");
+                setWidgetFlowRewriting(true);
+                continue;
+              }
+              const isWarning = severity === "warning"
+                || detector === "token_budget_compress"
+                || detector === "compactor_circuit_breaker"
+                || detector === "context_budget_compact"
+                || detector === "context_window";
+              if (eventAgentId === "meta") {
+                if (isWarning) {
+                  const noticeKind =
+                    detector === "context_budget_compact" || detector === "context_window"
+                      ? "context_compact"
+                      : detector === "compactor_circuit_breaker"
+                        ? "compactor_cb"
+                        : "budget_compress";
+                  addMessage("tool", errText, "meta", undefined, undefined, undefined, {
+                    noticeKind,
+                  });
+                } else if (!isEphemeralStopErrorText(errText)) {
+                  // Merge tool-scoped errors into the existing ToolCallCard when possible
+                  // (hook-block / not-loaded / permission deny all share tool_call_id).
+                  const errToolCallId = String(payload.data?.tool_call_id ?? "").trim();
+                  if (errToolCallId) {
+                    const merged = updateMessageByToolCallId(errToolCallId, {
+                      content: errText,
+                      toolStatus: "error",
+                      toolResultPreview: errText.slice(0, 120),
+                      toolStreamLines: [],
+                    });
+                    if (!merged) {
+                      addMessage("tool", `❌ ${errText}`, "meta");
+                    }
+                  } else {
+                    addMessage("tool", `❌ ${errText}`, "meta");
+                  }
+                }
+              } else if (isWarning) {
+                addSubAgentEvent(eventAgentId, { type: "warning", content: errText });
+              } else {
+                updateSubAgent(eventAgentId, { status: "failed", currentAction: errText });
+                addSubAgentEvent(eventAgentId, { type: "error", content: errText });
+              }
+            }
+          } catch { /* skip malformed SSE */ }
+        }
+        scrollToBottom();
+      }
+
+      const trimmedFull = full.trim();
+      syncTurnRefsSnapshot();
+      const refExtras = referenceExtrasFromTurn(pendingReferences, pendingSearchedQueries);
+      const sugExtras =
+        pendingSuggestedQuestions.length > 0
+          ? { suggestedQuestions: pendingSuggestedQuestions.slice(0, 3) }
+          : undefined;
+      const terminalMetaExtras = receivedFinalEvent
+        ? {
+            metadata: {
+              turn_terminal: pendingFinalTurnTerminal,
+              ...(pendingFinalTerminalReason
+                ? { terminal_reason: pendingFinalTerminalReason }
+                : {}),
+            },
+          }
+        : { metadata: { turn_terminal: false } };
+      const turnExtras =
+        refExtras || sugExtras || receivedFinalEvent
+          ? { ...refExtras, ...sugExtras, ...terminalMetaExtras }
+          : undefined;
+      if (isCurrentRequest() && trimmedFull && !isThinkingPlaceholderText(full) && !streamCommittedRef.current) {
+        const mid = lastMidStreamAssistantCommitRef.current;
+        const liveMessages = useAppStore.getState().messages ?? [];
+        let lastAssistantContent = "";
+        for (let i = liveMessages.length - 1; i >= 0; i -= 1) {
+          const row = liveMessages[i];
+          if (row.role === "user") break;
+          if (row.role === "assistant") {
+            lastAssistantContent = String(row.content ?? "");
+            break;
+          }
+        }
+        if (
+          (mid !== null && trimmedFull === String(mid).trim())
+          || shouldReuseLastAssistantRow(lastAssistantContent, trimmedFull)
+        ) {
+          streamCommittedRef.current = true;
+          if (turnExtras) {
+            mergeLastMessageByRole("assistant", turnExtras);
+          }
+        } else {
+          appendAssistantMessage(full, turnExtras);
+          streamCommittedRef.current = true;
+        }
+        void speak(full);
+      } else if (
+        isCurrentRequest()
+        && trimmedFull
+        && !isThinkingPlaceholderText(full)
+        && streamCommittedRef.current
+      ) {
+        const committedPatch = buildCommittedAssistantPatch(
+          full,
+          turnExtras,
+          receivedFinalEvent,
+        );
+        if (committedPatch) {
+          mergeLastMessageByRole("assistant", committedPatch);
+        }
+      }
+    } catch (err) {
+      if (!isCurrentRequest()) return;
+      if (err instanceof DOMException && err.name === "AbortError") {
+        if (!abortedByUserRef.current) {
+          commitCurrentStreamIfNeeded();
+        }
+      } else {
+        addMessage("tool", `❌ 请求失败: ${String(err)}`, "meta");
+      }
+    } finally {
+      for (const timer of showWidgetDeltaTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      showWidgetDeltaTimers.clear();
+      showWidgetDeltaPending.clear();
+      // Flush any tool_result patches that never found a matching tool_call
+      // row (dropped/out-of-order SSE) instead of silently discarding them.
+      const leftoverPatches = pendingToolResultPatchesRef.current;
+      pendingToolResultPatchesRef.current = {};
+      for (const [callId, patch] of Object.entries(leftoverPatches)) {
+        if (!patch.content?.trim()) continue;
+        addMessage("tool", patch.content, "meta", undefined, undefined, undefined, {
+          toolCallId: callId,
+          toolStatus: patch.toolStatus,
+          toolResultPreview: patch.toolResultPreview,
+        });
+      }
+      if (!isCurrentRequest()) return;
+      const refPatch = referenceExtrasFromTurn(
+        turnRefsSnapshot.references,
+        turnRefsSnapshot.queries,
+      );
+      if (refPatch && !abortController.signal.aborted) {
+        mergeLastMessageByRole("assistant", refPatch);
+      }
+      abortRef.current = null;
+      cancelStreamRenderFrame();
+      streamTextRef.current = "";
+      setStreamedAssistantText("");
+      setWidgetFlowRewriting(false);
+      setStreamReferences([]);
+      setStreamSearchedQueries([]);
+      setStreamingModel(null);
+
+      // Dequeue BEFORE setting idle — same fix as ChatPane: if a follow-up
+      // message is already queued, skip the "idle" transition so the task bar
+      // does not flash "已结束" and mislead the user.
+      const nextQueued = useAppStore.getState().dequeuePaneMessageForSession(
+        liteQueueKey,
+        sessionId,
+      );
+      if (!nextQueued) {
+        setStatus("idle");
+      }
+      setStreaming(false);
+      setSseActive(false);
+      scrollToBottom();
+      void syncSubAgents();
+
+      if (shouldAnnounceTaskComplete({
+        aborted: abortController.signal.aborted,
+        hasQueuedFollowup: Boolean(nextQueued),
+        isGroupPane: false,
+        receivedFinalEvent,
+        receivedGroupDone: false,
+        text: full,
+      })) {
+        void announceDesktopTaskComplete({
+          kind: "success",
+          label: "Near",
+          text: full,
+          paneId: liteQueueKey,
+          sessionId,
+          windowFocusedAndVisible: isDesktopWindowFocusedAndVisible(),
+          locale: i18n.language?.startsWith("en") ? "en" : "zh",
+        });
+      }
+      if (nextQueued) {
+        requestAnimationFrame(() => void sendChat(nextQueued.text));
+      }
+    }
+  };
+
+  const sendChatRef = useRef(sendChat);
+  sendChatRef.current = sendChat;
+
+  useEffect(() => {
+    if (!stallNudgeConfig.stall_auto_nudge_enabled) return;
+    if (!shouldAllowStallAutoNudge(stallState, sessionExecutionState)) return;
+    const sid = (sessionId || "").trim();
+    if (!sid) return;
+    const silentSeconds =
+      lastProgressAtRef.current > 0
+        ? Math.floor((Date.now() - lastProgressAtRef.current) / 1000)
+        : 0;
+    if (silentSeconds < stallNudgeConfig.stall_auto_nudge_after_seconds) return;
+    const count = autoNudgeTriggeredRef.current[sid] ?? 0;
+    if (count >= stallNudgeConfig.stall_auto_nudge_max_per_session) return;
+    const bucket = Math.floor(
+      silentSeconds / Math.max(1, stallNudgeConfig.stall_auto_nudge_after_seconds),
+    );
+    if ((autoNudgeBucketRef.current[sid] ?? -1) >= bucket) return;
+    autoNudgeBucketRef.current[sid] = bucket;
+    autoNudgeTriggeredRef.current[sid] = count + 1;
+    setAutoNudgeCount(count + 1);
+    const reason: ContinueReason =
+      sessionExecutionState === "interrupted" ? "interrupted" : "stall";
+    void sendChatRef.current("", {
+      continuation: { reason, source: "desktop_auto_nudge" },
+    });
+  }, [sessionExecutionState, sessionId, stallNudgeConfig, stallState, stallTick]);
+
+  const resumeCurrentTask = useCallback(async () => {
+    if (!sessionId) return;
+    let state: SessionExecutionState = sessionExecutionState;
+    try {
+      const r = await window.agenticxDesktop.listSessions(undefined);
+      if (r.ok) {
+        const row = (r.sessions ?? []).find((s) => s.session_id === sessionId);
+        state = (row?.execution_state ?? "idle") as SessionExecutionState;
+        setSessionExecutionState(state);
+      }
+    } catch {
+      /* ignore */
+    }
+    if (state === "running") return;
+    setStallState("none");
+    const reason = inferContinueReason({
+      stallState,
+      executionState: state,
+    });
+    await sendChatRef.current("", {
+      continuation: { reason, source: "desktop_manual" },
+    });
+  }, [sessionExecutionState, sessionId, stallState]);
+
+  const resumeWithModel = useCallback(
+    async (provider: string, model: string) => {
+      setActiveModel(provider, model);
+      void window.agenticxDesktop.saveConfig({ activeProvider: provider, activeModel: model });
+      await resumeCurrentTask();
+    },
+    [resumeCurrentTask, setActiveModel]
+  );
+
+  const send = async (manualInput?: string) => {
+    const toSend = (manualInput ?? input).trim();
+    if (!isLite && (commandOpen || toSend.startsWith("/"))) {
+      return;
+    }
+    pushHistory(toSend);
+    await sendChat(toSend, {
+      agentId: isLite ? undefined : (selectedSubAgent ?? undefined),
+    });
+  };
+
+  const executeCommand = async (id: string) => {
+    await registry.dispatch(id);
+    setInput("");
+    setCommandQuery("");
+    setCommandOpen(false);
+    setCommandPaletteOpen(false);
+  };
+
+  const stopStreaming = () => {
+    if (!showStopButton) return;
+    const sid = String(sessionId || "").trim();
+    if (sid) {
+      void window.agenticxDesktop.interruptSession?.(sid);
+      useAppStore.getState().cancelInFlightLiteTools(sid);
+    } else {
+      useAppStore.getState().cancelInFlightLiteTools();
+    }
+    abortedByUserRef.current = true;
+    abortRef.current?.abort();
+    const partial = streamTextRef.current.trim();
+    if (partial && !isThinkingPlaceholderText(partial) && !streamCommittedRef.current) { addMessage("assistant", streamTextRef.current, "meta", activeProvider, activeModel); streamCommittedRef.current = true; }
+    addMessage("tool", "已发送中断请求", "meta");
+    streamTextRef.current = "";
+    cancelStreamRenderFrame();
+    setStreamedAssistantText("⏹ 正在中断...");
+    setStreamingModel(null);
+    setStatus("idle");
+    setStreaming(false);
+    scrollToBottom();
+  };
+
+  const findPrecedingUserText = (msgId: string): string => {
+    const idx = messages.findIndex((m) => m.id === msgId);
+    for (let i = idx - 1; i >= 0; i--) {
+      if (messages[i].role === "user") return messages[i].content;
+    }
+    return "";
+  };
+
+  const onCopyMessage = (msg: Message) => {
+    void navigator.clipboard.writeText(messagePlainTextForClipboard(msg));
+  };
+
+  const onRetryMessage = (msg: Message) => {
+    const userText = findPrecedingUserText(msg.id);
+    if (!userText) return;
+    void sendChat(userText, { provider: msg.provider, model: msg.model });
+  };
+
+  const onReanswerMessage = (msgId: string) => {
+    setReanswerTarget(msgId);
+    setModelPickerOpen(true);
+  };
+
+  const onReanswerSelect = (provider: string, model: string) => {
+    if (!reanswerTarget) return;
+    const userText = findPrecedingUserText(reanswerTarget);
+    if (!userText) return;
+    void sendChat(userText, { provider, model, insertAfterId: reanswerTarget });
+    setReanswerTarget(null);
+  };
+
+  const onKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (event) => {
+    const isImeComposing =
+      event.nativeEvent.isComposing ||
+      imeComposingRef.current ||
+      (event.key !== "Enter" && (event.key === "Process" || event.keyCode === 229));
+    if (isImeComposing) return;
+    if (!isLite && event.altKey && event.key === "ArrowUp") {
+      event.preventDefault();
+      if (history.length === 0) return;
+      const nextIdx = Math.min(historyIndex + 1, history.length - 1);
+      setHistoryIndex(nextIdx);
+      setInput(history[nextIdx] ?? "");
+      return;
+    }
+    if (!isLite && event.altKey && event.key === "ArrowDown") {
+      event.preventDefault();
+      if (history.length === 0) return;
+      const nextIdx = historyIndex - 1;
+      if (nextIdx < 0) {
+        setHistoryIndex(-1);
+        setInput("");
+        return;
+      }
+      setHistoryIndex(nextIdx);
+      setInput(history[nextIdx] ?? "");
+      return;
+    }
+    if (!isLite && (event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "p") {
+      event.preventDefault();
+      setPlanMode(!planMode);
+      return;
+    }
+    if (!isLite && (event.ctrlKey || event.metaKey) && event.key === "/") {
+      event.preventDefault();
+      setKeybindingsOpen(true);
+      setKeybindingsPanelOpen(false);
+      return;
+    }
+    if (!isLite && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      setCommandOpen(true);
+      setCommandQuery("");
+      setCommandPaletteOpen(false);
+      return;
+    }
+    if (event.key === "Escape") {
+      if (commandOpen) {
+        event.preventDefault();
+        setCommandOpen(false);
+        setCommandQuery("");
+      } else if (streaming) {
+        event.preventDefault();
+        stopStreaming();
+      }
+      return;
+    }
+    if (commandOpen && event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (commandResults[0]) {
+        void executeCommand(commandResults[0].id);
+      }
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (!isLite && input.trim().startsWith("/")) {
+        const query = input.trim().slice(1);
+        const list = registry.search(query, userMode);
+        if (list[0]) {
+          void executeCommand(list[0].id);
+        } else {
+          setCommandOpen(true);
+          setCommandQuery(query);
+        }
+        return;
+      }
+      if (streaming) {
+        const trimmed = input.trim();
+        const queue = useAppStore.getState().pendingMessages[liteQueueKey] ?? [];
+        const sendQueuedNow =
+          isDoubleEnterWithinWindow(lastComposerEnterAtRef.current) ||
+          (!trimmed && queue.length > 0 && lastComposerEnterAtRef.current > 0);
+
+        if (sendQueuedNow) {
+          lastComposerEnterAtRef.current = 0;
+          if (trimmed) {
+            void sendChat(trimmed, { forceSend: true });
+          } else {
+            const latestQueued = queue[queue.length - 1];
+            if (latestQueued) {
+              const item = takePendingMessage(liteQueueKey, latestQueued.id);
+              if (item) {
+                const ownerSid = String(item.sessionId ?? "").trim();
+                if (!ownerSid || ownerSid === sessionId) {
+                  void sendChatRef.current(item.text, { forceSend: true });
+                }
+              }
+            }
+          }
+          return;
+        }
+
+        if (!trimmed) return;
+
+        lastComposerEnterAtRef.current = Date.now();
+        void send();
+        return;
+      }
+
+      lastComposerEnterAtRef.current = 0;
+      void send();
+    }
+  };
+
+  const applyVoiceTranscript = useCallback((text: string) => {
+    setInput((prev) => appendDictationText(prev, text));
+  }, []);
+
+  const { pttActive, pttLiveText, cancelPtt } = useVoicePushToTalk({
+    enabled: canSend,
+    composerEmpty: !input.trim(),
+    apiBase,
+    apiToken,
+    language: "zh-CN",
+    onCommit: applyVoiceTranscript,
+    onError: (message) => setVoiceInputHint(message),
+  });
+
+  useEffect(() => () => cancelPtt(), [cancelPtt]);
+
+  const onMicClick = () => {
+    cancelPtt();
+    if (voiceRecording || voiceTranscribing) {
+      dictationSessionRef.current?.stop();
+      dictationSessionRef.current = null;
+      setVoiceRecording(false);
+      setVoiceTranscribing(false);
+      setStatus("idle");
+      return;
+    }
+    setVoiceInputHint("");
+    setStatus("listening");
+    void startDictation(
+      {
+        onPhase: (phase: SttPhase) => {
+          setVoiceRecording(phase === "recording");
+          setVoiceTranscribing(phase === "transcribing");
+          if (phase === "transcribing") setStatus("processing");
+          if (phase === "idle") setStatus("idle");
+          if (phase === "recording") setStatus("listening");
+        },
+        onInterim: (interim) => {
+          if (!interim.trim()) return;
+          setVoiceInputHint(interim.trim());
+          interruptOnInterimResult(interim);
+        },
+        onFinal: (text) => {
+          dictationSessionRef.current = null;
+          setVoiceRecording(false);
+          setVoiceTranscribing(false);
+          setVoiceInputHint("");
+          setStatus("idle");
+          setInput((prev) => appendDictationText(prev, text));
+        },
+        onError: (message) => {
+          setVoiceInputHint(message);
+        },
+      },
+      {
+        apiBase,
+        apiToken,
+        language: "zh",
+      }
+    ).then((session) => {
+      dictationSessionRef.current = session;
+    });
+  };
+
+  return (
+    <div className="flex h-full min-w-0">
+      <div className="flex h-full min-w-0 flex-1 flex-col">
+      {/* Title bar */}
+      <div className="drag-region flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
+        <div className="flex w-20 items-center" />
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium text-text-muted">AgenticX</span>
+          {!isLite && <span className="text-text-faint">·</span>}
+          {!isLite && (
+            <div className="relative">
+              <button
+                ref={modelBtnRef}
+                className="no-drag flex items-center gap-1 rounded-md px-2 py-0.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-cyan-400"
+                onClick={() => setHeaderModelPickerOpen((v) => !v)}
+                title={t("model.switch")}
+              >
+                <span className="max-w-[200px] truncate">{modelLabel}</span>
+                <span className="text-[10px]">▾</span>
+              </button>
+              {headerModelPickerOpen && (
+                <div className="absolute left-0 top-full z-40 mt-1">
+                  <ModelPickerDropdown
+                    onSelect={(p, m) => {
+                      setActiveModel(p, m);
+                      setHeaderModelPickerOpen(false);
+                      void window.agenticxDesktop.saveConfig({ activeProvider: p, activeModel: m });
+                    }}
+                    onClose={() => setHeaderModelPickerOpen(false)}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+          {status !== "idle" && (
+            <span className="flex items-center gap-1.5 text-xs text-text-subtle">
+              <span className={`inline-block h-2 w-2 rounded-full ${statusDot[status]}`} />
+              {voiceStatusLabel}
+            </span>
+          )}
+          {!isLite && planMode && (
+            <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[11px] text-amber-300">{t("toolbar.planMode")}</span>
+          )}
+          {!isLite && (
+            <span className="rounded bg-surface-hover px-2 py-0.5 text-[11px] text-text-muted">
+              {t("toolbar.approval", { mode: runModeDisplay })}
+            </span>
+          )}
+        </div>
+        <div className="flex w-auto items-center justify-end gap-2">
+          {/* Lite 模式已废弃，不再展示 Pro/Lite 切换入口。 */}
+          {(subAgents.length > 0 || isLite) ? (
+            <button
+              className="no-drag rounded-md px-2 py-1 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+              onClick={() => setPanelOpen((v) => !v)}
+              title={t("subagent.panelTitle")}
+            >
+              {subAgents.length > 0 ? t("subagent.teamCount", { count: subAgents.length }) : t("toolbar.team")}
+            </button>
+          ) : null}
+          <button
+            className="no-drag rounded-md px-2 py-1 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+            onClick={() => {
+              const next = theme === "dark" || theme === "dim" ? "light" : "dark";
+              setTheme(next);
+            }}
+            title={theme === "light" ? t("toolbar.themeToDark") : t("toolbar.themeToLight")}
+            aria-label={t("toolbar.toggleTheme")}
+          >
+            {theme === "light" ? "🌙" : "☀"}
+          </button>
+          <button
+            className="no-drag rounded-md px-2 py-1 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+            onClick={() => openSettings()}
+            title={t("toolbar.settings")}
+          >
+            ⚙
+          </button>
+          {agxAccount.loggedIn ? (
+            <button
+              className="no-drag inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+              onClick={async () => {
+                const r = await window.agenticxDesktop.confirmDialog({
+                  title: t("misc.logoutTitle"),
+                  message: t("misc.logoutMessage"),
+                  confirmText: t("misc.logout"),
+                  destructive: true,
+                });
+                if (!r.confirmed) return;
+                await window.agenticxDesktop.agxAccountLogout();
+                setAgxAccount({ loggedIn: false, email: "", displayName: "" });
+              }}
+              title={agxAccount.displayName || agxAccount.email || t("misc.loggedIn")}
+            >
+              <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[rgba(var(--theme-color-rgb),0.9)] text-[9px] font-semibold text-[var(--theme-color-text)]">
+                {(agxAccount.displayName || agxAccount.email || "?").trim().charAt(0).toUpperCase()}
+              </span>
+              <span className="max-w-[80px] truncate">
+                {agxAccount.displayName || agxAccount.email}
+              </span>
+            </button>
+          ) : (
+            <button
+              className="no-drag rounded-md px-2 py-1 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+              disabled={loginBusy}
+              onClick={async () => {
+                if (loginBusy) return;
+                setLoginBusy(true);
+                try {
+                  const r = await window.agenticxDesktop.agxAccountLoginStart();
+                  if (!r.ok) {
+                    await window.agenticxDesktop.confirmDialog({
+                      title: t("misc.loginFailedTitle"),
+                      message: t("misc.loginFailedMessage"),
+                      detail: typeof r.error === "string" && r.error ? t("misc.loginErrorDetail", { error: r.error }) : undefined,
+                      confirmText: t("misc.ok"),
+                    });
+                  }
+                } catch (e) {
+                  await window.agenticxDesktop.confirmDialog({
+                    title: t("misc.loginFailedTitle"),
+                    message: String(e),
+                    confirmText: t("misc.ok"),
+                  });
+                } finally {
+                  setLoginBusy(false);
+                }
+              }}
+              title={t("misc.loginNear")}
+            >
+              {loginBusy ? t("misc.loggingIn") : t("misc.login")}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div ref={listRef} className="flex-1 overflow-y-auto px-4 py-3">
+        {visibleMessages.length === 0 && (
+          <div className="flex h-full items-center justify-center">
+            <div className="text-center text-text-faint">
+              <div className="mb-2 text-3xl">🤖</div>
+              <div className="text-sm">{isLite ? t("empty.liteHint") : t("empty.proHint")}</div>
+            </div>
+          </div>
+        )}
+        <div className={`mx-auto max-w-3xl space-y-3 ${isLite ? "text-[var(--agx-chat-im-body-font-size)]" : ""}`}>
+          {(() => {
+            const lastFlatToolGroupIdx = groupedVisibleMessages.reduce(
+              (acc, groupedRow, index) => (groupedRow.kind === "tool_group" ? index : acc),
+              -1,
+            );
+            const renderGroupedChatRow = (
+              row: GroupedChatRow,
+              reactWorkCol: boolean,
+              toolProgressContext?: Message[],
+            ) => {
+              if (row.kind === "message") {
+                const m = row.message;
+                return (
+                  <div key={m.id} className={`${isLite ? "text-[var(--agx-chat-im-body-font-size)]" : "text-sm"}`}>
+                    <MarkdownContext.Provider value={chatHttpLinkMarkdown}>
+                    <MessageRenderer
+                      message={m}
+                      assistantBadge={!isLite && m.role === "assistant" ? <ModelBadge provider={m.provider} model={m.model} /> : undefined}
+                      assistantName="Near"
+                      imAssistantVisual={
+                        m.role === "assistant" && reactWorkCol ? "compact-inline" : "default"
+                      }
+                      noBubbleBorder={reactWorkCol}
+                      toolCardOmitLeadingSpacer={m.role === "tool" && reactWorkCol}
+                      allMessages={messages}
+                      onFollowupClick={(t) => void send(t)}
+                      onOpenClarification={onOpenClarification}
+                      onSubmitClarification={onSubmitClarification}
+                    />
+                    </MarkdownContext.Provider>
+                    {!isLite && (
+                      <MessageActions
+                        msg={m}
+                        onCopy={() => onCopyMessage(m)}
+                        onRetry={() => onRetryMessage(m)}
+                        onReanswer={() => onReanswerMessage(m.id)}
+                      />
+                    )}
+                  </div>
+                );
+              }
+              return (
+                <MarkdownContext.Provider value={chatHttpLinkMarkdown}>
+                <TurnToolGroupCard
+                  key={`tg-${row.groupId}`}
+                  messages={row.messages}
+                  holdProgress={
+                    toolProgressContext
+                      ? shouldHoldToolGroupProgress(toolProgressContext, row.messages, streaming)
+                      : false
+                  }
+                  renderExtras={(msg) => renderToolMessageExtras(msg, {})}
+                  omitLeadingSpacer={reactWorkCol}
+                  flat={reactWorkCol}
+                />
+                </MarkdownContext.Provider>
+              );
+            };
+
+            if (topLevelRowsIm) {
+              return topLevelRowsIm.map((seg, segIdx) => {
+                if (seg.kind === "user") {
+                  return renderGroupedChatRow({ kind: "message", message: seg.message }, false);
+                }
+                const { workMessages, finalAssistant } = seg.block;
+                const groupedWork = groupConsecutiveToolMessages(workMessages);
+                const blockKey = `react-${workMessages[0]?.id ?? segIdx}-${finalAssistant?.id ?? ""}`;
+                const lastToolGroupIdxInWork = groupedWork.reduce(
+                  (acc, groupedRow, index) => (groupedRow.kind === "tool_group" ? index : acc),
+                  -1,
+                );
+                // 过程段：见 resolveProcessFoldRange —— 只折工具段，两头的正文不折。
+                const { start: processStart, end: processEnd } =
+                  resolveProcessFoldRange(groupedWork);
+                const beforeProcessRows = groupedWork.slice(0, processStart);
+                const processRows = groupedWork.slice(processStart, processEnd);
+                const tailRows = groupedWork.slice(lastToolGroupIdxInWork + 1);
+                const processToolCount = processRows.reduce(
+                  (n, r) => n + (r.kind === "tool_group" ? r.messages.length : 0),
+                  0,
+                );
+                const isLastBlock = segIdx === topLevelRowsIm.length - 1;
+                return (
+                  <div key={blockKey} className="space-y-3">
+                    <div className="flex min-w-0 items-start gap-2">
+                      <div className="flex min-w-0 flex-1 flex-col gap-3">
+                        {beforeProcessRows.map((r) => renderGroupedChatRow(r, true, undefined))}
+                        <ReactWorkCollapse toolCount={processToolCount} active={streaming && isLastBlock}>
+                          {processRows.map((r, i) =>
+                            renderGroupedChatRow(
+                              r,
+                              true,
+                              r.kind === "tool_group" && processStart + i === lastToolGroupIdxInWork
+                                ? workMessages
+                                : undefined,
+                            ),
+                          )}
+                        </ReactWorkCollapse>
+                        {tailRows.map((r) => renderGroupedChatRow(r, true, undefined))}
+                      </div>
+                    </div>
+                    {finalAssistant ? renderGroupedChatRow({ kind: "message", message: finalAssistant }, false) : null}
+                  </div>
+                );
+              });
+            }
+            return groupedVisibleMessages.map((row, rowIdx) =>
+              renderGroupedChatRow(
+                row,
+                false,
+                row.kind === "tool_group" && rowIdx === lastFlatToolGroupIdx ? visibleMessages : undefined,
+              ),
+            );
+          })()}
+          {widgetFlowRewriting && !String(streamedAssistantText ?? "").trim() ? (
+            <WidgetFlowRewriteStatusLine />
+          ) : null}
+          {streaming && !hideStreamOverlayAsDuplicate && (
+            <div className={["!mt-1.5", isLite ? "text-[var(--agx-chat-im-body-font-size)]" : "text-sm"].join(" ")}>
+              {chatStyle === "terminal" ? (
+                <TerminalLine
+                  message={streamAssistantMessage}
+                  badge={!isLite && streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
+                />
+              ) : chatStyle === "clean" ? (
+                <CleanBlock
+                  message={streamAssistantMessage}
+                  badge={!isLite && streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
+                />
+              ) : (
+                <ImBubble
+                  message={streamAssistantMessage}
+                  badge={!isLite && streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
+                  assistantName="Near"
+                  streamStalled={stallState === "stall"}
+                />
+              )}
+            </div>
+          )}
+          {midTurnStreamActivity && chatStyle === "im" ? (
+            <div className="-mt-2">
+              <ImBubble
+                message={{ id: "typing-meta", role: "assistant", content: "" }}
+                assistantName="Near"
+                assistantVisual="compact-inline"
+                noBubbleBorder
+                streamStalled={stallState === "stall"}
+              />
+            </div>
+          ) : null}
+          {stallWait ? (
+            <div className="mb-2 flex justify-start">
+              <StallWaitChip info={stallWait} />
+            </div>
+          ) : null}
+          {stallState === "stall" ? (
+            <StallRecoveryCard
+              kind="stall"
+              currentModelLabel={currentModelLabel}
+              modelOptions={stallModelOptions}
+              autoNudgeCount={autoNudgeCount}
+              autoNudgeMax={stallNudgeConfig.stall_auto_nudge_max_per_session}
+              allowResume={
+                !(
+                  !lastTurnHasCompletedAssistantReply(messages) &&
+                  lastTurnHasToolActivity(messages)
+                )
+              }
+              onResume={() => void resumeCurrentTask()}
+              onResumeWithModel={(provider, model) => void resumeWithModel(provider, model)}
+              onStop={stopStreaming}
+            />
+          ) : null}
+        </div>
+      </div>
+
+      {/* Input area */}
+      <div className="relative shrink-0 border-t border-border bg-surface-panel/80 px-4 pt-3 pb-4">
+        <div className="mx-auto mb-2 max-w-2xl">
+          <MessageQueuePanel
+            messages={queuedMessages}
+            onEdit={(id, newText) => editPendingMessage(liteQueueKey, id, newText)}
+            onRemove={(id) => removePendingMessage(liteQueueKey, id)}
+            onSendNow={(id) => {
+              const item = takePendingMessage(liteQueueKey, id);
+              if (!item) return;
+              void sendChatRef.current(item.text, { forceSend: true });
+            }}
+          />
+        </div>
+        {!isLite && (
+          <CommandPalette
+            open={commandOpen}
+            query={commandQuery}
+            commands={commandResults}
+            onQueryChange={setCommandQuery}
+            onClose={() => {
+              setCommandOpen(false);
+              setCommandQuery("");
+              setCommandPaletteOpen(false);
+            }}
+            onExecute={(id) => void executeCommand(id)}
+          />
+        )}
+        <div className="mx-auto flex max-w-2xl items-end gap-2">
+          {selectedSubAgent ? (
+            <div className="mb-2 w-full">
+              <div className="inline-flex items-center gap-2 rounded-md border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-200">
+                <span>{t("subagent.talkToNamed", { name: selectedSubAgentName })}</span>
+                <button
+                  className="rounded px-1 text-cyan-100 hover:bg-cyan-500/20"
+                  onClick={() => setSelectedSubAgent(null)}
+                >
+                  {t("subagent.switchToMeta")}
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
+        {isLite && <QuickActions onSend={(text) => { void send(text); }} />}
+        {voiceInputHint ? (
+          <div className="mx-auto mb-2 flex max-w-2xl justify-center">
+            <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-3 py-1 text-[12px] text-amber-100/95">
+              <span aria-hidden>!</span>
+              <span className="truncate">{voiceInputHint}</span>
+            </span>
+          </div>
+        ) : null}
+        <div className="relative mx-auto max-w-2xl">
+          <VoicePttOverlay text={pttLiveText} visible={pttActive} />
+          <div className="flex items-end gap-2">
+          <textarea
+            value={input}
+            onChange={(e) => {
+              interruptTtsOnUserSpeech(true);
+              const value = e.target.value;
+              setInput(value);
+              if (!isLite && value.startsWith("/")) {
+                setCommandOpen(true);
+                setCommandQuery(value.slice(1));
+              } else {
+                setCommandOpen(false);
+                setCommandQuery("");
+              }
+            }}
+            onCompositionStart={() => {
+              imeComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              window.setTimeout(() => {
+                imeComposingRef.current = false;
+              }, 0);
+            }}
+            onBlur={() => {
+              imeComposingRef.current = false;
+            }}
+            onKeyDown={onKeyDown}
+            rows={input.split("\n").length > 3 ? 4 : input.includes("\n") ? 2 : 1}
+            placeholder={composerPlaceholder}
+            disabled={!canSend && !streaming}
+            className="min-h-[40px] max-h-[120px] flex-1 resize-none rounded-xl border border-border bg-surface-card px-3 py-2.5 text-sm outline-none transition placeholder:text-text-faint focus:border-cyan-500/50"
+          />
+          <button
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border text-lg transition hover:bg-surface-hover"
+            onClick={onMicClick}
+            title={voiceTranscribing ? t("send.transcribing") : voiceRecording ? t("send.stopRecording") : t("send.voice")}
+          >
+            {voiceTranscribing ? "…" : "🎙"}
+          </button>
+          {showStopButton ? (
+            <div className="flex items-center gap-2">
+              <button className="flex h-10 shrink-0 items-center rounded-xl bg-rose-500 px-4 text-sm font-medium text-white transition hover:bg-rose-400" onClick={stopStreaming}>{t("send.interruptShort")}</button>
+              <button className="flex h-10 shrink-0 items-center rounded-xl bg-btnPrimary px-4 text-sm font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-40 disabled:hover:bg-btnPrimary" disabled={!canSend || !input.trim()} onClick={() => { lastComposerEnterAtRef.current = 0; void sendChat(input.trim(), { forceSend: true }); }}>{t("send.sendNow")}</button>
+              <button
+                className="flex h-10 shrink-0 items-center rounded-xl border border-border px-4 text-sm font-medium text-text-subtle transition hover:bg-surface-hover disabled:opacity-40"
+                disabled={!canSend || !input.trim()}
+                onClick={() => {
+                  const text = input.trim();
+                  if (!text) return;
+                  enqueuePaneMessage(liteQueueKey, {
+                    id: crypto.randomUUID(),
+                    text,
+                    sessionId,
+                    attachments: [],
+                    contextFiles: [],
+                    timestamp: Date.now(),
+                  });
+                  setInput("");
+                }}
+                title={t("send.queueHint")}
+              >{t("send.queueShort")}</button>
+            </div>
+          ) : (
+            <button className="flex h-10 shrink-0 items-center rounded-xl bg-btnPrimary px-4 text-sm font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-40 disabled:hover:bg-btnPrimary" disabled={!canSend || !input.trim()} onClick={() => void send()}>{t("send.send")}</button>
+          )}
+          </div>
+          {messages.some((m) => m.role === "user" || m.role === "assistant") ? (
+            <div className="mt-1.5 flex justify-center px-0.5">
+              <p className="select-none text-[11px] leading-none text-text-faint">
+                {t("composer.disclaimer")}
+              </p>
+            </div>
+          ) : null}
+        </div>
+        {!isLite && <ShortcutHints />}
+      </div>
+      </div>
+      <SubAgentPanel
+        open={panelOpen}
+        subAgents={subAgents}
+        selectedSubAgent={selectedSubAgent}
+        onToggle={() => setPanelOpen((v) => !v)}
+        onCancel={onCancelSubAgent}
+        onRetry={onRetrySubAgent}
+        onModelChange={(agentId, provider, model) => void changeSubAgentModel(agentId, provider, model)}
+        onChat={toggleSubAgentChat}
+      />
+      {/* Reanswer model picker */}
+      {modelPickerOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-[300px] rounded-xl border border-border bg-surface-panel p-3">
+            <div className="mb-2 text-sm font-medium text-text-muted">{t("actions.pickReanswerModel")}</div>
+            <ModelPickerDropdown
+              onSelect={(p, m) => { onReanswerSelect(p, m); setModelPickerOpen(false); }}
+              onClose={() => { setModelPickerOpen(false); setReanswerTarget(null); }}
+            />
+            <button className="mt-2 w-full rounded-md border border-border py-1.5 text-xs text-text-subtle hover:bg-surface-hover" onClick={() => { setModelPickerOpen(false); setReanswerTarget(null); }}>{t("delete.cancel")}</button>
+          </div>
+        </div>
+      )}
+      <KeybindingsPanel open={keybindingsOpen} mode={userMode} onClose={() => setKeybindingsOpen(false)} />
+    </div>
+  );
+}
+
+function ModelPickerDropdown({ onSelect, onClose }: { onSelect: (p: string, m: string) => void; onClose: () => void }) {
+  const { t } = useTranslation("chat");
+  const settings = useAppStore((s) => s.settings);
+  const options = useMemo(
+    () => collectSelectableModelOptions(settings.providers, " | "),
+    [settings.providers],
+  );
+
+  if (options.length === 0) {
+    return <div className="px-3 py-4 text-center text-xs text-text-faint">{t("model.empty")}</div>;
+  }
+  return (
+    <div className="max-h-[240px] overflow-y-auto">
+      {options.map((opt) => (
+        <button
+          key={`${opt.provider}:${opt.model}`}
+          type="button"
+          className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-text-muted transition hover:font-bold hover:text-text-strong"
+          onClick={() => { onSelect(opt.provider, opt.model); onClose(); }}
+        >
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
+          <span className="truncate">{opt.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 680 460" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+      markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke"
+        stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="40" y="40" width="600" height="56" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="340" y="60" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="15" fill="#2C2C2A">用户界面层</text>
+  <text x="340" y="79" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">桌面应用 / 命令行 agx / Python SDK</text>
+  <polyline points="340,96 340,124" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="40" y="126" width="600" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="340" y="146" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="15" fill="#2C2C2A">Studio 运行时层</text>
+  <text x="340" y="165" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">会话管理 / Meta-Agent 调度 / 团队管理 / 分身与群聊</text>
+  <polyline points="340,182 340,210" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="40" y="212" width="600" height="56" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+  <text x="340" y="232" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="15" fill="#2C2C2A">核心框架层</text>
+  <text x="340" y="251" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">编排执行 / 智能体 / 记忆 / 工具 / LLM 提供方 / Hooks</text>
+  <polyline points="340,268 340,296" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="40" y="298" width="600" height="56" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="340" y="318" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="15" fill="#2C2C2A">平台服务层</text>
+  <text x="340" y="337" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">可观测性 / 通信协议 / 安全治理 / 存储</text>
+  <polyline points="340,354 340,382" fill="none" stroke="#B4B2A9" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="40" y="384" width="600" height="56" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="340" y="404" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="15" fill="#2C2C2A">领域扩展层</text>
+  <text x="340" y="423" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif" font-size="12" fill="#5F5E5A">GUI Agent / 知识系统与 GraphRAG / AgentKit 集成</text>
+</svg>

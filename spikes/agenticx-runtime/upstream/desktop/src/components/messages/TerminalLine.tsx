@@ -1,0 +1,71 @@
+import type { ReactNode } from "react";
+import type { Message } from "../../store";
+import { ReferencesCard } from "./ReferencesCard";
+import { ReasoningBlock } from "./ReasoningBlock";
+import { parseReasoningContent } from "./reasoning-parser";
+import { CitationMarkdownBody } from "./CitationMarkdownBody";
+import { renderUserMessageInlineBody } from "./user-message-inline";
+import { assistantVisibleBodyForUi } from "../../utils/assistant-output";
+import { isWorkspaceReferenceAttachment, type FileReferenceOpenRequest } from "../../utils/reference-attachment";
+import { withBibliographyFallback } from "./source-attribution-parse";
+
+type Props = {
+  message: Message;
+  badge?: ReactNode;
+  onRevealPath?: (path: string) => void;
+  onOpenFileReference?: (request: FileReferenceOpenRequest) => void;
+  afterBody?: ReactNode;
+};
+
+export function TerminalLine({ message, badge, onRevealPath, onOpenFileReference, afterBody }: Props) {
+  const isUser = message.role === "user";
+  const isStreaming = message.id === "__stream__";
+  const parsed = !isUser ? parseReasoningContent(message.content) : null;
+  const hasThinkTag = parsed?.hasReasoningTag ?? false;
+  const reasoningClosed =
+    hasThinkTag && /<\/think>/i.test(String(message.content ?? ""));
+  const bodyText = !isUser ? assistantVisibleBodyForUi(message.content) : message.content;
+  const hasBody = !!bodyText?.trim();
+  const displayRefs = !isUser
+    ? withBibliographyFallback(message.references, bodyText)
+    : [];
+  return (
+    <div className="font-mono text-[13px] leading-6">
+      <div className="flex items-start gap-2">
+        <span
+          className="mt-[2px] select-none text-xs"
+          style={{ color: isUser ? "var(--chat-terminal-user)" : "var(--chat-terminal-meta)" }}
+        >
+          {isUser ? ">" : "┃"}
+        </span>
+        <div
+          className="msg-content min-w-0 flex-1 break-words"
+          style={{ color: isUser ? "var(--chat-terminal-user)" : "var(--chat-terminal-assistant)" }}
+        >
+          {badge}
+          {!isUser && displayRefs.length > 0 ? (
+            <ReferencesCard references={displayRefs} searchedQueries={message.searchedQueries} />
+          ) : null}
+          {!isUser && parsed?.reasoning ? (
+            <ReasoningBlock
+              text={parsed.reasoning}
+              streaming={isStreaming && !reasoningClosed && (hasThinkTag || !hasBody)}
+            />
+          ) : null}
+          {hasBody ? (
+            isUser ? (
+              renderUserMessageInlineBody(
+                bodyText,
+                (message.attachments ?? []).filter((a) => isWorkspaceReferenceAttachment(a)),
+                onOpenFileReference
+              )
+            ) : (
+              <CitationMarkdownBody content={bodyText} references={displayRefs} isStreaming={isStreaming} onRevealPath={onRevealPath} />
+            )
+          ) : null}
+          {afterBody}
+        </div>
+      </div>
+    </div>
+  );
+}

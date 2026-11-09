@@ -1,0 +1,328 @@
+.collapsed-group-menu {
+  width: min(300px, calc(100vw - 96px));
+  max-height: min(420px, calc(100vh - 32px));
+  position: fixed;
+  z-index: var(--z-overlay);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 8px;
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.collapsed-group-menu-header {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 5px 6px 9px;
+}
+
+.collapsed-group-menu-header > span:last-child,
+.collapsed-group-menu-header strong,
+.collapsed-group-menu-header small {
+  min-width: 0;
+  display: block;
+}
+
+.collapsed-group-menu-header strong {
+  color: var(--text-soft);
+  font-size: var(--text-sm);
+}
+
+.collapsed-group-menu-header small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.collapsed-group-menu-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.collapsed-group-menu-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.collapsed-group-menu-list {
+  min-height: 0;
+  display: grid;
+  gap: 2px;
+  overflow: auto;
+}
+
+.collapsed-group-option {
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-soft);
+  text-align: left;
+  cursor: pointer;
+}
+
+.collapsed-group-option:hover,
+.collapsed-group-option:focus-visible {
+  outline: none;
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.collapsed-group-option.active {
+  background: var(--surface-active);
+  color: var(--text);
+}
+
+.collapsed-group-option-main,
+.collapsed-group-option-main strong,
+.collapsed-group-option-main small {
+  min-width: 0;
+  display: block;
+}
+
+.collapsed-group-option-main strong,
+.collapsed-group-option-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collapsed-group-option-main strong {
+  font-size: var(--text-sm);
+}
+
+.collapsed-group-option-main small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.collapsed-group-option-state {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  color: var(--faint);
+}
+
+.collapsed-group-option-state > svg {
+  width: 15px;
+  height: 15px;
+  color: var(--accent);
+}
+
+.collapsed-group-option-state time {
+  overflow: hidden;
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collapsed-group-menu-empty {
+  margin: 0;
+  padding: 14px 8px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.conversation-link > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+
+.run-mark svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* "Needs your decision": an amber dot with a soft halo. */
+.attention-mark {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.attention-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  display: inline-block;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.attention-dot::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: var(--warning);
+  opacity: 0.22;
+  animation: attention-halo 1.8s var(--ease-standard) infinite;
+}
+
+@keyframes attention-halo {
+  0% { opacity: 0.4; transform: scale(0.7); }
+  70%, 100% { opacity: 0; transform: scale(1.7); }
+}
+
+.run-finished-mark {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--success);
+  animation: run-finished-in 0.22s ease-out both;
+}
+
+.run-finished-mark svg {
+  width: 15px;
+  height: 15px;
+}
+
+@keyframes run-finished-in {
+  from { opacity: 0; transform: scale(0.7); }
+}
+
+.nav-empty {
+  margin: 2px 8px 0;
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.sidebar-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+  padding: 9px 8px 12px;
+}
+
+.sidebar-footer button {
+  height: 38px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-soft);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-footer button:hover {
+  border-color: var(--border);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.sidebar-footer .sidebar-settings-entry:hover,
+.sidebar-footer .sidebar-settings-entry.active {
+  border-color: transparent;
+  background: transparent;
+}
+
+.sidebar-settings-entry.active {
+  color: var(--text);
+}
+
+.sidebar-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sidebar-footer-actions .icon-button {
+  width: 34px;
+  display: inline-flex;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  transition: color 0.14s ease;
+}
+
+.sidebar-footer-actions .icon-button:hover {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text);
+}
+
+.preference-icon-frame {
+  position: relative;
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+
+.preference-icon {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.preference-icon-enter-active,
+.preference-icon-leave-active {
+  transition: opacity 0.14s ease, transform 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.preference-icon-enter-from {
+  opacity: 0;
+  transform: scale(0.76) rotate(8deg);
+}
+
+.preference-icon-leave-to {
+  opacity: 0;
+  transform: scale(0.76) rotate(-8deg);
+}
+
+.sidebar-footer svg {
+  width: 17px;
+  height: 17px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .preference-icon-enter-active,
+  .preference-icon-leave-active {
+    transition-duration: 0.01ms;
+  }
+}
+
+.footer-count {
+  color: var(--muted);
+  font-size: var(--text-xs);
+}

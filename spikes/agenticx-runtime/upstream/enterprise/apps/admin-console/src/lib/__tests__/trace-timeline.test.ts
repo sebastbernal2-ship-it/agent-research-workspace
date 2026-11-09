@@ -1,0 +1,357 @@
+import { describe, expect, it } from "vitest";
+import type { PortalLogItem } from "../portal-logs-query";
+import type { AgentTraceSpanRow } from "../agent-trace-store";
+import {
+  assembleTraceTimeline,
+  computeGanttPlacement,
+  computeTraceTimeWindow,
+} from "../trace-timeline";
+
+function portalLog(partial: Partial<PortalLogItem> & Pick<PortalLogItem, "id" | "event">): PortalLogItem {
+  return {
+    tenant_id: "tenant-a",
+    log_time: "2026-08-10T08:00:00.000Z",
+    level: "info",
+    trace_id: "01JZTRACEID000000000000001",
+    user_id: "user-1",
+    session_id: "session-1",
+    route: "chat.completions",
+    mode: "chat",
+    run_id: null,
+    status: 200,
+    duration_ms: 1200,
+    error_name: null,
+    error_message: null,
+    error_stack: null,
+    fields: null,
+    ...partial,
+  };
+}
+
+function span(partial: Partial<AgentTraceSpanRow> & Pick<AgentTraceSpanRow, "id" | "step_no">): AgentTraceSpanRow {
+  return {
+    trace_id: "01JZTRACEID000000000000001",
+    step_kind: "model",
+    status: "ok",
+    model: "gpt-test",
+    provider: "openai",
+    input_tokens: 10,
+    output_tokens: 20,
+    reasoning_tokens: 0,
+    total_tokens: 30,
+    cost_usd: "0.001",
+    duration_ms: 100,
+    error_message: null,
+    metadata: null,
+    created_at: new Date("2026-08-10T08:00:00.000Z"),
+    ...partial,
+  };
+}
+
+describe("assembleTraceTimeline", () => {
+  it("builds request → model → deep-research tree with sanitization", () => {
+    const longNarrative = "n".repeat(250);
+    const timeline = assembleTraceTimeline({
+      traceId: "01JZTRACEID000000000000001",
+      portalLogs: [
+        portalLog({
+          id: "log-1",
+          event: "chat.completions.start",
+          log_time: "2026-08-10T08:00:00.000Z",
+          duration_ms: 1,
+        }),
+        portalLog({
+          id: "log-2",
+          event: "chat.completions.finish",
+          log_time: "2026-08-10T08:00:10.000Z",
+          duration_ms: 10000,
+        }),
+        portalLog({
+          id: "log-3",
+          event: "deep_research.stream.finish",
+          route: "deep_research.stream",
+          log_time: "2026-08-10T08:00:11.000Z",
+          duration_ms: 50,
+        }),
+      ],
+      modelSpans: [
+        span({ id: "s1", step_no: 1, total_tokens: 30 }),
+        span({ id: "s2", step_no: 2, total_tokens: 40 }),
+        span({ id: "s3", step_no: 3, total_tokens: 50 }),
+        span({ id: "s4", step_no: 4, total_tokens: 60 }),
+      ],
+      deepResearchRun: {
+        runId: "run-1",
+        sessionId: "session-1",
+        status: "completed",
+        phase: "done",
+        topic: "topic",
+        createdAt: "2026-08-10T08:00:00.000Z",
+        updatedAt: "2026-08-10T08:00:10.000Z",
+        events: [
+          { type: "phase", phase: "lanes", message: "lanes" },
+          { type: "lane_started", laneId: "lane-a", title: "Lane A", index: 0, total: 1 },
+          {
+            type: "lane_sources",
+            laneId: "lane-a",
+            sources: [{ title: "Doc", url: "https://example.com/doc" }],
+          },
+          { type: "lane_done", laneId: "lane-a", status: "ok" },
+          { type: "artifact", id: "art-1", path: "/r.md", title: "Report", kind: "report", bytes: 12 },
+          { type: "narrative", text: longNarrative },
+          {
+            type: "research_plan",
+            runId: "run-1",
+            action: "proposed",
+            version: 1,
+            plan: {
+              version: 1,
+              objective: "obj",
+              scope: [],
+              subQuestions: [{ id: "q1", title: "Q1", purpose: "secret purpose" }],
+              sourceStrategy: [],
+              deliverables: [],
+              assumptions: [],
+              prompt: "SHOULD_NOT_LEAK",
+            },
+          },
+        ],
+      },
+    });
+
+    expect(timeline.nodes).toHaveLength(3);
+    const primary = timeline.nodes.find((n) => n.label === "chat.completions.finish");
+    expect(primary).toBeTruthy();
+    expect(primary?.children.filter((c) => c.kind === "model_step")).toHaveLength(4);
+
+    const phase = primary?.children.find((c) => c.kind === "dr_phase");
+    expect(phase?.label).toBe("phase: lanes");
+    const lane = phase?.children.find((c) => c.kind === "dr_lane");
+    expect(lane?.label).toBe("lane: Lane A");
+    expect(lane?.children.some((c) => c.label === "lane_sources")).toBe(true);
+    expect(lane?.children.some((c) => c.label === "lane_done")).toBe(true);
+
+    expect(timeline.totals.tokens).toBe(30 + 40 + 50 + 60);
+    expect(timeline.sources.deep_research_run).toBe(true);
+
+    const narrative = primary?.children
+      .flatMap((c) => [c, ...c.children, ...c.children.flatMap((x) => x.children)])
+      .find((n) => n.label === "narrative");
+    const text = String(narrative?.attrs?.text ?? "");
+    expect(text.length).toBeLessThanOrEqual(201);
+    expect(text.endsWith("…")).toBe(true);
+
+    const planNode = primary?.children
+      .flatMap((c) => [c, ...c.children, ...c.children.flatMap((x) => x.children)])
+      .find((n) => n.label === "research_plan");
+    const planJson = JSON.stringify(planNode?.attrs ?? {});
+    expect(planJson.includes("SHOULD_NOT_LEAK")).toBe(false);
+    expect(planJson.includes("secret purpose")).toBe(false);
+    expect(planJson.includes("Q1")).toBe(true);
+  });
+
+  it("builds two-level tree without deep-research run", () => {
+    const timeline = assembleTraceTimeline({
+      traceId: "01JZTRACEID000000000000002",
+      portalLogs: [
+        portalLog({
+          id: "log-x",
+          event: "chat.completions.finish",
+          duration_ms: 500,
+        }),
+      ],
+      modelSpans: [span({ id: "s1", step_no: 1, total_tokens: 11 })],
+      deepResearchRun: null,
+    });
+
+    expect(timeline.sources.deep_research_run).toBe(false);
+    expect(timeline.nodes).toHaveLength(1);
+    expect(timeline.nodes[0]?.children).toHaveLength(1);
+    expect(timeline.nodes[0]?.children[0]?.kind).toBe("model_step");
+    expect(timeline.totals.tokens).toBe(11);
+  });
+
+  it("maps model step startedAt from span.created_at", () => {
+    const timeline = assembleTraceTimeline({
+      traceId: "01JZTRACEID000000000000004",
+      portalLogs: [
+        portalLog({
+          id: "log-z",
+          event: "chat.completions.finish",
+          log_time: "2026-08-10T08:00:00.000Z",
+          duration_ms: 10000,
+        }),
+      ],
+      modelSpans: [
+        span({
+          id: "s1",
+          step_no: 1,
+          created_at: new Date("2026-08-10T08:00:02.000Z"),
+          duration_ms: 1000,
+        }),
+      ],
+      deepResearchRun: null,
+    });
+
+    const model = timeline.nodes[0]?.children.find((c) => c.kind === "model_step");
+    expect(model?.startedAt).toBe("2026-08-10T08:00:02.000Z");
+
+    const window = computeTraceTimeWindow(timeline.nodes);
+    expect(window.tMinMs).toBe(Date.parse("2026-08-10T08:00:00.000Z"));
+    expect(window.tMaxMs).toBe(Date.parse("2026-08-10T08:00:10.000Z"));
+  });
+
+  it("computeGanttPlacement returns null without startedAt", () => {
+    expect(
+      computeGanttPlacement({ durationMs: 100 }, Date.parse("2026-08-10T08:00:00.000Z"), Date.parse("2026-08-10T08:00:10.000Z")),
+    ).toBeNull();
+  });
+
+  it("computeGanttPlacement offsets later steps to the right", () => {
+    const tMin = Date.parse("2026-08-10T08:00:00.000Z");
+    const tMax = Date.parse("2026-08-10T08:00:10.000Z");
+    const early = computeGanttPlacement(
+      { startedAt: "2026-08-10T08:00:01.000Z", durationMs: 1000 },
+      tMin,
+      tMax,
+    );
+    const late = computeGanttPlacement(
+      { startedAt: "2026-08-10T08:00:05.000Z", durationMs: 1000 },
+      tMin,
+      tMax,
+    );
+    expect(early).not.toBeNull();
+    expect(late).not.toBeNull();
+    expect(late!.offsetPct).toBeGreaterThan(early!.offsetPct);
+    expect(early!.widthPct).toBeGreaterThanOrEqual(1);
+  });
+
+  it("fills dr_lane duration from lane_started/lane_done ts", () => {
+    const timeline = assembleTraceTimeline({
+      traceId: "01JZTRACEID000000000000005",
+      portalLogs: [
+        portalLog({
+          id: "log-dr",
+          event: "chat.completions.finish",
+          log_time: "2026-08-10T08:00:00.000Z",
+          duration_ms: 10000,
+        }),
+      ],
+      modelSpans: [],
+      deepResearchRun: {
+        runId: "run-ts",
+        sessionId: "session-1",
+        status: "completed",
+        phase: "done",
+        topic: "topic",
+        createdAt: "2026-08-10T08:00:00.000Z",
+        updatedAt: "2026-08-10T08:00:20.000Z",
+        events: [
+          {
+            type: "phase",
+            phase: "lanes",
+            message: "lanes",
+            ts: "2026-08-10T08:00:01.000Z",
+          },
+          {
+            type: "lane_started",
+            laneId: "lane-a",
+            title: "Lane A",
+            index: 0,
+            total: 1,
+            ts: "2026-08-10T08:00:02.000Z",
+          },
+          {
+            type: "lane_done",
+            laneId: "lane-a",
+            status: "ok",
+            ts: "2026-08-10T08:00:07.000Z",
+          },
+          {
+            type: "phase",
+            phase: "done",
+            message: "done",
+            ts: "2026-08-10T08:00:08.000Z",
+          },
+        ],
+      },
+    });
+
+    const primary = timeline.nodes[0];
+    const lanesPhase = primary?.children.find((c) => c.label === "phase: lanes");
+    expect(lanesPhase?.startedAt).toBe("2026-08-10T08:00:01.000Z");
+    expect(lanesPhase?.durationMs).toBe(7000);
+
+    const lane = lanesPhase?.children.find((c) => c.kind === "dr_lane");
+    expect(lane?.startedAt).toBe("2026-08-10T08:00:02.000Z");
+    expect(lane?.durationMs).toBe(5000);
+    expect(lane?.status).toBe("ok");
+  });
+
+  it("leaves dr_lane duration empty when events lack ts", () => {
+    const timeline = assembleTraceTimeline({
+      traceId: "01JZTRACEID000000000000006",
+      portalLogs: [
+        portalLog({
+          id: "log-old",
+          event: "chat.completions.finish",
+          duration_ms: 1000,
+        }),
+      ],
+      modelSpans: [],
+      deepResearchRun: {
+        runId: "run-old",
+        sessionId: "session-1",
+        status: "completed",
+        phase: "done",
+        topic: "topic",
+        createdAt: "2026-08-10T08:00:00.000Z",
+        updatedAt: "2026-08-10T08:00:10.000Z",
+        events: [
+          { type: "phase", phase: "lanes", message: "lanes" },
+          { type: "lane_started", laneId: "lane-a", title: "Lane A", index: 0, total: 1 },
+          { type: "lane_done", laneId: "lane-a", status: "ok" },
+        ],
+      },
+    });
+
+    const lane = timeline.nodes[0]?.children
+      .find((c) => c.kind === "dr_phase")
+      ?.children.find((c) => c.kind === "dr_lane");
+    expect(lane?.durationMs).toBeUndefined();
+    expect(lane?.startedAt).toBeUndefined();
+  });
+
+  it("labels model steps with stage and surfaces duration/error status", () => {
+    const timeline = assembleTraceTimeline({
+      traceId: "01JZTRACEID000000000000003",
+      portalLogs: [
+        portalLog({
+          id: "log-y",
+          event: "chat.completions.finish",
+          duration_ms: 900,
+        }),
+      ],
+      modelSpans: [
+        span({
+          id: "s-err",
+          step_no: 2,
+          duration_ms: 1234,
+          status: "error",
+          error_message: "upstream 500",
+          metadata: { stage: "dr.lane.expand" },
+        }),
+      ],
+      deepResearchRun: null,
+    });
+
+    const node = timeline.nodes[0]?.children[0];
+    expect(node?.kind).toBe("model_step");
+    expect(node?.label).toContain("dr.lane.expand");
+    expect(node?.label).toContain("step 2");
+    expect(node?.durationMs).toBe(1234);
+    expect(node?.status).toBe("error");
+    expect(node?.attrs?.stage).toBe("dr.lane.expand");
+    expect(node?.attrs?.error_message).toBe("upstream 500");
+  });
+});

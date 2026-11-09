@@ -1,0 +1,397 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useAppStore } from "../../store";
+import { Panel } from "../ds/Panel";
+import { SETTINGS_INTRO_CLASS, SETTINGS_LABEL_CLASS } from "../ds/settings-typography";
+
+type WebSearchConfig = {
+  enabled: boolean;
+  default_provider: string;
+  max_results: number;
+  fetch_snippet_chars: number;
+  providers: Record<string, Record<string, unknown>>;
+};
+
+const DEFAULT_CONFIG: WebSearchConfig = {
+  enabled: true,
+  default_provider: "duckduckgo",
+  max_results: 5,
+  fetch_snippet_chars: 600,
+  providers: {},
+};
+
+/** Keep in sync with `WEB_SEARCH_MAX_RESULTS_CAP` in `agenticx/studio/web_search/contracts.py`. */
+const WEB_SEARCH_MAX_RESULTS_CAP = 50;
+
+const PROVIDERS: { id: string; label: string; needsKey: boolean }[] = [
+  { id: "duckduckgo", label: "DuckDuckGo", needsKey: false },
+  { id: "bocha", label: "Bocha AI", needsKey: true },
+  { id: "tavily", label: "Tavily", needsKey: true },
+  { id: "serper", label: "Serper (Google)", needsKey: true },
+  { id: "google", label: "Google CSE", needsKey: true },
+  { id: "bing", label: "Bing Web Search API", needsKey: true },
+];
+
+function normalizeWebSearchConfig(cfg: WebSearchConfig): WebSearchConfig {
+  return {
+    enabled: cfg.enabled !== false,
+    default_provider: cfg.default_provider || "duckduckgo",
+    max_results: typeof cfg.max_results === "number" ? cfg.max_results : 5,
+    fetch_snippet_chars: typeof cfg.fetch_snippet_chars === "number" ? cfg.fetch_snippet_chars : 600,
+    providers:
+      cfg.providers && typeof cfg.providers === "object"
+        ? (cfg.providers as Record<string, Record<string, unknown>>)
+        : {},
+  };
+}
+
+function webSearchConfigsEqual(a: WebSearchConfig, b: WebSearchConfig): boolean {
+  const left = normalizeWebSearchConfig(a);
+  const right = normalizeWebSearchConfig(b);
+  return (
+    left.enabled === right.enabled &&
+    left.default_provider === right.default_provider &&
+    left.max_results === right.max_results &&
+    left.fetch_snippet_chars === right.fetch_snippet_chars &&
+    JSON.stringify(left.providers) === JSON.stringify(right.providers)
+  );
+}
+
+export function WebSearchSettingsPanel() {
+  const { t } = useTranslation("settings");
+  const apiToken = useAppStore((s) => s.apiToken);
+  const apiBase = useAppStore((s) => s.apiBase);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [message, setMessage] = useState("");
+  const [draft, setDraft] = useState<WebSearchConfig>(DEFAULT_CONFIG);
+  const [saved, setSaved] = useState<WebSearchConfig>(DEFAULT_CONFIG);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [cxInput, setCxInput] = useState("");
+
+  const resolveApiBase = useCallback(async () => {
+    const u = (apiBase ?? "").trim();
+    if (u) return u.replace(/\/+$/, "");
+    const raw = String((await window.agenticxDesktop.getApiBase()) || "").trim();
+    return raw.replace(/\/+$/, "");
+  }, [apiBase]);
+
+  const headers = useMemo(
+    () => ({ "Content-Type": "application/json", "x-agx-desktop-token": apiToken }),
+    [apiToken],
+  );
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setMessage("");
+    try {
+      const base = await resolveApiBase();
+      const resp = await fetch(`${base}/api/web-search/config`, { headers });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const body = (await resp.json()) as { ok?: boolean; config?: WebSearchConfig };
+      const cfg = body.config;
+      if (cfg) {
+        const normalized = normalizeWebSearchConfig(cfg);
+        setDraft(normalized);
+        setSaved(normalized);
+      }
+      setApiKeyInput("");
+      setCxInput("");
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : t("webSearch.loadFailed"));
+    } finally {
+      setLoading(false);
+    }
+  }, [headers, resolveApiBase, t]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const currentProviderMeta = PROVIDERS.find((p) => p.id === draft.default_provider);
+  const needsKey = currentProviderMeta?.needsKey ?? false;
+  const needsCx = draft.default_provider === "google";
+  const webSearchDirty =
+    !webSearchConfigsEqual(draft, saved) || apiKeyInput.trim() !== "" || cxInput.trim() !== "";
+
+  const persist = async () => {
+    setSaving(true);
+    setMessage("");
+    try {
+      const base = await resolveApiBase();
+      const nextProviders = { ...draft.providers };
+      if (needsKey && apiKeyInput.trim()) {
+        const cur = { ...(nextProviders[draft.default_provider] || {}) };
+        cur.api_key = apiKeyInput.trim();
+        nextProviders[draft.default_provider] = cur;
+      }
+      if (needsCx && cxInput.trim()) {
+        const cur = { ...(nextProviders.google || {}) };
+        cur.cx = cxInput.trim();
+        nextProviders.google = cur;
+      }
+      const payload = {
+        enabled: draft.enabled,
+        default_provider: draft.default_provider,
+        max_results: draft.max_results,
+        fetch_snippet_chars: draft.fetch_snippet_chars,
+        providers: nextProviders,
+      };
+      const resp = await fetch(`${base}/api/web-search/config`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      setApiKeyInput("");
+      setCxInput("");
+      setMessage(t("webSearch.saved"));
+      await load();
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : t("webSearch.saveFailed"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const runTest = async () => {
+    setTesting(true);
+    setMessage("");
+    try {
+      const base = await resolveApiBase();
+      const resp = await fetch(`${base}/api/web-search/test`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ provider: draft.default_provider, query: "AgenticX" }),
+      });
+      const body = (await resp.json()) as { ok?: boolean; error?: string | null; hits?: unknown[] };
+      if (body.ok && body.hits && body.hits.length > 0) {
+        setMessage(t("webSearch.testOk"));
+      } else {
+        setMessage(body.error || t("webSearch.testEmpty"));
+      }
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : t("webSearch.testFailed"));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <Panel title={t("webSearch.title")}>
+        <div className="py-2 text-sm text-text-faint">{t("webSearch.loading")}</div>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title={t("webSearch.title")}>
+      <p className={`mb-3 ${SETTINGS_INTRO_CLASS}`}>{t("webSearch.intro")}</p>
+      <div className="flex items-center justify-between gap-4">
+        <span className={SETTINGS_LABEL_CLASS}>{t("webSearch.enable")}</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={draft.enabled}
+          onClick={() => {
+            setDraft((d) => ({ ...d, enabled: !d.enabled }));
+            setMessage("");
+          }}
+          className={`relative h-5 w-9 shrink-0 rounded-full transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--theme-color-rgb,16,185,129),0.55)] ${
+            draft.enabled ? "bg-[rgb(var(--theme-color-rgb,16,185,129))]" : "bg-surface-hover"
+          }`}
+        >
+          <span
+            className={`pointer-events-none absolute left-0.5 top-0.5 h-4 w-4 rounded-full shadow-sm transition-transform ${
+              draft.enabled ? "bg-[var(--theme-color-text)]" : "bg-white"
+            } ${draft.enabled ? "translate-x-4" : "translate-x-0"}`}
+          />
+        </button>
+      </div>
+      <label className={`mt-3 block ${SETTINGS_LABEL_CLASS}`}>
+        {t("webSearch.defaultEngine")}
+        <select
+          className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1.5 text-sm text-text-primary"
+          value={draft.default_provider}
+          onChange={(e) => {
+            setDraft((d) => ({ ...d, default_provider: e.target.value }));
+            setMessage("");
+          }}
+        >
+          {PROVIDERS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.id === "duckduckgo" ? t("webSearch.providerDdg") : p.id === "google" ? t("webSearch.providerGoogle") : p.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className={`mt-3 block ${SETTINGS_LABEL_CLASS}`}>
+        {t("webSearch.maxResults")}
+        <input
+          type="number"
+          min={1}
+          max={WEB_SEARCH_MAX_RESULTS_CAP}
+          className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1.5 text-sm text-text-primary"
+          value={draft.max_results}
+          onChange={(e) => {
+            setDraft((d) => ({
+              ...d,
+              max_results: Math.min(
+                WEB_SEARCH_MAX_RESULTS_CAP,
+                Math.max(1, Number(e.target.value) || 5),
+              ),
+            }));
+            setMessage("");
+          }}
+        />
+      </label>
+      {needsKey ? (
+        <label className={`mt-3 block ${SETTINGS_LABEL_CLASS}`}>
+          API Key
+          <input
+            type="password"
+            autoComplete="off"
+            className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1.5 text-sm text-text-primary"
+            value={apiKeyInput}
+            onChange={(e) => {
+              setApiKeyInput(e.target.value);
+              setMessage("");
+            }}
+            placeholder={t("webSearch.keyPh")}
+          />
+        </label>
+      ) : null}
+      {needsCx ? (
+        <label className={`mt-3 block ${SETTINGS_LABEL_CLASS}`}>
+          Search Engine ID (cx)
+          <input
+            type="text"
+            className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1.5 text-sm text-text-primary"
+            value={cxInput}
+            onChange={(e) => {
+              setCxInput(e.target.value);
+              setMessage("");
+            }}
+            placeholder={t("webSearch.cxPh")}
+          />
+        </label>
+      ) : null}
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        <button
+          type="button"
+          disabled={testing || !draft.enabled}
+          onClick={() => void runTest()}
+          className="rounded-md border border-border bg-surface-panel px-3 py-1.5 text-sm text-text-primary disabled:opacity-50"
+        >
+          {testing ? t("webSearch.testing") : t("webSearch.testConn")}
+        </button>
+        <button
+          type="button"
+          disabled={saving || !webSearchDirty}
+          onClick={() => void persist()}
+          className="rounded-md bg-btnPrimary px-3 py-1.5 text-sm font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-50"
+        >
+          {saving ? t("webSearch.saving") : t("webSearch.save")}
+        </button>
+      </div>
+      {message ? <div className="mt-2 text-xs text-text-muted">{message}</div> : null}
+    </Panel>
+  );
+}
+
+export function SuggestedQuestionsSettingsPanel() {
+  const { t } = useTranslation("settings");
+  const apiToken = useAppStore((s) => s.apiToken);
+  const apiBase = useAppStore((s) => s.apiBase);
+  const [loading, setLoading] = useState(true);
+  const [enabled, setEnabled] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const resolveApiBase = useCallback(async () => {
+    const u = (apiBase ?? "").trim();
+    if (u) return u.replace(/\/+$/, "");
+    const raw = String((await window.agenticxDesktop.getApiBase()) || "").trim();
+    return raw.replace(/\/+$/, "");
+  }, [apiBase]);
+
+  const headers = useMemo(
+    () => ({ "Content-Type": "application/json", "x-agx-desktop-token": apiToken }),
+    [apiToken],
+  );
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const base = await resolveApiBase();
+      const resp = await fetch(`${base}/api/runtime/suggested-questions`, { headers });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const body = (await resp.json()) as { enabled?: boolean };
+      setEnabled(body.enabled !== false);
+    } catch {
+      setEnabled(true);
+    } finally {
+      setLoading(false);
+    }
+  }, [headers, resolveApiBase]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const persist = async (next: boolean) => {
+    setSaving(true);
+    setMessage("");
+    try {
+      const base = await resolveApiBase();
+      const resp = await fetch(`${base}/api/runtime/suggested-questions`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      setEnabled(next);
+      setMessage(t("webSearch.saved"));
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : t("webSearch.saveFailed"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <Panel title={t("webSearch.suggestTitle")}>
+        <div className="py-2 text-sm text-text-faint">{t("webSearch.loading")}</div>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title={t("webSearch.suggestTitle")}>
+      <p className={`mb-3 ${SETTINGS_INTRO_CLASS}`}>{t("webSearch.suggestIntro")}</p>
+      <div className="flex items-center justify-between gap-4">
+        <span className={SETTINGS_LABEL_CLASS}>{t("webSearch.showSuggest")}</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          disabled={saving}
+          onClick={() => void persist(!enabled)}
+          className={`relative h-5 w-9 shrink-0 rounded-full transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--theme-color-rgb,16,185,129),0.55)] disabled:opacity-40 ${
+            enabled ? "bg-[rgb(var(--theme-color-rgb,16,185,129))]" : "bg-surface-hover"
+          }`}
+        >
+          <span
+            className={`pointer-events-none absolute left-0.5 top-0.5 h-4 w-4 rounded-full shadow-sm transition-transform ${
+              enabled ? "bg-[var(--theme-color-text)]" : "bg-white"
+            } ${enabled ? "translate-x-4" : "translate-x-0"}`}
+          />
+        </button>
+      </div>
+      {message ? <div className="mt-2 text-xs text-text-muted">{message}</div> : null}
+    </Panel>
+  );
+}

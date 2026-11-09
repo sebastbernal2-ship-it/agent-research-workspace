@@ -1,0 +1,67 @@
+services:
+  postgres:
+    profiles: ["postgresql"]
+    image: postgres:16-alpine
+    container_name: agenticx-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agenticx
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agenticx"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mysql:
+    profiles: ["mysql"]
+    image: mysql:8.0.36
+    container_name: agenticx-mysql-dev
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: agenticx
+      MYSQL_USER: agenticx
+      MYSQL_PASSWORD: agenticx
+      MYSQL_ROOT_PASSWORD: root
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+00:00
+      - --sql-mode=STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysqldata:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: agenticx-redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  mysqldata:
+  redisdata:

@@ -1,0 +1,44 @@
+import { VOICE_FOCUS_ENTRY_ENABLED } from "../voice/focus-mode-ui";
+
+export type KeybindingAction =
+  | "open-global-search"
+  | "open-settings"
+  | "clear-messages"
+  | "toggle-mode"
+  | "toggle-plan-mode"
+  | "toggle-focus-mode"
+  | "open-keybindings";
+export type UserMode = "pro" | "lite";
+
+type MatchRule = {
+  action: KeybindingAction;
+  key: string;
+  ctrlOrMeta?: boolean;
+  shift?: boolean;
+  mode: UserMode | "both";
+};
+
+const RULES: MatchRule[] = [
+  { action: "open-global-search", key: "k", ctrlOrMeta: true, mode: "pro" },
+  { action: "open-settings", key: ",", ctrlOrMeta: true, mode: "both" },
+  { action: "clear-messages", key: "l", ctrlOrMeta: true, mode: "pro" },
+  { action: "toggle-mode", key: "m", ctrlOrMeta: true, shift: true, mode: "both" },
+  { action: "toggle-plan-mode", key: "p", ctrlOrMeta: true, shift: true, mode: "pro" },
+  // 灵巧模式入口未成熟时不注册 ⇧⌘F；见 VOICE_FOCUS_ENTRY_ENABLED
+  ...(VOICE_FOCUS_ENTRY_ENABLED
+    ? [{ action: "toggle-focus-mode" as const, key: "f", ctrlOrMeta: true, shift: true, mode: "pro" as const }]
+    : []),
+  { action: "open-keybindings", key: "/", ctrlOrMeta: true, mode: "pro" },
+];
+
+export function matchKeybinding(event: KeyboardEvent, mode: UserMode): KeybindingAction | null {
+  const key = event.key.toLowerCase();
+  for (const rule of RULES) {
+    if (rule.mode !== "both" && rule.mode !== mode) continue;
+    if (key !== rule.key) continue;
+    if (!!rule.ctrlOrMeta !== !!(event.ctrlKey || event.metaKey)) continue;
+    if (!!rule.shift !== !!event.shiftKey) continue;
+    return rule.action;
+  }
+  return null;
+}

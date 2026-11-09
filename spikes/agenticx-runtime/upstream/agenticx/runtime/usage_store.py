@@ -1,0 +1,1214 @@
+#!/usr/bin/env python3
+"""Persist LLM usage events to ~/.agenticx/usage.sqlite for dashboards.
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from agenticx.runtime.model_pricing import compute_cost_usd
+
+_log = logging.getLogger(__name__)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    avatar_id TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts_ms);
+CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_usage_prov_model_ts ON usage_events(provider, model, ts_ms);
+CREATE TABLE IF NOT EXISTS usage_session_window (
+    session_id TEXT PRIMARY KEY,
+    keep_before_ms INTEGER NOT NULL DEFAULT 0,
+    alive_after_ms INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS usage_faults (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    avatar_id TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 1,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    recovered INTEGER NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_fault_ts ON usage_faults(ts_ms);
+CREATE INDEX IF NOT EXISTS idx_fault_session ON usage_faults(session_id, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_fault_model_ts ON usage_faults(model, ts_ms);
+"""
+
+
+class UsageStore:
+    """Thread-safe SQLite usage ledger."""
+
+    def __init__(self, db_path: Path | None = None) -> None:
+        self._path = db_path or (Path.home() / ".agenticx" / "usage.sqlite")
+        self._lock = threading.Lock()
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._path), timeout=60.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_schema(self) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.executescript(_SCHEMA)
+                conn.commit()
+            finally:
+                conn.close()
+
+    def record_sync(
+        self,
+        *,
+        session_id: str,
+        avatar_id: str,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int,
+        reasoning_tokens: int,
+        total_tokens: int,
+        ts_ms: int | None = None,
+    ) -> None:
+        sid = (session_id or "").strip()
+        aid = (avatar_id or "").strip()
+        prov = (provider or "").strip().lower()
+        mdl = (model or "").strip()
+        inp = max(0, int(input_tokens or 0))
+        out = max(0, int(output_tokens or 0))
+        cached = max(0, int(cached_tokens or 0))
+        reasoning = max(0, int(reasoning_tokens or 0))
+        total = max(0, int(total_tokens or 0))
+        if inp == 0 and out == 0 and total == 0 and cached == 0 and reasoning == 0:
+            return
+        cost = compute_cost_usd(mdl, input_tokens=inp, output_tokens=out, cached_tokens=cached)
+        try:
+            event_ts = int(ts_ms) if ts_ms is not None else 0
+        except (TypeError, ValueError):
+            event_ts = 0
+        if event_ts <= 0:
+            event_ts = int(time.time() * 1000)
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO usage_events (
+                        ts_ms, session_id, avatar_id, provider, model,
+                        input_tokens, output_tokens, cached_tokens, reasoning_tokens,
+                        total_tokens, cost_usd
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (event_ts, sid, aid, prov, mdl, inp, out, cached, reasoning, total, cost),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    async def record_async(
+        self,
+        *,
+        session_id: str,
+        avatar_id: str,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int,
+        reasoning_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self.record_sync,
+                session_id=session_id,
+                avatar_id=avatar_id,
+                provider=provider,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+                reasoning_tokens=reasoning_tokens,
+                total_tokens=total_tokens,
+            )
+        except Exception as exc:
+            _log.warning("usage_store.record_async failed: %s", exc)
+
+    def list_session_events_sync(
+        self, session_id: str
+    ) -> list[tuple[int, int, int, int]]:
+        """Return (ts_ms, input, output, cached) for one session, oldest first."""
+        sid = (session_id or "").strip()
+        if not sid:
+            return []
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT ts_ms, input_tokens, output_tokens, cached_tokens
+                    FROM usage_events
+                    WHERE session_id = ?
+                    ORDER BY ts_ms ASC, id ASC
+                    """,
+                    (sid,),
+                ).fetchall()
+            finally:
+                conn.close()
+        out: list[tuple[int, int, int, int]] = []
+        for row in rows:
+            try:
+                out.append((int(row[0]), int(row[1]), int(row[2]), int(row[3])))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def set_session_alive_window(
+        self,
+        session_id: str,
+        *,
+        keep_before_ms: int,
+        alive_after_ms: int,
+    ) -> None:
+        """Mark discarded generations after a retry/edit truncate.
+
+        Session-usage reads keep events at/before ``keep_before_ms`` or at/after
+        ``alive_after_ms``. The global billing dashboard still sums every row.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        keep = max(0, int(keep_before_ms or 0))
+        alive = max(0, int(alive_after_ms or 0))
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO usage_session_window (
+                        session_id, keep_before_ms, alive_after_ms
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        keep_before_ms = excluded.keep_before_ms,
+                        alive_after_ms = excluded.alive_after_ms
+                    """,
+                    (sid, keep, alive),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_session_alive_window(self, session_id: str) -> tuple[int, int] | None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT keep_before_ms, alive_after_ms
+                    FROM usage_session_window
+                    WHERE session_id = ?
+                    """,
+                    (sid,),
+                ).fetchone()
+            finally:
+                conn.close()
+        if not row:
+            return None
+        return int(row[0] or 0), int(row[1] or 0)
+
+    def cache_stats(
+        self,
+        *,
+        since_ms: int | None = None,
+        provider: str | None = None,
+        session_id: str | None = None,
+        keep_before_ms: int | None = None,
+        alive_after_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only cache-hit summary for local verification (no schema change)."""
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if since_ms is not None:
+            clauses.append("ts_ms >= ?")
+            params.append(int(since_ms))
+        prov = str(provider or "").strip().lower()
+        if prov:
+            clauses.append("provider = ?")
+            params.append(prov)
+        sid = str(session_id or "").strip()
+        if sid:
+            clauses.append("session_id = ?")
+            params.append(sid)
+            if keep_before_ms is None or alive_after_ms is None:
+                window = self.get_session_alive_window(sid)
+                if window is not None:
+                    keep_before_ms, alive_after_ms = window
+        if (
+            sid
+            and keep_before_ms is not None
+            and alive_after_ms is not None
+        ):
+            clauses.append("(ts_ms <= ? OR ts_ms >= ?)")
+            params.extend([int(keep_before_ms), int(alive_after_ms)])
+        where = " AND ".join(clauses)
+        last_input = 0
+        last_cached = 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(cached_tokens), 0),
+                        COALESCE(SUM(CASE WHEN cached_tokens = 0 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(total_tokens), 0)
+                    FROM usage_events
+                    WHERE {where}
+                    """,
+                    params,
+                ).fetchone()
+                if sid:
+                    last = conn.execute(
+                        f"""
+                        SELECT input_tokens, cached_tokens
+                        FROM usage_events
+                        WHERE {where}
+                        ORDER BY ts_ms DESC, id DESC
+                        LIMIT 1
+                        """,
+                        params,
+                    ).fetchone()
+                    if last:
+                        last_input = int(last[0] or 0)
+                        last_cached = int(last[1] or 0)
+            finally:
+                conn.close()
+        requests = int(row[0] or 0) if row else 0
+        input_tokens = int(row[1] or 0) if row else 0
+        cached_tokens = int(row[2] or 0) if row else 0
+        zero_cache = int(row[3] or 0) if row else 0
+        output_tokens = int(row[4] or 0) if row else 0
+        total_tokens = int(row[5] or 0) if row else 0
+        if total_tokens <= 0:
+            total_tokens = input_tokens + output_tokens
+        ratio = (float(cached_tokens) / float(input_tokens)) if input_tokens > 0 else 0.0
+        last_ratio = (float(last_cached) / float(last_input)) if last_input > 0 else 0.0
+        return {
+            "requests": requests,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_ratio": ratio,
+            "zero_cache_requests": zero_cache,
+            "last_input_tokens": last_input,
+            "last_cached_tokens": last_cached,
+            "last_cache_ratio": last_ratio,
+        }
+
+    def summary_sync(self, start_ms: int, end_ms: int) -> dict[str, Any]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(total_tokens), 0),
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cached_tokens), 0),
+                        COALESCE(SUM(reasoning_tokens), 0),
+                        COALESCE(SUM(cost_usd), 0),
+                        COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id END)
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ?
+                    """,
+                    (start_ms, end_ms),
+                ).fetchone()
+            finally:
+                conn.close()
+        if not row:
+            return {
+                "tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cached": 0,
+                "reasoning": 0,
+                "cost_usd": 0.0,
+                "conversations": 0,
+            }
+        return {
+            "tokens": int(row[0] or 0),
+            "input": int(row[1] or 0),
+            "output": int(row[2] or 0),
+            "cached": int(row[3] or 0),
+            "reasoning": int(row[4] or 0),
+            "cost_usd": float(row[5] or 0.0),
+            "conversations": int(row[6] or 0),
+        }
+
+    def breakdown_sync(
+        self,
+        start_ms: int,
+        end_ms: int,
+        *,
+        dimension: str,
+    ) -> list[dict[str, Any]]:
+        dim = (dimension or "provider").strip().lower()
+        with self._lock:
+            conn = self._connect()
+            try:
+                if dim == "model":
+                    rows = conn.execute(
+                        """
+                        SELECT model,
+                               SUM(total_tokens),
+                               SUM(cost_usd)
+                        FROM usage_events
+                        WHERE ts_ms >= ? AND ts_ms <= ? AND model != ''
+                        GROUP BY model
+                        ORDER BY SUM(total_tokens) DESC
+                        """,
+                        (start_ms, end_ms),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT provider,
+                               SUM(total_tokens),
+                               SUM(cost_usd),
+                               COUNT(DISTINCT CASE WHEN model != '' THEN model END)
+                        FROM usage_events
+                        WHERE ts_ms >= ? AND ts_ms <= ?
+                        GROUP BY provider
+                        ORDER BY SUM(total_tokens) DESC
+                        """,
+                        (start_ms, end_ms),
+                    ).fetchall()
+            finally:
+                conn.close()
+        total_tokens = sum(int(r[1] or 0) for r in rows)
+        from agenticx.llms.provider_display import provider_breakdown_label
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            key = str(r[0] or "(unknown)")
+            tks = int(r[1] or 0)
+            cst = float(r[2] or 0.0)
+            pct = (100.0 * tks / total_tokens) if total_tokens > 0 else 0.0
+            item: dict[str, Any] = {
+                "key": key,
+                "label": provider_breakdown_label(key) if dim != "model" else key,
+                "tokens": tks,
+                "percent": round(pct, 2),
+                "cost_usd": round(cst, 4),
+            }
+            if dim != "model" and len(r) > 3:
+                item["model_count"] = int(r[3] or 0)
+            out.append(item)
+        return out
+
+    def daily_sync(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        strftime('%Y-%m-%d', ts_ms / 1000, 'unixepoch') AS d,
+                        SUM(total_tokens),
+                        SUM(input_tokens),
+                        SUM(output_tokens),
+                        SUM(cached_tokens),
+                        SUM(reasoning_tokens),
+                        COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id END)
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ?
+                    GROUP BY d
+                    ORDER BY d ASC
+                    """,
+                    (start_ms, end_ms),
+                ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "date": str(r[0] or ""),
+                "total": int(r[1] or 0),
+                "input": int(r[2] or 0),
+                "output": int(r[3] or 0),
+                "cached": int(r[4] or 0),
+                "reasoning": int(r[5] or 0),
+                "convs": int(r[6] or 0),
+            }
+            for r in rows
+        ]
+
+    def heatmap_sync(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        """Daily totals for heatmap visualization."""
+        return [{"date": row["date"], "total": row["total"]} for row in self.daily_sync(start_ms, end_ms)]
+
+    def top_models_sync(self, start_ms: int, end_ms: int, limit: int = 3) -> list[dict[str, Any]]:
+        lim = max(1, min(20, int(limit or 3)))
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT model, SUM(total_tokens) AS t
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ? AND model != ''
+                    GROUP BY model
+                    ORDER BY t DESC
+                    LIMIT ?
+                    """,
+                    (start_ms, end_ms, lim),
+                ).fetchall()
+                total_row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(total_tokens), 0)
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ?
+                    """,
+                    (start_ms, end_ms),
+                ).fetchone()
+            finally:
+                conn.close()
+        grand = int(total_row[0] or 0) if total_row else 0
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            m = str(r[0] or "")
+            tks = int(r[1] or 0)
+            pct = (100.0 * tks / grand) if grand > 0 else 0.0
+            out.append({"model": m, "tokens": tks, "percent": round(pct, 2)})
+        return out
+
+    def started_at_sync(self) -> int | None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute("SELECT MIN(ts_ms) FROM usage_events").fetchone()
+            finally:
+                conn.close()
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
+
+    def active_days_sync(self, start_ms: int, end_ms: int) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT strftime('%Y-%m-%d', ts_ms / 1000, 'unixepoch'))
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ?
+                    """,
+                    (start_ms, end_ms),
+                ).fetchone()
+            finally:
+                conn.close()
+        return int(row[0] or 0) if row else 0
+
+    def month_conversations_sync(self, start_ms: int, end_ms: int) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT session_id)
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ? AND session_id != ''
+                    """,
+                    (start_ms, end_ms),
+                ).fetchone()
+            finally:
+                conn.close()
+        return int(row[0] or 0) if row else 0
+
+    def dashboard_sync(
+        self,
+        *,
+        range_start_ms: int,
+        range_end_ms: int,
+        week_start_ms: int,
+        week_end_ms: int,
+        month_start_ms: int,
+        month_end_ms: int,
+        calendar_month_start_ms: int,
+        now_ms: int,
+        top_limit: int = 3,
+    ) -> dict[str, Any]:
+        """Batch all token-dashboard queries in one lock + connection."""
+        lim = max(1, min(20, int(top_limit or 3)))
+
+        def _summary_row(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> dict[str, Any]:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cached_tokens), 0),
+                    COALESCE(SUM(reasoning_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0),
+                    COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id END)
+                FROM usage_events
+                WHERE ts_ms >= ? AND ts_ms <= ?
+                """,
+                (start_ms, end_ms),
+            ).fetchone()
+            if not row:
+                return {
+                    "tokens": 0,
+                    "input": 0,
+                    "output": 0,
+                    "cached": 0,
+                    "reasoning": 0,
+                    "cost_usd": 0.0,
+                    "conversations": 0,
+                }
+            return {
+                "tokens": int(row[0] or 0),
+                "input": int(row[1] or 0),
+                "output": int(row[2] or 0),
+                "cached": int(row[3] or 0),
+                "reasoning": int(row[4] or 0),
+                "cost_usd": float(row[5] or 0.0),
+                "conversations": int(row[6] or 0),
+            }
+
+        def _breakdown_rows(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                """
+                SELECT provider,
+                       SUM(total_tokens),
+                       SUM(cost_usd),
+                       COUNT(DISTINCT CASE WHEN model != '' THEN model END)
+                FROM usage_events
+                WHERE ts_ms >= ? AND ts_ms <= ?
+                GROUP BY provider
+                ORDER BY SUM(total_tokens) DESC
+                """,
+                (start_ms, end_ms),
+            ).fetchall()
+            total_tokens = sum(int(r[1] or 0) for r in rows)
+            from agenticx.llms.provider_display import provider_breakdown_label
+
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                key = str(r[0] or "(unknown)")
+                tks = int(r[1] or 0)
+                cst = float(r[2] or 0.0)
+                pct = (100.0 * tks / total_tokens) if total_tokens > 0 else 0.0
+                out.append(
+                    {
+                        "key": key,
+                        "label": provider_breakdown_label(key),
+                        "tokens": tks,
+                        "percent": round(pct, 2),
+                        "cost_usd": round(cst, 4),
+                        "model_count": int(r[3] or 0),
+                    }
+                )
+            return out
+
+        def _daily_rows(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                """
+                SELECT
+                    strftime('%Y-%m-%d', ts_ms / 1000, 'unixepoch') AS d,
+                    SUM(total_tokens),
+                    SUM(input_tokens),
+                    SUM(output_tokens),
+                    SUM(cached_tokens),
+                    SUM(reasoning_tokens),
+                    COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id END)
+                FROM usage_events
+                WHERE ts_ms >= ? AND ts_ms <= ?
+                GROUP BY d
+                ORDER BY d ASC
+                """,
+                (start_ms, end_ms),
+            ).fetchall()
+            return [
+                {
+                    "date": str(r[0] or ""),
+                    "total": int(r[1] or 0),
+                    "input": int(r[2] or 0),
+                    "output": int(r[3] or 0),
+                    "cached": int(r[4] or 0),
+                    "reasoning": int(r[5] or 0),
+                    "convs": int(r[6] or 0),
+                }
+                for r in rows
+            ]
+
+        def _top_models(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                """
+                SELECT model, SUM(total_tokens) AS t
+                FROM usage_events
+                WHERE ts_ms >= ? AND ts_ms <= ? AND model != ''
+                GROUP BY model
+                ORDER BY t DESC
+                LIMIT ?
+                """,
+                (start_ms, end_ms, lim),
+            ).fetchall()
+            total_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(total_tokens), 0)
+                FROM usage_events
+                WHERE ts_ms >= ? AND ts_ms <= ?
+                """,
+                (start_ms, end_ms),
+            ).fetchone()
+            grand = int(total_row[0] or 0) if total_row else 0
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                m = str(r[0] or "")
+                tks = int(r[1] or 0)
+                pct = (100.0 * tks / grand) if grand > 0 else 0.0
+                out.append({"model": m, "tokens": tks, "percent": round(pct, 2)})
+            return out
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                summary = _summary_row(conn, range_start_ms, range_end_ms)
+                breakdown = _breakdown_rows(conn, range_start_ms, range_end_ms)
+                daily = _daily_rows(conn, range_start_ms, range_end_ms)
+                top_models = _top_models(conn, range_start_ms, range_end_ms)
+                week_chip = _summary_row(conn, week_start_ms, week_end_ms)
+                month_chip = _summary_row(conn, month_start_ms, month_end_ms)
+
+                started_row = conn.execute("SELECT MIN(ts_ms) FROM usage_events").fetchone()
+                started_at = int(started_row[0]) if started_row and started_row[0] is not None else None
+
+                active_row = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT strftime('%Y-%m-%d', ts_ms / 1000, 'unixepoch'))
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ?
+                    """,
+                    (now_ms - 30 * 86400000, now_ms),
+                ).fetchone()
+                active_days_30d = int(active_row[0] or 0) if active_row else 0
+
+                conv_row = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT session_id)
+                    FROM usage_events
+                    WHERE ts_ms >= ? AND ts_ms <= ? AND session_id != ''
+                    """,
+                    (calendar_month_start_ms, now_ms),
+                ).fetchone()
+                month_conversations = int(conv_row[0] or 0) if conv_row else 0
+            finally:
+                conn.close()
+
+        return {
+            "summary": summary,
+            "breakdown": breakdown,
+            "daily": daily,
+            "top_models": top_models,
+            "meta": {
+                "started_at": started_at,
+                "active_days_30d": active_days_30d,
+                "month_conversations": month_conversations,
+            },
+            "week_chip": week_chip,
+            "month_chip": month_chip,
+        }
+
+
+    def record_fault_sync(
+        self,
+        *,
+        session_id: str,
+        avatar_id: str,
+        provider: str,
+        model: str,
+        kind: str,
+        phase: str = "",
+        attempt: int = 1,
+        retryable: bool = False,
+        recovered: bool = False,
+        message: str = "",
+        ts_ms: int | None = None,
+    ) -> None:
+        sid = (session_id or "").strip()
+        aid = (avatar_id or "").strip()
+        prov = (provider or "").strip().lower()
+        mdl = (model or "").strip()
+        fault_kind = (kind or "unknown").strip() or "unknown"
+        fault_phase = (phase or "").strip()
+        try:
+            attempt_n = max(1, int(attempt or 1))
+        except (TypeError, ValueError):
+            attempt_n = 1
+        note = str(message or "").strip()[:400]
+        try:
+            event_ts = int(ts_ms) if ts_ms is not None else 0
+        except (TypeError, ValueError):
+            event_ts = 0
+        if event_ts <= 0:
+            event_ts = int(time.time() * 1000)
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO usage_faults (
+                        ts_ms, session_id, avatar_id, provider, model,
+                        kind, phase, attempt, retryable, recovered, message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_ts,
+                        sid,
+                        aid,
+                        prov,
+                        mdl,
+                        fault_kind,
+                        fault_phase,
+                        attempt_n,
+                        1 if retryable else 0,
+                        1 if recovered else 0,
+                        note,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _filter_clause(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        session_id: str = "",
+        provider: str = "",
+        model: str = "",
+        table: str = "usage_events",
+    ) -> tuple[str, list[Any]]:
+        _ = table
+        clauses = ["ts_ms >= ?", "ts_ms <= ?"]
+        params: list[Any] = [int(start_ms), int(end_ms)]
+        sid = (session_id or "").strip()
+        if sid:
+            clauses.append("session_id = ?")
+            params.append(sid)
+        prov = (provider or "").strip().lower()
+        if prov:
+            clauses.append("LOWER(provider) = ?")
+            params.append(prov)
+        needle = (model or "").strip().lower()
+        if needle:
+            clauses.append("LOWER(model) LIKE ?")
+            params.append(f"%{needle}%")
+        return " AND ".join(clauses), params
+
+    def query_calls_sync(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        session_id: str = "",
+        provider: str = "",
+        model: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        where, params = self._filter_clause(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+        )
+        cap = max(1, min(200, int(limit or 50)))
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT ts_ms, session_id, provider, model,
+                           input_tokens, output_tokens, cached_tokens,
+                           reasoning_tokens, total_tokens, cost_usd
+                    FROM usage_events
+                    WHERE {where}
+                    ORDER BY ts_ms DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (*params, cap),
+                ).fetchall()
+            finally:
+                conn.close()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "ts_ms": int(row[0] or 0),
+                    "session_id": str(row[1] or ""),
+                    "provider": str(row[2] or ""),
+                    "model": str(row[3] or ""),
+                    "input_tokens": int(row[4] or 0),
+                    "output_tokens": int(row[5] or 0),
+                    "cached_tokens": int(row[6] or 0),
+                    "reasoning_tokens": int(row[7] or 0),
+                    "total_tokens": int(row[8] or 0),
+                    "cost_usd": float(row[9] or 0.0),
+                    "outcome": "ok",
+                    "kind": "call",
+                }
+            )
+        return out
+
+    def summarize_calls_sync(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        session_id: str = "",
+        provider: str = "",
+        model: str = "",
+    ) -> dict[str, Any]:
+        where, params = self._filter_clause(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+        )
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(total_tokens), 0),
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cached_tokens), 0),
+                        COALESCE(SUM(cost_usd), 0)
+                    FROM usage_events
+                    WHERE {where}
+                    """,
+                    params,
+                ).fetchone()
+                by_model = conn.execute(
+                    f"""
+                    SELECT model, COUNT(*), COALESCE(SUM(total_tokens), 0)
+                    FROM usage_events
+                    WHERE {where} AND model != ''
+                    GROUP BY model
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 20
+                    """,
+                    params,
+                ).fetchall()
+                by_provider = conn.execute(
+                    f"""
+                    SELECT provider, COUNT(*), COALESCE(SUM(total_tokens), 0)
+                    FROM usage_events
+                    WHERE {where} AND provider != ''
+                    GROUP BY provider
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 20
+                    """,
+                    params,
+                ).fetchall()
+            finally:
+                conn.close()
+        return {
+            "calls": int(row[0] or 0) if row else 0,
+            "tokens": int(row[1] or 0) if row else 0,
+            "input_tokens": int(row[2] or 0) if row else 0,
+            "output_tokens": int(row[3] or 0) if row else 0,
+            "cached_tokens": int(row[4] or 0) if row else 0,
+            "cost_usd": round(float(row[5] or 0.0), 6) if row else 0.0,
+            "by_model": {str(r[0]): {"calls": int(r[1] or 0), "tokens": int(r[2] or 0)} for r in by_model},
+            "by_provider": {str(r[0]): {"calls": int(r[1] or 0), "tokens": int(r[2] or 0)} for r in by_provider},
+        }
+
+    def query_faults_sync(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        session_id: str = "",
+        provider: str = "",
+        model: str = "",
+        kind: str = "",
+        phase: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        where, params = self._filter_clause(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            table="usage_faults",
+        )
+        fault_kind = (kind or "").strip()
+        if fault_kind:
+            where += " AND kind = ?"
+            params.append(fault_kind)
+        fault_phase = (phase or "").strip()
+        if fault_phase:
+            where += " AND phase = ?"
+            params.append(fault_phase)
+        cap = max(1, min(200, int(limit or 50)))
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT ts_ms, session_id, provider, model, kind, phase,
+                           attempt, retryable, recovered, message
+                    FROM usage_faults
+                    WHERE {where}
+                    ORDER BY ts_ms DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (*params, cap),
+                ).fetchall()
+            finally:
+                conn.close()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "ts_ms": int(row[0] or 0),
+                    "session_id": str(row[1] or ""),
+                    "provider": str(row[2] or ""),
+                    "model": str(row[3] or ""),
+                    "kind": str(row[4] or ""),
+                    "phase": str(row[5] or ""),
+                    "attempt": int(row[6] or 1),
+                    "retryable": bool(row[7]),
+                    "recovered": bool(row[8]),
+                    "message": str(row[9] or ""),
+                    "outcome": "failed",
+                }
+            )
+        return out
+
+    def summarize_faults_sync(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        session_id: str = "",
+        provider: str = "",
+        model: str = "",
+    ) -> dict[str, Any]:
+        where, params = self._filter_clause(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            table="usage_faults",
+        )
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(CASE WHEN phase = 'retry' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN retryable = 1 THEN 1 ELSE 0 END), 0)
+                    FROM usage_faults
+                    WHERE {where}
+                    """,
+                    params,
+                ).fetchone()
+                by_kind = conn.execute(
+                    f"""
+                    SELECT kind, COUNT(*)
+                    FROM usage_faults
+                    WHERE {where} AND kind != ''
+                    GROUP BY kind
+                    ORDER BY COUNT(*) DESC
+                    """,
+                    params,
+                ).fetchall()
+            finally:
+                conn.close()
+        return {
+            "faults": int(row[0] or 0) if row else 0,
+            "retries": int(row[1] or 0) if row else 0,
+            "retryable": int(row[2] or 0) if row else 0,
+            "by_kind": {str(r[0]): int(r[1] or 0) for r in by_kind},
+        }
+
+    def consecutive_fault_streaks_sync(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        session_id: str = "",
+        provider: str = "",
+        model: str = "",
+        min_streak: int = 2,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        faults = self.query_faults_sync(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            limit=200,
+        )
+        successes = self.query_calls_sync(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            limit=200,
+        )
+        timeline: dict[tuple[str, str], list[tuple[int, str, dict[str, Any]]]] = {}
+        for row in successes:
+            key = (str(row.get("session_id") or ""), str(row.get("model") or ""))
+            timeline.setdefault(key, []).append((int(row.get("ts_ms") or 0), "ok", row))
+        for row in faults:
+            key = (str(row.get("session_id") or ""), str(row.get("model") or ""))
+            timeline.setdefault(key, []).append((int(row.get("ts_ms") or 0), "failed", row))
+        streaks: list[dict[str, Any]] = []
+        floor = max(2, int(min_streak or 2))
+        for (sid, mdl), items in timeline.items():
+            items.sort(key=lambda item: item[0])
+            run_kind = ""
+            run_count = 0
+            run_last: dict[str, Any] | None = None
+            for _ts, outcome, row in items:
+                if outcome == "failed":
+                    kind = str(row.get("kind") or "unknown")
+                    if run_count and kind == run_kind:
+                        run_count += 1
+                    else:
+                        run_kind = kind
+                        run_count = 1
+                    run_last = row
+                else:
+                    run_kind = ""
+                    run_count = 0
+                    run_last = None
+            if run_count >= floor and run_last is not None:
+                streaks.append(
+                    {
+                        "session_id": sid,
+                        "model": mdl,
+                        "provider": str(run_last.get("provider") or ""),
+                        "count": run_count,
+                        "kind": run_kind,
+                        "latest_ts_ms": int(run_last.get("ts_ms") or 0),
+                        "latest_message": str(run_last.get("message") or ""),
+                        "retryable": bool(run_last.get("retryable")),
+                    }
+                )
+        streaks.sort(key=lambda item: (int(item.get("count") or 0), int(item.get("latest_ts_ms") or 0)), reverse=True)
+        return streaks[: max(1, min(20, int(limit or 8)))]
+
+
+_store_singleton: UsageStore | None = None
+_store_lock = threading.Lock()
+
+
+def log_model_fault(
+    session: Any | None = None,
+    *,
+    session_id: str = "",
+    avatar_id: str = "",
+    provider: str = "",
+    model: str = "",
+    kind: str = "unknown",
+    phase: str = "",
+    attempt: int = 1,
+    retryable: bool = False,
+    recovered: bool = False,
+    message: str = "",
+) -> None:
+    """Best-effort persist of a model/provider fault. Never raises to callers."""
+    sid = (session_id or "").strip()
+    aid = (avatar_id or "").strip()
+    prov = (provider or "").strip()
+    mdl = (model or "").strip()
+    if session is not None:
+        if not sid:
+            for attr in ("_usage_owner_session_id", "_session_id", "session_id"):
+                raw = getattr(session, attr, None)
+                if raw is not None and str(raw).strip():
+                    sid = str(raw).strip()
+                    break
+        if not prov:
+            prov = str(getattr(session, "provider_name", "") or "")
+        if not mdl:
+            mdl = str(getattr(session, "model_name", "") or "")
+    if not kind and not message:
+        return
+    try:
+        get_usage_store().record_fault_sync(
+            session_id=sid,
+            avatar_id=aid,
+            provider=prov,
+            model=mdl,
+            kind=kind,
+            phase=phase,
+            attempt=attempt,
+            retryable=retryable,
+            recovered=recovered,
+            message=message,
+        )
+    except Exception as exc:
+        _log.debug("usage_store.log_model_fault skipped: %s", exc)
+
+
+def get_usage_store() -> UsageStore:
+    global _store_singleton
+    with _store_lock:
+        if _store_singleton is None:
+            _store_singleton = UsageStore()
+        return _store_singleton

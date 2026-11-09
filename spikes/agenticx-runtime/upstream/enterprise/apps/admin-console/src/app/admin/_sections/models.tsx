@@ -1,0 +1,1165 @@
+"use client";
+import { adminFetch } from "../../../lib/admin-client-auth";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import {
+  Badge,
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  EmptyState,
+  Input,
+  Label,
+  PageHeader,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  toast,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@agenticx/ui";
+import { useTranslations } from "next-intl";
+import {
+  Activity,
+  Check,
+  CircleDot,
+  CircleMinus,
+  Eye,
+  EyeOff,
+  Loader2,
+  Plus,
+  RefreshCcw,
+  Trash2,
+  Wrench,
+  Server,
+} from "lucide-react";
+import { inferModelCapabilities, isEmbeddingModelId } from "../../../lib/infer-model-capabilities";
+
+type ProviderRoute = "local" | "private-cloud" | "third-party";
+
+interface ProviderModel {
+  name: string;
+  label: string;
+  capabilities?: string[];
+  enabled: boolean;
+}
+
+interface ProviderRecord {
+  id: string;
+  displayName: string;
+  baseUrl: string;
+  apiKeyMasked: string;
+  apiKeyConfigured: boolean;
+  enabled: boolean;
+  isDefault: boolean;
+  route: ProviderRoute;
+  envKey?: string;
+  models: ProviderModel[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ProviderTemplate {
+  id: string;
+  displayName: string;
+  baseUrl: string;
+  envKey: string;
+  route: ProviderRoute;
+  popularModels: ProviderModel[];
+}
+
+type ListResp = {
+  code: string;
+  message: string;
+  data?: { providers: ProviderRecord[]; templates: ProviderTemplate[] };
+};
+
+type ProviderResp = {
+  code: string;
+  message: string;
+  data?: { provider: ProviderRecord };
+};
+
+type TestResp = {
+  code: string;
+  message: string;
+  data?: { reachable?: boolean; via?: string; status?: number; preview?: string; modelCount?: number };
+};
+
+type FetchModelsResp = {
+  code: string;
+  message: string;
+  data?: { models?: string[]; warning?: string };
+};
+
+interface ProviderFormBaseline {
+  displayName: string;
+  baseUrl: string;
+  enabled: boolean;
+  isDefault: boolean;
+  apiKeyDraft: string;
+}
+
+export default function ModelProvidersPage() {
+  const t = useTranslations("pages.admin.models");
+  const tc = useTranslations("common");
+  const ts = useTranslations("shell");
+  const routeLabel = useMemo(
+    (): Record<ProviderRoute, string> => ({
+      local: t("route.local"),
+      "private-cloud": t("route.privateCloud"),
+      "third-party": t("route.thirdParty"),
+    }),
+    [t]
+  );
+  const [providers, setProviders] = useState<ProviderRecord[]>([]);
+  const [templates, setTemplates] = useState<ProviderTemplate[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [addOpen, setAddOpen] = useState(false);
+  const [baseline, setBaseline] = useState<ProviderFormBaseline | null>(null);
+  const [displayNameDraft, setDisplayNameDraft] = useState("");
+  const [baseUrlDraft, setBaseUrlDraft] = useState("");
+  const [enabledDraft, setEnabledDraft] = useState(false);
+  const [isDefaultDraft, setIsDefaultDraft] = useState(false);
+  const [keyDraft, setKeyDraft] = useState("");
+  const [keyVisible, setKeyVisible] = useState(false);
+  const [revealingKey, setRevealingKey] = useState(false);
+  const serverKeyRef = useRef<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [addingModel, setAddingModel] = useState(false);
+  const [newModel, setNewModel] = useState<{ name: string; label: string }>({ name: "", label: "" });
+  const [fetchModelsOpen, setFetchModelsOpen] = useState(false);
+  const [fetchModelsSearch, setFetchModelsSearch] = useState("");
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [fetchModelsError, setFetchModelsError] = useState<string | null>(null);
+  const [fetchModelsWarning, setFetchModelsWarning] = useState<string | null>(null);
+  const formInitializedForId = useRef<string | null>(null);
+
+  const active = useMemo(() => providers.find((p) => p.id === activeId) ?? null, [providers, activeId]);
+
+  const formDirty = useMemo(() => {
+    if (!baseline) return false;
+    return (
+      displayNameDraft.trim() !== baseline.displayName ||
+      baseUrlDraft.trim() !== baseline.baseUrl ||
+      enabledDraft !== baseline.enabled ||
+      isDefaultDraft !== baseline.isDefault ||
+      keyDraft !== baseline.apiKeyDraft &&
+      keyDraft !== serverKeyRef.current
+    );
+  }, [baseline, displayNameDraft, baseUrlDraft, enabledDraft, isDefaultDraft, keyDraft]);
+
+  const syncFormFromProvider = useCallback((provider: ProviderRecord) => {
+    const snap: ProviderFormBaseline = {
+      displayName: provider.displayName,
+      baseUrl: provider.baseUrl,
+      enabled: provider.enabled,
+      isDefault: provider.isDefault,
+      apiKeyDraft: "",
+    };
+    setBaseline(snap);
+    setDisplayNameDraft(snap.displayName);
+    setBaseUrlDraft(snap.baseUrl);
+    setEnabledDraft(snap.enabled);
+    setIsDefaultDraft(snap.isDefault);
+    setKeyDraft("");
+    setKeyVisible(false);
+    serverKeyRef.current = null;
+  }, []);
+
+  const load = useCallback(async (preferId?: string) => {
+    setLoading(true);
+    try {
+      const res = await adminFetch("/api/admin/providers", { cache: "no-store" });
+      const json = (await res.json()) as ListResp;
+      if (!res.ok || !json.data) {
+        toast.error(json.message ?? t("toast.loadFailed"));
+        return;
+      }
+      setProviders(json.data.providers);
+      setTemplates(json.data.templates);
+      setActiveId((prev) => preferId ?? prev ?? json.data!.providers[0]?.id ?? null);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t("toast.networkError"));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // 切换厂商时从已落库数据初始化表单草稿
+  useEffect(() => {
+    if (!activeId) {
+      formInitializedForId.current = null;
+      setBaseline(null);
+      return;
+    }
+    const provider = providers.find((p) => p.id === activeId);
+    if (!provider) return;
+    if (formInitializedForId.current === activeId) return;
+    formInitializedForId.current = activeId;
+    syncFormFromProvider(provider);
+  }, [activeId, providers, syncFormFromProvider]);
+
+  const persistProvider = useCallback(
+    async (id: string, patch: Partial<ProviderRecord> & { apiKey?: string }) => {
+      const res = await fetch(`/api/admin/providers/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      const json = (await res.json()) as ProviderResp;
+      if (!res.ok || !json.data) {
+        toast.error(json.message ?? t("toast.saveFailed"));
+        return null;
+      }
+      setProviders((prev) => prev.map((p) => (p.id === id ? json.data!.provider : p)));
+      return json.data.provider;
+    },
+    []
+  );
+
+  const handleSaveForm = async () => {
+    if (!active || !baseline || !formDirty) return;
+    const patch: Partial<ProviderRecord> & { apiKey?: string } = {};
+    const nextDisplayName = displayNameDraft.trim();
+    const nextBaseUrl = baseUrlDraft.trim();
+    if (!nextDisplayName) {
+      toast.error(t("toast.displayNameRequired"));
+      return;
+    }
+    if (!nextBaseUrl) {
+      toast.error(t("toast.baseUrlRequired"));
+      return;
+    }
+    if (nextDisplayName !== baseline.displayName) patch.displayName = nextDisplayName;
+    if (nextBaseUrl !== baseline.baseUrl) patch.baseUrl = nextBaseUrl;
+    if (enabledDraft !== baseline.enabled) patch.enabled = enabledDraft;
+    if (isDefaultDraft !== baseline.isDefault) patch.isDefault = isDefaultDraft;
+    if (keyDraft.trim() && keyDraft !== baseline.apiKeyDraft && keyDraft !== serverKeyRef.current) {
+      patch.apiKey = keyDraft.trim();
+    }
+
+    setSaving(true);
+    try {
+      const updated = await persistProvider(active.id, patch);
+      if (updated) {
+        toast.success(t("saved"));
+        formInitializedForId.current = active.id;
+        syncFormFromProvider(updated);
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteProvider = async () => {
+    if (!active) return;
+    if (!window.confirm(t("confirm.deleteProvider", { name: active.displayName }))) return;
+    const res = await fetch(`/api/admin/providers/${active.id}`, { method: "DELETE" });
+    if (!res.ok) {
+      toast.error(t("toast.deleteFailed"));
+      return;
+    }
+    toast.success(t("toast.deleted"));
+    formInitializedForId.current = null;
+    setActiveId(null);
+    await load();
+  };
+
+  const handleTest = async () => {
+    if (!active) return;
+    setTesting(true);
+    try {
+      const probeModel =
+        active.models.find((m) => m.enabled)?.name ?? active.models[0]?.name ?? undefined;
+      const payload: { apiKey?: string; baseUrl?: string; probeModel?: string } = {};
+      if (keyDraft.trim()) payload.apiKey = keyDraft.trim();
+      if (baseUrlDraft.trim()) payload.baseUrl = baseUrlDraft.trim();
+      if (probeModel) payload.probeModel = probeModel;
+      const res = await fetch(`/api/admin/providers/${active.id}/test`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = (await res.json()) as TestResp;
+      if (json.data?.reachable) {
+        toast.success(`${t("toast.testSuccess")}（${json.data.via ?? "OK"}${json.data.modelCount ? ` · ${json.data.modelCount} ${t("toast.testSuccessModels")}` : ""}）`);
+      } else {
+        toast.error(json.message ?? t("toast.testFailed"));
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t("toast.networkError"));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleToggleKeyVisible = async () => {
+    if (!active) return;
+
+    if (keyVisible) {
+      if (serverKeyRef.current !== null && keyDraft === serverKeyRef.current) {
+        setKeyDraft("");
+        serverKeyRef.current = null;
+      }
+      setKeyVisible(false);
+      return;
+    }
+
+    if (!keyDraft.trim() && active.apiKeyConfigured) {
+      setRevealingKey(true);
+      try {
+        const res = await fetch(`/api/admin/providers/${active.id}/key`, { cache: "no-store" });
+        const json = (await res.json()) as { code?: string; message?: string; data?: { apiKey?: string } };
+        const apiKey = json.data?.apiKey?.trim() ?? "";
+        if (!res.ok || !apiKey) {
+          toast.error(json.message ?? t("toast.keyReadFailed"));
+          return;
+        }
+        serverKeyRef.current = apiKey;
+        setKeyDraft(apiKey);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : t("toast.networkError"));
+        return;
+      } finally {
+        setRevealingKey(false);
+      }
+    }
+
+    setKeyVisible(true);
+  };
+
+  const handleAddModel = async () => {
+    if (!active) return;
+    if (!newModel.name.trim()) {
+      toast.error(t("toast.modelNameRequired"));
+      return;
+    }
+    const res = await fetch(`/api/admin/providers/${active.id}/models`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: newModel.name.trim(),
+        label: newModel.label.trim() || newModel.name.trim(),
+        enabled: true,
+      }),
+    });
+    const json = (await res.json()) as ProviderResp;
+    if (!res.ok || !json.data) {
+      toast.error(json.message ?? t("toast.addModelFailed"));
+      return;
+    }
+    setProviders((prev) => prev.map((p) => (p.id === active.id ? json.data!.provider : p)));
+    setNewModel({ name: "", label: "" });
+    setAddingModel(false);
+    toast.success(t("toast.modelAdded"));
+  };
+
+  const handleToggleModel = async (modelName: string, enabled: boolean) => {
+    if (!active) return;
+    const res = await fetch(
+      `/api/admin/providers/${active.id}/models/${encodeURIComponent(modelName)}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    const json = (await res.json()) as ProviderResp;
+    if (!res.ok || !json.data) {
+      toast.error(json.message ?? t("toast.updateFailed"));
+      return;
+    }
+    setProviders((prev) => prev.map((p) => (p.id === active.id ? json.data!.provider : p)));
+  };
+
+  const handleDeleteModel = async (modelName: string) => {
+    if (!active) return;
+    if (!window.confirm(t("confirm.removeModel", { name: modelName }))) return;
+    const res = await fetch(
+      `/api/admin/providers/${active.id}/models/${encodeURIComponent(modelName)}`,
+      { method: "DELETE" }
+    );
+    const json = (await res.json()) as ProviderResp;
+    if (!res.ok || !json.data) {
+      toast.error(json.message ?? t("toast.deleteFailed"));
+      return;
+    }
+    setProviders((prev) => prev.map((p) => (p.id === active.id ? json.data!.provider : p)));
+    toast.success(t("toast.modelRemoved"));
+  };
+
+  const providerCredentialed = useMemo(() => {
+    if (!active) return false;
+    const base = (baseUrlDraft.trim() || active.baseUrl).trim();
+    if (!base) return false;
+    if (active.id === "ollama" || active.id.startsWith("custom_ollama_")) return true;
+    return Boolean(keyDraft.trim() || active.apiKeyConfigured);
+  }, [active, baseUrlDraft, keyDraft]);
+
+  const filteredFetchedModels = useMemo(() => {
+    const keyword = fetchModelsSearch.trim().toLowerCase();
+    if (!keyword) return fetchedModels;
+    return fetchedModels.filter((model) => model.toLowerCase().includes(keyword));
+  }, [fetchedModels, fetchModelsSearch]);
+
+  const getFetchedModelState = useCallback(
+    (modelName: string): "enabled" | "disabled" | "absent" => {
+      if (!active) return "absent";
+      const existing = active.models.find((m) => m.name === modelName);
+      if (!existing) return "absent";
+      return existing.enabled ? "enabled" : "disabled";
+    },
+    [active]
+  );
+
+  const handleFetchModels = async () => {
+    if (!active || !providerCredentialed) return;
+    setFetchingModels(true);
+    setFetchModelsError(null);
+    setFetchModelsWarning(null);
+    try {
+      const payload: { apiKey?: string; baseUrl?: string } = {};
+      if (keyDraft.trim()) payload.apiKey = keyDraft.trim();
+      if (baseUrlDraft.trim()) payload.baseUrl = baseUrlDraft.trim();
+      const res = await fetch(`/api/admin/providers/${active.id}/fetch-models`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = (await res.json()) as FetchModelsResp;
+      if (!res.ok) {
+        setFetchModelsError(json.message ?? t("toast.fetchModelsFailed"));
+        return;
+      }
+      if (json.data?.warning) {
+        setFetchModelsWarning(json.data.warning);
+      }
+      const apiModels = json.data?.models ?? [];
+      if (apiModels.length === 0) {
+        if (!json.data?.warning) {
+          setFetchModelsError(t("fetchModelsEmpty"));
+        }
+        return;
+      }
+      const merged = Array.from(
+        new Set([...active.models.map((m) => m.name), ...apiModels].map((m) => m.trim()).filter(Boolean))
+      ).sort((a, b) => a.localeCompare(b));
+      setFetchedModels(merged);
+      setFetchModelsSearch("");
+      setFetchModelsOpen(true);
+    } catch (error) {
+      setFetchModelsError(error instanceof Error ? error.message : t("toast.networkError"));
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  const handleEnableFetchedModel = async (modelName: string) => {
+    if (!active || isEmbeddingModelId(modelName)) return;
+    const state = getFetchedModelState(modelName);
+    if (state === "enabled") return;
+
+    if (state === "absent") {
+      const capabilities = inferModelCapabilities(active.id, modelName);
+      const res = await fetch(`/api/admin/providers/${active.id}/models`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: modelName,
+          label: modelName,
+          capabilities,
+          enabled: true,
+        }),
+      });
+      const json = (await res.json()) as ProviderResp;
+      if (!res.ok || !json.data) {
+        toast.error(json.message ?? t("toast.addModelFailed"));
+        return;
+      }
+      setProviders((prev) => prev.map((p) => (p.id === active.id ? json.data!.provider : p)));
+      toast.success(t("toast.modelAdded"));
+      return;
+    }
+
+    await handleToggleModel(modelName, true);
+  };
+
+  const handleDisableFetchedModel = async (modelName: string) => {
+    if (!active) return;
+    const state = getFetchedModelState(modelName);
+    if (state !== "enabled") return;
+    await handleToggleModel(modelName, false);
+  };
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        breadcrumb={
+          <Breadcrumb>
+            <BreadcrumbList>
+              <BreadcrumbItem>
+                <BreadcrumbLink asChild>
+                  <Link href="/dashboard">Admin</Link>
+                </BreadcrumbLink>
+              </BreadcrumbItem>
+              <BreadcrumbSeparator />
+              <BreadcrumbItem>{t("breadcrumb.platform")}</BreadcrumbItem>
+              <BreadcrumbSeparator />
+              <BreadcrumbItem>
+                <BreadcrumbPage>{t("breadcrumb.models")}</BreadcrumbPage>
+              </BreadcrumbItem>
+            </BreadcrumbList>
+          </Breadcrumb>
+        }
+        title={t("breadcrumb.models")}
+        description={t("description")}
+        actions={
+          <>
+            <Button variant="outline" size="sm" onClick={() => void load()}>
+              <RefreshCcw />
+              {t("refresh")}
+            </Button>
+            <Button size="sm" onClick={() => setAddOpen(true)}>
+              <Plus />
+              {t("addProvider")}
+            </Button>
+          </>
+        }
+      />
+
+      <div className="grid gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
+        {/* 左：厂商列表 */}
+        <Card>
+          <CardContent className="p-2">
+            {loading ? (
+              <EmptyState
+                icon={<Server className="h-5 w-5" />}
+                title={t("loadingTitle")}
+                description={t("loadingDescription")}
+                size="sm"
+                className="border-0"
+              />
+            ) : providers.length === 0 ? (
+              <EmptyState
+                icon={<Server className="h-5 w-5" />}
+                title={t("emptyProvidersTitle")}
+                description={t("emptyProvidersDescription")}
+                size="sm"
+                className="border-0"
+              />
+            ) : (
+              <ul className="space-y-1">
+                {providers.map((p) => (
+                  <li key={p.id}>
+                    <button
+                      type="button"
+                      onClick={() => setActiveId(p.id)}
+                      className={[
+                        "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors",
+                        activeId === p.id ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-muted",
+                      ].join(" ")}
+                    >
+                      <CircleDot
+                        className={[
+                          "h-3 w-3 shrink-0",
+                          p.enabled && p.apiKeyConfigured ? "text-success" : "text-destructive",
+                        ].join(" ")}
+                      />
+                      <span className="min-w-0 flex-1 truncate font-medium">{p.displayName}</span>
+                      {p.isDefault ? (
+                        <Badge variant="soft" className="ml-auto text-[10px]">{t("defaultBadge")}</Badge>
+                      ) : null}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* 右：详情 */}
+        <Card>
+          <CardContent className="space-y-5 p-5">
+            {!active ? (
+              <EmptyState
+                icon={<Wrench className="h-5 w-5" />}
+                title={t("noSelectionTitle")}
+                description={t("noSelectionDescription")}
+                size="sm"
+                className="border-0"
+              />
+            ) : (
+              <>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-semibold">{displayNameDraft || active.displayName}</h2>
+                    <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                      <Badge variant="soft" className="font-mono text-[10px]">{active.id}</Badge>
+                      <span>·</span>
+                      <span>{routeLabel[active.route]}</span>
+                      {active.envKey ? (
+                        <>
+                          <span>·</span>
+<span>{t("envFallback")} <code className="font-mono">{active.envKey}</code></span>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => void handleDeleteProvider()}>
+                    <Trash2 />
+                    {t("deleteProvider")}
+                  </Button>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <ToggleRow
+                    label={t("enabledLabel")}
+                    description={t("enabledDescription")}
+                    checked={enabledDraft}
+                    onChange={setEnabledDraft}
+                  />
+                  <ToggleRow
+                    label={t("defaultLabel")}
+                    description={t("defaultDescription")}
+                    checked={isDefaultDraft}
+                    onChange={setIsDefaultDraft}
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label>{t("displayNameLabel")}</Label>
+                  <Input
+                    value={displayNameDraft}
+                    onChange={(event) => setDisplayNameDraft(event.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">{t("displayNameHint")}</p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label>{t("apiKeyLabel")}</Label>
+                  <div className="flex items-center gap-2">
+                    <div className="relative min-w-0 flex-1">
+                      <Input
+                        type={keyVisible ? "text" : "password"}
+                        className="pr-10"
+                        placeholder={
+                          keyDraft.trim()
+                            ? t("apiKeyPlaceholder")
+                            : active.apiKeyConfigured
+                              ? active.apiKeyMasked
+                              : t("apiKeyPlaceholder")
+                        }
+                        value={keyDraft}
+                        onChange={(event) => {
+                          serverKeyRef.current = null;
+                          setKeyDraft(event.target.value);
+                        }}
+                        autoComplete="off"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        className="absolute right-0.5 top-1/2 z-10 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                        onClick={() => void handleToggleKeyVisible()}
+                        disabled={revealingKey}
+                        aria-label={keyVisible ? t("hideKey") : t("showKey")}
+                      >
+                        {keyVisible ? <EyeOff /> : <Eye />}
+                      </Button>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={() => void handleTest()} disabled={testing}>
+                      <Activity />
+                      {testing ? t("testing") : t("test")}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {t("apiKeyHint")}
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label>{t("baseUrlLabel")}</Label>
+                  <Input
+                    value={baseUrlDraft}
+                    onChange={(event) => setBaseUrlDraft(event.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t("baseUrlPreview")}{(baseUrlDraft || active.baseUrl).replace(/\/$/, "")}/chat/completions
+                  </p>
+                </div>
+
+                <div className="space-y-2 rounded-lg border border-border p-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+<h3 className="text-sm font-semibold">{t("modelListTitle")}（{active.models.length}）</h3>
+                      <p className="text-xs text-muted-foreground">{t("modelListHint")}</p>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <TooltipProvider delayDuration={280}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="icon-sm"
+                              variant="outline"
+                              aria-label={t("fetchModels")}
+                              disabled={fetchingModels || !providerCredentialed}
+                              onClick={() => void handleFetchModels()}
+                            >
+                              {fetchingModels ? <Loader2 className="animate-spin" /> : <RefreshCcw />}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{t("fetchModels")}</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                      <Button size="sm" variant="outline" onClick={() => setAddingModel(true)}>
+                        <Plus />
+                        {t("addModel")}
+                      </Button>
+                    </div>
+                  </div>
+
+                  {fetchModelsError ? (
+                    <p className="text-xs text-destructive">{fetchModelsError}</p>
+                  ) : fetchModelsWarning ? (
+                    <p className="text-xs text-amber-600 dark:text-amber-400">{fetchModelsWarning}</p>
+                  ) : null}
+
+                  {active.models.length === 0 ? (
+                    <EmptyState
+                      icon={<Server className="h-5 w-5" />}
+                      title={t("emptyModelsTitle")}
+                      description={t("emptyModelsDescription")}
+                      size="sm"
+                      className="border-0"
+                    />
+                  ) : (
+                    <ul className="divide-y divide-border">
+                      {active.models.map((m) => (
+                        <li key={m.name} className="flex items-center gap-3 py-2.5">
+                          <Checkbox
+                            checked={m.enabled}
+                            onCheckedChange={(value) => void handleToggleModel(m.name, value === true)}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium">{m.label}</div>
+                            <div className="truncate text-xs text-muted-foreground font-mono">{m.name}</div>
+                          </div>
+                          {m.capabilities?.map((cap) => (
+                            <Badge key={cap} variant="soft" className="text-[10px]">{cap}</Badge>
+                          ))}
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            onClick={() => void handleDeleteModel(m.name)}
+                            aria-label={t("removeModel")}
+                          >
+                            <Trash2 />
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-end gap-2 border-t border-border pt-4">
+                  {!formDirty ? (
+                    <span className="text-xs text-muted-foreground">{t("saved")}</span>
+                  ) : null}
+                  <Button
+                    size="sm"
+                    onClick={() => void handleSaveForm()}
+                    disabled={!formDirty || saving}
+                  >
+                    {saving ? null : <Check />}
+{saving ? t("saving") : tc("actions.save")}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <AddProviderDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        templates={templates}
+        existingIds={providers.map((p) => p.id)}
+        onCreated={(id) => void load(id)}
+      />
+
+      <Dialog
+        open={fetchModelsOpen}
+        onOpenChange={(open) => {
+          setFetchModelsOpen(open);
+          if (!open) setFetchModelsSearch("");
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{t("fetchModelsDialogTitle")}</DialogTitle>
+            <DialogDescription>{active?.displayName ?? ""}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              value={fetchModelsSearch}
+              onChange={(event) => setFetchModelsSearch(event.target.value)}
+              placeholder={t("fetchModelsSearchPlaceholder")}
+            />
+            <div className="max-h-[min(56vh,460px)] space-y-1 overflow-y-auto pr-1">
+              {filteredFetchedModels.length === 0 ? (
+                <EmptyState
+                  icon={<Server className="h-5 w-5" />}
+                  title={fetchedModels.length === 0 ? t("fetchModelsEmpty") : t("fetchModelsNoMatch")}
+                  size="sm"
+                  className="border border-dashed"
+                />
+              ) : (
+                filteredFetchedModels.map((modelName) => {
+                  const state = getFetchedModelState(modelName);
+                  const isVisible = state === "enabled";
+                  const isEmbedding = isEmbeddingModelId(modelName);
+                  const caps = inferModelCapabilities(active?.id ?? "", modelName);
+                  return (
+                    <div
+                      key={modelName}
+                      className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium">{modelName}</div>
+                        <div className="text-[11px] text-muted-foreground">
+                          {isVisible ? t("fetchModelsStatusVisible") : t("fetchModelsStatusHidden")}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap justify-end gap-1">
+                        {caps.map((cap) => (
+                          <Badge key={cap} variant="soft" className="text-[10px]">
+                            {cap}
+                          </Badge>
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="outline"
+                          aria-label={t("fetchModelsEnable", { name: modelName })}
+                          className={isVisible ? "border-emerald-500/40 text-emerald-600" : undefined}
+                          disabled={isVisible || isEmbedding}
+                          onClick={() => void handleEnableFetchedModel(modelName)}
+                        >
+                          <Plus />
+                        </Button>
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="outline"
+                          aria-label={t("fetchModelsDisable", { name: modelName })}
+                          className={!isVisible ? "border-destructive/40 text-destructive/70" : undefined}
+                          disabled={!isVisible}
+                          onClick={() => void handleDisableFetchedModel(modelName)}
+                        >
+                          <CircleMinus />
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+          <DialogFooter className="sm:justify-between">
+            <span className="text-xs text-muted-foreground">
+              {t("fetchModelsSummary", {
+                total: fetchedModels.length,
+                visible: active?.models.filter((m) => m.enabled).length ?? 0,
+              })}
+            </span>
+            <Button variant="outline" onClick={() => setFetchModelsOpen(false)}>
+              {t("fetchModelsDone")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={addingModel} onOpenChange={setAddingModel}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("addModel")}</DialogTitle>
+            <DialogDescription>{active?.displayName ?? ""}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="add-model-name">{t("modelIdLabel")}</Label>
+              <Input
+                id="add-model-name"
+                placeholder={t("modelIdPlaceholder")}
+                value={newModel.name}
+                onChange={(event) => setNewModel((prev) => ({ ...prev, name: event.target.value }))}
+              />
+              <p className="text-xs text-muted-foreground">{t("modelIdHint")}</p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="add-model-label">{t("modelLabelLabel")}</Label>
+              <Input
+                id="add-model-label"
+                placeholder={t("modelLabelPlaceholder")}
+                value={newModel.label}
+                onChange={(event) => setNewModel((prev) => ({ ...prev, label: event.target.value }))}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+<Button variant="outline" onClick={() => setAddingModel(false)}>{tc("actions.cancel")}</Button>
+<Button onClick={() => void handleAddModel()}>{tc("actions.add")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function ToggleRow({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  checked: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border bg-surface-card px-3 py-2.5">
+      <Checkbox checked={checked} onCheckedChange={(value) => onChange(value === true)} />
+      <span className="flex-1">
+        <span className="block text-sm font-medium">{label}</span>
+        {description ? <span className="block text-xs text-muted-foreground">{description}</span> : null}
+      </span>
+      <Badge variant={checked ? "success" : "soft"} className="self-center text-[10px]">
+        {checked ? "ON" : "OFF"}
+      </Badge>
+    </label>
+  );
+}
+
+function AddProviderDialog({
+  open,
+  onOpenChange,
+  templates,
+  existingIds,
+  onCreated,
+}: {
+  open: boolean;
+  onOpenChange: (next: boolean) => void;
+  templates: ProviderTemplate[];
+  existingIds: string[];
+  onCreated: (id: string) => void;
+}) {
+  const t = useTranslations("pages.admin.models");
+  const tc = useTranslations("common");
+  const available = useMemo(
+    () => templates.filter((t) => !existingIds.includes(t.id)),
+    [templates, existingIds]
+  );
+
+  const [tab, setTab] = useState<"template" | "custom">("template");
+  const [pickedTemplate, setPickedTemplate] = useState<string>("");
+  const [custom, setCustom] = useState<{ id: string; displayName: string; baseUrl: string; route: ProviderRoute }>({
+    id: "",
+    displayName: "",
+    baseUrl: "",
+    route: "third-party",
+  });
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setTab(available.length > 0 ? "template" : "custom");
+      setPickedTemplate(available[0]?.id ?? "");
+      setCustom({ id: "", displayName: "", baseUrl: "", route: "third-party" });
+    }
+  }, [open, available]);
+
+  const submit = async () => {
+    setSubmitting(true);
+    try {
+      let payload: Record<string, unknown>;
+      if (tab === "template") {
+        const tpl = available.find((t) => t.id === pickedTemplate);
+        if (!tpl) {
+          toast.error(t("toast.selectTemplate"));
+          return;
+        }
+        payload = {
+          id: tpl.id,
+          displayName: tpl.displayName,
+          baseUrl: tpl.baseUrl,
+          envKey: tpl.envKey,
+          route: tpl.route,
+        };
+      } else {
+        if (!custom.id.trim() || !custom.baseUrl.trim()) {
+          toast.error(t("toast.idAndBaseUrlRequired"));
+          return;
+        }
+        payload = {
+          id: custom.id.trim(),
+          displayName: custom.displayName.trim() || custom.id.trim(),
+          baseUrl: custom.baseUrl.trim(),
+          route: custom.route,
+        };
+      }
+      const res = await adminFetch("/api/admin/providers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = (await res.json()) as ProviderResp;
+      if (!res.ok || !json.data) {
+        toast.error(json.message ?? t("toast.addModelFailed"));
+        return;
+      }
+      toast.success(`${t("toast.providerAdded")} ${json.data.provider.displayName}`);
+      onCreated(json.data.provider.id);
+      onOpenChange(false);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{t("addProvider")}</DialogTitle>
+          <DialogDescription>{t("addProviderDialogDescription")}</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          <div className="flex gap-1 rounded-md bg-muted p-1 text-sm">
+            <button
+              type="button"
+              onClick={() => setTab("template")}
+              className={[
+                "flex-1 rounded px-3 py-1.5 transition-colors",
+                tab === "template" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+              ].join(" ")}
+            >
+              {t("tabTemplate")}
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("custom")}
+              className={[
+                "flex-1 rounded px-3 py-1.5 transition-colors",
+                tab === "custom" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+              ].join(" ")}
+            >
+              {t("tabCustom")}
+            </button>
+          </div>
+
+          {tab === "template" ? (
+            available.length === 0 ? (
+              <p className="text-sm text-muted-foreground">{t("allTemplatesAdded")}</p>
+            ) : (
+              <Select value={pickedTemplate} onValueChange={setPickedTemplate}>
+                <SelectTrigger>
+                  <SelectValue placeholder={t("selectTemplatePlaceholder")} />
+                </SelectTrigger>
+                <SelectContent>
+                  {available.map((t) => (
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.displayName}（{t.id}）
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )
+          ) : (
+            <div className="space-y-2">
+              <div className="space-y-1.5">
+                <Label>{t("providerIdLabel")}</Label>
+                <Input
+                  placeholder={t("providerIdPlaceholder")}
+                  value={custom.id}
+                  onChange={(event) => setCustom((prev) => ({ ...prev, id: event.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground">{t("providerIdHint")}</p>
+              </div>
+              <div className="space-y-1.5">
+<Label>{t("displayNameLabel")}</Label>
+                <Input
+                  placeholder={t("displayNameOptionalPlaceholder")}
+                  value={custom.displayName}
+                  onChange={(event) => setCustom((prev) => ({ ...prev, displayName: event.target.value }))}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label>{t("baseUrlOpenAiHint")}</Label>
+                <Input
+                  placeholder="https://api.example.com/v1"
+                  value={custom.baseUrl}
+                  onChange={(event) => setCustom((prev) => ({ ...prev, baseUrl: event.target.value }))}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label>{t("routeTypeLabel")}</Label>
+                <Select
+                  value={custom.route}
+                  onValueChange={(value) => setCustom((prev) => ({ ...prev, route: value as ProviderRoute }))}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="local">{t("route.local")}</SelectItem>
+                    <SelectItem value="private-cloud">{t("route.privateCloud")}</SelectItem>
+                    <SelectItem value="third-party">{t("route.thirdParty")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <DialogFooter>
+<Button variant="outline" onClick={() => onOpenChange(false)}>{tc("actions.cancel")}</Button>
+          <Button onClick={() => void submit()} disabled={submitting}>
+            <Plus />
+            {tc("actions.add")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

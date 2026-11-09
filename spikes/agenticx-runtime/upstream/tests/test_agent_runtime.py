@@ -1,0 +1,1183 @@
+#!/usr/bin/env python3
+"""Tests for AgentRuntime event stream behavior."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+import pytest
+
+from agenticx.cli.studio import StudioSession
+from agenticx.runtime import AgentRuntime, ConfirmGate, EventType
+from agenticx.runtime.agent_runtime import _chat_history_append_deduped
+
+
+class _FakeResponse:
+    def __init__(self, content: str, tool_calls):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _ToolThenFinalLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return _FakeResponse(
+                "need tool",
+                [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "bash_exec", "arguments": {"command": "rm -rf /tmp/demo"}},
+                    }
+                ],
+            )
+        return _FakeResponse("done", [])
+
+    def stream(self, *_args, **_kwargs):
+        yield "done"
+
+
+class _AlwaysToolLLM:
+    def invoke(self, *_args, **_kwargs):
+        return _FakeResponse(
+            "loop",
+            [
+                {
+                    "id": "call-x",
+                    "type": "function",
+                    "function": {"name": "list_files", "arguments": {"path": ".", "limit": 1}},
+                }
+            ],
+        )
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _AlwaysRestrictedWriteLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, *_args, **_kwargs):
+        self.calls += 1
+        return _FakeResponse(
+            "trying to write",
+            [
+                {
+                    "id": f"call-plan-write-{self.calls}",
+                    "type": "function",
+                    "function": {
+                        "name": "file_write",
+                        "arguments": {"path": "/tmp/game.html", "content": "<html />"},
+                    },
+                }
+            ],
+        )
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _AlwaysStatusQueryLLM:
+    def invoke(self, *_args, **_kwargs):
+        return _FakeResponse(
+            "checking",
+            [
+                {
+                    "id": "call-status",
+                    "type": "function",
+                    "function": {
+                        "name": "query_subagent_status",
+                        "arguments": {},
+                    },
+                }
+            ],
+        )
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _SleepThenFinalLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return _FakeResponse(
+                "waiting",
+                [
+                    {
+                        "id": "call-sleep",
+                        "type": "function",
+                        "function": {
+                            "name": "bash_exec",
+                            "arguments": {"command": "sleep 90"},
+                        },
+                    }
+                ],
+            )
+        return _FakeResponse("委派任务正在后台运行。", [])
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _ReasoningOnlyLLM:
+    def invoke(self, *_args, **_kwargs):
+        response = _FakeResponse("<think>继续分析代码结构</think>", [])
+        response.reasoning_content = "继续分析代码结构"
+        return response
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _TextOnlyLLM:
+    def invoke(self, *_args, **_kwargs):
+        # Empty invoke text forces the stream fallback path (TOKEN chunks then FINAL).
+        return _FakeResponse("", [])
+
+    def stream(self, *_args, **_kwargs):
+        yield "tok1"
+        yield "tok2"
+
+
+class _RateLimitLLM:
+    def invoke(self, *_args, **_kwargs):
+        raise RuntimeError("RateLimitError: rate limit reached")
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _CaptureMessagesLLM:
+    def __init__(self) -> None:
+        self.messages: List[Dict[str, Any]] = []
+
+    def invoke(self, messages, **_kwargs):
+        self.messages = [dict(item) for item in messages]
+        return _FakeResponse("ok", [])
+
+
+class _ApproveGate(ConfirmGate):
+    async def request_confirm(self, question: str, context: Dict[str, Any] | None = None) -> bool:
+        return True
+
+
+async def _collect(runtime: AgentRuntime, session: StudioSession, text: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    async for event in runtime.run_turn(text, session):
+        items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+    return items
+
+
+class _InvalidToolNameLLM:
+    def invoke(self, *_args, **_kwargs):
+        return _FakeResponse(
+            "bad tool call",
+            [
+                {
+                    "id": "call-invalid",
+                    "type": "function",
+                    "function": {"name": None, "arguments": {}},
+                }
+            ],
+        )
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+def test_runtime_event_flow_tool_confirm_result_final(monkeypatch) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return "tool-ok"
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    runtime = AgentRuntime(_ToolThenFinalLLM(), _ApproveGate())
+    session = StudioSession()
+    checkpoints: list[list[Dict[str, Any]]] = []
+
+    def _persist() -> None:
+        checkpoints.append([dict(row) for row in session.chat_history])
+
+    runtime._mid_turn_persist = _persist  # type: ignore[attr-defined]
+    events = __import__("asyncio").run(_collect(runtime, session, "do it"))
+
+    types = [e["type"] for e in events]
+    assert all(e["agent_id"] == "meta" for e in events)
+    assert EventType.ROUND_START.value in types
+    assert EventType.TOOL_CALL.value in types
+    assert EventType.TOOL_RESULT.value in types
+    assert EventType.FINAL.value in types
+    assert checkpoints
+    assert any(row.get("role") == "tool" for row in checkpoints[-1])
+    assert checkpoints[-1][-1]["role"] == "assistant"
+    assert checkpoints[-1][-1]["content"] == "done"
+    assert checkpoints[-1][-1]["metadata"]["turn_terminal"] is True
+
+
+async def test_runtime_tool_result_keeps_full_ledger_only_result(
+    monkeypatch,
+) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    class _ReadThenFinalLLM(_ToolThenFinalLLM):
+        def invoke(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    "need tool",
+                    [
+                        {
+                            "id": "call-read",
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": {"path": ".", "limit": 1},
+                            },
+                        }
+                    ],
+                )
+            return _FakeResponse("done", [])
+
+    full_result = "r" * 5001
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return full_result
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    runtime = AgentRuntime(_ReadThenFinalLLM(), _ApproveGate())
+    events = [
+        event
+        async for event in runtime.run_turn("do it", StudioSession())
+    ]
+    result_event = next(
+        event for event in events if event.type == EventType.TOOL_RESULT.value
+    )
+
+    assert result_event.private_data["raw_result"] == full_result
+    assert result_event.private_data["tool_status"] == "completed"
+    assert result_event.data["result"] != full_result
+
+
+@pytest.mark.parametrize(
+    ("raw_result", "expected_status"),
+    [
+        ('{"ok":false,"error":"denied"}', "error"),
+        ("ERROR: tool failed", "error"),
+        ("CANCELLED: user stopped", "cancelled"),
+        ("[ACTION_REJECTED] user declined", "cancelled"),
+    ],
+)
+async def test_runtime_tool_result_private_status_uses_existing_classification(
+    monkeypatch,
+    raw_result: str,
+    expected_status: str,
+) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    class _ReadThenFinalLLM(_ToolThenFinalLLM):
+        def invoke(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    "need tool",
+                    [
+                        {
+                            "id": "call-status",
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": {"path": ".", "limit": 1},
+                            },
+                        }
+                    ],
+                )
+            return _FakeResponse("done", [])
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return raw_result
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    runtime = AgentRuntime(_ReadThenFinalLLM(), _ApproveGate())
+    result_events = [
+        event
+        async for event in runtime.run_turn("do it", StudioSession())
+        if event.type == EventType.TOOL_RESULT.value
+    ]
+    result_event = result_events[0]
+
+    assert result_event.private_data["raw_result"] == raw_result
+    assert result_event.private_data["tool_status"] == expected_status
+
+
+def test_runtime_max_rounds_emits_error(monkeypatch) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return "tool-ok"
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    runtime = AgentRuntime(_AlwaysToolLLM(), _ApproveGate(), max_tool_rounds=2)
+    events = __import__("asyncio").run(_collect(runtime, StudioSession(), "loop"))
+    assert all(e["agent_id"] == "meta" for e in events)
+    assert events[-1]["type"] == EventType.ERROR.value
+
+
+def test_plan_mode_stops_after_two_restricted_tool_attempts() -> None:
+    llm = _AlwaysRestrictedWriteLLM()
+    runtime = AgentRuntime(llm, _ApproveGate(), max_tool_rounds=20)
+    session = StudioSession()
+    session.plan_mode = True
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "file_read",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def _run() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("做一个小游戏", session, tools=tools):
+            items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+        return items
+
+    events = __import__("asyncio").run(_run())
+
+    assert llm.calls == 2
+    assert events[-1]["type"] == EventType.FINAL.value
+    assert events[-1]["data"]["terminal_reason"] == "plan_mode_tool_violation"
+    assert "没有创建或修改任何文件" in events[-1]["data"]["text"]
+
+
+def test_runtime_text_only_emits_tokens_then_final() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    events = __import__("asyncio").run(_collect(runtime, StudioSession(), "hello"))
+    types = [e["type"] for e in events]
+    assert all(e["agent_id"] == "meta" for e in events)
+    assert EventType.TOKEN.value in types
+    assert events[-1]["type"] == EventType.FINAL.value
+
+
+def test_runtime_synthetic_final_is_added_before_checkpoint() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    session = StudioSession()
+    persisted: list[list[Dict[str, Any]]] = []
+
+    def _persist() -> None:
+        persisted.append([dict(row) for row in session.chat_history])
+
+    runtime._mid_turn_persist = _persist  # type: ignore[attr-defined]
+    runtime._append_terminal_assistant(
+        session,
+        "状态查询达到预算上限，已停止轮询。",
+        is_system_trigger=False,
+    )
+    runtime._persist_final_checkpoint()
+
+    assert session.agent_messages[-1]["content"] == "状态查询达到预算上限，已停止轮询。"
+    assert session.chat_history[-1]["content"] == "状态查询达到预算上限，已停止轮询。"
+    assert persisted[-1][-1]["content"] == "状态查询达到预算上限，已停止轮询。"
+
+
+def test_runtime_status_query_synthetic_final_is_checkpointed() -> None:
+    runtime = AgentRuntime(_AlwaysStatusQueryLLM(), _ApproveGate())
+    session = StudioSession()
+    checkpoints: list[list[Dict[str, Any]]] = []
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "query_subagent_status",
+                "description": "Query status",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    def _persist() -> None:
+        checkpoints.append([dict(row) for row in session.chat_history])
+
+    runtime._mid_turn_persist = _persist  # type: ignore[attr-defined]
+
+    async def _run() -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("check status", session, tools=tools):
+            events.append({"type": event.type, "data": event.data})
+        return events
+
+    events = __import__("asyncio").run(_run())
+
+    assert events[-1]["type"] == EventType.FINAL.value
+    assert checkpoints
+    assert checkpoints[-1][-1]["role"] == "assistant"
+    assert checkpoints[-1][-1]["content"] == events[-1]["data"]["text"]
+
+
+def test_runtime_stream_fallback_syncs_agent_messages_with_chat_history() -> None:
+    """Empty invoke + stream fallback must not leave agent_messages assistant blank."""
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    session = StudioSession()
+    events = __import__("asyncio").run(_collect(runtime, session, "hello"))
+    assert events[-1]["type"] == EventType.FINAL.value
+    assert events[-1]["data"]["text"] == "tok1tok2"
+    assert session.chat_history[-1]["role"] == "assistant"
+    assert session.chat_history[-1]["content"] == "tok1tok2"
+    assert session.chat_history[-1]["metadata"]["turn_terminal"] is True
+    assert session.agent_messages[-1] == {"role": "assistant", "content": "tok1tok2"}
+    assert "metadata" not in session.agent_messages[-1]
+
+
+def test_runtime_should_stop_interrupts_generation() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    calls = {"n": 0}
+
+    async def _should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    async def _collect_interrupt() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("hello", StudioSession(), should_stop=_should_stop):
+            items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+        return items
+
+    events = __import__("asyncio").run(_collect_interrupt())
+    assert any(e["type"] == EventType.ROUND_START.value for e in events)
+    assert events[-1]["type"] == EventType.ERROR.value
+    assert events[-1]["agent_id"] == "meta"
+    assert events[-1]["data"]["text"] == "已中断当前生成"
+    assert not any(e["type"] == EventType.FINAL.value for e in events)
+
+
+def test_runtime_accepts_custom_agent_id() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+
+    async def _collect_custom() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("hello", StudioSession(), agent_id="sa-1"):
+            items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+        return items
+
+    events = __import__("asyncio").run(_collect_custom())
+    assert events
+    assert all(e["agent_id"] == "sa-1" for e in events)
+
+
+def test_runtime_rate_limit_pauses_subagent(monkeypatch) -> None:
+    monkeypatch.setenv("AGX_LLM_RETRY_RATE_LIMIT", "0")
+    runtime = AgentRuntime(_RateLimitLLM(), _ApproveGate())
+
+    async def _collect_rate_limited() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("long task", StudioSession(), agent_id="worker-1"):
+            items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+        return items
+
+    events = __import__("asyncio").run(_collect_rate_limited())
+    assert events[-1]["type"] == EventType.SUBAGENT_PAUSED.value
+    assert events[-1]["agent_id"] == "worker-1"
+    assert events[-1]["data"]["detector"] == "rate_limit"
+    assert events[-1]["data"]["retryable"] is True
+
+
+def test_runtime_minimax_does_not_send_non_initial_system_messages() -> None:
+    llm = _CaptureMessagesLLM()
+    runtime = AgentRuntime(llm, _ApproveGate())
+    session = StudioSession()
+    session.provider_name = "minimax"
+    session.model_name = "MiniMax-M2.7"
+
+    events = __import__("asyncio").run(_collect(runtime, session, "hello"))
+
+    assert events[-1]["type"] == EventType.FINAL.value
+    assert llm.messages
+    assert llm.messages[0]["role"] == "system"
+    assert all(message.get("role") != "system" for message in llm.messages[1:])
+
+
+def test_runtime_rejects_tool_outside_allowlist(monkeypatch) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    called = {"n": 0}
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        called["n"] += 1
+        return "tool-ok"
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    runtime = AgentRuntime(_ToolThenFinalLLM(), _ApproveGate())
+    allow_only_list_files = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def _collect_blocked() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("do it", StudioSession(), tools=allow_only_list_files):
+            items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+        return items
+
+    events = __import__("asyncio").run(_collect_blocked())
+    assert called["n"] == 0
+    assert any("不在当前允许列表" in str(e["data"].get("text", "")) for e in events if e["type"] == EventType.ERROR.value)
+
+
+def test_runtime_handles_invalid_tool_name_without_none_noise(monkeypatch) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    called = {"n": 0}
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        called["n"] += 1
+        return "tool-ok"
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    runtime = AgentRuntime(_InvalidToolNameLLM(), _ApproveGate())
+    events = __import__("asyncio").run(_collect(runtime, StudioSession(), "who is cole"))
+
+    assert called["n"] == 0
+    error_texts = [str(e["data"].get("text", "")) for e in events if e["type"] == EventType.ERROR.value]
+    assert not any("Tool 'None'" in text or "工具 'None'" in text for text in error_texts)
+
+
+def test_summarize_tool_calls_for_history_removes_runtime_ids() -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    tool_calls = [
+        {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+                "name": "file_write",
+                "arguments": "{\"path\":\"demo.py\",\"content\":\"print('ok')\"}",
+            },
+        }
+    ]
+    summary = runtime_module._summarize_tool_calls_for_history(tool_calls)
+    assert summary == [
+        {
+            "name": "file_write",
+            "arguments": {"path": "demo.py", "content": "print('ok')"},
+        }
+    ]
+    assert "call_abc123" not in str(summary)
+
+
+def test_sanitize_context_messages_drops_empty_assistant_without_tools() -> None:
+    from agenticx.runtime.agent_runtime import _sanitize_context_messages
+
+    history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "forwarded card"},
+    ]
+    sanitized = _sanitize_context_messages(history)
+    assert sanitized == [
+        {"role": "user", "content": "hello"},
+        {"role": "user", "content": "forwarded card"},
+    ]
+
+
+async def test_skip_user_history_still_persists_display_user() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    session = StudioSession()
+    persisted: list[int] = []
+
+    def _persist() -> None:
+        persisted.append(len(session.chat_history))
+
+    runtime._mid_turn_persist = _persist  # type: ignore[attr-defined]
+
+    async for _ in runtime.run_turn(
+        "能不能听到？",
+        session,
+        persist_user_message=False,
+    ):
+        pass
+
+    user_rows = [m for m in session.agent_messages if m.get("role") == "user"]
+    assert user_rows == []
+    assert session.chat_history[0] == {"role": "user", "content": "能不能听到？"}
+    assert persisted == [1, 2]
+    assert session.chat_history[-1]["role"] == "assistant"
+    assert session.chat_history[-1]["content"] == "tok1tok2"
+    assert session.chat_history[-1]["metadata"]["turn_terminal"] is True
+
+
+async def test_skip_user_history_dedupes_existing_tail_user() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    session = StudioSession()
+    session.chat_history = [{"role": "user", "content": "能不能听到？"}]
+
+    async for _ in runtime.run_turn(
+        "能不能听到？",
+        session,
+        persist_user_message=False,
+    ):
+        pass
+
+    user_rows = [m for m in session.chat_history if m.get("role") == "user"]
+    assert len(user_rows) == 1
+    assert user_rows[0]["content"] == "能不能听到？"
+
+
+async def test_skip_user_history_skips_forward_card_follow_up_echo() -> None:
+    """Auto-reply after merge-forward must not create a second identical user bubble."""
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    session = StudioSession()
+    note = "请阅读刚转发的聊天记录并继续回复。"
+    session.chat_history = [
+        {
+            "role": "user",
+            "content": f"【转发的聊天记录 · 来自 会话】\n我: hi\n\n附加说明: {note}",
+            "forwarded_history": {
+                "title": "聊天记录 · 来自 会话",
+                "source_session": "src",
+                "note": note,
+                "items": [{"sender": "我", "role": "user", "content": "hi"}],
+            },
+        }
+    ]
+    session.agent_messages = [dict(session.chat_history[0])]
+
+    async for _ in runtime.run_turn(
+        note,
+        session,
+        persist_user_message=False,
+    ):
+        pass
+
+    user_rows = [m for m in session.chat_history if m.get("role") == "user"]
+    assert len(user_rows) == 1
+    assert user_rows[0].get("forwarded_history", {}).get("note") == note
+
+
+async def test_user_history_persists_client_turn_metadata() -> None:
+    runtime = AgentRuntime(_TextOnlyLLM(), _ApproveGate())
+    session = StudioSession()
+    metadata = {"client_turn_id": "turn-123"}
+
+    async for _ in runtime.run_turn(
+        "检查附件",
+        session,
+        history_user_metadata=metadata,
+    ):
+        pass
+
+    agent_user = next(
+        row for row in session.agent_messages if row.get("role") == "user"
+    )
+    history_user = next(
+        row for row in session.chat_history if row.get("role") == "user"
+    )
+    assert agent_user["metadata"] == metadata
+    assert history_user["metadata"] == metadata
+
+
+def test_chat_history_dedupe_keeps_distinct_client_turn_ids() -> None:
+    history = [
+        {
+            "role": "user",
+            "content": "继续",
+            "metadata": {"client_turn_id": "turn-old"},
+        }
+    ]
+
+    appended = _chat_history_append_deduped(
+        history,
+        {
+            "role": "user",
+            "content": "继续",
+            "metadata": {"client_turn_id": "turn-new"},
+        },
+    )
+
+    assert appended is True
+    assert [row["metadata"]["client_turn_id"] for row in history] == [
+        "turn-old",
+        "turn-new",
+    ]
+
+
+def test_sanitize_context_messages_placeholders_empty_assistant_with_tools() -> None:
+    from agenticx.runtime.agent_runtime import _sanitize_context_messages
+
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "bash_exec", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+    ]
+    sanitized = _sanitize_context_messages(history)
+    assert len(sanitized) == 2
+    assert sanitized[0]["role"] == "assistant"
+    assert sanitized[0]["content"] == " "
+    assert sanitized[0]["tool_calls"]
+
+
+def test_should_emit_show_widget_delta_first_frame_and_throttle() -> None:
+    from agenticx.runtime.agent_runtime import _should_emit_show_widget_delta
+
+    state: Dict[int, Dict[str, float]] = {}
+    assert _should_emit_show_widget_delta(state, 0, "", now_mono=1.0) is True
+    # No growth: do not emit repeatedly.
+    assert _should_emit_show_widget_delta(state, 0, "", now_mono=1.2) is False
+    # Small growth + short interval: still throttled.
+    assert _should_emit_show_widget_delta(state, 0, "x" * 100, now_mono=1.06) is False
+    # Enough interval: emit.
+    assert _should_emit_show_widget_delta(state, 0, "x" * 100, now_mono=1.2) is True
+    # Large growth: emit even before interval threshold.
+    huge = "x" * 1200
+    assert _should_emit_show_widget_delta(state, 0, huge, now_mono=1.25) is True
+
+
+def test_should_emit_show_widget_delta_force_flush_only_when_new_data() -> None:
+    from agenticx.runtime.agent_runtime import _should_emit_show_widget_delta
+
+    state: Dict[int, Dict[str, float]] = {}
+    assert _should_emit_show_widget_delta(state, 1, "", now_mono=2.0) is True
+    assert _should_emit_show_widget_delta(state, 1, "", force=True, now_mono=2.1) is False
+    assert _should_emit_show_widget_delta(state, 1, "<svg", force=True, now_mono=2.2) is True
+
+
+class _CreateAvatarThenMalformedLLM:
+    """Tool call → malformed cross-nested → still malformed after nudge."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._malformed = (
+            "<think>r block with exactly three followups"
+            "<followups>prompt</think>\n"
+            "**分身「侠客」已创建完成。**\n"
+            "| 项目 | 内容 |\n"
+            "</followups>"
+        )
+
+    def invoke(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return _FakeResponse(
+                "creating",
+                [
+                    {
+                        "id": "call-av",
+                        "type": "function",
+                        "function": {
+                            "name": "create_avatar",
+                            "arguments": {"name": "侠客"},
+                        },
+                    }
+                ],
+            )
+        return _FakeResponse(self._malformed, [])
+
+    def stream(self, *_args, **_kwargs):
+        yield self._malformed
+
+
+def test_create_avatar_malformed_final_uses_public_message(monkeypatch) -> None:
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    public_msg = "数字分身「侠客」已创建并加入分身列表（id=avatar-1）。"
+
+    async def _fake_meta_dispatch(name, *_args, **_kwargs):
+        assert name == "create_avatar"
+        return (
+            '{"ok": true, "avatar_id": "avatar-1", "name": "侠客", '
+            f'"message": "{public_msg}"}}'
+        )
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_resolve_meta_tool_dispatchers",
+        lambda: ({"create_avatar"}, _fake_meta_dispatch),
+    )
+    llm = _CreateAvatarThenMalformedLLM()
+    runtime = AgentRuntime(llm, _ApproveGate(), team_manager=object())
+    session = StudioSession()
+    hooked: list[str] = []
+
+    async def _spy_end(text, _session):
+        hooked.append(str(text))
+
+    runtime.hooks.run_on_agent_end = _spy_end  # type: ignore[method-assign]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "create_avatar",
+                "description": "Create avatar",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def _run():
+        events = []
+        async for event in runtime.run_turn("建分身", session, tools=tools):
+            events.append({"type": event.type, "data": event.data})
+        return events
+
+    events = __import__("asyncio").run(_run())
+    # Post-tool reason-only budget is 3: tool + 3 nudges + terminal fallback.
+    assert llm.calls == 5
+    final = events[-1]
+    assert final["type"] == EventType.FINAL.value
+    assert final["data"]["text"] == public_msg
+    assert "suggested_questions" not in final["data"]
+    assert final["data"]["turn_terminal"] is True
+    assert final["data"]["terminal_reason"] == "tool_result_fallback"
+    assert session.chat_history[-1]["content"] == public_msg
+    assert session.chat_history[-1]["metadata"]["turn_terminal"] is True
+    assert session.agent_messages[-1]["content"] == public_msg
+    assert "metadata" not in session.agent_messages[-1]
+    assert "block with exactly" not in str(session.chat_history[-1].get("reasoning", ""))
+    assert hooked == [public_msg]
+
+
+def test_public_summary_rejected_for_non_whitelist_and_unsafe_message(monkeypatch) -> None:
+    from agenticx.runtime.agent_runtime import (
+        _classify_tool_turn_outcome,
+        _extract_public_tool_result_summary,
+    )
+
+    assert (
+        _extract_public_tool_result_summary(
+            "memory_append",
+            '{"ok": true, "message": "should not surface"}',
+        )
+        is None
+    )
+    assert (
+        _extract_public_tool_result_summary(
+            "create_avatar",
+            '{"ok": false, "message": "nope"}',
+        )
+        is None
+    )
+    assert (
+        _extract_public_tool_result_summary(
+            "create_avatar",
+            '{"ok": true, "message": "<think>x</think>bad"}',
+        )
+        is None
+    )
+    assert _classify_tool_turn_outcome("x", "[ACTION_CONFIRMATION_EXPIRED]") == "failed"
+    assert _classify_tool_turn_outcome("x", "OK: appended") == "success"
+    assert _classify_tool_turn_outcome(
+        "x", '{"ok": true, "queued": true, "message": "later"}'
+    ) == "pending"
+
+
+def test_status_query_final_has_turn_terminal_marker() -> None:
+    runtime = AgentRuntime(_AlwaysStatusQueryLLM(), _ApproveGate())
+    session = StudioSession()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "query_subagent_status",
+                "description": "Query status",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def _run():
+        events = []
+        async for event in runtime.run_turn("check status", session, tools=tools):
+            events.append({"type": event.type, "data": event.data})
+        return events
+
+    events = __import__("asyncio").run(_run())
+    assert events[-1]["type"] == EventType.FINAL.value
+    assert events[-1]["data"]["turn_terminal"] is True
+    assert session.chat_history[-1]["metadata"]["turn_terminal"] is True
+
+
+class _FallbackReplacementLLM:
+    pass
+
+
+def test_runtime_preserves_reasoning_content_for_tool_round(monkeypatch) -> None:
+    import asyncio
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return "tool-ok"
+
+    class _ThinkingToolLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    "<think>完整的工具前思考</think>需要读取文件",
+                    [
+                        {
+                            "id": "call-thinking-1",
+                            "type": "function",
+                            "function": {"name": "list_files", "arguments": {"path": "."}},
+                        }
+                    ],
+                )
+            return _FakeResponse("完成", [])
+
+        def stream(self, *_args, **_kwargs):
+            yield ""
+
+    async def _collect(runtime: AgentRuntime, session: StudioSession, text: str):
+        items = []
+        async for event in runtime.run_turn(text, session):
+            items.append(event)
+        return items
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    llm = _ThinkingToolLLM()
+    session = StudioSession()
+    runtime = AgentRuntime(llm, _ApproveGate())
+    asyncio.run(_collect(runtime, session, "读取文件"))
+
+    tool_assistant = next(
+        row for row in session.agent_messages
+        if row.get("role") == "assistant" and row.get("tool_calls")
+    )
+    assert tool_assistant["reasoning_content"] == "完整的工具前思考"
+
+
+def test_runtime_tool_round_always_sets_reasoning_content_key(monkeypatch) -> None:
+    import asyncio
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return "tool-ok"
+
+    class _ToolNoThinkLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    "need tool",
+                    [
+                        {
+                            "id": "call-empty-rc",
+                            "type": "function",
+                            "function": {"name": "list_files", "arguments": {"path": "."}},
+                        }
+                    ],
+                )
+            return _FakeResponse("完成", [])
+
+        def stream(self, *_args, **_kwargs):
+            yield ""
+
+    async def _collect(runtime: AgentRuntime, session: StudioSession, text: str):
+        items = []
+        async for event in runtime.run_turn(text, session):
+            items.append(event)
+        return items
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    session = StudioSession()
+    runtime = AgentRuntime(_ToolNoThinkLLM(), _ApproveGate())
+    asyncio.run(_collect(runtime, session, "列出文件"))
+
+    tool_assistant = next(
+        row for row in session.agent_messages
+        if row.get("role") == "assistant" and row.get("tool_calls")
+    )
+    assert "reasoning_content" in tool_assistant
+    assert tool_assistant["reasoning_content"] == ""
+
+
+def test_runtime_persists_invoke_reasoning_content_for_tool_round(monkeypatch) -> None:
+    import asyncio
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return "tool-ok"
+
+    class _InvokeReasoningLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                resp = _FakeResponse(
+                    "need tool",
+                    [
+                        {
+                            "id": "call-rc-field",
+                            "type": "function",
+                            "function": {"name": "list_files", "arguments": {"path": "."}},
+                        }
+                    ],
+                )
+                resp.reasoning_content = "invoke-path thought"
+                return resp
+            return _FakeResponse("完成", [])
+
+        def stream(self, *_args, **_kwargs):
+            yield ""
+
+    async def _collect(runtime: AgentRuntime, session: StudioSession, text: str):
+        items = []
+        async for event in runtime.run_turn(text, session):
+            items.append(event)
+        return items
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    session = StudioSession()
+    runtime = AgentRuntime(_InvokeReasoningLLM(), _ApproveGate())
+    asyncio.run(_collect(runtime, session, "列出文件"))
+
+    tool_assistant = next(
+        row for row in session.agent_messages
+        if row.get("role") == "assistant" and row.get("tool_calls")
+    )
+    assert tool_assistant["reasoning_content"] == "invoke-path thought"
+
+
+def test_runtime_tool_round_appends_single_assistant(monkeypatch) -> None:
+    import asyncio
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        return "tool-ok"
+
+    async def _collect(runtime: AgentRuntime, session: StudioSession, text: str):
+        items = []
+        async for event in runtime.run_turn(text, session):
+            items.append(event)
+        return items
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    session = StudioSession()
+    runtime = AgentRuntime(_ToolThenFinalLLM(), _ApproveGate())
+    asyncio.run(_collect(runtime, session, "do it"))
+
+    tool_assistants = [
+        row
+        for row in session.agent_messages
+        if row.get("role") == "assistant" and row.get("tool_calls")
+    ]
+    assert len(tool_assistants) == 1
+    idx = session.agent_messages.index(tool_assistants[0])
+    assert idx + 1 < len(session.agent_messages)
+    assert session.agent_messages[idx + 1].get("role") == "tool"
+
+
+def test_runtime_can_replace_active_llm_after_fallback() -> None:
+    initial = object()
+    replacement = _FallbackReplacementLLM()
+    runtime = AgentRuntime(initial, _ApproveGate(), llm_factory=lambda: replacement)
+
+    assert runtime._reload_llm_for_session(StudioSession()) is True
+    assert runtime.llm is replacement
+    assert runtime.compactor.llm is replacement
+
+
+def test_meta_blocks_pure_shell_sleep_while_delegation_running(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from agenticx.runtime import agent_runtime as runtime_module
+
+    dispatched: list[str] = []
+
+    async def _fake_dispatch(name, *_args, **_kwargs):
+        dispatched.append(name)
+        return "unexpected"
+
+    monkeypatch.setattr(runtime_module, "dispatch_tool_async", _fake_dispatch)
+    running = SimpleNamespace(
+        _delegation_task=SimpleNamespace(done=lambda: False),
+    )
+    session = StudioSession()
+    session._session_manager = SimpleNamespace(_sessions={"avatar-session": running})
+    runtime = AgentRuntime(_SleepThenFinalLLM(), _ApproveGate())
+
+    async def _run():
+        return [
+            event
+            async for event in runtime.run_turn(
+                "让分身执行",
+                session,
+                agent_id="meta",
+            )
+        ]
+
+    events = asyncio.run(_run())
+
+    assert "bash_exec" not in dispatched
+    assert any(
+        event.type == EventType.TOOL_RESULT.value
+        and "后台完成事件" in str(event.data.get("result", ""))
+        for event in events
+    )
+
+
+def test_shell_wait_guard_does_not_match_business_commands() -> None:
+    from agenticx.runtime.agent_runtime import _is_pure_shell_wait_command
+
+    assert _is_pure_shell_wait_command("sleep 90") is True
+    assert _is_pure_shell_wait_command("wait") is True
+    assert _is_pure_shell_wait_command("python build.py --label sleep") is False
+    assert _is_pure_shell_wait_command("echo sleep 90") is False
+
+
+def test_delegation_reasoning_only_stall_pauses_early() -> None:
+    import asyncio
+
+    session = StudioSession()
+    runtime = AgentRuntime(_ReasoningOnlyLLM(), _ApproveGate(), max_tool_rounds=20)
+
+    async def _run():
+        return [
+            event
+            async for event in runtime.run_turn(
+                "执行委派任务",
+                session,
+                agent_id="dlg-reasoning",
+            )
+        ]
+
+    events = asyncio.run(_run())
+    paused = next(event for event in events if event.type == EventType.SUBAGENT_PAUSED.value)
+
+    assert paused.data["detector"] == "reasoning_only_stall"
+    assert paused.data["retryable"] is True
+    assert int(paused.data["round"]) < 20

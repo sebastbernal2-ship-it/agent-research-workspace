@@ -1,0 +1,255 @@
+/* Voice focus capsule — themed accent via --theme-color-rgb */
+
+.agx-voice-focus-root {
+  --agx-voice-focus-accent: rgb(var(--theme-color-rgb, 59, 130, 246));
+  --agx-voice-focus-accent-dim: rgba(var(--theme-color-rgb, 59, 130, 246), 0.45);
+  --agx-voice-focus-rim: rgba(255, 255, 255, 0.22);
+
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  /* 与灵巧窗口底板同色（由 .agx-app.agx-voice-focus-app 注入 --agx-voice-focus-shell-bg） */
+  background: var(--agx-voice-focus-shell-bg, var(--ui-surface-elevated, #1a1d24));
+  border-radius: 12px;
+  border: 1px solid var(--agx-voice-focus-rim);
+  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.42);
+  /* 左右略不对称：左侧弧形内收视觉上更「顶」，多给 2px；整体留出呼吸感 */
+  padding: 8px 18px;
+  cursor: grab;
+  margin: 0;
+}
+
+.agx-voice-focus-root:active {
+  cursor: grabbing;
+}
+
+/* ─── 左侧麦克风（无文案） ─── */
+.agx-voice-focus-mic-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  pointer-events: none;
+  width: 14px;
+  margin-inline-end: 0;
+}
+
+.agx-voice-focus-mic {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--agx-voice-focus-accent);
+  opacity: 0.92;
+}
+
+/* ─── Dot-grid waveform ─── */
+.agx-voice-focus-dots {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  pointer-events: none;
+  flex: 0 0 54px;
+  min-width: 54px;
+  margin-inline: 0;
+}
+
+.agx-voice-focus-dot-col {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  align-items: center;
+}
+
+.agx-voice-focus-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: var(--agx-voice-focus-accent);
+  transition: opacity 50ms linear, transform 50ms linear, box-shadow 50ms linear;
+  will-change: transform, opacity;
+}
+
+/* ─── Stop：外圈留白命中区 + 内嵌实心方钮（参考 Perplexity） ─── */
+.agx-voice-focus-stop {
+  width: 24px;
+  height: 24px;
+  border-radius: 0;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  pointer-events: all;
+  flex-shrink: 0;
+  padding: 0;
+  margin-inline-start: -6.5px;
+  margin-inline-end: -6.5px;
+}
+
+.agx-voice-focus-stop:hover .agx-voice-focus-stop-square {
+  filter: brightness(1.12);
+  box-shadow: 0 0 14px var(--agx-voice-focus-dim);
+}
+
+.agx-voice-focus-stop-square {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--agx-voice-focus-accent);
+  box-shadow: 0 0 10px var(--agx-voice-focus-dim);
+}
+
+/* ─── Error (absolute positioning) ─── */
+.agx-voice-focus-error {
+  position: absolute;
+  left: 24px;
+  bottom: -24px;
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  color: var(--ui-danger, #ef4444);
+}
+
+/* Hint 覆盖在胶囊内部（dot-grid 之上），不要溢出到窗口外被裁。 */
+.agx-voice-focus-hint {
+  position: absolute;
+  left: 38px;
+  right: 70px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  max-height: 40px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  pointer-events: none;
+  color: var(--ui-warning, #facc15);
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 6px;
+  padding: 4px 8px;
+  line-height: 1.35;
+  text-align: left;
+  z-index: 4;
+  backdrop-filter: blur(2px);
+}
+
+.agx-voice-focus-hint--error {
+  color: #ffd1d1;
+  background: rgba(127, 29, 29, 0.78);
+}
+
+.agx-voice-focus-hint--clickable {
+  pointer-events: all;
+  cursor: pointer;
+}
+
+.agx-voice-focus-hint--clickable:hover {
+  background: rgba(127, 29, 29, 0.92);
+}
+
+/* Tool bridge toggle (Doubao) — ON/OFF 强对比；与点阵/挂断钮之间只靠 root gap，避免单侧 margin 导致左右空隙不对称 */
+.agx-voice-focus-tool {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: all;
+  flex-shrink: 0;
+  padding: 0;
+  margin-inline: 0;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease, transform 80ms ease;
+}
+
+.agx-voice-focus-tool:active {
+  transform: scale(0.92);
+}
+
+/* OFF：低对比、灰描边、点是红色 */
+.agx-voice-focus-tool--off {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  opacity: 0.55;
+}
+
+.agx-voice-focus-tool--off:hover {
+  opacity: 0.9;
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.agx-voice-focus-tool--off .agx-voice-focus-tool-icon {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.agx-voice-focus-tool--off .agx-voice-focus-tool-dot {
+  background: var(--ui-danger, #ef4444);
+}
+
+/* ON：强调色实底 + 实色图标 + 绿点 */
+.agx-voice-focus-tool--on {
+  background: var(--agx-voice-focus-accent);
+  border: 1px solid var(--agx-voice-focus-accent);
+  box-shadow: 0 0 0 1px rgba(var(--theme-color-rgb, 59, 130, 246), 0.22),
+    0 0 8px rgba(var(--theme-color-rgb, 59, 130, 246), 0.38);
+  opacity: 1;
+}
+
+.agx-voice-focus-tool--on .agx-voice-focus-tool-icon {
+  color: #fff;
+}
+
+.agx-voice-focus-tool--on .agx-voice-focus-tool-dot {
+  background: #22c55e;
+  box-shadow: 0 0 4px rgba(34, 197, 94, 0.75);
+}
+
+.agx-voice-focus-tool-icon {
+  width: 11px;
+  height: 11px;
+}
+
+.agx-voice-focus-tool-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  border: 1.5px solid var(--agx-voice-focus-shell-bg, #1a1d24);
+}
+
+.agx-app.agx-voice-focus-app {
+  /* 与胶囊填充一致：圆角药丸铺在矩形窗口内时，四角楔区若透明会露出 surface-base（浅灰）或桌面，看起来像「双层底」 */
+  --agx-voice-focus-shell-bg: var(--ui-surface-elevated, #1a1d24);
+
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  width: 100vw;
+  height: 100vh;
+  padding: 0;
+  border-radius: 0;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  background: transparent !important;
+}
+
+html:has(.agx-voice-focus-app),
+body:has(.agx-voice-focus-app),
+#root:has(.agx-voice-focus-app) {
+  background: transparent !important;
+}

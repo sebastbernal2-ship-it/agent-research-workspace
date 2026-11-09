@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Near</title>
+    <script>
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        var theme = params.get("theme");
+        if (theme !== "light") theme = "dark";
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+    <style>
+      :root {
+        color-scheme: dark;
+        --text-muted: rgba(206, 220, 246, 0.62);
+        --track: rgba(255, 255, 255, 0.14);
+        --shimmer: rgba(226, 238, 255, 0.9);
+        --glass-tint: rgba(8, 10, 16, 0.16);
+        --glass-sheen: linear-gradient(
+          160deg,
+          rgba(255, 255, 255, 0.22) 0%,
+          rgba(255, 255, 255, 0.05) 34%,
+          rgba(8, 12, 22, 0.08) 100%
+        );
+        --glass-stroke: rgba(255, 255, 255, 0.28);
+        --glass-highlight: rgba(255, 255, 255, 0.42);
+      }
+
+      :root[data-theme="light"] {
+        color-scheme: light;
+        --text-muted: rgba(38, 48, 68, 0.58);
+        --track: rgba(24, 34, 56, 0.12);
+        --shimmer: rgba(74, 104, 168, 0.9);
+        --glass-tint: rgba(255, 255, 255, 0.14);
+        --glass-sheen: linear-gradient(
+          160deg,
+          rgba(255, 255, 255, 0.42) 0%,
+          rgba(255, 255, 255, 0.1) 38%,
+          rgba(220, 228, 244, 0.06) 100%
+        );
+        --glass-stroke: rgba(255, 255, 255, 0.46);
+        --glass-highlight: rgba(255, 255, 255, 0.72);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* Near-opaque tint only. Click-through is owned by the BrowserWindow. */
+        background: rgba(8, 10, 16, 0.02);
+        font-family: "SF Pro Display", "Helvetica Neue", "PingFang SC", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      :root[data-theme="light"] html,
+      :root[data-theme="light"] body {
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      /*
+       * Native desktop blur comes from Electron vibrancy / acrylic.
+       * This pane is only the web glass approximation: tint, rim, specular.
+       */
+      .glass {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        isolation: isolate;
+        background: var(--glass-sheen), var(--glass-tint);
+        border: 1px solid var(--glass-stroke);
+        box-shadow:
+          inset 0 1px 0 var(--glass-highlight),
+          inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+      }
+
+      .glass::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background:
+          radial-gradient(circle at 16% -8%, rgba(255, 255, 255, 0.38), transparent 42%),
+          radial-gradient(circle at 88% 112%, rgba(255, 255, 255, 0.1), transparent 40%),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.1), transparent 46%, rgba(255, 255, 255, 0.08));
+      }
+
+      .glass::after {
+        content: "";
+        position: absolute;
+        inset: -18%;
+        pointer-events: none;
+        background:
+          radial-gradient(ellipse 46% 28% at 30% 18%, rgba(255, 255, 255, 0.22), transparent 70%),
+          radial-gradient(ellipse 38% 24% at 72% 78%, rgba(210, 232, 255, 0.1), transparent 72%);
+        filter: blur(18px);
+        animation: liquid-shift 11s ease-in-out infinite;
+      }
+
+      .glass-specular {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        mix-blend-mode: screen;
+        background: linear-gradient(
+          118deg,
+          transparent 28%,
+          rgba(226, 240, 255, 0.08) 42%,
+          rgba(255, 255, 255, 0.2) 50%,
+          rgba(190, 218, 255, 0.07) 58%,
+          transparent 72%
+        );
+        background-size: 260% 100%;
+        animation: specular 9s ease-in-out infinite;
+      }
+
+      @keyframes specular {
+        0%,
+        100% {
+          background-position: 130% 0;
+        }
+        50% {
+          background-position: -30% 0;
+        }
+      }
+
+      @keyframes liquid-shift {
+        0%,
+        100% {
+          transform: translate3d(-4%, -2%, 0) scale(1.02);
+          opacity: 0.7;
+        }
+        50% {
+          transform: translate3d(5%, 3%, 0) scale(1.08);
+          opacity: 1;
+        }
+      }
+
+      body.is-washing {
+        opacity: 0;
+        transition: opacity 320ms cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      .stage {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 40px 72px 48px;
+        pointer-events: auto;
+      }
+
+      .drift {
+        position: relative;
+        width: 100%;
+        overflow: hidden;
+      }
+
+      .drift-title {
+        width: 78%;
+        height: clamp(168px, 34vh, 216px);
+      }
+
+      .drift-tagline {
+        width: 68%;
+        height: clamp(39px, 7.3vh, 48px);
+        margin-top: 4px;
+      }
+
+      .drift canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .shell {
+        position: relative;
+        z-index: 3;
+        width: 70%;
+        margin-top: 16px;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-start;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .footer {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .progress-row {
+        width: 100%;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        letter-spacing: 0.06em;
+        color: var(--text-muted);
+      }
+
+      .progress-stage {
+        font-size: 12px;
+        font-weight: 500;
+        color: rgba(226, 238, 255, 0.9);
+      }
+
+      .progress-percent {
+        font-size: 14px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.04em;
+        color: rgba(255, 255, 255, 0.94);
+      }
+
+      .progress-track {
+        width: 100%;
+        height: 3px;
+        border-radius: 999px;
+        background: var(--track);
+        overflow: hidden;
+        position: relative;
+      }
+
+      .progress-fill {
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 0%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(249, 115, 26, 0.55), var(--shimmer));
+        box-shadow: 0 0 10px rgba(249, 115, 26, 0.28);
+      }
+
+      .progress-fill::after {
+        content: "";
+        position: absolute;
+        right: 0;
+        top: -1px;
+        width: 26px;
+        height: 4px;
+        border-radius: 999px;
+        background: radial-gradient(ellipse at center, rgba(255, 255, 255, 0.9), transparent 70%);
+        animation: buffer-pulse 1.6s ease-in-out infinite;
+      }
+
+      @keyframes buffer-pulse {
+        0%,
+        100% {
+          opacity: 0.35;
+        }
+        50% {
+          opacity: 0.95;
+        }
+      }
+
+      .log {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-height: 18px;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        color: rgba(196, 212, 240, 0.5);
+        text-align: left;
+      }
+
+      .log-line {
+        animation: log-in 260ms cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      .log-line.is-current {
+        color: rgba(236, 242, 255, 0.9);
+      }
+
+      @keyframes log-in {
+        from {
+          opacity: 0;
+          transform: translateY(3px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      :root[data-theme="light"] .progress-stage {
+        color: rgba(38, 50, 76, 0.88);
+      }
+
+      :root[data-theme="light"] .progress-percent {
+        color: rgba(28, 36, 56, 0.92);
+      }
+
+      :root[data-theme="light"] .progress-fill {
+        background: linear-gradient(90deg, rgba(249, 115, 26, 0.7), var(--shimmer));
+        box-shadow: 0 0 10px rgba(249, 115, 26, 0.22);
+      }
+
+      :root[data-theme="light"] .progress-fill::after {
+        background: radial-gradient(ellipse at center, rgba(249, 115, 26, 0.85), transparent 70%);
+      }
+
+      :root[data-theme="light"] .log {
+        color: rgba(38, 48, 68, 0.5);
+      }
+
+      :root[data-theme="light"] .log-line.is-current {
+        color: rgba(38, 50, 76, 0.88);
+      }
+
+      :root[data-theme="light"] .glass-specular {
+        mix-blend-mode: soft-light;
+        background: linear-gradient(
+          118deg,
+          transparent 28%,
+          rgba(255, 255, 255, 0.34) 42%,
+          rgba(255, 255, 255, 0.62) 50%,
+          rgba(255, 255, 255, 0.3) 58%,
+          transparent 72%
+        );
+        background-size: 260% 100%;
+      }
+
+      :root[data-theme="light"] .glass::after {
+        background:
+          radial-gradient(ellipse 46% 28% at 30% 18%, rgba(255, 255, 255, 0.4), transparent 70%),
+          radial-gradient(ellipse 38% 24% at 72% 78%, rgba(255, 255, 255, 0.16), transparent 72%);
+      }
+
+      @media (prefers-reduced-transparency: reduce) {
+        .glass {
+          background: rgba(12, 14, 20, 0.94);
+        }
+
+        :root[data-theme="light"] .glass {
+          background: rgba(248, 250, 253, 0.96);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .progress-fill::after,
+        .log-line,
+        .glass-specular,
+        .glass::after {
+          animation: none;
+        }
+      }
+
+      @media (max-width: 620px) {
+        .stage {
+          padding: 32px 36px 40px;
+        }
+
+        .drift-title,
+        .drift-tagline,
+        .shell {
+          width: 82%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <h1 class="sr-only">Near</h1>
+    <p class="sr-only">Near, Always Near.</p>
+    <div class="glass" aria-hidden="true"></div>
+    <div class="glass-specular" aria-hidden="true"></div>
+    <div class="stage">
+      <div id="drift-title" class="drift drift-title" aria-hidden="true">
+        <canvas id="drift-title-canvas"></canvas>
+      </div>
+      <div id="drift-tagline" class="drift drift-tagline" aria-hidden="true">
+        <canvas id="drift-tagline-canvas"></canvas>
+      </div>
+      <div class="shell">
+        <div class="footer">
+          <div class="progress-row">
+            <span id="stage" class="progress-stage">启动中</span>
+            <span id="percent" class="progress-percent">0%</span>
+          </div>
+          <div class="progress-track" aria-hidden="true">
+            <div id="fill" class="progress-fill"></div>
+          </div>
+          <div id="log" class="log" aria-hidden="true"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        var STAGES = {
+          initializing: { label: "启动中", done: "初始化完成", pct: 6 },
+          "backend-starting": { label: "唤醒本地引擎", done: "本地引擎已启动", pct: 22 },
+          "backend-waiting": { label: "等待引擎就绪", done: "引擎已就绪", pct: 44 },
+          "pinging-remote": { label: "连接远程服务", done: "远程服务已连接", pct: 44 },
+          "loading-ui": { label: "加载界面", done: "界面已加载", pct: 66 },
+          "preloading-core": { label: "预载工作数据", done: "工作数据已就绪", pct: 84 },
+          "restoring-session": { label: "恢复上次会话", done: "会话已恢复", pct: 94 },
+          ready: { label: "准备就绪", done: "准备就绪", pct: 100 },
+        };
+        var MAX_LOG_LINES = 2;
+
+        var reduceMotion =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+        var stageEl = document.getElementById("stage");
+        var percentEl = document.getElementById("percent");
+        var fillEl = document.getElementById("fill");
+        var logEl = document.getElementById("log");
+
+        var currentStage = "initializing";
+        var target = STAGES.initializing.pct;
+        var value = 0;
+        var rafId = 0;
+
+        function cubicBezier(x1, y1, x2, y2) {
+          var cx = 3 * x1;
+          var bx = 3 * (x2 - x1) - cx;
+          var ax = 1 - cx - bx;
+          var cy = 3 * y1;
+          var by = 3 * (y2 - y1) - cy;
+          var ay = 1 - cy - by;
+          var sampleX = function (t) {
+            return ((ax * t + bx) * t + cx) * t;
+          };
+          var sampleY = function (t) {
+            return ((ay * t + by) * t + cy) * t;
+          };
+          return function (x) {
+            if (x <= 0) return 0;
+            if (x >= 1) return 1;
+            var lo = 0;
+            var hi = 1;
+            var t = x;
+            for (var i = 0; i < 12; i++) {
+              var mid = (lo + hi) / 2;
+              var sx = sampleX(mid);
+              if (Math.abs(sx - x) < 1e-6) {
+                t = mid;
+                break;
+              }
+              if (sx < x) lo = mid;
+              else hi = mid;
+              t = mid;
+            }
+            return sampleY(t);
+          };
+        }
+
+        function fitFontSize(measureCtx, label, family, maxW, maxH, cap) {
+          if (!label) return cap;
+          var lo = 8;
+          var hi = cap;
+          var best = lo;
+          for (var iter = 0; iter < 12; iter++) {
+            var mid = (lo + hi) / 2;
+            measureCtx.font = "700 " + mid + "px " + family;
+            var m = measureCtx.measureText(label);
+            var w = m.width;
+            var h =
+              (m.actualBoundingBoxAscent || mid * 0.8) + (m.actualBoundingBoxDescent || mid * 0.2);
+            if (w <= maxW && h <= maxH) {
+              best = mid;
+              lo = mid;
+            } else {
+              hi = mid;
+            }
+          }
+          return Math.max(8, Math.floor(best));
+        }
+
+        function startPixelDrift(container, canvas, opts) {
+          if (!container || !canvas) return function () {};
+          var ctx = canvas.getContext("2d", { alpha: true });
+          if (!ctx) return function () {};
+
+          opts = opts || {};
+          var palette = ["#FFFFFF", "#F9731A", "#FFFFFF"];
+          var text = opts.text || "NEAR";
+          var particleSize = typeof opts.particleSize === "number" ? opts.particleSize : 10;
+          var particleCount = typeof opts.particleCount === "number" ? opts.particleCount : 32;
+          var maxParticles = typeof opts.maxParticles === "number" ? opts.maxParticles : 2800;
+          var fontSize = typeof opts.fontSize === "number" ? opts.fontSize : 160;
+          var maxWRatio = typeof opts.maxWRatio === "number" ? opts.maxWRatio : 0.88;
+          var maxHRatio = typeof opts.maxHRatio === "number" ? opts.maxHRatio : 0.72;
+          var letterSpacing = opts.letterSpacing || "0";
+          var formDelay = reduceMotion ? 0 : typeof opts.formDelay === "number" ? opts.formDelay : 0;
+          var autoFit = true;
+          var mcEnabled = !reduceMotion;
+          var mcRadius = 50;
+          var mcForce = 30;
+          var easeFn = cubicBezier(0.23, 1, 0.32, 1);
+          var formMs = reduceMotion ? 0 : 1100;
+
+          var pointer = { x: -99999, y: -99999, active: false };
+          var formVal = 0;
+          var lastFrame = null;
+          var hidden = true;
+          var reverse = false;
+          var rafLoop = 0;
+          var idleTimer = 0;
+          var sampleStride = 3;
+
+          var count = 0;
+          var ox = new Float32Array(0);
+          var oy = new Float32Array(0);
+          var sx = new Float32Array(0);
+          var sy = new Float32Array(0);
+          var px = new Float32Array(0);
+          var py = new Float32Array(0);
+          var repX = new Float32Array(0);
+          var repY = new Float32Array(0);
+          var cIdx = new Uint8Array(0);
+
+          var prevMx = -99999;
+          var prevMy = -99999;
+          var mouseSpeed = 0;
+          var smoothX = -99999;
+          var smoothY = -99999;
+          var cssW = 0;
+          var cssH = 0;
+          var dpr = 1;
+          var buckets = palette.map(function () {
+            return [];
+          });
+
+          function sampleText() {
+            var W = cssW;
+            var H = cssH;
+            if (W <= 0 || H <= 0) return;
+
+            var off = document.createElement("canvas");
+            off.width = Math.max(1, Math.floor(W * dpr));
+            off.height = Math.max(1, Math.floor(H * dpr));
+            var offCtx = off.getContext("2d", { willReadFrequently: true });
+            if (!offCtx) return;
+            offCtx.scale(dpr, dpr);
+
+            var fontFamily =
+              'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+            var maxW = W * maxWRatio;
+            var maxH = H * maxHRatio;
+            if (offCtx.letterSpacing !== undefined) offCtx.letterSpacing = letterSpacing;
+            var effectiveSize = Math.max(8, fontSize);
+            if (autoFit) {
+              effectiveSize = fitFontSize(offCtx, text, fontFamily, maxW, maxH, Math.max(8, fontSize));
+            }
+
+            offCtx.font = "700 " + effectiveSize + "px " + fontFamily;
+            var gm = offCtx.measureText(text);
+            var gW = gm.width || 1;
+            var gH =
+              (gm.actualBoundingBoxAscent || effectiveSize * 0.8) +
+              (gm.actualBoundingBoxDescent || effectiveSize * 0.2);
+            var fitScale = Math.min(1, maxW / gW, maxH / gH);
+            if (fitScale < 1) effectiveSize = Math.max(8, effectiveSize * fitScale);
+
+            offCtx.clearRect(0, 0, W, H);
+            offCtx.fillStyle = "#fff";
+            offCtx.font = "700 " + effectiveSize + "px " + fontFamily;
+            if (offCtx.letterSpacing !== undefined) offCtx.letterSpacing = letterSpacing;
+            offCtx.textAlign = "center";
+            offCtx.textBaseline = "middle";
+            offCtx.fillText(text, W / 2, H * (opts.anchorY || 0.5));
+
+            var img = offCtx.getImageData(0, 0, Math.floor(W * dpr), Math.floor(H * dpr));
+            var data = img.data;
+            var pCount = Math.max(1, Math.min(80, particleCount));
+            var stride = Math.max(2, Math.round(150 / pCount));
+            sampleStride = stride;
+
+            var candidates = 0;
+            for (var y = 0; y < H; y += stride) {
+              for (var x = 0; x < W; x += stride) {
+                var ix = Math.floor(x * dpr);
+                var iy = Math.floor(y * dpr);
+                var idx = (iy * img.width + ix) * 4 + 3;
+                if (data[idx] > 128) candidates++;
+              }
+            }
+
+            var downsample = candidates > maxParticles ? Math.ceil(candidates / maxParticles) : 1;
+            var allocCount = Math.min(candidates, maxParticles);
+            var newOx = new Float32Array(allocCount);
+            var newOy = new Float32Array(allocCount);
+            var newSx = new Float32Array(allocCount);
+            var newSy = new Float32Array(allocCount);
+            var newPx = new Float32Array(allocCount);
+            var newPy = new Float32Array(allocCount);
+            var newC = new Uint8Array(allocCount);
+
+            var i = 0;
+            var seen = 0;
+            for (y = 0; y < H && i < allocCount; y += stride) {
+              for (x = 0; x < W && i < allocCount; x += stride) {
+                ix = Math.floor(x * dpr);
+                iy = Math.floor(y * dpr);
+                idx = (iy * img.width + ix) * 4 + 3;
+                if (data[idx] > 128) {
+                  if (seen % downsample === 0) {
+                    newOx[i] = x;
+                    newOy[i] = y;
+                    var ang = Math.random() * Math.PI * 2;
+                    var rad = Math.max(W, H) * (0.6 + Math.random() * 0.5);
+                    newSx[i] = W / 2 + Math.cos(ang) * rad;
+                    newSy[i] = H / 2 + Math.sin(ang) * rad;
+                    newPx[i] = newSx[i];
+                    newPy[i] = newSy[i];
+                    newC[i] = Math.floor(Math.random() * palette.length);
+                    i++;
+                  }
+                  seen++;
+                }
+              }
+            }
+
+            count = i;
+            ox = newOx;
+            oy = newOy;
+            sx = newSx;
+            sy = newSy;
+            px = newPx;
+            py = newPy;
+            repX = new Float32Array(allocCount);
+            repY = new Float32Array(allocCount);
+            cIdx = newC;
+            formVal = 0;
+            lastFrame = null;
+          }
+
+          function resize() {
+            var rect = container.getBoundingClientRect();
+            var w = Math.floor(rect.width);
+            var h = Math.floor(rect.height);
+            if (w <= 0 || h <= 0) return;
+            var nextDpr = Math.max(1, Math.min(1.5, window.devicePixelRatio || 1));
+            if (
+              w === cssW &&
+              h === cssH &&
+              nextDpr === dpr &&
+              canvas.width === Math.floor(w * nextDpr)
+            ) {
+              return;
+            }
+            dpr = nextDpr;
+            cssW = w;
+            cssH = h;
+            canvas.width = Math.floor(cssW * dpr);
+            canvas.height = Math.floor(cssH * dpr);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            sampleText();
+            resumeLoop();
+          }
+
+          function formIn() {
+            reverse = false;
+            hidden = false;
+            resumeLoop();
+          }
+
+          function drawFrame() {
+            if (hidden) return;
+            ctx.clearRect(0, 0, cssW, cssH);
+            var drawSize = Math.max(1.4, particleSize / 4, sampleStride * 0.9);
+            var half = drawSize / 2;
+            var now = performance.now();
+            var last = lastFrame == null ? now : lastFrame;
+            var dt = Math.min(64, Math.max(0, now - last));
+            lastFrame = now;
+
+            var dest = reverse ? 0 : 1;
+            var v = formVal;
+            if (formMs <= 0) {
+              v = dest;
+            } else {
+              var stepv = dt / formMs;
+              if (v < dest) v = Math.min(dest, v + stepv);
+              else if (v > dest) v = Math.max(dest, v - stepv);
+            }
+            formVal = v;
+            if (reverse && v <= 0) hidden = true;
+            if (hidden) return;
+
+            var forming = v < 1;
+            var factor = easeFn(v);
+            var hitSpeed = mouseSpeed;
+            mouseSpeed *= 0.88;
+            var active = !forming && mcEnabled && pointer.active;
+            if (active) {
+              var lerpFactor = Math.max(0.08, 0.3 - hitSpeed * 0.006);
+              if (smoothX < -9000) {
+                smoothX = pointer.x;
+                smoothY = pointer.y;
+              } else {
+                smoothX += (pointer.x - smoothX) * lerpFactor;
+                smoothY += (pointer.y - smoothY) * lerpFactor;
+              }
+            } else {
+              smoothX = -99999;
+              smoothY = -99999;
+            }
+
+            var mx = smoothX;
+            var my = smoothY;
+            var repCutoff = Math.max(1, mcRadius);
+            var repCutoffSq = repCutoff * repCutoff;
+            var b;
+            for (b = 0; b < buckets.length; b++) buckets[b].length = 0;
+
+            for (var i = 0; i < count; i++) {
+              var oxi = ox[i];
+              var oyi = oy[i];
+              if (forming) {
+                px[i] = sx[i] + (oxi - sx[i]) * factor;
+                py[i] = sy[i] + (oyi - sy[i]) * factor;
+                buckets[cIdx[i]].push(i);
+                continue;
+              }
+
+              var inZone = false;
+              if (active) {
+                var dx = oxi - mx;
+                var dy = oyi - my;
+                var distSq = dx * dx + dy * dy;
+                if (distSq > 0 && distSq < repCutoffSq) {
+                  var dist = Math.sqrt(distSq);
+                  var nx = dx / dist;
+                  var ny = dy / dist;
+                  var falloff = 1 - dist / repCutoff;
+                  var push = falloff * hitSpeed * mcForce * 0.05;
+                  repX[i] += nx * push;
+                  repY[i] += ny * push;
+                  var targetRepX = nx * (repCutoff - dist);
+                  var targetRepY = ny * (repCutoff - dist);
+                  repX[i] += (targetRepX - repX[i]) * 0.06;
+                  repY[i] += (targetRepY - repY[i]) * 0.06;
+                  inZone = true;
+                }
+              }
+              if (!inZone) {
+                repX[i] *= 0.97;
+                repY[i] *= 0.97;
+              }
+              var wave = now * 0.00115;
+              px[i] = oxi + repX[i] + Math.sin(wave + i * 0.41) * 0.65;
+              py[i] = oyi + repY[i] + Math.cos(wave * 0.85 + i * 0.27) * 0.4;
+              buckets[cIdx[i]].push(i);
+            }
+
+            ctx.globalAlpha = forming ? Math.min(1, Math.max(0, factor)) : 1;
+            for (b = 0; b < buckets.length; b++) {
+              var bucket = buckets[b];
+              if (bucket.length === 0) continue;
+              ctx.fillStyle = palette[b];
+              for (var k = 0; k < bucket.length; k++) {
+                var pi = bucket[k];
+                ctx.fillRect(px[pi] - half, py[pi] - half, drawSize, drawSize);
+              }
+            }
+            ctx.globalAlpha = 1;
+          }
+
+          function isIdle() {
+            return !hidden && formVal >= 1 && !reverse && !pointer.active && mouseSpeed < 0.2;
+          }
+
+          function clearSched() {
+            if (rafLoop) cancelAnimationFrame(rafLoop);
+            if (idleTimer) clearTimeout(idleTimer);
+            rafLoop = 0;
+            idleTimer = 0;
+          }
+
+          function resumeLoop() {
+            if (rafLoop || idleTimer) return;
+            rafLoop = requestAnimationFrame(function () {
+              rafLoop = 0;
+              drawFrame();
+              if (hidden) return;
+              if (isIdle()) {
+                idleTimer = setTimeout(function () {
+                  idleTimer = 0;
+                  resumeLoop();
+                }, 48);
+              } else {
+                resumeLoop();
+              }
+            });
+          }
+
+          function onMove(e) {
+            if (!mcEnabled) return;
+            var rect = canvas.getBoundingClientRect();
+            var inside =
+              e.clientX >= rect.left &&
+              e.clientX <= rect.right &&
+              e.clientY >= rect.top &&
+              e.clientY <= rect.bottom;
+            if (!inside) {
+              if (pointer.active) onLeave();
+              return;
+            }
+            var scaleX = rect.width > 0 ? cssW / rect.width : 1;
+            var scaleY = rect.height > 0 ? cssH / rect.height : 1;
+            var mx = (e.clientX - rect.left) * scaleX;
+            var my = (e.clientY - rect.top) * scaleY;
+            if (prevMx > -9000) {
+              var ddx = mx - prevMx;
+              var ddy = my - prevMy;
+              mouseSpeed = Math.sqrt(ddx * ddx + ddy * ddy);
+            }
+            prevMx = mx;
+            prevMy = my;
+            pointer.x = mx;
+            pointer.y = my;
+            pointer.active = true;
+            resumeLoop();
+          }
+
+          function onLeave() {
+            pointer.x = -99999;
+            pointer.y = -99999;
+            pointer.active = false;
+            prevMx = -99999;
+            prevMy = -99999;
+            resumeLoop();
+          }
+
+          var entered = false;
+          function enter() {
+            if (entered) return;
+            entered = true;
+            formIn();
+          }
+
+          function tryEnter() {
+            if (entered) return;
+            var r = container.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) return;
+            enter();
+          }
+
+          var enterTimers = [
+            setTimeout(tryEnter, 60 + formDelay),
+            setTimeout(tryEnter, 250 + formDelay),
+            setTimeout(tryEnter, 600 + formDelay),
+          ];
+
+          resize();
+          reverse = false;
+          hidden = true;
+          formVal = 0;
+          tryEnter();
+
+          var ro = new ResizeObserver(function () {
+            resize();
+            tryEnter();
+          });
+          ro.observe(container);
+          document.addEventListener("pointermove", onMove);
+          document.addEventListener("pointerleave", onLeave);
+          document.addEventListener("pointercancel", onLeave);
+          document.addEventListener("pointerdown", onMove);
+          resumeLoop();
+
+          return function destroy() {
+            clearSched();
+            enterTimers.forEach(clearTimeout);
+            document.removeEventListener("pointermove", onMove);
+            document.removeEventListener("pointerleave", onLeave);
+            document.removeEventListener("pointercancel", onLeave);
+            document.removeEventListener("pointerdown", onMove);
+            ro.disconnect();
+          };
+        }
+
+        var stopTitle = startPixelDrift(
+          document.getElementById("drift-title"),
+          document.getElementById("drift-title-canvas"),
+          {
+            text: "NEAR",
+            fontSize: 176,
+            particleSize: 9,
+            particleCount: 50,
+            maxWRatio: 0.92,
+            maxHRatio: 0.84,
+            maxParticles: 2800,
+          }
+        );
+        var stopTagline = startPixelDrift(
+          document.getElementById("drift-tagline"),
+          document.getElementById("drift-tagline-canvas"),
+          {
+            text: "NEAR, ALWAYS NEAR.",
+            fontSize: 25,
+            particleSize: 6,
+            particleCount: 75,
+            maxWRatio: 0.96,
+            maxHRatio: 0.88,
+            letterSpacing: "0.05em",
+            formDelay: 180,
+            maxParticles: 2400,
+          }
+        );
+
+        function paintProgress() {
+          if (fillEl) fillEl.style.width = value.toFixed(2) + "%";
+          if (percentEl) percentEl.textContent = Math.round(value) + "%";
+        }
+
+        function stageCeiling() {
+          if (currentStage === "ready") return 100;
+          if (currentStage === "loading-ui") return 80;
+          if (currentStage === "preloading-core") return 90;
+          if (currentStage === "restoring-session") return 98;
+          return Math.min(99, target + 8);
+        }
+
+        function tick() {
+          if (value < target) {
+            value += (target - value) * 0.045;
+            if (target - value < 0.05) value = target;
+          } else if (currentStage !== "ready") {
+            var ceiling = stageCeiling();
+            if (value < ceiling) value += Math.max(0.025, (ceiling - value) * 0.006);
+          }
+          paintProgress();
+          if (currentStage === "ready") {
+            rafId = 0;
+            return;
+          }
+          rafId = requestAnimationFrame(tick);
+        }
+
+        function kickTick() {
+          if (rafId) return;
+          rafId = requestAnimationFrame(tick);
+        }
+
+        function appendLog(text) {
+          if (!logEl || !text) return;
+          var line = document.createElement("div");
+          line.className = "log-line is-current";
+          line.textContent = "· " + text;
+          var prev = logEl.lastElementChild;
+          if (prev) prev.classList.remove("is-current");
+          logEl.appendChild(line);
+          while (logEl.childElementCount > MAX_LOG_LINES) {
+            logEl.removeChild(logEl.firstElementChild);
+          }
+        }
+
+        function setStage(stage) {
+          var next = STAGES[stage];
+          if (!next || stage === currentStage) return;
+          var prev = STAGES[currentStage];
+          if (prev && next.pct >= prev.pct) appendLog(prev.done);
+          currentStage = stage;
+          target = next.pct;
+          if (stageEl) stageEl.textContent = next.label;
+          if (stage === "ready") {
+            value = 100;
+            target = 100;
+            paintProgress();
+            document.body.classList.add("is-washing");
+            return;
+          }
+          kickTick();
+        }
+
+        if (window.nearSplash && window.nearSplash.onStage) {
+          window.nearSplash.onStage(setStage);
+        }
+
+        kickTick();
+
+        window.addEventListener("beforeunload", function () {
+          if (rafId) cancelAnimationFrame(rafId);
+          if (typeof stopTitle === "function") stopTitle();
+          if (typeof stopTagline === "function") stopTagline();
+        });
+      })();
+    </script>
+  </body>
+</html>

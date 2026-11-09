@@ -1,0 +1,1136 @@
+/**
+ * Collect on-disk artifact paths produced in the current chat session.
+ *
+ * Sources (aligned with team_manager output-file extraction):
+ * - file_write / file_edit tool rows (toolArgs.path + OK: wrote|edited)
+ * - bash_exec redirect / tee targets in toolArgs.command
+ * - bash_exec stdout JSON `"output": "/abs/file.ext"` (e.g. openpyxl wb.save)
+ * - labeled save paths in assistant prose (保存路径 / 路径 / 已保存至 …)
+ * - save labels with the absolute file path on a following line
+ * - sub-agent outputFiles / resultFile
+ *
+ * Author: Damon Li
+ */
+
+import type { Message, SubAgent } from "../store";
+import { absoluteTaskspacePath, isAbsoluteFilePath } from "./workspace-file-path";
+
+// Start with `\S` so a missing `(N chars)` suffix cannot collapse the path to `/`.
+// `.*?` then allows spaces in the filename until the optional size suffix or EOL.
+const OK_WRITE_RE =
+  /OK:\s*(?:wrote|edited)\s+(\S.*?)(?:\s+\(\d+\s+chars?\))?(?=\s*(?:\n|$))/gi;
+
+const ABS_PATH_BODY =
+  "(\\/(?:Users|home|tmp|var|opt|private|Volumes)[^\\s`<>\\[\\]()]+|[a-zA-Z]:[\\\\/][^\\s`<>\\[\\]()]+|~\\/[^\\s`<>\\[\\]()]+)";
+
+const SAVED_FILE_LABEL =
+  "(?:产物(?:位于|在)|报告已保存(?:至|到)|文件已保存(?:至|到)|报告(?:文件)?已落盘(?:至|到)?|已保存(?:至|到)|保存路径|路径|saved\\s+to|written\\s+to|report\\s+saved\\s+to|file\\s+saved\\s+to)";
+
+const LABELED_SAVE_PATH_RE = new RegExp(
+  `${SAVED_FILE_LABEL}[：:\\s]*(\`?)${ABS_PATH_BODY}(\\1)`,
+  "gi",
+);
+
+/**
+ * Line that introduces a saved artifact; path may follow on later lines.
+ * Bare「路径」must be a label (`路径：`), not prose like「管理 ~/.codewiki/… 路径」.
+ */
+const SAVE_CUE_LINE_RE =
+  /(?:产出文件|保存路径|路径\s*[：:]|已保存(?:至|到)?|saved\s+to|written\s+to|report\s+saved\s+to|file\s+saved\s+to)/i;
+const EXPLICIT_ARTIFACT_MANIFEST_RE =
+  /(?:产出文件|产物(?:位于|在)|\|\s*产物\s*\||(?:deliverables?|artifacts?)\s+(?:at|in)\b)/i;
+
+const INLINE_ABS_PATH_RE = new RegExp(`\`?${ABS_PATH_BODY}\`?`, "g");
+
+/** bash / skill JSON result: "output": "/abs/file.ext" */
+const JSON_OUTPUT_PATH_RE =
+  /"output"\s*:\s*"(\/(?:Users|home|tmp|var|opt|private|Volumes)[^"\s]+|[a-zA-Z]:[\\/][^"\s]+|~\/[^"\s]+)"/gi;
+
+const BASH_REDIRECT_RE = /(?:>>?|\btee\b(?:\s+-a)?)\s+(['"]?)([^\s'"|;&<>]+)\1/g;
+
+/** Backticked relative output path in a Markdown table cell. */
+const TABLE_FILE_PATH_RE = /`([^`\r\n|]+?\.[a-zA-Z0-9]{1,12})`/g;
+const TABLE_BARE_FILENAME_RE =
+  /\|[ \t]*([^`|/\s\\]+\.[a-zA-Z0-9]{1,12})[ \t]*(?=\|)/g;
+
+/** Skill/source trees listed by find/ls must not become task artifacts. */
+const ARTIFACT_SOURCE_EXCLUDE_RE =
+  /\/(?:\.agenticx\/skills|\.git|node_modules|site-packages)\//i;
+
+const PREVIEW_IMAGE_RANK: Record<string, number> = {
+  gif: 0,
+  webp: 1,
+  png: 2,
+  jpg: 3,
+  jpeg: 3,
+  bmp: 4,
+  svg: 5,
+};
+
+function looksLikeArtifactFile(path: string): boolean {
+  const base = path.split("/").pop() || "";
+  if (!base) return false;
+  // Hidden config dirs (`.codewiki`, `.git`) look like "name.ext" to a naive regex — reject.
+  if (/^\.[A-Za-z0-9_-]+$/.test(base)) return false;
+  return /\.[a-zA-Z0-9]{1,12}$/.test(base);
+}
+
+/** Dirs that live in the session default workspace but are not task outputs. */
+const WORKSPACE_ARTIFACT_SKIP_DIRS = new Set([
+  "memory",
+  "attachments",
+  ".git",
+  "node_modules",
+  "site-packages",
+  "__pycache__",
+  "task_artifacts",
+]);
+
+/** Chat uploads are materialized under <default>/attachments/; never task outputs. */
+const SESSION_USER_ATTACHMENT_RE =
+  /(?:^|\/)\.agenticx\/taskspaces\/[^/]+\/default\/attachments(?:\/|$)/i;
+
+/** True when a path is a user chat-upload, not an agent deliverable. */
+export function isSessionUserAttachmentPath(path: string): boolean {
+  const value = String(path || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (!value) return false;
+  if (SESSION_USER_ATTACHMENT_RE.test(value)) return true;
+  return /^attachments(?:\/|$)/i.test(value);
+}
+
+function isVirtualEnvironmentDirName(name: string): boolean {
+  const value = String(name || "").trim().toLowerCase();
+  return /^(?:env|venv|virtualenv|[a-z0-9_-]+env)$/.test(value);
+}
+
+function isRuntimeArtifactPath(path: string): boolean {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .some(
+      (part) =>
+        isVirtualEnvironmentDirName(part) ||
+        part.toLowerCase() === "site-packages",
+    );
+}
+
+export type WorkspaceArtifactListingEntry = {
+  name: string;
+  type: string;
+  path?: string;
+  mount_mode?: string;
+};
+
+/** True when a default-workspace directory should be scanned for artifacts. */
+export function isWalkableWorkspaceArtifactDir(
+  entry: WorkspaceArtifactListingEntry,
+): boolean {
+  if (String(entry.type || "").trim() !== "dir") return false;
+  const name = String(entry.name || "").trim();
+  if (!name || name.startsWith(".")) return false;
+  if (WORKSPACE_ARTIFACT_SKIP_DIRS.has(name.toLowerCase())) return false;
+  if (isVirtualEnvironmentDirName(name)) return false;
+  if (String(entry.mount_mode || "").trim()) return false;
+  return true;
+}
+
+/**
+ * Map one default-workspace directory listing to artifact file paths.
+ * Group chat often writes files here without persisting file_write rows.
+ */
+export function collectWorkspaceListingArtifactPaths(opts: {
+  workspaceRoot: string;
+  entries: WorkspaceArtifactListingEntry[] | undefined | null;
+}): string[] {
+  const root = String(opts.workspaceRoot || "").trim();
+  if (!root) return [];
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of opts.entries ?? []) {
+    if (String(entry.type || "").trim() !== "file") continue;
+    const name = String(entry.name || "").trim();
+    if (!name || name.startsWith(".")) continue;
+    if (!looksLikeArtifactFile(name)) continue;
+    const rel = String(entry.path || name).trim().replace(/\\/g, "/");
+    if (!rel) continue;
+    if (isRuntimeArtifactPath(rel)) continue;
+    const parts = rel.split("/").filter(Boolean);
+    if (parts.some((part) => WORKSPACE_ARTIFACT_SKIP_DIRS.has(part.toLowerCase()))) {
+      continue;
+    }
+    addPath(paths, seen, absoluteTaskspacePath(root, rel));
+  }
+  return paths;
+}
+
+/** Best-effort $HOME for expanding `~/…` during normalize (Node/Electron/Vitest). */
+function homeDirForArtifacts(): string {
+  try {
+    const env = typeof process !== "undefined" ? process.env : undefined;
+    const fromEnv = String(env?.HOME || env?.USERPROFILE || "").trim();
+    if (fromEnv) return fromEnv.replace(/\\/g, "/").replace(/\/+$/, "");
+  } catch {
+    /* ignore */
+  }
+  return "";
+}
+
+/** Expand `~/…` when home is known; otherwise return the path unchanged. */
+export function expandArtifactHomePath(value: string, homeDir?: string): string {
+  const raw = String(value || "").trim().replace(/\\/g, "/");
+  if (!raw) return "";
+  const home = String(homeDir || homeDirForArtifacts() || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  if (!home) return raw;
+  if (raw === "~") return home;
+  if (raw.startsWith("~/")) return `${home}/${raw.slice(2)}`;
+  return raw;
+}
+
+/**
+ * Home-relative key so `~/Desktop/a.md` and `/Users/<name>/Desktop/a.md`
+ * collide for dedupe even when $HOME is unavailable in the renderer.
+ */
+export function artifactHomeRelativeKey(normalized: string): string | null {
+  const value = String(normalized || "").trim().replace(/\\/g, "/");
+  if (!value) return null;
+  if (value.startsWith("~/")) return value;
+  const posix = value.match(/^\/(?:Users|home)\/[^/]+\/(.+)$/);
+  if (posix?.[1]) return `~/${posix[1]}`;
+  const win = value.match(/^[a-zA-Z]:\/Users\/[^/]+\/(.+)$/i);
+  if (win?.[1]) return `~/${win[1]}`;
+  return null;
+}
+
+function normalizeArtifactPath(raw: string): string | null {
+  let value = String(raw || "").trim();
+  if (!value) return null;
+  if (
+    (value.startsWith("`") && value.endsWith("`")) ||
+    (value.startsWith("'") && value.endsWith("'")) ||
+    (value.startsWith('"') && value.endsWith('"'))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  value = value.replace(/[，。；：！？,.]+$/u, "").trim();
+  if (!value || /[\n\r]/.test(value)) return null;
+  // Docs / templates like `~/.codewiki/<project>/` are not real artifacts.
+  if (/[<>]/.test(value)) return null;
+  if (!isAbsoluteFilePath(value) && !value.startsWith("/") && !/^[a-zA-Z]:[\\/]/.test(value) && !value.startsWith("~/")) {
+    return null;
+  }
+  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (isRuntimeArtifactPath(normalized)) return null;
+  if (isSessionUserAttachmentPath(normalized)) return null;
+  return normalized || null;
+}
+
+function parseWbBridgeResultJson(raw: string): Record<string, unknown> | null {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const stripped = text.replace(/^\[micro-compact[^\]]*\]\s*/i, "");
+  const start = stripped.indexOf("{");
+  if (start < 0) return null;
+  try {
+    const parsed = JSON.parse(stripped.slice(start)) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* persist may leave raw control chars inside tail — fall through */
+  }
+  const match = stripped.match(/"written_paths"\s*:\s*(\[[^\]]*\])/);
+  if (!match?.[1]) return null;
+  try {
+    const list = JSON.parse(match[1]) as unknown;
+    if (!Array.isArray(list)) return null;
+    const statusMatch = stripped.match(/"status"\s*:\s*"([^"]*)"/);
+    const turnMatch = stripped.match(/"turn_state"\s*:\s*"([^"]*)"/);
+    return {
+      status: statusMatch?.[1] ?? "",
+      turn_state: turnMatch?.[1] ?? "",
+      written_paths: list,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractWbBridgeWrittenPaths(
+  raw: string,
+  paths: string[],
+  seen: Set<string>,
+): void {
+  const parsed = parseWbBridgeResultJson(raw);
+  if (!parsed) return;
+  const status = String(parsed.status || parsed.turn_state || "");
+  if (status === "running") return;
+  const list = parsed.written_paths;
+  if (!Array.isArray(list)) return;
+  for (const item of list) {
+    addPath(paths, seen, String(item || "").trim());
+  }
+}
+
+function addPath(paths: string[], seen: Set<string>, raw: string): void {
+  const normalized = normalizeArtifactPath(raw);
+  if (!normalized) return;
+
+  // `~/Desktop/a.md` ≡ `/Users/<name>/Desktop/a.md` (string-level home-relative key).
+  const relKey = artifactHomeRelativeKey(normalized);
+  const keys = [normalized];
+  if (relKey) keys.push(relKey);
+
+  if (keys.some((k) => seen.has(k))) {
+    // Upgrade a previously stored tilde path to the concrete absolute form.
+    if (!normalized.startsWith("~/") && relKey) {
+      const idx = paths.findIndex(
+        (p) => p === relKey || artifactHomeRelativeKey(p) === relKey,
+      );
+      if (idx >= 0 && String(paths[idx] || "").startsWith("~/")) {
+        paths[idx] = normalized;
+        seen.add(normalized);
+      }
+    }
+    return;
+  }
+  for (const k of keys) seen.add(k);
+  paths.push(normalized);
+}
+
+function extractOkWritePaths(content: string, paths: string[], seen: Set<string>): void {
+  OK_WRITE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = OK_WRITE_RE.exec(content)) !== null) {
+    addPath(paths, seen, match[1] ?? "");
+  }
+}
+
+function extractLabeledSavePaths(content: string, paths: string[], seen: Set<string>): void {
+  LABELED_SAVE_PATH_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = LABELED_SAVE_PATH_RE.exec(content)) !== null) {
+    const candidate = normalizeArtifactPath(match[2] ?? "");
+    if (!candidate) continue;
+    // Directory-only labels are join bases for table filenames, not standalone artifacts.
+    if (!looksLikeArtifactFile(candidate)) continue;
+    addPath(paths, seen, candidate);
+  }
+}
+
+/**
+ * Common agent report shape:
+ *   ## 1. 新 Excel 已保存
+ *   路径：
+ *   `/Users/.../file.xlsx`
+ */
+function extractNearbyLabeledSavePaths(content: string, paths: string[], seen: Set<string>): void {
+  const lines = String(content || "").split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const cueLine = lines[i] ?? "";
+    if (!SAVE_CUE_LINE_RE.test(cueLine)) continue;
+
+    let nonEmptySeen = 0;
+    for (let j = i; j < lines.length && nonEmptySeen < 6; j++) {
+      const line = (lines[j] ?? "").trim();
+      if (!line) continue;
+      if (j > i) nonEmptySeen += 1;
+
+      INLINE_ABS_PATH_RE.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = INLINE_ABS_PATH_RE.exec(line)) !== null) {
+        const candidate = normalizeArtifactPath(match[1] ?? "");
+        if (!candidate || !looksLikeArtifactFile(candidate)) continue;
+        addPath(paths, seen, candidate);
+      }
+    }
+  }
+}
+
+function extractBashRedirectPaths(command: string, paths: string[], seen: Set<string>): void {
+  BASH_REDIRECT_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = BASH_REDIRECT_RE.exec(command)) !== null) {
+    const raw = String(match[2] || "").trim();
+    if (!raw || raw.startsWith("/dev/")) continue;
+    // Only keep absolute / home-relative targets; relative redirects need a cwd we may not have.
+    if (raw.startsWith("/") || raw.startsWith("~/") || /^[a-zA-Z]:[\\/]/.test(raw)) {
+      addPath(paths, seen, raw);
+    }
+  }
+}
+
+/** Pull absolute artifact files from bash stdout (echoed PNG:/GIF: paths, ls -lh, etc.). */
+function extractAbsArtifactPathsFromText(
+  content: string,
+  paths: string[],
+  seen: Set<string>,
+): void {
+  INLINE_ABS_PATH_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = INLINE_ABS_PATH_RE.exec(content)) !== null) {
+    const candidate = normalizeArtifactPath(match[1] ?? "");
+    if (!candidate || !looksLikeArtifactFile(candidate)) continue;
+    if (ARTIFACT_SOURCE_EXCLUDE_RE.test(candidate.replace(/\\/g, "/"))) continue;
+    addPath(paths, seen, candidate);
+  }
+}
+
+/** Pull artifact file paths from bash/skill JSON stdout (`"output": "/abs/file.ext"`). */
+function extractJsonOutputArtifactPaths(content: string, paths: string[], seen: Set<string>): void {
+  JSON_OUTPUT_PATH_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = JSON_OUTPUT_PATH_RE.exec(content)) !== null) {
+    const candidate = normalizeArtifactPath(match[1] ?? "");
+    if (!candidate || !looksLikeArtifactFile(candidate)) continue;
+    addPath(paths, seen, candidate);
+  }
+}
+
+function resolvePublishedRelativePath(outputDir: string, relativePath: string): string {
+  const dir = outputDir.replace(/\\/g, "/").replace(/\/+$/, "");
+  let relative = relativePath.replace(/\\/g, "/").replace(/^\.?\//, "");
+  if (!dir || !relative) return "";
+  const dirBase = artifactBaseName(dir);
+  if (relative === dirBase || relative.startsWith(`${dirBase}/`)) {
+    const parent = dir.slice(0, Math.max(0, dir.length - dirBase.length)).replace(/\/+$/, "");
+    return `${parent}/${relative}`;
+  }
+  return `${dir}/${relative}`;
+}
+
+/** Join table file paths with a same-message output directory. */
+function extractTableFilesUnderSaveDirs(content: string, paths: string[], seen: Set<string>): void {
+  const dirs: string[] = [];
+  const dirSeen = new Set<string>();
+  LABELED_SAVE_PATH_RE.lastIndex = 0;
+  let labelMatch: RegExpExecArray | null;
+  while ((labelMatch = LABELED_SAVE_PATH_RE.exec(content)) !== null) {
+    const dir = normalizeArtifactPath(labelMatch[2] ?? "");
+    if (!dir || dirSeen.has(dir)) continue;
+    // Prefer directory-like labels; skip if it already looks like a concrete file.
+    if (/\.[a-zA-Z0-9]{1,12}$/.test(dir.split("/").pop() || "")) continue;
+    dirSeen.add(dir);
+    dirs.push(dir);
+  }
+  if (dirs.length === 0) return;
+
+  for (const line of String(content || "").split(/\r?\n/)) {
+    if (!line.includes("|")) continue;
+    TABLE_FILE_PATH_RE.lastIndex = 0;
+    const tokens: string[] = [];
+    let fileMatch: RegExpExecArray | null;
+    while ((fileMatch = TABLE_FILE_PATH_RE.exec(line)) !== null) {
+      const value = String(fileMatch[1] || "").trim();
+      if (value && !value.includes("..")) tokens.push(value);
+    }
+    if (tokens.length === 0) {
+      TABLE_BARE_FILENAME_RE.lastIndex = 0;
+      while ((fileMatch = TABLE_BARE_FILENAME_RE.exec(line)) !== null) {
+        const value = String(fileMatch[1] || "").trim();
+        if (value && !value.includes("..")) tokens.push(value);
+      }
+    }
+    let lineRelativeDir = "";
+    for (const token of tokens) {
+      let relative = token;
+      if (!relative.includes("/") && lineRelativeDir) {
+        relative = `${lineRelativeDir}/${relative}`;
+      } else if (relative.includes("/")) {
+        lineRelativeDir = relative.slice(0, relative.lastIndexOf("/"));
+      }
+      for (const dir of dirs) {
+        addPath(paths, seen, resolvePublishedRelativePath(dir, relative));
+      }
+    }
+  }
+}
+
+/** True when a write-tool result body indicates failure (not merely in-flight). */
+export function isFailedWriteResultText(text: string | undefined | null): boolean {
+  const body = String(text ?? "");
+  const trimmed = body.trimStart();
+  if (trimmed.startsWith("ERROR:")) return true;
+  if (body.includes("path escapes workspace")) return true;
+  return false;
+}
+
+/**
+ * True when a pane tool message must not contribute `toolArgs.path` as an artifact.
+ * Explicit failure only — `toolStatus` undefined (history / agent_messages) is not failure.
+ */
+export function isFailedWriteToolMessage(message: Message): boolean {
+  if (message.toolStatus === "error") return true;
+  if (isFailedWriteResultText(message.content)) return true;
+  if (isFailedWriteResultText(message.toolResultPreview)) return true;
+  return false;
+}
+
+/**
+ * Map persisted `agent_messages.json` rows into collector-friendly Message shapes.
+ * Agent rows use OpenAI-style `name` + optional assistant `tool_calls`, while the
+ * chat pane uses `toolName` / `toolArgs` — without this bridge, HTML writes that
+ * only landed in agent_messages never appear under WorkPanel「任务产物」.
+ */
+export function agentMessageRowsToCollectorMessages(rows: unknown[] | undefined | null): Message[] {
+  const out: Message[] = [];
+  if (!Array.isArray(rows)) return out;
+
+  // Pair assistant tool_calls with later role:tool results by tool_call_id.
+  const toolResultsById = new Map<string, string>();
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    if (String(r.role || "").trim() !== "tool") continue;
+    const callId = String(r.tool_call_id || "").trim();
+    if (!callId) continue;
+    toolResultsById.set(callId, String(r.content ?? ""));
+  }
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const role = String(r.role || "").trim();
+
+    if (role === "tool") {
+      out.push({
+        id: String(r.tool_call_id || r.id || `am-tool-${i}`),
+        role: "tool",
+        content: String(r.content ?? ""),
+        toolName: String(r.name || r.tool_name || "").trim() || undefined,
+        timestamp: 0,
+      });
+      continue;
+    }
+
+    if (role === "assistant") {
+      out.push({
+        id: String(r.id || `am-asst-${i}`),
+        role: "assistant",
+        content: String(r.content ?? ""),
+        timestamp: 0,
+      });
+      const toolCalls = r.tool_calls;
+      if (!Array.isArray(toolCalls)) continue;
+      for (let j = 0; j < toolCalls.length; j += 1) {
+        const tc = toolCalls[j];
+        if (!tc || typeof tc !== "object") continue;
+        const call = tc as Record<string, unknown>;
+        const fn = call.function;
+        if (!fn || typeof fn !== "object") continue;
+        const fnObj = fn as Record<string, unknown>;
+        const name = String(fnObj.name || "").trim();
+        if (name !== "file_write" && name !== "file_edit") continue;
+        let args: Record<string, unknown> = {};
+        const rawArgs = fnObj.arguments;
+        if (typeof rawArgs === "string" && rawArgs.trim()) {
+          try {
+            const parsed = JSON.parse(rawArgs) as unknown;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              args = parsed as Record<string, unknown>;
+            }
+          } catch {
+            /* ignore malformed tool args */
+          }
+        } else if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+          args = rawArgs as Record<string, unknown>;
+        }
+        // Only trust toolArgs.path when a matching tool result exists and succeeded.
+        // In-flight calls (no result yet) and denied writes must not become artifacts.
+        const callId = String(call.id || "").trim();
+        const resultContent = callId ? toolResultsById.get(callId) : undefined;
+        const nextArgs: Record<string, unknown> = { ...args };
+        const argPath = String(args.path ?? "").trim();
+        if (argPath) {
+          if (resultContent === undefined || isFailedWriteResultText(resultContent)) {
+            delete nextArgs.path;
+          }
+        }
+        out.push({
+          id: String(call.id || `am-tc-${i}-${j}`),
+          role: "tool",
+          toolName: name,
+          toolArgs: nextArgs,
+          content: "",
+          timestamp: 0,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** Collect artifact paths from raw `agent_messages.json` rows. */
+export function collectArtifactPathsFromAgentMessages(
+  rows: unknown[] | undefined | null,
+): string[] {
+  return collectSessionArtifactPaths(agentMessageRowsToCollectorMessages(rows));
+}
+
+/**
+ * Accept a raw `messages.json` / `agent_messages.json` payload (list or
+ * `{ messages | chat_history: [...] }` wrapper).
+ */
+export function parseSessionMessageFilePayload(parsed: unknown): unknown[] {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as Record<string, unknown>;
+    const inner = obj.messages ?? obj.chat_history;
+    if (Array.isArray(inner)) return inner;
+  }
+  return [];
+}
+
+function slimToolArgs(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const src = raw as Record<string, unknown>;
+  const next: Record<string, unknown> = {};
+  const path = String(src.path ?? "").trim();
+  if (path) next.path = path;
+  const command = String(src.command ?? "").trim();
+  if (command) next.command = command;
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/**
+ * Map persisted `messages.json` chat-history rows into collector-friendly
+ * Message shapes. Chat rows use snake_case `tool_name` / `tool_args` (not
+ * OpenAI `tool_calls`). Only `path` / `command` are copied from tool_args so
+ * huge `file_write` bodies stay out of the collector.
+ */
+export function chatHistoryRowsToCollectorMessages(rows: unknown[] | undefined | null): Message[] {
+  const out: Message[] = [];
+  if (!Array.isArray(rows)) return out;
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const role = String(r.role || "").trim();
+
+    if (role === "tool") {
+      const statusRaw = String(r.tool_status ?? r.toolStatus ?? "").trim();
+      out.push({
+        id: String(r.tool_call_id || r.id || `ch-tool-${i}`),
+        role: "tool",
+        content: String(r.content ?? ""),
+        toolName: String(r.tool_name || r.toolName || r.name || "").trim() || undefined,
+        toolArgs: slimToolArgs(r.tool_args ?? r.toolArgs),
+        toolStatus: statusRaw === "error" ? "error" : undefined,
+        toolResultPreview: String(r.tool_result_preview ?? r.toolResultPreview ?? ""),
+        timestamp: 0,
+      });
+      continue;
+    }
+
+    if (role === "assistant") {
+      out.push({
+        id: String(r.id || `ch-asst-${i}`),
+        role: "assistant",
+        content: String(r.content ?? ""),
+        timestamp: 0,
+      });
+    }
+  }
+  return out;
+}
+
+/** Collect artifact paths from raw `messages.json` chat-history rows. */
+export function collectArtifactPathsFromChatMessages(
+  rows: unknown[] | undefined | null,
+): string[] {
+  return collectSessionArtifactPaths(chatHistoryRowsToCollectorMessages(rows));
+}
+
+/**
+ * Union artifacts from full chat history + model-context tail.
+ * Needed because `agent_messages.json` is persisted as last 40 rows only.
+ */
+export function collectArtifactPathsFromPersistedSessionFiles(opts: {
+  chatHistoryRows?: unknown[] | null;
+  agentMessageRows?: unknown[] | null;
+}): string[] {
+  return collectSessionArtifactPaths([
+    ...chatHistoryRowsToCollectorMessages(opts.chatHistoryRows),
+    ...agentMessageRowsToCollectorMessages(opts.agentMessageRows),
+  ]);
+}
+
+/** Extract artifact absolute paths from pane messages + sub-agent outputs. */
+export function collectSessionArtifactPaths(
+  messages: Message[] | undefined | null,
+  subAgents?: SubAgent[] | undefined | null,
+  extraPaths?: string[] | undefined | null,
+  ownerSessionId?: string | null,
+): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const sid = String(ownerSessionId || "").trim();
+
+  for (const message of messages ?? []) {
+    if (sid && message.ownerSessionId && message.ownerSessionId !== sid) continue;
+    const role = message.role;
+
+    if (role === "tool") {
+      const toolName = String(message.toolName || "").trim();
+      if (toolName === "file_write" || toolName === "file_edit") {
+        // Denied / failed writes must not become auto-mount inputs (privilege escalation).
+        if (!isFailedWriteToolMessage(message)) {
+          const argPath = String(message.toolArgs?.path ?? "").trim();
+          if (argPath) addPath(paths, seen, argPath);
+          extractAbsArtifactPathsFromText(String(message.content || ""), paths, seen);
+          extractAbsArtifactPathsFromText(String(message.toolResultPreview || ""), paths, seen);
+        }
+        extractOkWritePaths(String(message.content || ""), paths, seen);
+        extractOkWritePaths(String(message.toolResultPreview || ""), paths, seen);
+      } else if (toolName === "bash_exec") {
+        // A denied/failed command never produced its redirect target.
+        if (!isFailedWriteToolMessage(message)) {
+          const command = String(message.toolArgs?.command ?? "").trim();
+          if (command) extractBashRedirectPaths(command, paths, seen);
+          extractJsonOutputArtifactPaths(String(message.content || ""), paths, seen);
+          extractJsonOutputArtifactPaths(String(message.toolResultPreview || ""), paths, seen);
+          extractAbsArtifactPathsFromText(String(message.content || ""), paths, seen);
+          extractAbsArtifactPathsFromText(String(message.toolResultPreview || ""), paths, seen);
+        }
+      } else if (toolName === "wb_bridge_send" || toolName === "wb_bridge_describe") {
+        extractWbBridgeWrittenPaths(String(message.content || ""), paths, seen);
+        extractWbBridgeWrittenPaths(String(message.toolResultPreview || ""), paths, seen);
+        extractAbsArtifactPathsFromText(String(message.content || ""), paths, seen);
+        extractAbsArtifactPathsFromText(String(message.toolResultPreview || ""), paths, seen);
+      } else {
+        // Formatted tool rows may still embed OK: wrote even if toolName was lost.
+        extractOkWritePaths(String(message.content || ""), paths, seen);
+        extractJsonOutputArtifactPaths(String(message.content || ""), paths, seen);
+        extractJsonOutputArtifactPaths(String(message.toolResultPreview || ""), paths, seen);
+      }
+      continue;
+    }
+
+    if (role === "assistant") {
+      const body = String(message.content || "");
+      extractLabeledSavePaths(body, paths, seen);
+      extractNearbyLabeledSavePaths(body, paths, seen);
+      extractOkWritePaths(body, paths, seen);
+      extractTableFilesUnderSaveDirs(body, paths, seen);
+    }
+  }
+
+  for (const agent of subAgents ?? []) {
+    if (agent.resultFile) addPath(paths, seen, agent.resultFile);
+    for (const file of agent.outputFiles ?? []) addPath(paths, seen, file);
+  }
+
+  for (const extra of extraPaths ?? []) addPath(paths, seen, extra);
+
+  return paths;
+}
+
+/**
+ * Prefer files explicitly handed off in assistant reports over implementation
+ * helpers discovered by the workspace fallback scanner.
+ */
+export function selectSessionDeliverablePaths(
+  messages: Message[] | undefined | null,
+  candidatePaths: string[],
+): string[] {
+  const published: string[] = [];
+  const publishedSeen = new Set<string>();
+  for (const message of messages ?? []) {
+    if (message.role !== "assistant") continue;
+    const body = String(message.content || "");
+    if (!EXPLICIT_ARTIFACT_MANIFEST_RE.test(body)) continue;
+    extractLabeledSavePaths(body, published, publishedSeen);
+    extractNearbyLabeledSavePaths(body, published, publishedSeen);
+    extractTableFilesUnderSaveDirs(body, published, publishedSeen);
+  }
+  if (published.length > 0) return published;
+
+  const fallback: string[] = [];
+  const fallbackSeen = new Set<string>();
+  for (const path of candidatePaths) addPath(fallback, fallbackSeen, path);
+  return fallback;
+}
+
+export function isPreviewImageArtifactPath(path: string): boolean {
+  const base = artifactBaseName(path).toLowerCase();
+  const ext = base.match(/\.([a-z0-9]{1,12})$/)?.[1] ?? "";
+  return Object.prototype.hasOwnProperty.call(PREVIEW_IMAGE_RANK, ext);
+}
+
+function previewImageRank(path: string): number {
+  const base = artifactBaseName(path).toLowerCase();
+  const ext = base.match(/\.([a-z0-9]{1,12})$/)?.[1] ?? "";
+  return PREVIEW_IMAGE_RANK[ext] ?? 99;
+}
+
+/**
+ * Same-stem PNG/GIF/SVG → keep the most useful preview (animated GIF first).
+ * Non-image paths are dropped.
+ */
+export function preferAnimatedPreviewImages(paths: string[]): string[] {
+  const groups = new Map<string, string[]>();
+  const order: string[] = [];
+  for (const raw of paths) {
+    const path = String(raw || "").trim();
+    if (!path || !isPreviewImageArtifactPath(path)) continue;
+    const normalized = path.replace(/\\/g, "/");
+    const base = artifactBaseName(normalized);
+    const stem = base.replace(/\.[a-zA-Z0-9]{1,12}$/, "");
+    const dir = normalized.slice(0, Math.max(0, normalized.length - base.length));
+    const key = `${dir}${stem}`;
+    const bucket = groups.get(key);
+    if (!bucket) {
+      groups.set(key, [path]);
+      order.push(key);
+    } else {
+      bucket.push(path);
+    }
+  }
+  return order.map((key) => {
+    const files = groups.get(key) ?? [];
+    files.sort((a, b) => previewImageRank(a) - previewImageRank(b));
+    return files[0] ?? "";
+  }).filter(Boolean);
+}
+
+/** Inject `![name](path)` for generated images not already present in markdown. */
+export function appendMissingImageMarkdown(content: string, imagePaths: string[]): string {
+  const body = String(content || "");
+  const missing = imagePaths.filter((raw) => {
+    const path = String(raw || "").trim();
+    if (!path) return false;
+    return !body.includes(`](${path})`);
+  });
+  if (missing.length === 0) return body;
+  const block = missing.map((path) => `![${artifactBaseName(path)}](${path})`).join("\n\n");
+  return `${body.replace(/\s+$/, "")}\n\n${block}`;
+}
+
+/** Image previews produced in the same user turn as this assistant message. */
+export function collectTurnPreviewImagePaths(
+  messages: Message[] | undefined | null,
+  assistantMessageId: string,
+): string[] {
+  const list = messages ?? [];
+  const idx = list.findIndex((row) => row.id === assistantMessageId);
+  if (idx < 0) return [];
+  // Only the last assistant in the turn should embed the gallery (avoid duplicates).
+  for (let i = idx + 1; i < list.length; i += 1) {
+    if (list[i]?.role === "user") break;
+    if (list[i]?.role === "assistant") return [];
+  }
+  let start = 0;
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    if (list[i]?.role === "user") {
+      start = i + 1;
+      break;
+    }
+  }
+  return preferAnimatedPreviewImages(collectSessionArtifactPaths(list.slice(start, idx + 1)));
+}
+
+/** Lowercase file extension without the dot (`html`, `py`). Empty when none. */
+export function artifactExt(path: string): string {
+  const base = artifactBaseName(path).toLowerCase();
+  return base.match(/\.([a-z0-9]{1,12})$/)?.[1] ?? "";
+}
+
+const PRIMARY_ARTIFACT_RANK: Record<string, number> = {
+  html: 0,
+  htm: 0,
+  pdf: 1,
+  docx: 2,
+  doc: 2,
+  xlsx: 3,
+  xls: 3,
+  csv: 3,
+  pptx: 4,
+  ppt: 4,
+  md: 5,
+  markdown: 5,
+  txt: 6,
+  png: 8,
+  jpg: 8,
+  jpeg: 8,
+  gif: 8,
+  webp: 8,
+  svg: 8,
+  bmp: 8,
+};
+
+const PRIMARY_ARTIFACT_EXCLUDE = new Set([
+  "py",
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "json",
+  "yaml",
+  "yml",
+  "toml",
+  "lock",
+  "log",
+  "sh",
+  "bash",
+  "zsh",
+  "fish",
+]);
+
+function turnWindowForAssistant(
+  messages: Message[] | undefined | null,
+  assistantMessageId: string,
+): Message[] | null {
+  const list = messages ?? [];
+  const idx = list.findIndex((row) => row.id === assistantMessageId);
+  if (idx < 0) return null;
+  // Only the last assistant in the turn owns the card / auto-open (avoid duplicates).
+  for (let i = idx + 1; i < list.length; i += 1) {
+    if (list[i]?.role === "user") break;
+    if (list[i]?.role === "assistant") return [];
+  }
+  let start = 0;
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    if (list[i]?.role === "user") {
+      start = i + 1;
+      break;
+    }
+  }
+  return list.slice(start, idx + 1);
+}
+
+/** Deliverable files produced in the same user turn as this assistant message. */
+export function collectTurnArtifactPaths(
+  messages: Message[] | undefined | null,
+  assistantMessageId: string,
+): string[] {
+  const turnMsgs = turnWindowForAssistant(messages, assistantMessageId);
+  if (!turnMsgs || turnMsgs.length === 0) return [];
+  return selectSessionDeliverablePaths(turnMsgs, collectSessionArtifactPaths(turnMsgs));
+}
+
+export type ArtifactChangeRow = {
+  path: string;
+  added: number;
+  removed: number;
+};
+
+function countArtifactLines(text: string): number {
+  const body = String(text || "").replace(/\r\n/g, "\n");
+  if (!body) return 0;
+  const parts = body.split("\n");
+  if (parts.length > 0 && parts[parts.length - 1] === "") return parts.length - 1;
+  return parts.length;
+}
+
+export function firstWritePathFromToolMessage(message: Message): string | null {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  extractOkWritePaths(String(message.content || ""), paths, seen);
+  extractOkWritePaths(String(message.toolResultPreview || ""), paths, seen);
+  extractAbsArtifactPathsFromText(String(message.content || ""), paths, seen);
+  extractAbsArtifactPathsFromText(String(message.toolResultPreview || ""), paths, seen);
+  const argPath = String(message.toolArgs?.path ?? "").trim();
+  if (argPath) addPath(paths, seen, argPath);
+  return paths[0] ?? null;
+}
+
+/** file_write / file_edit rows as a change list (session-wide). */
+export function collectSessionFileChanges(
+  messages: Message[] | undefined | null,
+): ArtifactChangeRow[] {
+  const byPath = new Map<string, ArtifactChangeRow>();
+  for (const message of messages ?? []) {
+    if (message.role !== "tool") continue;
+    const toolName = String(message.toolName || "").trim();
+    if (toolName !== "file_write" && toolName !== "file_edit") continue;
+    if (isFailedWriteToolMessage(message)) continue;
+    const path = firstWritePathFromToolMessage(message);
+    if (!path) continue;
+    const args = message.toolArgs ?? {};
+    let added = 0;
+    let removed = 0;
+    if (toolName === "file_write") {
+      added = countArtifactLines(String(args.content ?? ""));
+    } else {
+      const oldLines = countArtifactLines(String(args.old_string ?? args.oldString ?? ""));
+      const newLines = countArtifactLines(String(args.new_string ?? args.newString ?? args.content ?? ""));
+      added = Math.max(0, newLines - oldLines);
+      removed = Math.max(0, oldLines - newLines);
+    }
+    const prev = byPath.get(path);
+    if (prev) {
+      byPath.set(path, {
+        path,
+        added: prev.added + added,
+        removed: prev.removed + removed,
+      });
+    } else {
+      byPath.set(path, { path, added, removed });
+    }
+  }
+  return [...byPath.values()];
+}
+
+/** Same window as collectTurnArtifactPaths. */
+export function collectTurnFileChanges(
+  messages: Message[] | undefined | null,
+  assistantMessageId: string,
+): ArtifactChangeRow[] {
+  const turnMsgs = turnWindowForAssistant(messages, assistantMessageId);
+  if (!turnMsgs || turnMsgs.length === 0) return [];
+  return collectSessionFileChanges(turnMsgs);
+}
+
+export function pickPrimaryTurnArtifact(paths: string[]): string | null {
+  let best: string | null = null;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const raw of paths) {
+    const path = String(raw || "").trim();
+    if (!path) continue;
+    const ext = artifactExt(path);
+    if (!ext || PRIMARY_ARTIFACT_EXCLUDE.has(ext)) continue;
+    const rank = PRIMARY_ARTIFACT_RANK[ext] ?? 50;
+    if (rank < bestRank) {
+      best = path;
+      bestRank = rank;
+    }
+  }
+  return best;
+}
+
+/** Primary artifact first; remaining paths keep collection order. */
+export function orderTurnArtifactsForCard(paths: string[]): string[] {
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    const path = String(raw || "").trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    unique.push(path);
+  }
+  const primary = pickPrimaryTurnArtifact(unique);
+  if (!primary) return unique;
+  return [primary, ...unique.filter((path) => path !== primary)];
+}
+
+export function artifactBaseName(path: string): string {
+  const normalized = String(path || "").replace(/\\/g, "/");
+  const trimmed = normalized.replace(/\/+$/, "");
+  const idx = trimmed.lastIndexOf("/");
+  return idx >= 0 ? trimmed.slice(idx + 1) || trimmed : trimmed;
+}
+
+export function normalizeArtifactPathKey(path: string): string {
+  return String(path || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+/** True when `path` is the same deliverable already shown on the turn handoff chip. */
+export function matchesHandoffPath(path: string, handoffPaths?: string[] | null): boolean {
+  const key = normalizeArtifactPathKey(path);
+  if (!key || !handoffPaths?.length) return false;
+  return handoffPaths.some((candidate) => normalizeArtifactPathKey(candidate) === key);
+}
+
+/** True when `path` is a parent directory of a turn handoff file. */
+export function matchesHandoffAncestor(path: string, handoffPaths?: string[] | null): boolean {
+  const key = normalizeArtifactPathKey(path);
+  if (!key || !handoffPaths?.length) return false;
+  return handoffPaths.some((candidate) => {
+    const child = normalizeArtifactPathKey(candidate);
+    return child === key || child.startsWith(`${key}/`);
+  });
+}
+
+/**
+ * Session default / extra taskspace: `~/.agenticx/taskspaces/<sid>/<name>[/rel]`.
+ * The session UUID is never useful in chat copy.
+ */
+const TASKSPACE_CHAT_PATH_RE =
+  /(?:^|\/)\.agenticx\/taskspaces\/[^/]+\/([^/]+)(?:\/(.*))?$/;
+
+function displayTaskspaceChatPath(normalized: string): string | null {
+  const homeRel = artifactHomeRelativeKey(normalized) ?? normalized;
+  const match = homeRel.match(TASKSPACE_CHAT_PATH_RE);
+  if (!match) return null;
+  const space = String(match[1] || "").trim();
+  const rel = String(match[2] || "").replace(/\/+$/, "");
+  if (!space) return null;
+  if (space === "default" && !rel) return "当前工作区";
+  if (space === "default") return rel;
+  return rel ? `${space}/${rel}` : space;
+}
+
+/**
+ * Chat-visible label for an inline local path. Collapses handoff files to the
+ * basename and never dumps `~/.agenticx/taskspaces/<uuid>/…`.
+ * Returns null when the original markdown children should stay as-is.
+ */
+export function displayChatLocalPath(
+  path: string,
+  handoffPaths?: string[] | null,
+): string | null {
+  const key = normalizeArtifactPathKey(path);
+  if (!key) return null;
+  if (matchesHandoffPath(path, handoffPaths)) {
+    return artifactBaseName(key);
+  }
+  const taskspaceLabel = displayTaskspaceChatPath(key);
+  if (taskspaceLabel != null) return taskspaceLabel;
+  if (matchesHandoffAncestor(key, handoffPaths)) {
+    const base = artifactBaseName(key);
+    return looksLikeDirectoryPath(path) ? `${base}/` : base;
+  }
+  return null;
+}
+
+/** True when path looks like a directory (trailing slash or no file extension segment). */
+export function looksLikeDirectoryPath(path: string): boolean {
+  const value = String(path || "").trim().replace(/\\/g, "/");
+  if (!value) return false;
+  if (value.endsWith("/")) return true;
+  const base = artifactBaseName(value);
+  if (!base || base === "." || base === "..") return true;
+  // Has a short extension → likely a file; otherwise treat as directory candidate.
+  return !/\.[a-zA-Z0-9]{1,12}$/.test(base);
+}
+
+/** HTML reports preview inside WorkPanel browser tab (Trae-style), not system Chrome. */
+export function isInAppHtmlPreviewPath(path: string): boolean {
+  const lower = String(path || "").trim().toLowerCase().replace(/\\/g, "/");
+  const base = lower.split("/").pop() || lower;
+  return base.endsWith(".html") || base.endsWith(".htm");
+}
+
+/**
+ * Files that should open with Near in-app preview (WorkspaceFilePreview), not the OS
+ * default app. HTML is handled separately via the WorkPanel browser tab.
+ */
+export function isInAppArtifactPreviewPath(path: string): boolean {
+  if (!path || looksLikeDirectoryPath(path)) return false;
+  if (isInAppHtmlPreviewPath(path)) return false;
+  const base = artifactBaseName(path).toLowerCase();
+  // Concrete file with a short extension → attempt WorkspaceFilePreview (PDF/Office/image/text…).
+  return /\.[a-z0-9]{1,12}$/.test(base);
+}
+
+/** Convert an absolute filesystem path to a file:// URL for the browser address bar. */
+export function pathToFileUrl(absPath: string): string {
+  const normalized = String(absPath || "").trim().replace(/\\/g, "/");
+  if (!normalized) return "about:blank";
+  if (normalized.startsWith("file://")) return normalized;
+  // encodeURI keeps path separators; encode # which would otherwise truncate the URL.
+  const encoded = encodeURI(normalized).replace(/#/g, "%23");
+  if (/^[a-zA-Z]:\//.test(normalized)) return `file:///${encoded}`;
+  if (normalized.startsWith("/")) return `file://${encoded}`;
+  return `file://${encoded}`;
+}

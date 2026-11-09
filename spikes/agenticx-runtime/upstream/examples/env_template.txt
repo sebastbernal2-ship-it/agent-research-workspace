@@ -1,0 +1,56 @@
+# --- DeepSeek ---
+DEEPSEEK_API_KEY=
+DEEPSEEK_API_BASE=https://api.deepseek.com
+
+# --- OpenAI ---
+OPENAI_API_KEY=
+OPENAI_API_BASE=https://api.gptsapi.net/v1
+
+# --- Anthropic ---
+ANTHROPIC_API_KEY=
+ANTHROPIC_API_BASE=
+
+# --- Google Gemini ---
+GOOGLE_API_KEY=
+GOOGLE_API_BASE=
+
+# --- Kimi (Moonshot AI) ---
+KIMI_API_KEY=your_kimi_api_key_here
+KIMI_API_BASE=https://api.moonshot.cn/v1
+KIMI_MODEL_NAME=kimi-k2-0711-preview
+
+# --- SiliconFlow Embedding ---
+SILICONFLOW_API_KEY=your_siliconflow_api_key_here
+SILICONFLOW_API_BASE=https://api.siliconflow.cn/v1/embeddings
+SILICONFLOW_DEFAULT_MODEL=BAAI/bge-large-zh-v1.5
+
+# --- Bailian/Dashscope (阿里云百炼) ---
+# 百炼API密钥 - 用于LLM和多模态模型（推荐使用此变量名）
+BAILIAN_API_KEY=your_bailian_api_key_here
+
+# Dashscope API密钥 - 向后兼容（如果没有设置BAILIAN_API_KEY会使用此变量）
+DASHSCOPE_API_KEY=your_dashscope_api_key_here
+
+# 百炼LLM API基础URL
+BAILIAN_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# 百炼嵌入模型配置
+BAILIAN_EMBEDDING_API_BASE=https://api.bailian.aliyun.com/v1/embeddings
+BAILIAN_DEFAULT_MODEL=bge-large-zh-v1.5
+
+# 百炼多模态模型推荐配置
+# BAILIAN_VLM_MODEL=qwen-vl-plus  # 多模态模型
+# BAILIAN_TEXT_MODEL=qwen-turbo   # 纯文本模型
+
+# --- 其他 LLM 提供商 ---
+# AZURE_API_KEY=
+# AZURE_API_BASE=
+
+# COHERE_API_KEY=
+# COHERE_API_BASE=
+
+# HUGGINGFACE_API_KEY=
+# HUGGINGFACE_API_BASE=
+
+# --- 网络搜索引擎提供商 ---
+BOCHA_API_KEY=

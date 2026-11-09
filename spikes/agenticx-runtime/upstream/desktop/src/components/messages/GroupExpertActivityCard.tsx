@@ -1,0 +1,190 @@
+/**
+ * Live group expert activity card. Not a chat Message.
+ * Author: Damon Li
+ */
+import { useState } from "react";
+import { AlertCircle, ChevronDown, ChevronRight } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import {
+  formatActivityElapsed,
+  formatGroupToolLabel,
+  stripTrailingStatusEllipsis,
+  type GroupExpertActivity,
+} from "../../utils/group-expert-activity";
+import "../../i18n/i18n";
+import { HoverTip } from "../ds/HoverTip";
+import { Shimmer } from "../ds/Shimmer";
+import { GROUP_SENDER_NAME_CLASS, GROUP_STANDALONE_RAIL_ROW_CLASS } from "./im-layout";
+import { ChatImAvatar } from "./ImBubble";
+
+type Props = {
+  activity: GroupExpertActivity;
+  now: number;
+  /** Test hook so static markup can assert the expanded tool list. */
+  defaultExpanded?: boolean;
+  onResolveConfirm?: (approved: boolean) => void;
+};
+
+function WorkingEllipsis() {
+  return (
+    <span className="agx-working-ellipsis text-text-faint" aria-hidden="true">
+      <span>.</span>
+      <span>.</span>
+      <span>.</span>
+    </span>
+  );
+}
+
+function toolStepLabel(toolName: string, fallback: string): string {
+  return formatGroupToolLabel(toolName) || fallback;
+}
+
+export function GroupExpertActivityCard({
+  activity,
+  now,
+  defaultExpanded = false,
+  onResolveConfirm,
+}: Props) {
+  const { t } = useTranslation("chat");
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const elapsed = formatActivityElapsed(activity.startedAt, now);
+  const waiting = activity.phase === "waiting";
+  const pendingConfirm = waiting ? activity.pendingConfirm : undefined;
+  const hasSteps = activity.toolSteps.length > 0;
+  const summaryText = waiting
+    ? activity.summary
+    : stripTrailingStatusEllipsis(activity.summary);
+
+  const resolveConfirm = (approved: boolean) => {
+    if (!pendingConfirm || confirmBusy || !onResolveConfirm) return;
+    setConfirmBusy(true);
+    onResolveConfirm(approved);
+  };
+
+  return (
+    <div
+      className={`agx-group-expert-activity mb-2 max-w-[520px] ${GROUP_STANDALONE_RAIL_ROW_CLASS}`}
+      data-agent-id={activity.agentId}
+      data-phase={activity.phase}
+    >
+      <ChatImAvatar
+        label={activity.avatarName}
+        imageUrl={activity.avatarUrl}
+        variant="circle"
+        avatarId={activity.agentId}
+        size="sm"
+      />
+      <div className="min-w-0 w-fit max-w-full">
+        <div className={GROUP_SENDER_NAME_CLASS}>{activity.avatarName}</div>
+        <div className="agx-group-activity-status mt-1 flex w-fit max-w-full flex-wrap items-center gap-1.5">
+          {waiting ? (
+            <p className="min-w-0 text-[13px] leading-snug text-text-muted">{summaryText}</p>
+          ) : (
+            <span className="inline-flex min-w-0 items-baseline text-[13px] leading-snug">
+              <Shimmer
+                variant="status"
+                text={summaryText}
+                className="min-w-0 text-[13px] leading-snug"
+              />
+              <WorkingEllipsis />
+            </span>
+          )}
+          {waiting ? (
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+          ) : null}
+          {waiting ? (
+            <span className="shrink-0 text-[11px] tabular-nums text-text-faint">{elapsed}</span>
+          ) : (
+            <Shimmer
+              variant="status"
+              text={elapsed}
+              className="shrink-0 text-[11px] tabular-nums"
+            />
+          )}
+          {hasSteps ? (
+            <HoverTip label={t("groupActivity.viewRecentSteps")}>
+              <button
+                type="button"
+                className="inline-flex h-5 w-5 items-center justify-center rounded text-text-faint hover:bg-surface-hover hover:text-text-strong"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((prev) => !prev)}
+              >
+                {expanded ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+              </button>
+            </HoverTip>
+          ) : null}
+        </div>
+        {expanded && hasSteps ? (
+          <ul className="mt-2 space-y-2 border-t border-border/40 pt-2">
+            {activity.toolSteps.map((step) => {
+              const label = toolStepLabel(step.toolName, t("tool.tool"));
+              const running = step.phase !== "done";
+              const waitingStep = running && waiting;
+              const status = waitingStep
+                ? t("groupActivity.statusWaiting")
+                : running
+                  ? t("groupActivity.statusRunning")
+                  : t("groupActivity.statusDone");
+              const title = `${label} · ${status}`;
+              return (
+                <li key={step.callId} className="min-w-0 text-[11px] leading-snug text-text-muted">
+                  {running && !waitingStep ? (
+                    <Shimmer variant="status" text={title} className="text-[11px]" />
+                  ) : (
+                    <div className="text-text-muted">{title}</div>
+                  )}
+                  {step.detail ? (
+                    running && !waitingStep ? (
+                      <Shimmer
+                        variant="status"
+                        text={step.detail}
+                        className="mt-0.5 block text-[11px]"
+                      />
+                    ) : (
+                      <div className="mt-0.5 break-all text-text-faint">{step.detail}</div>
+                    )
+                  ) : null}
+                  {step.output ? (
+                    <div className="mt-0.5 break-all text-text-faint">{step.output}</div>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
+        {pendingConfirm ? (
+          <div className="mt-2 border-t border-border/40 pt-2">
+            <p className="break-all text-[11px] leading-snug text-text-muted">
+              {pendingConfirm.question}
+            </p>
+            {onResolveConfirm ? (
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  className="rounded-md bg-[var(--ui-btn-primary-bg)] px-2.5 py-1 text-[11px] font-medium text-[var(--ui-btn-primary-text)] hover:opacity-90 disabled:opacity-50"
+                  disabled={confirmBusy}
+                  onClick={() => resolveConfirm(true)}
+                >
+                  {t("groupActivity.approve")}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-md border border-border bg-surface-hover px-2.5 py-1 text-[11px] text-text-strong hover:opacity-90 disabled:opacity-50"
+                  disabled={confirmBusy}
+                  onClick={() => resolveConfirm(false)}
+                >
+                  {t("groupActivity.reject")}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}

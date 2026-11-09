@@ -1,0 +1,78 @@
+name: Type check
+# see: https://help.github.com/en/actions/reference/events-that-trigger-workflows
+on: # Trigger the workflow on pull request or merge
+  schedule:
+    - cron: "0 0 * * *" # daily at midnight UTC
+  workflow_dispatch: # allows manual triggering of the workflow
+  # pull_request:
+  # push:
+  #   branches:
+  #     - main
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref }}
+  cancel-in-progress: true
+permissions: {}
+
+jobs:
+  type-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        optional-dependencies:
+          - "none"
+          # LLMs
+          - "openai"
+          - "gemini"
+          - "anthropic"
+          - "deepseek"
+          # optional dependencies
+          - "browser-use"
+          - "commsagent-discord"
+          - "commsagent-slack"
+          - "commsagent-telegram"
+          - "jupyter-executor"
+          - "retrievechat"
+          - "retrievechat-pgvector"
+          - "retrievechat-mongodb"
+          - "retrievechat-qdrant"
+          - "graph-rag-falkor-db"
+          - "neo4j"
+          - "interop"
+          - "crawl4ai"
+          - "docs"
+          - "interop-langchain"
+          - "interop-pydantic-ai"
+          - "mcp"
+          - "websockets"
+        exclude:
+          # Issues with installing retrievechat-qdrant in python 3.14
+          - python-version: "3.14"
+            optional-dependencies: "retrievechat-qdrant"
+          # Browser use doesn't support below python 3.11
+          - python-version: "3.10"
+            optional-dependencies: "browser-use"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "latest"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      # All additional modules should be defined in pyproject.toml
+      - run: uv pip install --system --group types .
+        if: matrix.optional-dependencies == 'none'
+      - run: uv pip install --system --group types ".[${{ matrix.optional-dependencies }}]"
+        if: matrix.optional-dependencies != 'none'
+      # Any additional configuration should be defined in pyproject.toml
+      - run: |
+          mypy

@@ -1,0 +1,535 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Loader2, MoreHorizontal, Plus, Sparkles, Star } from "lucide-react";
+import { MainViewShell } from "../ds/MainViewShell";
+import { useAppStore } from "../../store";
+import {
+  avatarBgClass,
+  avatarFgClass,
+  resolveAvatarPaletteKey,
+} from "../../utils/avatar-color";
+import { AvatarCreateDialog } from "../AvatarCreateDialog";
+import { AvatarSettingsPanel } from "../AvatarSettingsPanel";
+import { usePaneNavigation } from "../../hooks/usePaneNavigation";
+import { ThemedAvatarImage } from "../ds/ThemedAvatarImage";
+import { collectionPortraitCreateFields, CUBE_PORTRAIT_STYLE } from "../../utils/expert-portrait";
+import { ExpertPortraitStyleControl } from "./ExpertPortraitStyleControl";
+import { mapAvatarsFromApi } from "../../utils/splash-preload-core";
+import { useDisplayedMetaAvatarUrl } from "../../hooks/useDisplayedMetaAvatarUrl";
+import { META_AGENT_DISPLAY_NAME } from "../../constants/branding";
+import { UserCubeColorwayPicker } from "../settings/UserCubeColorwayPicker";
+import { EmptyStateHeaderFigures } from "../brand/EmptyStateCornerLotties";
+
+function avatarInitials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return name.slice(0, 2).toUpperCase();
+}
+
+type CardMenuState = { avatarId: string; x: number; y: number } | null;
+
+/** Gallery cards: idle / focus / selected borders follow --theme-color-rgb. */
+const GALLERY_CARD_BASE =
+  "group relative flex cursor-pointer flex-col rounded-xl border bg-surface-card p-4 transition-all outline-none hover:bg-surface-card-strong";
+const GALLERY_CARD_IDLE =
+  "border-border hover:border-[rgba(var(--theme-color-rgb,59,130,246),0.35)] focus-visible:border-[rgba(var(--theme-color-rgb,59,130,246),0.5)] focus-visible:ring-1 focus-visible:ring-[rgba(var(--theme-color-rgb,59,130,246),0.22)]";
+const GALLERY_CARD_SELECTED =
+  "border-[rgba(var(--theme-color-rgb,59,130,246),0.5)] bg-surface-card-strong ring-1 ring-[rgba(var(--theme-color-rgb,59,130,246),0.22)]";
+
+const GALLERY_CREATE_BASE =
+  "flex min-h-[168px] flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed text-text-faint outline-none transition";
+const GALLERY_CREATE_IDLE =
+  "border-border hover:border-[rgba(var(--theme-color-rgb,59,130,246),0.35)] hover:text-[rgb(var(--theme-color-rgb,59,130,246))] focus-visible:border-[rgba(var(--theme-color-rgb,59,130,246),0.5)] focus-visible:text-[rgb(var(--theme-color-rgb,59,130,246))] focus-visible:ring-1 focus-visible:ring-[rgba(var(--theme-color-rgb,59,130,246),0.22)]";
+const GALLERY_CREATE_ACTIVE =
+  "border-[rgba(var(--theme-color-rgb,59,130,246),0.5)] text-[rgb(var(--theme-color-rgb,59,130,246))] ring-1 ring-[rgba(var(--theme-color-rgb,59,130,246),0.22)]";
+
+export function AvatarGalleryView() {
+  const { t } = useTranslation("sidebar");
+  const { t: tCommon } = useTranslation("common");
+  const avatars = useAppStore((s) => s.avatars);
+  const setAvatars = useAppStore((s) => s.setAvatars);
+  const panes = useAppStore((s) => s.panes);
+  const corePreloadAttempted = useAppStore((s) => s.corePreloadAttempted);
+  const removePane = useAppStore((s) => s.removePane);
+  const activeAvatarId = useAppStore((s) => s.activeAvatarId);
+  const setActiveAvatarId = useAppStore((s) => s.setActiveAvatarId);
+
+  const { openMetaOrAvatarPane, newMetaTask } = usePaneNavigation();
+  const nearAvatarUrl = useDisplayedMetaAvatarUrl();
+  const collectionPortraitStyle = useAppStore((s) => s.collectionPortraitStyle);
+  const userCubeColorwayId = useAppStore((s) => s.userCubeColorwayId);
+  const setUserCubeColorwayId = useAppStore((s) => s.setUserCubeColorwayId);
+  const openSettings = useAppStore((s) => s.openSettings);
+  const [nearSettingsOpen, setNearSettingsOpen] = useState(false);
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [settingsAvatarId, setSettingsAvatarId] = useState<string | null>(null);
+  const [cardMenu, setCardMenu] = useState<CardMenuState>(null);
+  const cardMenuRef = useRef<HTMLDivElement>(null);
+
+  const avatarsLoaded = corePreloadAttempted || avatars.length > 0;
+
+  const sortedAvatars = useMemo(() => {
+    return [...avatars].sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  }, [avatars]);
+
+  const refreshAvatars = async () => {
+    window.dispatchEvent(
+      new CustomEvent("agenticx:avatars:changed", { detail: { openPane: false } })
+    );
+  };
+
+  useEffect(() => {
+    if (!cardMenu) return;
+    const dismiss = (e: MouseEvent) => {
+      if (cardMenuRef.current && !cardMenuRef.current.contains(e.target as Node)) {
+        setCardMenu(null);
+      }
+    };
+    const dismissByEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setCardMenu(null);
+    };
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", dismissByEsc);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", dismissByEsc);
+    };
+  }, [cardMenu]);
+
+  const handleCreate = async (data: {
+    name: string;
+    role: string;
+    systemPrompt: string;
+    blurb?: string;
+    tags?: string[];
+    toolsEnabled: Record<string, boolean>;
+    skillsEnabled?: Record<string, boolean>;
+    defaultProvider?: string;
+    defaultModel?: string;
+    workspaceDir?: string;
+  }) => {
+    const se = data.skillsEnabled;
+    const falses =
+      se && typeof se === "object"
+        ? Object.fromEntries(Object.entries(se).filter(([, v]) => v === false))
+        : {};
+    const skillsPayload = Object.keys(falses).length > 0 ? falses : undefined;
+    const dp = (data.defaultProvider || "").trim();
+    const dm = (data.defaultModel || "").trim();
+    const ws = (data.workspaceDir || "").trim();
+    const blurb = (data.blurb || "").trim();
+    const tags = (data.tags || []).filter(Boolean);
+    await window.agenticxDesktop.createAvatar({
+      name: data.name,
+      role: data.role,
+      system_prompt: data.systemPrompt,
+      tools_enabled: data.toolsEnabled,
+      ...(skillsPayload !== undefined ? { skills_enabled: skillsPayload } : {}),
+      ...(dp ? { default_provider: dp } : {}),
+      ...(dm ? { default_model: dm } : {}),
+      ...(ws ? { workspace_dir: ws } : {}),
+      ...(blurb ? { description: blurb } : {}),
+      ...(tags.length > 0 ? { tags } : {}),
+      ...collectionPortraitCreateFields(data.name),
+    });
+    await refreshAvatars();
+  };
+
+  const handleCreateViaChat = (description: string) => {
+    newMetaTask(t("gallery.createDraft", { description }));
+  };
+
+  const handlePinToggle = async (avatarId: string) => {
+    setCardMenu(null);
+    const avatar = avatars.find((a) => a.id === avatarId);
+    if (!avatar) return;
+    await window.agenticxDesktop.updateAvatar({ id: avatarId, pinned: !avatar.pinned });
+    await refreshAvatars();
+  };
+
+  const handleDelete = async (avatarId: string) => {
+    setCardMenu(null);
+    const avatar = avatars.find((a) => a.id === avatarId);
+    if (!avatar) return;
+    const api = window.agenticxDesktop;
+    const confirmResult =
+      typeof api.confirmDialog === "function"
+        ? await api.confirmDialog({
+            title: t("gallery.deleteTitle"),
+            message: t("gallery.deleteMessage", { name: avatar.name }),
+            detail: t("gallery.deleteIrreversible"),
+            confirmText: tCommon("delete"),
+            cancelText: tCommon("cancel"),
+            destructive: true,
+          })
+        : { ok: true, confirmed: window.confirm(t("gallery.deleteConfirm", { name: avatar.name })) };
+    if (!confirmResult.confirmed) return;
+    panes.filter((item) => item.avatarId === avatarId).forEach((item) => removePane(item.id));
+    if (activeAvatarId === avatarId) setActiveAvatarId(null);
+    setAvatars(avatars.filter((a) => a.id !== avatarId));
+    await api.deleteAvatar(avatarId);
+    await refreshAvatars();
+  };
+
+  const settingsAvatar = settingsAvatarId
+    ? avatars.find((a) => a.id === settingsAvatarId)
+    : undefined;
+
+  return (
+    <MainViewShell>
+      {/* Sticky title row only; 关注分身仍靠排序置顶，不钉死 */}
+      <div className="sticky top-0 z-10 -mx-6 -mt-6 mb-5 bg-surface-base px-6 pb-4 pt-6">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-text-strong">{t("gallery.title")}</h2>
+            <p className="mt-1 text-sm text-text-muted">
+              {t("gallery.subtitle")}
+            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <ExpertPortraitStyleControl
+                avatars={avatars}
+                onUpdated={(row) => {
+                  setAvatars(
+                    useAppStore.getState().avatars.map((avatar) =>
+                      avatar.id === row.id
+                        ? { ...avatar, avatarUrl: row.avatarUrl, portraitStyle: row.portraitStyle }
+                        : avatar,
+                    ),
+                  );
+                }}
+                onApplied={async () => {
+                  const listed = await window.agenticxDesktop.listAvatars();
+                  if (listed.ok) setAvatars(mapAvatarsFromApi(listed.avatars));
+                  await refreshAvatars();
+                }}
+              />
+              <button
+                type="button"
+                className="flex shrink-0 items-center gap-1.5 rounded-lg bg-btnPrimary px-3 py-2 text-[13px] font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover"
+                onClick={() => setCreateOpen(true)}
+              >
+                <Plus className="h-4 w-4" />
+                {t("gallery.newExpert")}
+              </button>
+            </div>
+          </div>
+          <div className="hidden shrink-0 md:block [@media(max-height:560px)]:hidden">
+            <EmptyStateHeaderFigures />
+          </div>
+        </div>
+      </div>
+
+      {!avatarsLoaded ? (
+        <div className="flex items-center justify-center gap-2 py-16 text-sm text-text-faint">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          {t("gallery.loading")}
+        </div>
+      ) : (
+        <>
+          <section className="mb-6">
+            <h3 className="text-sm font-medium text-text-strong">{t("gallery.builtinTitle")}</h3>
+            <p className="mt-1 text-xs text-text-muted">{t("gallery.builtinHint")}</p>
+            <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              <div
+                role="button"
+                tabIndex={0}
+                className={`${GALLERY_CARD_BASE} ${nearSettingsOpen ? GALLERY_CARD_SELECTED : GALLERY_CARD_IDLE}`}
+                onClick={() => setNearSettingsOpen(true)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setNearSettingsOpen(true);
+                  }
+                }}
+              >
+                <div className="flex items-start gap-3">
+                  <ThemedAvatarImage
+                    src={nearAvatarUrl}
+                    alt={META_AGENT_DISPLAY_NAME}
+                    className="h-14 w-14 shrink-0 rounded-2xl object-cover"
+                  />
+                  <div className="min-w-0 flex-1 pt-0.5">
+                    <div className="truncate text-[15px] font-semibold text-text-strong">
+                      {META_AGENT_DISPLAY_NAME}
+                    </div>
+                    <p className="mt-0.5 truncate text-xs text-text-muted">{t("gallery.nearRole")}</p>
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
+                  <button
+                    type="button"
+                    className="flex-1 rounded-md border border-border bg-surface-panel px-3 py-2 text-xs font-medium text-text-strong transition hover:border-[rgb(var(--theme-color-rgb,59,130,246))] hover:text-[rgb(var(--theme-color-rgb,59,130,246))]"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openMetaOrAvatarPane(null, META_AGENT_DISPLAY_NAME);
+                    }}
+                  >
+                    {t("gallery.startChat")}
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-border px-3 py-2 text-xs text-text-muted transition hover:bg-surface-hover hover:text-text-strong"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setNearSettingsOpen(true);
+                    }}
+                  >
+                    {t("gallery.nearSettings")}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <h3 className="mb-3 text-sm font-medium text-text-strong">{t("gallery.myExperts")}</h3>
+          {sortedAvatars.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-16 text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-surface-card text-text-faint">
+            <Sparkles className="h-5 w-5" />
+          </div>
+          <div className="text-[15px] font-semibold text-text-strong">{t("gallery.emptyTitle")}</div>
+          <p className="text-sm text-text-muted">{t("gallery.emptyHint")}</p>
+          <button
+            type="button"
+            className="mt-1 flex items-center gap-1.5 rounded-lg bg-btnPrimary px-3 py-2 text-[13px] font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover"
+            onClick={() => setCreateOpen(true)}
+          >
+            <Plus className="h-4 w-4" />
+            {t("gallery.newExpert")}
+          </button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {sortedAvatars.map((avatar) => {
+            const hasPane = panes.some((p) => p.avatarId === avatar.id);
+            const isCardSelected = settingsAvatarId === avatar.id;
+            const paletteKey = resolveAvatarPaletteKey(avatar.id, avatar.color);
+            return (
+              <div
+                key={avatar.id}
+                role="button"
+                tabIndex={0}
+                className={`${GALLERY_CARD_BASE} ${isCardSelected ? GALLERY_CARD_SELECTED : GALLERY_CARD_IDLE}`}
+                onClick={() => setSettingsAvatarId(avatar.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setSettingsAvatarId(avatar.id);
+                  }
+                }}
+              >
+                <div className="flex items-start gap-3">
+                  <div className="relative shrink-0">
+                    {avatar.avatarUrl ? (
+                      <ThemedAvatarImage
+                        src={avatar.avatarUrl}
+                        alt={avatar.name}
+                        className="h-14 w-14 rounded-2xl object-cover"
+                      />
+                    ) : (
+                      <div
+                        className={`flex h-14 w-14 items-center justify-center rounded-2xl text-base font-bold ${avatarBgClass(paletteKey)} ${avatarFgClass(paletteKey)}`}
+                      >
+                        {avatarInitials(avatar.name)}
+                      </div>
+                    )}
+                    {hasPane && (
+                      <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-surface-card bg-emerald-500" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1 pt-0.5">
+                    <div className="flex items-center gap-1">
+                      <span className="truncate text-[15px] font-semibold text-text-strong">
+                        {avatar.name}
+                      </span>
+                      {avatar.pinned && <Star className="h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-400" />}
+                    </div>
+                    {avatar.role && (
+                      <p className="mt-0.5 truncate text-xs text-text-muted">{avatar.role}</p>
+                    )}
+                  </div>
+                </div>
+                {avatar.description ? (
+                  <p className="mt-3 line-clamp-2 text-xs leading-relaxed text-text-muted">
+                    {avatar.description}
+                  </p>
+                ) : null}
+                {avatar.tags && avatar.tags.length > 0 ? (
+                  <div className="mt-2.5 flex flex-wrap gap-1.5">
+                    {avatar.tags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="rounded-md bg-surface-hover px-2 py-0.5 text-[11px] text-text-subtle"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
+                  <button
+                    type="button"
+                    className="flex-1 rounded-md border border-border bg-surface-panel px-3 py-2 text-xs font-medium text-text-strong transition hover:border-[rgb(var(--theme-color-rgb,59,130,246))] hover:text-[rgb(var(--theme-color-rgb,59,130,246))] hover:ring-1 hover:ring-[rgba(var(--theme-color-rgb,59,130,246),0.25)]"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openMetaOrAvatarPane(avatar.id, avatar.name);
+                    }}
+                  >
+                    {t("gallery.startChat")}
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-border p-2 text-text-faint transition hover:bg-surface-hover hover:text-text-strong"
+                    aria-label={t("gallery.moreActions")}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      setCardMenu({ avatarId: avatar.id, x: rect.right - 132, y: rect.bottom + 4 });
+                    }}
+                  >
+                    <MoreHorizontal className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+          <button
+            type="button"
+            className={`${GALLERY_CREATE_BASE} ${createOpen ? GALLERY_CREATE_ACTIVE : GALLERY_CREATE_IDLE}`}
+            onClick={() => setCreateOpen(true)}
+          >
+            <Plus className="h-5 w-5" />
+            <span className="text-[13px] font-medium">{t("gallery.createExpert")}</span>
+          </button>
+        </div>
+          )}
+        </>
+      )}
+
+      {cardMenu && (
+        <div
+          ref={cardMenuRef}
+          className="fixed z-[200] w-[132px] rounded-md border border-border bg-surface-base py-1 shadow-2xl"
+          style={{ left: cardMenu.x, top: cardMenu.y }}
+        >
+          <button
+            type="button"
+            className="w-full px-3 py-1.5 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
+            onClick={() => {
+              const id = cardMenu.avatarId;
+              setCardMenu(null);
+              setSettingsAvatarId(id);
+            }}
+          >
+            {tCommon("settings")}
+          </button>
+          <button
+            type="button"
+            className="w-full px-3 py-1.5 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
+            onClick={() => void handlePinToggle(cardMenu.avatarId)}
+          >
+            {avatars.find((a) => a.id === cardMenu.avatarId)?.pinned ? t("gallery.unfollow") : t("gallery.follow")}
+          </button>
+          {avatars.find((a) => a.id === cardMenu.avatarId)?.workspaceDir ? (
+            <button
+              type="button"
+              className="w-full px-3 py-1.5 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
+              onClick={() => {
+                const dir = avatars.find((a) => a.id === cardMenu.avatarId)?.workspaceDir;
+                setCardMenu(null);
+                if (dir) void window.agenticxDesktop.shellOpenPath(dir);
+              }}
+            >
+              {t("gallery.openFolder")}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="w-full px-3 py-1.5 text-left text-[13px] text-rose-400 transition hover:bg-rose-500/10"
+            onClick={() => void handleDelete(cardMenu.avatarId)}
+          >
+            {tCommon("delete")}
+          </button>
+        </div>
+      )}
+
+      {nearSettingsOpen ? (
+        <div
+          className="fixed inset-0 z-modal flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setNearSettingsOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-label={META_AGENT_DISPLAY_NAME}
+            className="max-h-[80vh] w-[480px] max-w-[92vw] overflow-y-auto rounded-xl border border-border bg-surface-popover p-4 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center gap-3">
+              <ThemedAvatarImage
+                src={nearAvatarUrl}
+                alt={META_AGENT_DISPLAY_NAME}
+                className="h-12 w-12 rounded-2xl object-cover"
+              />
+              <div>
+                <div className="text-sm font-semibold text-text-strong">{META_AGENT_DISPLAY_NAME}</div>
+                <p className="text-xs text-text-muted">{t("gallery.nearRole")}</p>
+              </div>
+            </div>
+            <p className="mb-3 text-xs text-text-muted">
+              {collectionPortraitStyle === CUBE_PORTRAIT_STYLE
+                ? t("gallery.nearCubeHint")
+                : t("gallery.nearStyleHint")}
+            </p>
+            <UserCubeColorwayPicker
+              selectedId={userCubeColorwayId}
+              onSelect={setUserCubeColorwayId}
+              open
+            />
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="h-8 rounded-md px-3 text-xs text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                onClick={() => setNearSettingsOpen(false)}
+              >
+                {tCommon("cancel")}
+              </button>
+              <button
+                type="button"
+                className="h-8 rounded-md bg-[var(--ui-btn-primary-bg)] px-3 text-xs font-medium text-[var(--ui-btn-primary-text)]"
+                onClick={() => {
+                  setNearSettingsOpen(false);
+                  openSettings("account");
+                }}
+              >
+                {t("gallery.nearIdentity")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <AvatarCreateDialog
+        open={createOpen}
+        onClose={() => {
+          setCreateOpen(false);
+          void refreshAvatars();
+        }}
+        onCreate={handleCreate}
+        onCreateViaChat={handleCreateViaChat}
+      />
+
+      {settingsAvatar && (
+        <AvatarSettingsPanel
+          mode="avatar"
+          avatar={settingsAvatar}
+          onClose={() => setSettingsAvatarId(null)}
+          onSaved={() => void refreshAvatars()}
+        />
+      )}
+    </MainViewShell>
+  );
+}

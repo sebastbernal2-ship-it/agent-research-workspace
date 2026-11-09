@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Near</title>
+    <script>
+      try {
+        var savedTheme = localStorage.getItem("agx-theme");
+        document.documentElement.setAttribute(
+          "data-theme",
+          savedTheme === "light" ? "light" : "dark"
+        );
+        var savedThemeColor = localStorage.getItem("agx-theme-color");
+        var themeColor =
+          savedThemeColor === "blue" ||
+          savedThemeColor === "green" ||
+          savedThemeColor === "pink" ||
+          savedThemeColor === "yellow" ||
+          savedThemeColor === "white"
+            ? savedThemeColor
+            : "white";
+        document.documentElement.setAttribute("data-theme-color", themeColor);
+        var savedLocale = localStorage.getItem("agx-locale");
+        var nav = (navigator.language || "").toLowerCase();
+        var loc = savedLocale === "en" || savedLocale === "zh"
+          ? savedLocale
+          : nav.indexOf("en") === 0 ? "en" : "zh";
+        document.documentElement.lang = loc === "en" ? "en" : "zh-CN";
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

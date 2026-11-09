@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# CI / 本地：按是否注入 CSC_LINK 选择签名或免签名 electron-builder 配置。
+set -euo pipefail
+
+ARCH="${1:?usage: ci-package-mac.sh <arm64|x64>}"
+
+mirror_apple_notarize_env() {
+  if [[ -n "${APPLE_ID_PASSWORD:-}" && -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+    export APPLE_APP_SPECIFIC_PASSWORD="${APPLE_ID_PASSWORD}"
+  fi
+  if [[ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -z "${APPLE_ID_PASSWORD:-}" ]]; then
+    export APPLE_ID_PASSWORD="${APPLE_APP_SPECIFIC_PASSWORD}"
+  fi
+}
+
+report_signing_env() {
+  mirror_apple_notarize_env
+  local names=(CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_ID_PASSWORD APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID)
+  for n in "${names[@]}"; do
+    local v="${!n:-}"
+    if [[ -n "${v}" ]]; then
+      echo "  ${n}: set (${#v} chars)"
+    else
+      echo "  ${n}: MISSING"
+    fi
+  done
+}
+
+prepare_signing_cert() {
+  # workflow 里 secrets 未配置时，GitHub 会注入空字符串；须 unset 避免 electron-builder 把 cwd 当证书路径
+  if [[ -z "${CSC_LINK:-}" ]]; then
+    unset CSC_LINK CSC_KEY_PASSWORD 2>/dev/null || true
+    return 1
+  fi
+
+  if [[ -z "${CSC_KEY_PASSWORD:-}" ]]; then
+    echo "::error::CSC_KEY_PASSWORD is not set. GitHub → Settings → Secrets and variables → Actions → Repository secrets → add CSC_KEY_PASSWORD"
+    exit 1
+  fi
+
+  local p12_file="${RUNNER_TEMP:-/tmp}/near-codesign.p12"
+
+  if [[ -f "${CSC_LINK}" ]]; then
+    p12_file="${CSC_LINK}"
+    echo "==> Using CSC_LINK file path: ${p12_file}"
+  else
+    local clean_b64
+    clean_b64="$(printf '%s' "${CSC_LINK}" | tr -d '[:space:]')"
+    if ! printf '%s' "${clean_b64}" | base64 -d > "${p12_file}" 2>/dev/null; then
+      echo "::error::CSC_LINK is not a valid file path and not valid base64. Run: base64 -i ~/Documents/AppleCerts/DeveloperID.p12"
+      exit 1
+    fi
+    if [[ ! -s "${p12_file}" ]]; then
+      echo "::error::Decoded CSC_LINK is empty. Re-copy base64 -i DeveloperID.p12 into the CSC_LINK secret."
+      exit 1
+    fi
+    echo "==> Decoded CSC_LINK base64 to ${p12_file} ($(wc -c < "${p12_file}") bytes)"
+  fi
+
+  if ! openssl pkcs12 -in "${p12_file}" -passin "pass:${CSC_KEY_PASSWORD}" -noout 2>/dev/null; then
+    echo "::error::Cannot open .p12 with CSC_KEY_PASSWORD. Password must match the .p12 export password."
+    exit 1
+  fi
+
+  export CSC_LINK="${p12_file}"
+}
+
+echo "==> Signing env preflight:"
+report_signing_env
+
+if [[ -z "${CSC_LINK:-}" && "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]]; then
+  echo "::error::No GitHub Repository secrets detected for macOS signing."
+  echo "::error::Add ALL of: CSC_LINK, CSC_KEY_PASSWORD, APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID"
+  echo "::error::Path: Repo → Settings → Secrets and variables → Actions → Repository secrets (not Environment-only)"
+  exit 1
+fi
+
+if prepare_signing_cert; then
+  mirror_apple_notarize_env
+  export CSC_IDENTITY_AUTO_DISCOVERY=true
+  CONFIG="electron-builder.signing.yml"
+  echo "==> macOS package: signed + notarize (when APPLE_* set)"
+else
+  unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_ID_PASSWORD APPLE_TEAM_ID 2>/dev/null || true
+  export CSC_IDENTITY_AUTO_DISCOVERY=false
+  CONFIG="electron-builder.yml"
+  echo "==> macOS package: unsigned (no CSC_LINK)"
+fi
+
+npx electron-builder --mac "--${ARCH}" --config "${CONFIG}" --publish never
+
+if [[ "${CONFIG}" == "electron-builder.signing.yml" ]]; then
+  APP="release/mac-${ARCH}/Near.app"
+  echo "==> Verifying code signature on ${APP}"
+  SIG_INFO="$(codesign -dv --verbose=2 "${APP}" 2>&1 || true)"
+  echo "${SIG_INFO}" | head -20
+  if echo "${SIG_INFO}" | grep -q "Signature=adhoc"; then
+    echo "::error::${APP} is adhoc-signed — electron-builder skipped signing (do not set mac.identity: null in signing config)"
+    exit 1
+  fi
+  if echo "${SIG_INFO}" | grep -q "TeamIdentifier=not set"; then
+    echo "::error::${APP} has no TeamIdentifier — Developer ID certificate was not applied"
+    exit 1
+  fi
+  codesign --verify --deep --strict --verbose=2 "${APP}"
+  if command -v spctl >/dev/null 2>&1; then
+    spctl -a -vv --type execute "${APP}" 2>&1 || true
+  fi
+fi

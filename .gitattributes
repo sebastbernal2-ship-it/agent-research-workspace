@@ -1,0 +1,2 @@
+# Preserve imported upstream source snapshots byte-for-byte in Git; do not normalize line endings.
+spikes/*/upstream/** -text

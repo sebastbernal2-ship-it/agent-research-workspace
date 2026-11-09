@@ -1,0 +1,108 @@
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --text-primary: #e6e7ea;
+  --text-strong: #ffffff;
+  --text-muted: rgba(255, 255, 255, 0.7);
+  --text-subtle: rgba(255, 255, 255, 0.6);
+  --text-faint: rgba(255, 255, 255, 0.45);
+
+  --surface-base: #1C1C1E;
+  --surface-base-fallback: #1C1C1E;
+  --surface-panel: rgba(38, 38, 42, 0.78);
+  --surface-popover: #26262a;
+  --surface-sidebar: rgba(38, 38, 42, 0.72);
+  --shell-canvas: #2c2c2e;
+  --shell-panel: #161618;
+  --surface-topbar: rgba(38, 38, 42, 0.72);
+  --surface-messages: transparent;
+  --surface-composer: rgba(45, 45, 48, 0.85);
+  --chat-followup-chip-bg: var(--surface-popover);
+  --chat-followup-chip-bg-hover: var(--surface-hover);
+  --chat-followup-chip-border: var(--border-subtle);
+  --surface-card: rgba(255, 255, 255, 0.05);
+  --surface-card-strong: rgba(255, 255, 255, 0.11);
+  --surface-hover: rgba(255, 255, 255, 0.09);
+  --surface-bubble: rgba(255, 255, 255, 0.10);
+  --surface-bubble-user: rgba(77, 153, 255, 0.35);
+  --chat-im-user-bg: rgb(var(--theme-color-rgb));
+  --chat-im-user-border: transparent;
+  --chat-im-user-text: var(--theme-color-text);
+  --chat-im-assistant-bg: #3b3b3d;
+  --chat-im-assistant-border: rgba(255, 255, 255, 0.12);
+  --chat-im-assistant-text: #ffffff;
+  --chat-im-avatar-bg: rgba(255, 255, 255, 0.12);
+  /* Settings accent — neutral high-contrast (dots / success keep emerald in TSX) */
+  --settings-accent-subtle-bg: rgba(255, 255, 255, 0.06);
+  --settings-accent-subtle-bg-hover: rgba(255, 255, 255, 0.11);
+  --settings-accent-row-bg: rgba(255, 255, 255, 0.11);
+  --settings-accent-fg: rgba(255, 255, 255, 0.92);
+  --settings-accent-fg-muted: rgba(255, 255, 255, 0.8);
+  --settings-accent-border-muted: rgba(255, 255, 255, 0.32);
+  --settings-accent-border-strong: rgba(255, 255, 255, 0.42);
+  --settings-accent-solid: rgba(var(--theme-color-rgb), 1);
+  --settings-accent-solid-hover: rgba(var(--theme-color-rgb), 0.9);
+  --settings-accent-solid-text: var(--theme-color-text);
+  --settings-accent-badge-bg: rgba(255, 255, 255, 0.12);
+  --settings-accent-focus: rgba(255, 255, 255, 0.45);
+  --settings-accent-progress: #94a3b8;
+  --chat-terminal-user: #9cffc8;
+  --chat-terminal-assistant: #e6f0ff;
+  --chat-terminal-meta: rgba(148, 163, 184, 0.8);
+  --chat-clean-user-accent: rgba(74, 222, 128, 0.95);
+  --chat-clean-user-bg: rgba(16, 185, 129, 0.1);
+  --chat-clean-assistant-bg: rgba(255, 255, 255, 0.04);
+  --chat-clean-assistant-border: rgba(255, 255, 255, 0.08);
+
+  /* Panel / 分割线：在 #050505 底上略高于旧值，贴近豆包式浅白边线的可辨度 */
+  --border-subtle: rgba(255, 255, 255, 0.11);
+  --border-muted: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --window-outline: rgba(255, 255, 255, 0.22);
+  /* Focus mode glass layer: frosted whitish acrylic. Opacity must be high
+     enough to look like glass without vibrancy underneath; otherwise it
+     reads as a dark gray frame on top of whatever is behind the window. */
+  --focus-glass-bg: rgba(255, 255, 255, 0.58);
+  --focus-glass-border: rgba(255, 255, 255, 0);
+  --focus-glass-highlight: rgba(255, 255, 255, 0);
+  --focus-glass-shadow-outer: rgba(0, 0, 0, 0);
+  /* Inner input keeps the dark-theme original look (dark surface + light text). */
+  --focus-composer-surface: #1a1a1a;
+  --focus-composer-border: rgba(255, 255, 255, 0.12);
+  --focus-composer-text: #e6e7ea;
+  --focus-composer-text-muted: rgba(255, 255, 255, 0.5);
+
+  --status-success: rgba(120, 235, 190, 0.95);
+  --status-warning: rgba(255, 175, 85, 0.95);
+  --status-error: rgba(255, 110, 110, 0.95);
+
+  --brain-scope-global-bg: rgba(139, 92, 246, 0.18);
+  --brain-scope-global-fg: #ddd6fe;
+  --brain-scope-global-ring: rgba(167, 139, 250, 0.35);
+  --brain-scope-global-icon: #c4b5fd;
+  --brain-scope-private-bg: rgba(245, 158, 11, 0.16);
+  --brain-scope-private-fg: #fde68a;
+  --brain-scope-private-ring: rgba(251, 191, 36, 0.35);
+  --brain-scope-private-icon: #fcd34d;
+  --brain-scope-enabled-bg: rgba(16, 185, 129, 0.16);
+  --brain-scope-enabled-fg: #6ee7b7;
+  --brain-scope-type-bg: rgba(255, 255, 255, 0.1);
+  --brain-scope-type-fg: rgba(255, 255, 255, 0.72);
+
+  --ui-btn-primary-bg: rgba(var(--theme-color-rgb), 1);
+  --ui-btn-primary-bg-hover: rgba(var(--theme-color-rgb), 0.9);
+  --ui-btn-primary-text: var(--theme-color-text);
+  /* Off-state switch track: visible gray pill around the white thumb */
+  --ui-switch-track-off: rgba(255, 255, 255, 0.24);
+  --ui-accent-surface: rgba(255, 255, 255, 0.08);
+  --ui-accent-surface-hover: rgba(255, 255, 255, 0.13);
+  --ui-accent-text: rgba(255, 255, 255, 0.82);
+  --ui-accent-divider: rgba(255, 255, 255, 0.10);
+  --ui-accent-divider-hover: rgba(255, 255, 255, 0.22);
+
+  --kb-citation-bg: rgba(var(--theme-color-rgb), 0.24);
+  --kb-citation-bg-muted: rgba(var(--theme-color-rgb), 0.12);
+  --kb-citation-fg: rgb(var(--theme-color-rgb));
+  --kb-citation-list-bg: rgba(var(--theme-color-rgb), 0.08);
+}
+

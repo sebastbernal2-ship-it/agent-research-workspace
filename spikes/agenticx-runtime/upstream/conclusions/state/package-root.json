@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "module_id": "package-root",
+  "generation": "d07f789dd9454ddbb747bd181b428a80",
+  "mapping_revision": 2,
+  "baseline_commit": "ca9d92bec05627539228094cacc30dd6d4879f47",
+  "baseline_tree": "71f4737c2ec6b071cb29abb2de3b301434889025",
+  "source_fingerprint": "sha256:e3a4ecff01f2a2291c5ff8303b5d087cb09c8b82c68d030064273dccd28a55c9",
+  "summary_path": "conclusions/package_root_conclusion.md",
+  "summary_sha256": "sha256:bccbab964410939e15eacb373d2f9c2b5fc0925c3f0002a65daf9c32bed2001b",
+  "updated_at": "2026-09-30T00:54:15.843117+00:00"
+}

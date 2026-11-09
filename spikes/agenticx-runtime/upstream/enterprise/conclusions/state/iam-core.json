@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "module_id": "iam-core",
+  "generation": "35cda114289e4df49d48e99ba79e3f89",
+  "mapping_revision": 1,
+  "baseline_commit": "30e57496990b0e2acb18978091d9e623210eaba3",
+  "baseline_tree": "9e11bd92dc6c05fbdd0ce563ef6bb404616a70af",
+  "source_fingerprint": "sha256:a9770a8ef0d4fd941ec063d7102eb40e1a169f8590103ee22e1663d768d35bc8",
+  "summary_path": "enterprise/conclusions/packages/iam-core_conclusion.md",
+  "summary_sha256": "sha256:e37e318ef9ce4e71b51ab929ae3d5aff637b33b16d11bddd6df620645f95c2a6",
+  "updated_at": "2026-09-17T23:54:04.098427+00:00"
+}

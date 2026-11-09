@@ -1,0 +1,3590 @@
+import { useTranslation } from "react-i18next";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Boxes,
+  ChevronDown,
+  Cookie,
+  FileCode2,
+  FileDiff,
+  FileText,
+  FolderOpen,
+  Globe,
+  ListTodo,
+  Maximize2,
+  Minimize2,
+  PanelRight,
+  Plus,
+  RefreshCw,
+  Share2,
+  Terminal as TerminalIcon,
+  CirclePlay,
+  X,
+} from "lucide-react";
+import { useAppStore, type Avatar, type ChatPane, type Message, type PaneTerminalTab, type SubAgent } from "../../store";
+import { i18n } from "../../i18n/i18n";
+import { ScratchChatIcon } from "./ScratchChatIcon";
+import { WorkspacePanel } from "../WorkspacePanel";
+import { RunGraphPanel } from "../graph/RunGraphPanel";
+import { replayFocusTargetForSession } from "../replay/branch-lineage-navigation";
+import { RunReplayPanel } from "../replay/RunReplayPanel";
+import { GroupMembersSummaryList } from "./GroupMembersSummaryList";
+import {
+  loadAbsoluteFilePreview,
+  type WorkspacePreview,
+  type WorkspacePreviewLineRange,
+  type WorkspacePreviewOpenRequest,
+  type WorkspacePreviewQuotePayload,
+} from "../workspace/workspace-preview-types";
+import { WorkspaceFilePreview } from "../workspace/WorkspaceFilePreview";
+import {
+  PREVIEW_LIVE_RELOAD_MS,
+  isLiveReloadablePreview,
+  previewKnownMtimeMs,
+  shouldReloadPreviewFromStat,
+  textualPreviewUnchanged,
+} from "./preview-live-reload";
+import { TerminalEmbed } from "../TerminalEmbed";
+import { SubAgentCard } from "../SubAgentCard";
+import { HoverTip } from "../ds/HoverTip";
+import { Button } from "../ds/Button";
+import { Modal } from "../ds/Modal";
+import { ScratchChatCard } from "./ScratchChatCard";
+import { useScratchChatRuntime } from "./use-scratch-chat-runtime";
+import {
+  filterScratchChatsForHost,
+  listSummaryScratchChats,
+  scratchParkedPreview,
+  type ScratchChat,
+  type ScratchChatDraft,
+} from "../../utils/scratch-chat";
+import {
+  buildBlankScratchDraft,
+  buildPathScratchDraft,
+  buildPreviewScratchDraft,
+  buildQuotedScratchDraft,
+  clipScratchTitleSnippet,
+  fileLabelFromPath,
+} from "../../utils/scratch-chat-open";
+import {
+  resolveActiveScratchId,
+  resolveScratchFocusId,
+} from "../../utils/scratch-chat-panel";
+import { loadPreparedHtmlSrcDoc } from "../../utils/html-preview-assets";
+import { isFreshTask, workspaceToolLocked } from "../../utils/fresh-task-workspace";
+import {
+  artifactBaseName,
+  collectSessionArtifactPaths,
+  collectSessionFileChanges,
+  isInAppArtifactPreviewPath,
+  isInAppHtmlPreviewPath,
+  looksLikeDirectoryPath,
+  pathToFileUrl,
+  selectSessionDeliverablePaths,
+} from "../../utils/session-artifacts";
+import { collectFileChangeHighlight } from "../../utils/session-change-highlights";
+import {
+  nextPreviewHighlightMode,
+  resolveActiveChangeHighlight,
+  type PreviewHighlightMode,
+} from "../../utils/preview-highlight-mode";
+import { HtmlPreviewChrome } from "../workspace/HtmlPreviewChrome";
+import { HtmlPreviewShell } from "../workspace/HtmlPreviewShell";
+import {
+  DEFAULT_HTML_PREVIEW_VIEWPORT,
+  type HtmlPreviewViewport,
+} from "../workspace/html-preview-device";
+import { SessionArtifactList } from "./SessionArtifactList";
+import { SessionChangeList } from "./SessionChangeList";
+import { SessionReferenceList } from "./SessionReferenceList";
+import { SessionTodoList } from "./SessionTodoList";
+import { GroupWorkItemList } from "./GroupWorkItemList";
+import { ChromeCookieImportBanner, ChromeCookieImportDialog } from "./ChromeCookieImport";
+import {
+  applyPinnedAutoExpand,
+  contentDrivenOpenSections,
+  exclusiveOpenSections,
+  type SummarySectionId,
+} from "./summary-sections";
+import {
+  createWorkItem,
+  fetchWorkItems,
+  postWorkItemAction,
+  workItemRequestError,
+  type WorkItem,
+} from "../../utils/work-items";
+import { collectSessionReferences } from "../../utils/session-references";
+import { resolveWorkPanelTodoFromMessages } from "../../utils/task-stall-policy";
+import { latestRunningWbBridgeProgress } from "../../utils/wb-bridge-ui";
+import type { ParsedTodo } from "../TodoUpdateCard";
+import {
+  ensureArtifactTaskspacesForSession,
+  loadPersistedSessionArtifactPaths,
+  startPersistedArtifactPathResync,
+} from "../../utils/ensure-artifact-taskspaces";
+import { RUNTIME_DEFAULT_TASKSPACES } from "../automation/RuntimeConfigSection";
+import {
+  BROWSER_SELECTION_HOOK_JS,
+  BROWSER_SELECTION_READ_JS,
+  mapGuestRectToHostAnchor,
+  parseBrowserGuestSelection,
+  type BrowserQuotePayload,
+} from "./browser-selection";
+import { BrowserSelectionToolbar } from "./BrowserSelectionToolbar";
+import type { SelectionPopupAnchor } from "../workspace/selection-quote-popover";
+import { BrowserAgentOverlay } from "./BrowserAgentOverlay";
+import {
+  BROWSER_AGENT_INDEX_JS,
+  browserAgentClickJs,
+  browserAgentExtractJs,
+  browserAgentPressKeyJs,
+  browserAgentTypeJs,
+  filterExtractedText,
+  parseBrowserAgentResult,
+  type BrowserAgentResult,
+} from "./browser-agent-actions";
+import {
+  ensureBrowserAgentIpc,
+  registerBrowserAgentController,
+} from "./browser-agent-registry";
+
+/**
+ * Multipane: each WorkPanel may register a handler. First one that claims the URL
+ * (active browser tab) wins; else fall back to system browser.
+ */
+type InAppBrowserOpenHandler = (url: string) => boolean;
+type InAppBrowserOpenBridge = {
+  handlers: Set<InAppBrowserOpenHandler>;
+  wired: boolean;
+};
+function inAppBrowserOpenBridge(): InAppBrowserOpenBridge {
+  const host = window as Window & { __nearInAppBrowserOpen?: InAppBrowserOpenBridge };
+  if (!host.__nearInAppBrowserOpen) {
+    host.__nearInAppBrowserOpen = { handlers: new Set(), wired: false };
+  }
+  return host.__nearInAppBrowserOpen;
+}
+
+const EMPTY_MESSAGES: Message[] = [];
+const EMPTY_SCRATCH_CHATS: ScratchChat[] = [];
+const EMPTY_PARKED_SCRATCH_CHATS: ScratchChat[] = [];
+const EMPTY_TERMINAL_TABS: PaneTerminalTab[] = [];
+
+function logWorkspacePerf(payload: Record<string, unknown>): void {
+  console.debug("[workspace-perf]", payload);
+  void window.agenticxDesktop?.writeWorkspacePerfLog?.({
+    component: "WorkPanel",
+    ...payload,
+  })?.catch(() => undefined);
+}
+
+function ensureInAppBrowserOpenIpc(): void {
+  const bridge = inAppBrowserOpenBridge();
+  if (bridge.wired) return;
+  const api = window.agenticxDesktop;
+  if (!api?.onInAppBrowserOpen) return;
+  bridge.wired = true;
+  api.onInAppBrowserOpen((url) => {
+    for (const handler of bridge.handlers) {
+      if (handler(url)) return;
+    }
+  });
+}
+
+function browserTitleFromUrl(nextUrl: string, fallback?: string): string {
+  const resolvedFallback = fallback ?? i18n.t("work.browser", { ns: "workspace" });
+  try {
+    if (nextUrl === "about:blank") return i18n.t("work.newTab", { ns: "workspace" });
+    return new URL(nextUrl).hostname || new URL(nextUrl).pathname.split("/").pop() || resolvedFallback;
+  } catch {
+    return resolvedFallback;
+  }
+}
+
+/** webview.loadURL / attribute src races reject with ERR_ABORTED — ignore those. */
+function ignoreWebviewNavAbort(err: unknown): void {
+  const e = err as { code?: string; errno?: number; message?: string } | null;
+  if (e?.code === "ERR_ABORTED" || e?.errno === -3) return;
+  if (typeof e?.message === "string" && e.message.includes("ERR_ABORTED")) return;
+  console.warn("[RemoteBrowserPane] webview navigation failed:", err);
+}
+
+function loadWebviewUrl(wv: NearElectronWebview, nextUrl: string): void {
+  try {
+    const result = wv.loadURL(nextUrl);
+    if (result != null && typeof (result as Promise<void>).then === "function") {
+      void (result as Promise<void>).catch(ignoreWebviewNavAbort);
+    }
+  } catch (err) {
+    ignoreWebviewNavAbort(err);
+  }
+}
+
+/**
+ * Remote https tab via Electron <webview> (not iframe).
+ * Baidu/Google etc. send X-Frame-Options → iframe gets ERR_BLOCKED_BY_RESPONSE;
+ * webview is a top-level guest and loads normally.
+ *
+ * Important: keep `src` frozen after mount. Updating `src` on every address-bar
+ * sync races with loadURL / in-page redirects and floods
+ * `GUEST_VIEW_MANAGER_CALL` + ERR_ABORTED in the main process log.
+ */
+function RemoteBrowserPane({
+  title,
+  url,
+  reloadKey = 0,
+  onNavigate,
+  onReplaceNavigate,
+  onGuestHistory,
+  onOpenLinkInNewTab,
+  onQuoteSelection,
+  onSearchSelection,
+  onOpenScratchSelection,
+  onWebviewReady,
+}: {
+  title: string;
+  url: string;
+  reloadKey?: number;
+  /** Guest navigated (link / redirect / intercepted window.open) → sync address bar. */
+  onNavigate?: (nextUrl: string) => void;
+  /** Same visit as the current history entry (server redirect). Do not add a back step. */
+  onReplaceNavigate?: (nextUrl: string) => void;
+  onGuestHistory?: (state: { canBack: boolean; canForward: boolean }) => void;
+  onOpenLinkInNewTab?: (url: string, title: string) => void;
+  onQuoteSelection?: (payload: BrowserQuotePayload) => void;
+  onSearchSelection?: (text: string) => void;
+  onOpenScratchSelection?: (payload: BrowserQuotePayload) => void;
+  onWebviewReady?: (wv: NearElectronWebview | null) => void;
+}) {
+  const [deviceToolbarVisible, setDeviceToolbarVisible] = useState(false);
+  const [viewport, setViewport] = useState<HtmlPreviewViewport>(DEFAULT_HTML_PREVIEW_VIEWPORT);
+  const [inspectEnabled, setInspectEnabled] = useState(false);
+  const webviewRef = useRef<NearElectronWebview | null>(null);
+  const webviewHostRef = useRef<HTMLDivElement | null>(null);
+  const [selectionUi, setSelectionUi] = useState<{
+    text: string;
+    href?: string;
+    anchor: SelectionPopupAnchor;
+  } | null>(null);
+  /** Initial src only — subsequent navigations use loadURL. */
+  const initialSrcRef = useRef(url);
+  const committedUrlRef = useRef(url);
+  const onNavigateRef = useRef(onNavigate);
+  onNavigateRef.current = onNavigate;
+  const onReplaceNavigateRef = useRef(onReplaceNavigate);
+  onReplaceNavigateRef.current = onReplaceNavigate;
+  const onGuestHistoryRef = useRef(onGuestHistory);
+  onGuestHistoryRef.current = onGuestHistory;
+  const onOpenLinkInNewTabRef = useRef(onOpenLinkInNewTab);
+  onOpenLinkInNewTabRef.current = onOpenLinkInNewTab;
+  const { t } = useTranslation("workspace");
+  const [linkMenu, setLinkMenu] = useState<{
+    url: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  /** Server redirects belong to the current visit, not a new back step. */
+  const redirectingRef = useRef(false);
+  /** loadURL from the address bar / in-app open already created the history entry. */
+  const programmaticNavRef = useRef(false);
+  const onWebviewReadyRef = useRef(onWebviewReady);
+  onWebviewReadyRef.current = onWebviewReady;
+  useEffect(() => {
+    return () => {
+      onWebviewReadyRef.current?.(null);
+    };
+  }, []);
+  const fixed =
+    viewport.width != null && viewport.height != null && viewport.width > 0 && viewport.height > 0;
+  const zoom = Math.max(25, Math.min(300, viewport.zoomPercent || 100)) / 100;
+
+  // Electron throws synchronously if called before guest is attached + dom-ready;
+  // .catch() alone cannot prevent RootErrorBoundary from swallowing the page.
+  const injectSelectionHook = () => {
+    const wv = webviewRef.current;
+    if (!wv?.executeJavaScript) return;
+    try {
+      void wv.executeJavaScript(BROWSER_SELECTION_HOOK_JS).catch(() => {
+        /* guest may be mid-navigation */
+      });
+    } catch {
+      /* not attached / not dom-ready yet */
+    }
+  };
+
+  // Parent-driven navigation (address bar / back / forward) — never mutate src attr.
+  useEffect(() => {
+    const wv = webviewRef.current;
+    if (!wv) return;
+    if (url === committedUrlRef.current) return;
+    committedUrlRef.current = url;
+    programmaticNavRef.current = true;
+    setSelectionUi(null);
+    loadWebviewUrl(wv, url);
+  }, [url]);
+
+  // Trae-style refresh.
+  useEffect(() => {
+    if (reloadKey === 0) return;
+    const wv = webviewRef.current;
+    if (!wv) return;
+    setSelectionUi(null);
+    try {
+      const result = wv.reload();
+      if (result != null && typeof (result as Promise<void>).then === "function") {
+        void (result as Promise<void>).catch(ignoreWebviewNavAbort);
+      }
+    } catch (err) {
+      ignoreWebviewNavAbort(err);
+    }
+  }, [reloadKey]);
+
+  useEffect(() => {
+    const wv = webviewRef.current;
+    if (!wv) return;
+    const reportGuestHistory = () => {
+      onGuestHistoryRef.current?.({
+        canBack: Boolean(wv.canGoBack?.()),
+        canForward: Boolean(wv.canGoForward?.()),
+      });
+    };
+    const syncFromGuest = (nextUrl: string, mode: "push" | "replace") => {
+      const href = String(nextUrl || "").trim();
+      reportGuestHistory();
+      if (!href || !/^https?:\/\//i.test(href)) return;
+      if (href === committedUrlRef.current && mode === "push") return;
+      committedUrlRef.current = href;
+      setSelectionUi(null);
+      if (mode === "replace") onReplaceNavigateRef.current?.(href);
+      else onNavigateRef.current?.(href);
+    };
+    const onDidNavigate = (event: Event) => {
+      const e = event as Event & { url?: string };
+      const replaced = redirectingRef.current || programmaticNavRef.current;
+      redirectingRef.current = false;
+      programmaticNavRef.current = false;
+      syncFromGuest(e.url || wv.getURL?.() || "", replaced ? "replace" : "push");
+      // Do not inject here — guest may not be dom-ready yet after navigate.
+    };
+    const onRedirect = (event: Event) => {
+      const e = event as Event & { url?: string };
+      const href = e.url || "";
+      if (!redirectingRef.current && !programmaticNavRef.current) {
+        redirectingRef.current = true;
+        syncFromGuest(href, "push");
+        return;
+      }
+      redirectingRef.current = true;
+      syncFromGuest(href, "replace");
+    };
+    const onDomReady = () => injectSelectionHook();
+    wv.addEventListener("dom-ready", onDomReady);
+    wv.addEventListener("did-finish-load", onDomReady);
+    wv.addEventListener("did-navigate", onDidNavigate);
+    wv.addEventListener("did-navigate-in-page", onDidNavigate);
+    wv.addEventListener("did-redirect-navigation", onRedirect);
+    const showLinkMenu = (linkURL: string, guestX: number, guestY: number) => {
+      if (!/^https?:\/\//i.test(linkURL)) {
+        setLinkMenu(null);
+        return;
+      }
+      setSelectionUi(null);
+      const host = webviewHostRef.current?.getBoundingClientRect();
+      const zoomFactor = fixed ? zoom : 1;
+      const rawX = (host?.left ?? 0) + guestX * zoomFactor;
+      const rawY = (host?.top ?? 0) + guestY * zoomFactor;
+      const x = Math.max(8, Math.min(rawX, window.innerWidth - 220));
+      const y = Math.max(8, Math.min(rawY, window.innerHeight - 72));
+      setLinkMenu({ url: linkURL, x, y });
+    };
+    const onContextMenu = (event: Event) => {
+      const params = (event as Event & { params?: { x?: number; y?: number; linkURL?: string } }).params;
+      const linkURL = String(params?.linkURL || "").trim();
+      const guestX = Number(params?.x) || 0;
+      const guestY = Number(params?.y) || 0;
+      if (/^https?:\/\//i.test(linkURL)) {
+        event.preventDefault();
+        showLinkMenu(linkURL, guestX, guestY);
+        return;
+      }
+      void wv.executeJavaScript?.(
+        `(() => { try { return String(window.__nearLinkHref || ""); } catch (_) { return ""; } })()`,
+      ).then((found) => {
+        const href = String(found || "").trim();
+        if (!/^https?:\/\//i.test(href)) return;
+        event.preventDefault();
+        showLinkMenu(href, guestX, guestY);
+      }).catch(() => undefined);
+    };
+    const onConsoleMessage = (event: Event) => {
+      const message = String((event as Event & { message?: string }).message || "");
+      if (!message.startsWith("__NEAR_LINK_MENU__")) return;
+      try {
+        const payload = JSON.parse(message.slice("__NEAR_LINK_MENU__".length)) as {
+          href?: string;
+          x?: number;
+          y?: number;
+        };
+        showLinkMenu(String(payload.href || ""), Number(payload.x) || 0, Number(payload.y) || 0);
+      } catch {
+        /* ignore malformed guest payload */
+      }
+    };
+    wv.addEventListener("context-menu", onContextMenu);
+    wv.addEventListener("console-message", onConsoleMessage);
+    try {
+      void wv.executeJavaScript?.(BROWSER_SELECTION_HOOK_JS).catch(() => undefined);
+    } catch {
+      /* guest not ready yet; dom-ready will inject */
+    }
+    // Wait for dom-ready / did-finish-load — eager inject on mount races attach.
+    return () => {
+      wv.removeEventListener("dom-ready", onDomReady);
+      wv.removeEventListener("did-finish-load", onDomReady);
+      wv.removeEventListener("did-navigate", onDidNavigate);
+      wv.removeEventListener("did-navigate-in-page", onDidNavigate);
+      wv.removeEventListener("did-redirect-navigation", onRedirect);
+      wv.removeEventListener("context-menu", onContextMenu);
+      wv.removeEventListener("console-message", onConsoleMessage);
+    };
+  }, [fixed, zoom]);
+
+  useEffect(() => {
+    if (!linkMenu) return;
+    const close = () => setLinkMenu(null);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [linkMenu]);
+
+  // Poll guest selection → host toolbar (webview has no shared Selection API with host).
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      const wv = webviewRef.current;
+      const host = webviewHostRef.current;
+      if (!wv?.executeJavaScript || !host) return;
+      try {
+        const raw = await wv.executeJavaScript(BROWSER_SELECTION_READ_JS);
+        if (cancelled) return;
+        const snap = parseBrowserGuestSelection(raw);
+        if (!snap) {
+          setSelectionUi((prev) => (prev ? null : prev));
+          return;
+        }
+        const hostRect = host.getBoundingClientRect();
+        const anchor = mapGuestRectToHostAnchor(snap.rect, hostRect, {
+          zoom: fixed ? zoom : 1,
+        });
+        setSelectionUi((prev) => {
+          if (
+            prev &&
+            prev.text === snap.text &&
+            prev.href === snap.href &&
+            prev.anchor.top === anchor.top &&
+            prev.anchor.left === anchor.left
+          ) {
+            return prev;
+          }
+          return { text: snap.text, href: snap.href, anchor };
+        });
+      } catch {
+        /* ignore transient guest errors */
+      }
+    };
+    const id = window.setInterval(() => {
+      void tick();
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [fixed, zoom, url]);
+
+  const frameStyle: CSSProperties = fixed
+    ? {
+        width: viewport.width!,
+        height: viewport.height!,
+        transform: zoom !== 1 ? `scale(${zoom})` : undefined,
+        transformOrigin: "top left",
+        border: 0,
+        display: "flex",
+      }
+    : { width: "100%", height: "100%", minHeight: 220, border: 0, display: "flex" };
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <HtmlPreviewChrome
+        documentUrl={url}
+        inspectEnabled={inspectEnabled}
+        onInspectEnabledChange={setInspectEnabled}
+        inspectAvailable={false}
+        deviceToolbarVisible={deviceToolbarVisible}
+        onDeviceToolbarVisibleChange={setDeviceToolbarVisible}
+        viewport={viewport}
+        onViewportChange={setViewport}
+        onOpenInBrowser={() => {
+          void window.agenticxDesktop?.openExternal?.(url);
+        }}
+        onOpenDevTools={() => {
+          const wv = webviewRef.current;
+          try {
+            wv?.openDevTools?.();
+          } catch {
+            void window.agenticxDesktop?.openHtmlPreviewDevTools?.({ url });
+          }
+        }}
+        openDevToolsDisabled={!/^https?:\/\//i.test(url)}
+      />
+      <div className="flex min-h-0 flex-1 justify-center overflow-auto bg-[color-mix(in_oklab,var(--surface-hover)_80%,transparent)] p-3">
+        <div
+          ref={webviewHostRef}
+          className={
+            fixed
+              ? "relative shrink-0 overflow-hidden rounded-md border border-border bg-white shadow-sm"
+              : "min-h-0 w-full flex-1 overflow-hidden rounded-md border border-border bg-white"
+          }
+          style={
+            fixed
+              ? {
+                  width: Math.ceil((viewport.width ?? 0) * zoom),
+                  height: Math.ceil((viewport.height ?? 0) * zoom),
+                }
+              : undefined
+          }
+        >
+          <webview
+            ref={(el) => {
+              webviewRef.current = el as NearElectronWebview | null;
+              onWebviewReadyRef.current?.(webviewRef.current);
+            }}
+            title={title}
+            src={initialSrcRef.current}
+            partition="persist:near-workpanel-browser"
+            allowpopups="true"
+            className="border-0 bg-white"
+            style={frameStyle}
+          />
+        </div>
+      </div>
+      {selectionUi ? (
+        <BrowserSelectionToolbar
+          anchor={selectionUi.anchor}
+          onOpenInNewTab={
+            selectionUi.href && /^https?:\/\//i.test(selectionUi.href)
+              ? () => {
+                  const href = selectionUi.href || "";
+                  setSelectionUi(null);
+                  onOpenLinkInNewTabRef.current?.(href, browserTitleFromUrl(href));
+                }
+              : undefined
+          }
+          onSearch={() => {
+            const text = selectionUi.text.trim();
+            if (!text) return;
+            onSearchSelection?.(text);
+          }}
+          onCopy={() => {
+            const text = selectionUi.text.trim();
+            if (!text) return;
+            void navigator.clipboard.writeText(text);
+          }}
+          onQuote={() => {
+            const text = selectionUi.text.trim();
+            if (!text) return;
+            onQuoteSelection?.({ text, url, title });
+            setSelectionUi(null);
+          }}
+          onOpenScratch={
+            onOpenScratchSelection
+              ? () => {
+                  const text = selectionUi.text.trim();
+                  if (!text) return;
+                  onOpenScratchSelection({ text, url, title });
+                  setSelectionUi(null);
+                }
+              : undefined
+          }
+        />
+      ) : null}
+      {linkMenu
+        ? createPortal(
+            <div
+              className="fixed z-[200] min-w-[196px] overflow-hidden rounded-lg border border-border bg-surface-popover py-1 shadow-lg"
+              style={{ left: linkMenu.x, top: linkMenu.y }}
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-text-strong hover:bg-surface-hover"
+                onClick={() => {
+                  const nextUrl = linkMenu.url;
+                  setLinkMenu(null);
+                  onOpenLinkInNewTabRef.current?.(nextUrl, browserTitleFromUrl(nextUrl));
+                }}
+              >
+                {t("work.openLinkInNewTab")}
+              </button>
+              <button
+                type="button"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-text-strong hover:bg-surface-hover"
+                onClick={() => {
+                  void navigator.clipboard.writeText(linkMenu.url);
+                  setLinkMenu(null);
+                }}
+              >
+                {t("work.copyLinkAddress")}
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
+    </div>
+  );
+}
+
+export type WorkPanelTabKind =
+  | "summary"
+  | "workspace"
+  | "terminal"
+  | "browser"
+  | "preview"
+  | "graph"
+  | "timeline"
+  | "scratch";
+
+export type { SummarySectionId } from "./summary-sections";
+
+export type WorkPanelFocus =
+  | { kind: "summary"; section?: SummarySectionId; highlightPath?: string }
+  | { kind: "workspace" }
+  | { kind: "terminal"; tabId?: string }
+  | {
+      kind: "browser";
+      tabId?: string;
+      /** Display URL in the address bar (https://… or file:///…). */
+      url?: string;
+      title?: string;
+      /** Local HTML body rendered via srcDoc (Trae-style in-app preview). */
+      srcDoc?: string;
+    }
+  /** Trae-style file preview tab (fills WorkPanel; never opens 工作区 file tree). */
+  | {
+      kind: "preview";
+      absolutePath: string;
+      title?: string;
+      lineRange?: WorkspacePreviewLineRange;
+      highlightMode?: PreviewHighlightMode;
+    }
+  /** Run Graph God-View tab (same shell as browser / summary). */
+  | { kind: "graph" }
+  | {
+      kind: "timeline";
+      sessionId?: string;
+      runId?: string;
+      eventId?: string;
+    }
+  | { kind: "scratch"; chatId: string }
+  | null;
+
+type BrowserHistoryEntry = {
+  url: string;
+  title: string;
+  srcDoc?: string | null;
+};
+
+type BrowserTab = {
+  id: string;
+  title: string;
+  url: string;
+  draftUrl: string;
+  /** When set, iframe uses srcDoc instead of remote src (local HTML reports). */
+  srcDoc?: string | null;
+  /** Bump to force iframe remount after refresh. */
+  reloadNonce?: number;
+  /** Trae-style back/forward stack for this tab. */
+  history: BrowserHistoryEntry[];
+  historyIndex: number;
+};
+
+function browserEntry(
+  url: string,
+  title: string,
+  srcDoc?: string | null,
+): BrowserHistoryEntry {
+  return { url, title, srcDoc: srcDoc ?? null };
+}
+
+function createBrowserTab(init: {
+  id: string;
+  title: string;
+  url: string;
+  draftUrl?: string;
+  srcDoc?: string | null;
+}): BrowserTab {
+  const entry = browserEntry(init.url, init.title, init.srcDoc);
+  return {
+    id: init.id,
+    title: init.title,
+    url: init.url,
+    draftUrl: init.draftUrl ?? (init.url === "about:blank" ? "" : init.url),
+    srcDoc: init.srcDoc ?? null,
+    history: [entry],
+    historyIndex: 0,
+  };
+}
+
+/** Push a navigation entry (truncates forward stack). Same URL updates in place. */
+function pushBrowserHistory(tab: BrowserTab, entry: BrowserHistoryEntry): BrowserTab {
+  const idx = Math.max(0, Math.min(tab.historyIndex, tab.history.length - 1));
+  const cur = tab.history[idx];
+  if (cur && cur.url === entry.url) {
+    const history = tab.history.map((e, i) => (i === idx ? entry : e));
+    return {
+      ...tab,
+      url: entry.url,
+      draftUrl: entry.url === "about:blank" ? tab.draftUrl : entry.url,
+      title: entry.title,
+      srcDoc: entry.srcDoc,
+      history,
+      historyIndex: idx,
+    };
+  }
+  const history = [...tab.history.slice(0, idx + 1), entry];
+  return {
+    ...tab,
+    url: entry.url,
+    draftUrl: entry.url === "about:blank" ? "" : entry.url,
+    title: entry.title,
+    srcDoc: entry.srcDoc,
+    history,
+    historyIndex: history.length - 1,
+  };
+}
+
+function replaceBrowserHistory(tab: BrowserTab, entry: BrowserHistoryEntry): BrowserTab {
+  if (tab.history.length === 0) return pushBrowserHistory(tab, entry);
+  const idx = Math.max(0, Math.min(tab.historyIndex, tab.history.length - 1));
+  const history = tab.history.slice();
+  history[idx] = entry;
+  return {
+    ...tab,
+    url: entry.url,
+    draftUrl: entry.url === "about:blank" ? "" : entry.url,
+    title: entry.title,
+    srcDoc: entry.srcDoc,
+    history,
+    historyIndex: idx,
+  };
+}
+
+function goBrowserHistory(tab: BrowserTab, delta: -1 | 1): BrowserTab | null {
+  const next = tab.historyIndex + delta;
+  if (next < 0 || next >= tab.history.length) return null;
+  const entry = tab.history[next];
+  if (!entry) return null;
+  return {
+    ...tab,
+    historyIndex: next,
+    url: entry.url,
+    draftUrl: entry.url === "about:blank" ? "" : entry.url,
+    title: entry.title,
+    srcDoc: entry.srcDoc,
+  };
+}
+
+type PreviewTab = {
+  id: string;
+  title: string;
+  absolutePath: string;
+  preview: WorkspacePreview | null;
+  loading: boolean;
+  error: string | null;
+  copied: boolean;
+  lineRange?: WorkspacePreviewLineRange;
+  highlightMode: PreviewHighlightMode;
+};
+
+type Props = {
+  paneId: string;
+  sessionId: string;
+  activeTaskspaceId: string | null;
+  onActiveTaskspaceChange: (taskspaceId: string | null) => void;
+  autoRefreshKey?: number;
+  tintColor?: string;
+  onClose: () => void;
+  /** Trae-style: enlarge work panel to dominate the pane (main content). */
+  expanded?: boolean;
+  onToggleExpand?: () => void;
+  focusRequest?: WorkPanelFocus;
+  onFocusRequestHandled?: () => void;
+  onPickFileForReference?: (taskspaceId: string, path: string) => void;
+  onPickDirectoryForReference?: (payload: {
+    taskspaceId: string;
+    relPath: string;
+    label: string;
+  }) => void;
+  onQuotePreviewSnippet?: (payload: WorkspacePreviewQuotePayload) => void;
+  onOpenScratchChat?: (draft: ScratchChatDraft) => void;
+  /** Remote webview text selection → quote chip in current chat. */
+  onQuoteBrowserSelection?: (payload: BrowserQuotePayload) => void;
+  /** Embedded terminal text selection → quote chip in current chat. */
+  onQuoteTerminalSelection?: (text: string) => void;
+  /** Remote webview text selection → in-app Google search tab. */
+  onSearchBrowserSelection?: (text: string) => void;
+  previewOpenRequest?: WorkspacePreviewOpenRequest | null;
+  onPreviewOpenRequestHandled?: () => void;
+  onEnsureSessionForWorkspace?: () => Promise<string | null>;
+  subAgents: SubAgent[];
+  selectedSubAgent: string | null;
+  onCancelSubAgent: (agentId: string) => void;
+  onRetrySubAgent: (agentId: string) => void;
+  onChatSubAgent: (agentId: string) => void;
+  onModelChangeSubAgent?: (agentId: string, provider: string, model: string) => void;
+  onConfirmResolveSubAgent?: (agentId: string, approved: boolean) => void;
+  /** Align「待办」status with StickyTaskBar (in_progress spinner + idle promote). */
+  todoLiveness?: "active" | "stalled" | "idle";
+  todoExecutionState?: string;
+  /** Group chat id; when set, WorkPanel exposes 成员 / 执行时间线 tabs. */
+  groupId?: string | null;
+  avatarList?: Avatar[];
+  metaLeaderLabel?: string;
+  /** Agent ids currently typing or showing a live activity hint. */
+  groupActiveAgentIds?: string[];
+  groupActivityHint?: Record<string, string>;
+  groupMemberPhase?: Record<string, "waiting" | "failed">;
+  onCrewAppendDirective?: (agentId: string) => void;
+  onCrewSwitchModel?: (agentId: string) => void;
+  onCrewInterrupt?: (agentId: string) => void;
+};
+
+function uid(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function normalizeBrowseUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "about:blank";
+  if (/^https?:\/\//i.test(trimmed) || /^about:/i.test(trimmed) || /^file:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  // Absolute local path typed into the address bar → file:// URL.
+  if (trimmed.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith("~/")) {
+    return pathToFileUrl(trimmed);
+  }
+  return `https://${trimmed}`;
+}
+
+function fileUrlToLocalPath(fileUrl: string): string | null {
+  const raw = String(fileUrl || "").trim();
+  if (!/^file:\/\//i.test(raw)) return null;
+  try {
+    const parsed = new URL(raw);
+    let pathname = decodeURIComponent(parsed.pathname || "");
+    // Windows file:///C:/… → pathname "/C:/…" — drop the leading slash before drive.
+    if (/^\/[a-zA-Z]:\//.test(pathname)) pathname = pathname.slice(1);
+    return pathname || null;
+  } catch {
+    return null;
+  }
+}
+
+function Section({
+  id,
+  title,
+  count,
+  open,
+  onToggle,
+  children,
+  footer,
+  actions,
+}: {
+  id: SummarySectionId;
+  title: string;
+  count?: number;
+  open: boolean;
+  onToggle: (id: SummarySectionId) => void;
+  children: ReactNode;
+  footer?: ReactNode;
+  actions?: ReactNode;
+}) {
+  // Size to content (no flex-1 fill). Parent summary column scrolls as a whole when
+  // sections exceed the panel — avoids large empty gaps under short lists like「待办」.
+  return (
+    <section className="flex shrink-0 flex-col border-b border-border last:border-b-0">
+      <div className="flex w-full shrink-0 items-center">
+        <button
+          type="button"
+          className="group flex min-w-0 flex-1 items-center gap-2 px-3 py-3.5 text-left text-[13px] text-text-strong hover:bg-surface-hover/40"
+          onClick={() => onToggle(id)}
+          aria-expanded={open}
+        >
+          <ChevronDown
+            className={`h-3.5 w-3.5 shrink-0 text-text-faint transition-transform ${open ? "" : "-rotate-90"}`}
+            strokeWidth={2}
+          />
+          <span className="font-normal group-hover:font-semibold">{title}</span>
+          {typeof count === "number" ? (
+            <span className="text-[11px] font-normal text-text-faint">{count}</span>
+          ) : null}
+        </button>
+        {actions ? (
+          <div
+            className="shrink-0 pr-3"
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            {actions}
+          </div>
+        ) : null}
+      </div>
+      {open ? <div className="px-3 pb-3">{children}</div> : null}
+      {open && footer ? <div className="shrink-0 px-3 pb-3">{footer}</div> : null}
+    </section>
+  );
+}
+
+function EmptyBlock({
+  icon,
+  title,
+  subtitle,
+}: {
+  icon: ReactNode;
+  title: string;
+  subtitle: string;
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-1.5 px-2 py-5 text-center">
+      <div className="text-text-faint opacity-70">{icon}</div>
+      <div className="text-[13px] text-text-subtle">{title}</div>
+      <div className="max-w-[240px] text-[11px] leading-relaxed text-text-faint">{subtitle}</div>
+    </div>
+  );
+}
+
+export function WorkPanel({
+  paneId,
+  sessionId,
+  activeTaskspaceId,
+  onActiveTaskspaceChange,
+  autoRefreshKey,
+  tintColor,
+  onClose,
+  expanded = false,
+  onToggleExpand,
+  focusRequest,
+  onFocusRequestHandled,
+  onPickFileForReference,
+  onPickDirectoryForReference,
+  onQuotePreviewSnippet,
+  onOpenScratchChat,
+  onQuoteBrowserSelection,
+  onQuoteTerminalSelection,
+  onSearchBrowserSelection,
+  previewOpenRequest,
+  onPreviewOpenRequestHandled,
+  onEnsureSessionForWorkspace,
+  subAgents,
+  selectedSubAgent,
+  onCancelSubAgent,
+  onRetrySubAgent,
+  onChatSubAgent,
+  onModelChangeSubAgent,
+  onConfirmResolveSubAgent,
+  todoLiveness = "idle",
+  todoExecutionState,
+  groupId = null,
+  avatarList = [],
+  metaLeaderLabel = "Machi",
+  groupActiveAgentIds = [],
+  groupActivityHint = {},
+  groupMemberPhase = {},
+  onCrewAppendDirective,
+  onCrewSwitchModel,
+  onCrewInterrupt,
+}: Props) {
+  const { t } = useTranslation("workspace");
+  const isGroupPane = Boolean(groupId);
+  const addPaneTerminalTab = useAppStore((s) => s.addPaneTerminalTab);
+  const removePaneTerminalTab = useAppStore((s) => s.removePaneTerminalTab);
+  const setActivePaneTerminalTab = useAppStore((s) => s.setActivePaneTerminalTab);
+  // Stable fallbacks: `?? []` inline creates a new array every snapshot and can
+  // infinite-loop useSyncExternalStore when the pane field is briefly missing.
+  const terminalTabs = useAppStore(
+    (s) => s.panes.find((p) => p.id === paneId)?.terminalTabs ?? EMPTY_TERMINAL_TABS,
+  );
+  const activeTerminalTabId = useAppStore(
+    (s) => s.panes.find((p) => p.id === paneId)?.activeTerminalTabId ?? null
+  );
+  const paneMessages = useAppStore(
+    (s) => s.panes.find((p) => p.id === paneId)?.messages ?? EMPTY_MESSAGES,
+  );
+  const scratchChatsRaw = useAppStore(
+    (s) => s.panes.find((p) => p.id === paneId)?.scratchChats ?? EMPTY_SCRATCH_CHATS,
+  );
+  const parkedScratchChatsRaw = useAppStore(
+    (s) => s.panes.find((p) => p.id === paneId)?.parkedScratchChats ?? EMPTY_PARKED_SCRATCH_CHATS,
+  );
+  const hostSessionId = String(sessionId ?? "").trim();
+  const scratchChats = useMemo(
+    () => filterScratchChatsForHost(scratchChatsRaw, hostSessionId),
+    [scratchChatsRaw, hostSessionId],
+  );
+  const parkedScratchChats = useMemo(
+    () => filterScratchChatsForHost(parkedScratchChatsRaw, hostSessionId),
+    [parkedScratchChatsRaw, hostSessionId],
+  );
+  const closeScratchChat = useAppStore((s) => s.closeScratchChat);
+  const restoreParkedScratchChat = useAppStore((s) => s.restoreParkedScratchChat);
+  const deleteScratchChat = useAppStore((s) => s.deleteScratchChat);
+  const promoteScratchChat = useAppStore((s) => s.promoteScratchChat);
+  const clearHostScratchChats = useAppStore((s) => s.clearHostScratchChats);
+  const setScratchChatFloating = useAppStore((s) => s.setScratchChatFloating);
+  const { sendScratch, sendingIds: scratchSendingIds, errors: scratchSendErrors, clearScratchRuntime } =
+    useScratchChatRuntime(paneId);
+
+  const [summaryTabOpen, setSummaryTabOpen] = useState(true);
+  const [activeKind, setActiveKind] = useState<WorkPanelTabKind | null>("summary");
+  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(null);
+  const [browserTabs, setBrowserTabs] = useState<BrowserTab[]>([]);
+  const [chromeCookieDialogOpen, setChromeCookieDialogOpen] = useState(false);
+  const [chromeCookieBannerRev, setChromeCookieBannerRev] = useState(0);
+  const [activePreviewId, setActivePreviewId] = useState<string | null>(null);
+  const [previewTabs, setPreviewTabs] = useState<PreviewTab[]>([]);
+  const [workspaceTabOpen, setWorkspaceTabOpen] = useState(false);
+  const [graphTabOpen, setGraphTabOpen] = useState(false);
+  const [timelineTabOpen, setTimelineTabOpen] = useState(false);
+  const [activeScratchId, setActiveScratchId] = useState<string | null>(null);
+  const [pendingDismissParked, setPendingDismissParked] = useState<ScratchChat | null>(null);
+  const [pendingClearHost, setPendingClearHost] = useState(false);
+  const [timelineFocusTarget, setTimelineFocusTarget] = useState<{
+    sessionId: string;
+    runId: string;
+    eventId: string;
+  } | null>(null);
+  const paneForGraph = useAppStore(
+    (s) => s.panes.find((p) => p.id === paneId) ?? null,
+  );
+  const groups = useAppStore((s) => s.groups);
+  const groupAvatarIds = useMemo(() => {
+    if (!groupId) return [] as string[];
+    return groups.find((g) => g.id === groupId)?.avatarIds ?? [];
+  }, [groupId, groups]);
+  const timelineAvatarById = useMemo(() => {
+    const map = new Map<string, Avatar>();
+    for (const item of avatarList) map.set(item.id, item);
+    return map;
+  }, [avatarList]);
+  const timelineAgentIds = useMemo(
+    () => ["__meta__", ...groupAvatarIds],
+    [groupAvatarIds],
+  );
+  const [plusOpen, setPlusOpen] = useState(false);
+  const [plusPos, setPlusPos] = useState<{ left: number; top: number } | null>(null);
+  const plusBtnRef = useRef<HTMLButtonElement | null>(null);
+  const tabStripRef = useRef<HTMLDivElement | null>(null);
+  const activeKindRef = useRef(activeKind);
+  const activeBrowserIdRef = useRef(activeBrowserId);
+  const agentWebviewRef = useRef<NearElectronWebview | null>(null);
+  const [guestHistory, setGuestHistory] = useState({ canBack: false, canForward: false });
+  const openWebReferenceInBrowserRef = useRef<(url: string, title: string) => void>(() => undefined);
+  const previewDirtyRef = useRef(false);
+  const previewRequestLeaveRef = useRef<((proceed: () => void) => void) | null>(null);
+  const previewTabsRef = useRef(previewTabs);
+  const activePreviewIdRef = useRef(activePreviewId);
+  activeKindRef.current = activeKind;
+  activeBrowserIdRef.current = activeBrowserId;
+  previewTabsRef.current = previewTabs;
+  activePreviewIdRef.current = activePreviewId;
+  // Empty zones stay collapsed by default; content arrival auto-expands (Trae-style).
+  const [openSections, setOpenSections] = useState<Record<SummarySectionId, boolean>>({
+    todo: false,
+    workitems: false,
+    artifacts: false,
+    changes: false,
+    scratch: false,
+    spawns: false,
+    refs: false,
+    members: false,
+  });
+  const apiToken = useAppStore((s) => s.apiToken);
+  const apiBase = useAppStore((s) => s.apiBase);
+  const addPane = useAppStore((s) => s.addPane);
+  const setActivePaneId = useAppStore((s) => s.setActivePaneId);
+  const openRunDrawer = useAppStore((s) => s.openRunDrawer);
+  const panes = useAppStore((s) => s.panes);
+  const [workItems, setWorkItems] = useState<WorkItem[]>([]);
+  const [workItemError, setWorkItemError] = useState("");
+  const [extraArtifactPaths, setExtraArtifactPaths] = useState<string[]>([]);
+  /**
+   * Paths from on-disk session files. `messages.json` is the full chat history;
+   * `agent_messages.json` is only the last 40 model-context rows (SSE gap).
+   */
+  const [diskArtifactPaths, setDiskArtifactPaths] = useState<string[]>([]);
+  const [artifactHighlightPath, setArtifactHighlightPath] = useState<string | null>(null);
+  /**
+   * User-focused summary section (产物 / 变更). Ref is written synchronously so
+   * same-tick auto-expand effects do not reopen 待办 / 参考 / 子智能体.
+   */
+  const [pinnedSummarySection, setPinnedSummarySectionState] = useState<SummarySectionId | null>(
+    null,
+  );
+  const pinnedSummarySectionRef = useRef<SummarySectionId | null>(null);
+  const setPinnedSummarySection = (section: SummarySectionId | null) => {
+    pinnedSummarySectionRef.current = section;
+    setPinnedSummarySectionState(section);
+  };
+
+  // Tail-loaded panes only hold the last 3 rounds / 40 messages. Re-scan the
+  // full `messages.json` so older file_write / bash artifacts stay listed.
+  // Keep polling while the summary tab exists: group chat writes often land
+  // on disk without file_write rows, and WorkspacePanel already refreshes
+  // every 3s — without this,「任务产物」stays on the first listing.
+  useEffect(() => {
+    const sid = String(sessionId || "").trim();
+    if (!sid) {
+      setDiskArtifactPaths([]);
+      return;
+    }
+    return startPersistedArtifactPathResync({
+      sessionId: sid,
+      enabled: summaryTabOpen && activeKind === "summary",
+      load: async (targetSid) => {
+        const startedAt = performance.now();
+        const paths = await loadPersistedSessionArtifactPaths(targetSid);
+        logWorkspacePerf({
+          event: "persisted artifact resync",
+          paneId,
+          sessionId: targetSid,
+          artifactCount: paths.length,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        return paths;
+      },
+      onPaths: setDiskArtifactPaths,
+      onError: (err) => {
+        console.warn("[WorkPanel] persisted artifacts load failed:", err);
+        setDiskArtifactPaths([]);
+      },
+    });
+  }, [sessionId, summaryTabOpen, activeKind, autoRefreshKey]);
+
+  const reloadWorkItems = useCallback(async () => {
+    if (!groupId || !apiBase) return;
+    try {
+      const rows = await fetchWorkItems(groupId, apiToken, apiBase);
+      setWorkItems(rows);
+      setWorkItemError("");
+    } catch (e) {
+      setWorkItemError(workItemRequestError(e));
+    }
+  }, [groupId, apiToken, apiBase]);
+
+  useEffect(() => {
+    if (!isGroupPane || !summaryTabOpen) return;
+    void reloadWorkItems();
+    const t = window.setInterval(() => void reloadWorkItems(), 5000);
+    return () => window.clearInterval(t);
+  }, [isGroupPane, summaryTabOpen, reloadWorkItems]);
+
+  const runWorkItemAction = useCallback(
+    async (item: WorkItem, action: "accept" | "pause" | "resume") => {
+      if (!groupId || !apiBase) return;
+      try {
+        const next = await postWorkItemAction(
+          groupId,
+          item.id,
+          apiToken,
+          action,
+          item.version,
+          apiBase,
+        );
+        setWorkItems((prev) => prev.map((row) => (row.id === next.id ? next : row)));
+        setWorkItemError("");
+      } catch (e) {
+        const code = e instanceof Error ? (e as Error & { code?: string }).code : "";
+        if (code === "conflict") {
+          await reloadWorkItems();
+          setWorkItemError(t("work.workItemChanged"));
+          return;
+        }
+        setWorkItemError(workItemRequestError(e));
+      }
+    },
+    [groupId, apiBase, apiToken, reloadWorkItems],
+  );
+
+  const runCreateWorkItem = useCallback(
+    async (input: { title: string; owner_kind: WorkItem["owner_kind"]; owner_id: string }) => {
+      if (!groupId || !apiBase) return;
+      try {
+        const created = await createWorkItem(groupId, apiToken, input, apiBase);
+        setWorkItems((prev) => [...prev, created]);
+        setWorkItemError("");
+      } catch (e) {
+        setWorkItemError(workItemRequestError(e));
+      }
+    },
+    [groupId, apiBase, apiToken],
+  );
+
+  const openWorkItemOwner = useCallback(
+    (item: WorkItem) => {
+      if (item.owner_kind === "human") return;
+      if (item.owner_kind === "meta" || item.owner_id === "__meta__") {
+        const existing = panes.find((p) => !p.avatarId || p.avatarId === "__meta__");
+        if (existing) {
+          setActivePaneId(existing.id);
+          return;
+        }
+        addPane(null, metaLeaderLabel, "");
+        return;
+      }
+      const existing = panes.find((p) => p.avatarId === item.owner_id);
+      if (existing) {
+        setActivePaneId(existing.id);
+        return;
+      }
+      const name = avatarList.find((a) => a.id === item.owner_id)?.name || item.owner_id;
+      addPane(item.owner_id, name, "");
+    },
+    [addPane, avatarList, metaLeaderLabel, panes, setActivePaneId],
+  );
+
+  const artifactPaths = useMemo(
+    () => {
+      const candidates = collectSessionArtifactPaths(
+        paneMessages,
+        subAgents,
+        [...extraArtifactPaths, ...diskArtifactPaths],
+        sessionId,
+      );
+      return selectSessionDeliverablePaths(paneMessages, candidates);
+    },
+    [paneMessages, subAgents, extraArtifactPaths, diskArtifactPaths, sessionId],
+  );
+
+  const changeRows = useMemo(
+    () => collectSessionFileChanges(paneMessages),
+    [paneMessages],
+  );
+
+  /** Content-stable key so effect does not re-fire on new array identity. */
+  const artifactSyncKey = useMemo(
+    () => [...artifactPaths].sort().join("\0"),
+    [artifactPaths],
+  );
+  const artifactSyncDoneKeyRef = useRef<string>("");
+
+  /**
+   * Only list paths that exist on disk. Text extraction alone can false-positive
+   * (e.g. prose「管理 ~/.codewiki/… 路径」) and produce ENOENT on open.
+   */
+  const [presentArtifactPaths, setPresentArtifactPaths] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    if (artifactPaths.length === 0) {
+      setPresentArtifactPaths([]);
+      return;
+    }
+    const stat = window.agenticxDesktop?.statLocalPath;
+    if (!stat) {
+      setPresentArtifactPaths(artifactPaths);
+      return;
+    }
+    void Promise.all(
+      artifactPaths.map(async (path) => {
+        try {
+          const result = await stat(path);
+          return result.ok ? path : null;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((rows) => {
+      if (cancelled) return;
+      setPresentArtifactPaths(rows.filter((p): p is string => Boolean(p)));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifactSyncKey, artifactPaths]);
+
+  // Keep left-sidebar「历史对话 → 文件管理」in sync: stage this session's
+  // artifacts into task_artifacts/ and attach that single folder.
+  useEffect(() => {
+    const sid = String(sessionId || "").trim();
+    if (!sid || !artifactSyncKey) return;
+    const runKey = `${sid}\n${artifactSyncKey}`;
+    if (artifactSyncDoneKeyRef.current === runKey) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          let maxTaskspaces = RUNTIME_DEFAULT_TASKSPACES;
+          const runtime = await window.agenticxDesktop?.loadRuntimeConfig?.();
+          if (runtime?.ok && Number.isFinite(runtime.max_taskspaces)) {
+            maxTaskspaces = runtime.max_taskspaces;
+          }
+          if (cancelled) return;
+          const paths = artifactSyncKey.split("\0").filter(Boolean);
+          const result = await ensureArtifactTaskspacesForSession(sid, paths, {
+            maxTaskspaces,
+          });
+          if (!cancelled && result.ok) {
+            artifactSyncDoneKeyRef.current = runKey;
+          }
+        } catch (err) {
+          console.warn("[WorkPanel] artifact → workspace sync failed:", err);
+        }
+      })();
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [sessionId, artifactSyncKey]);
+
+  const referenceBundle = useMemo(
+    () => collectSessionReferences(paneMessages),
+    [paneMessages],
+  );
+
+  /**
+   * Trae Work 语义（侧栏只读）：
+   * - 与 StickyTaskBar 同源展示（含 idle promote / 运行中 in_progress 转圈）
+   * - 用户已发下一轮且尚未新 todo_write：清空旧清单（刷新），勿把完成态打回空心圆
+   * - 新一轮写出新 todo_write：整栏替换为新清单
+   */
+  const sessionTodo = useMemo(() => {
+    const real = resolveWorkPanelTodoFromMessages(
+      paneMessages,
+      todoLiveness,
+      todoExecutionState,
+    );
+    if (real) return real;
+    const wbLine = latestRunningWbBridgeProgress(paneMessages);
+    if (!wbLine) return null;
+    const delegated: ParsedTodo = {
+      items: [
+        {
+          status: "in_progress",
+          content: i18n.t("work.delegating", { ns: "workspace" }),
+          activeForm: wbLine,
+        },
+      ],
+      completed: 0,
+      total: 1,
+    };
+    return delegated;
+  }, [paneMessages, todoLiveness, todoExecutionState]);
+  const hasSessionTodo = !!sessionTodo;
+  const overviewOpenSections = () =>
+    contentDrivenOpenSections({
+      todo: hasSessionTodo,
+      workitems: isGroupPane && workItems.length > 0,
+      artifacts: presentArtifactPaths.length > 0,
+      changes: changeRows.length > 0,
+      scratch: scratchChats.length + parkedScratchChats.length > 0,
+      spawns: subAgents.length > 0,
+      refs: !referenceBundle.isEmpty,
+      members: isGroupPane,
+    });
+
+  const activeBrowser = useMemo(
+    () => browserTabs.find((t) => t.id === activeBrowserId) ?? null,
+    [browserTabs, activeBrowserId]
+  );
+
+  const activePreview = useMemo(
+    () => previewTabs.find((t) => t.id === activePreviewId) ?? null,
+    [previewTabs, activePreviewId],
+  );
+
+  const activeChangeHighlight = useMemo(() => {
+    if (!activePreview) return null;
+    const preview = activePreview.preview;
+    const content =
+      preview && (preview.kind === "text" || preview.kind === "markdown" || preview.kind === "code")
+        ? preview.content
+        : undefined;
+    const collected = collectFileChangeHighlight(
+      paneMessages,
+      activePreview.absolutePath,
+      content,
+    );
+    return resolveActiveChangeHighlight(activePreview.highlightMode, collected);
+  }, [activePreview, paneMessages]);
+
+  const hasAnyTab =
+    summaryTabOpen ||
+    workspaceTabOpen ||
+    graphTabOpen ||
+    timelineTabOpen ||
+    terminalTabs.length > 0 ||
+    browserTabs.length > 0 ||
+    previewTabs.length > 0 ||
+    scratchChats.length > 0;
+
+  const resolveFallbackKind = (opts?: {
+    excludeSummary?: boolean;
+    excludeWorkspace?: boolean;
+    excludeGraph?: boolean;
+    excludeTimeline?: boolean;
+    excludeTerminalId?: string;
+    excludeBrowserId?: string;
+    excludePreviewId?: string;
+    excludeScratchId?: string;
+  }): WorkPanelTabKind | null => {
+    const remainingScratch = scratchChats.find((chat) => chat.id !== opts?.excludeScratchId);
+    if (opts?.excludeScratchId && remainingScratch) {
+      setActiveScratchId(remainingScratch.id);
+      return "scratch";
+    }
+    if (!opts?.excludeSummary && summaryTabOpen) return "summary";
+    if (!opts?.excludeGraph && graphTabOpen) return "graph";
+    if (!opts?.excludeTimeline && timelineTabOpen) return "timeline";
+    const nextPreview = previewTabs.find((t) => t.id !== opts?.excludePreviewId);
+    if (nextPreview) {
+      setActivePreviewId(nextPreview.id);
+      return "preview";
+    }
+    if (!opts?.excludeWorkspace && workspaceTabOpen) return "workspace";
+    const nextTerminal = terminalTabs.find((t) => t.id !== opts?.excludeTerminalId);
+    if (nextTerminal) return "terminal";
+    const nextBrowser = browserTabs.find((t) => t.id !== opts?.excludeBrowserId);
+    if (nextBrowser) {
+      setActiveBrowserId(nextBrowser.id);
+      return "browser";
+    }
+    if (remainingScratch) {
+      setActiveScratchId(remainingScratch.id);
+      return "scratch";
+    }
+    return null;
+  };
+
+  const summaryScratchChats = useMemo(
+    () => listSummaryScratchChats(scratchChats, parkedScratchChats),
+    [scratchChats, parkedScratchChats],
+  );
+  const activeScratch = useMemo(
+    () => scratchChats.find((chat) => chat.id === activeScratchId) ?? scratchChats[0] ?? null,
+    [scratchChats, activeScratchId],
+  );
+  useEffect(() => {
+    setActiveScratchId((current) => resolveActiveScratchId(scratchChats, current));
+  }, [scratchChats]);
+
+  const deleteScratchSessionIfUnused = (sid: string) => {
+    const sessionId = String(sid ?? "").trim();
+    if (!sessionId) return;
+    const usedByMainPane = useAppStore
+      .getState()
+      .panes.some((pane) => String(pane.sessionId ?? "").trim() === sessionId);
+    if (usedByMainPane || typeof window.agenticxDesktop?.deleteSession !== "function") return;
+    void window.agenticxDesktop.deleteSession(sessionId).finally(() => {
+      useAppStore.getState().bumpSessionCatalogRevision();
+    });
+  };
+
+  const commitCloseScratch = (chatId: string) => {
+    clearScratchRuntime(chatId);
+    const evicted = closeScratchChat(paneId, chatId);
+    for (const sid of evicted) deleteScratchSessionIfUnused(sid);
+    if (activeKind === "scratch" && activeScratchId === chatId) {
+      setActiveKind(resolveFallbackKind({ excludeScratchId: chatId }));
+    }
+  };
+
+  const requestCloseScratch = (chat: ScratchChat) => {
+    commitCloseScratch(chat.id);
+  };
+
+  const restoreParkedScratch = (chat: ScratchChat) => {
+    const restoredId = restoreParkedScratchChat(paneId, chat.id);
+    if (!restoredId) return;
+    setActiveScratchId(restoredId);
+    setActiveKind("scratch");
+  };
+
+  const commitDismissParked = (chatId: string) => {
+    clearScratchRuntime(chatId);
+    const sid = deleteScratchChat(paneId, chatId);
+    deleteScratchSessionIfUnused(sid);
+    setPendingDismissParked(null);
+    if (activeKind === "scratch" && activeScratchId === chatId) {
+      setActiveKind(resolveFallbackKind({ excludeScratchId: chatId }));
+    }
+  };
+
+  const commitPromoteScratch = (chat: ScratchChat) => {
+    const sid = promoteScratchChat(paneId, chat.id);
+    if (!sid) return;
+    clearScratchRuntime(chat.id);
+    useAppStore.getState().bumpSessionCatalogRevision();
+    if (activeKind === "scratch" && activeScratchId === chat.id) {
+      setActiveKind(resolveFallbackKind({ excludeScratchId: chat.id }));
+    }
+  };
+
+  const commitClearHost = () => {
+    const ids = clearHostScratchChats(paneId, hostSessionId);
+    for (const sid of ids) deleteScratchSessionIfUnused(sid);
+    setPendingClearHost(false);
+    setActiveScratchId(null);
+    if (activeKind === "scratch") {
+      setActiveKind("summary");
+    }
+  };
+
+  const openExistingScratch = (chat: ScratchChat, isParked: boolean) => {
+    if (isParked) {
+      restoreParkedScratch(chat);
+      return;
+    }
+    setActiveScratchId(chat.id);
+    setActiveKind("scratch");
+  };
+
+  const openScratchFromPlus = () => {
+    closePlus();
+    const latestOpen = scratchChats[scratchChats.length - 1];
+    if (latestOpen) {
+      setActiveScratchId(latestOpen.id);
+      setActiveKind("scratch");
+      return;
+    }
+    const latestParked = parkedScratchChats[0];
+    if (latestParked) {
+      restoreParkedScratch(latestParked);
+      return;
+    }
+    onOpenScratchChat?.(buildBlankScratchDraft(t("work.tabScratch")));
+  };
+
+  const scratchAbout = (snippet: string) =>
+    t("work.scratchAbout", { snippet: clipScratchTitleSnippet(snippet) || snippet });
+
+  const openPreviewScratch = (payload: WorkspacePreviewQuotePayload) => {
+    const abs = String(payload.absolutePath || payload.path || "").trim();
+    if (!abs) return;
+    const snippet = "snippet" in payload ? String(payload.snippet || "").trim() : "";
+    onOpenScratchChat?.(
+      buildPreviewScratchDraft({
+        absolutePath: abs,
+        snippet: snippet || undefined,
+        title: scratchAbout(snippet || fileLabelFromPath(abs)),
+      }),
+    );
+  };
+
+  const silentReloadPreviewTab = useCallback(async (tabId: string, path: string) => {
+    if (previewDirtyRef.current && activePreviewIdRef.current === tabId) return;
+    const loaded = await loadAbsoluteFilePreview(path);
+    if (!loaded.ok) return;
+    setPreviewTabs((prev) =>
+      prev.map((t) => {
+        if (t.id !== tabId) return t;
+        if (textualPreviewUnchanged(t.preview, loaded.preview)) return t;
+        return { ...t, preview: loaded.preview, error: null, loading: false };
+      }),
+    );
+  }, []);
+
+  const openLocalFilePreview = (
+    absPathRaw: string,
+    titleHint?: string,
+    lineRange?: WorkspacePreviewLineRange,
+    highlightMode?: PreviewHighlightMode,
+  ) => {
+    const path = String(absPathRaw || "").trim();
+    if (!path) return;
+    const mode = nextPreviewHighlightMode(highlightMode);
+    const title = String(titleHint || "").trim() || artifactBaseName(path) || t("work.preview");
+    const existing = previewTabs.find((t) => t.absolutePath === path);
+    if (existing) {
+      setPreviewTabs((prev) =>
+        prev.map((t) =>
+          t.id === existing.id
+            ? { ...t, highlightMode: mode, ...(lineRange ? { lineRange } : {}) }
+            : t,
+        ),
+      );
+      setActivePreviewId(existing.id);
+      setActiveKind("preview");
+      void silentReloadPreviewTab(existing.id, path);
+      return;
+    }
+    const nextId = uid();
+    setPreviewTabs((prev) => [
+      ...prev,
+      {
+        id: nextId,
+        title,
+        absolutePath: path,
+        preview: null,
+        loading: true,
+        error: null,
+        copied: false,
+        highlightMode: mode,
+        ...(lineRange ? { lineRange } : {}),
+      },
+    ]);
+    setActivePreviewId(nextId);
+    setActiveKind("preview");
+    void (async () => {
+      const loaded = await loadAbsoluteFilePreview(path);
+      setPreviewTabs((prev) =>
+        prev.map((t) =>
+          t.id !== nextId
+            ? t
+            : loaded.ok
+              ? {
+                  ...t,
+                  loading: false,
+                  preview: loaded.preview,
+                  error: null,
+                  title: artifactBaseName(path) || t.title,
+                }
+              : { ...t, loading: false, preview: null, error: loaded.error },
+        ),
+      );
+    })();
+  };
+
+  const forceClosePreviewTab = (tabId: string) => {
+    const next = previewTabs.filter((t) => t.id !== tabId);
+    setPreviewTabs(next);
+    if (activePreviewId === tabId) {
+      setActivePreviewId(next[next.length - 1]?.id ?? null);
+      if (activeKind === "preview") {
+        setActiveKind(resolveFallbackKind({ excludePreviewId: tabId }));
+      }
+    }
+  };
+
+  const closePreviewTab = (tabId: string) => {
+    if (tabId === activePreviewId && previewDirtyRef.current && previewRequestLeaveRef.current) {
+      previewRequestLeaveRef.current(() => forceClosePreviewTab(tabId));
+      return;
+    }
+    forceClosePreviewTab(tabId);
+  };
+
+  const activatePreviewTab = (tabId: string) => {
+    if (tabId === activePreviewId) {
+      setActiveKind("preview");
+      return;
+    }
+    if (previewDirtyRef.current && previewRequestLeaveRef.current) {
+      previewRequestLeaveRef.current(() => {
+        setActivePreviewId(tabId);
+        setActiveKind("preview");
+      });
+      return;
+    }
+    setActivePreviewId(tabId);
+    setActiveKind("preview");
+  };
+
+  // Agent / external writes do not reopen the tab — poll mtime and refresh in place.
+  useEffect(() => {
+    if (activeKind !== "preview") return;
+    const tabId = activePreviewId;
+    const path = String(activePreview?.absolutePath || "").trim();
+    if (!tabId || !path) return;
+
+    let cancelled = false;
+    let inFlight = false;
+
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      if (previewDirtyRef.current && activePreviewIdRef.current === tabId) return;
+      const tab = previewTabsRef.current.find((t) => t.id === tabId);
+      if (!tab || tab.loading) return;
+      const stat = window.agenticxDesktop?.statLocalPath;
+      if (!stat) return;
+      inFlight = true;
+      try {
+        const result = await stat(path);
+        if (cancelled || !result.ok) return;
+        const latest = previewTabsRef.current.find((t) => t.id === tabId);
+        if (
+          !latest ||
+          !isLiveReloadablePreview(latest.preview) ||
+          !shouldReloadPreviewFromStat({
+            dirty: previewDirtyRef.current && activePreviewIdRef.current === tabId,
+            loading: latest.loading,
+            knownMtimeMs: previewKnownMtimeMs(latest.preview),
+            diskMtimeMs: result.mtimeMs,
+          })
+        ) {
+          return;
+        }
+        await silentReloadPreviewTab(tabId, path);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void tick();
+    const timer = window.setInterval(() => {
+      void tick();
+    }, PREVIEW_LIVE_RELOAD_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    activeKind,
+    activePreviewId,
+    activePreview?.absolutePath,
+    activePreview?.loading,
+    silentReloadPreviewTab,
+  ]);
+
+  // iframe target=_blank / window.open → main denies + IPC; stay in Near browser tab.
+  useEffect(() => {
+    ensureInAppBrowserOpenIpc();
+    const handler: InAppBrowserOpenHandler = (rawUrl) => {
+      if (activeKindRef.current !== "browser") return false;
+      const tabId = activeBrowserIdRef.current;
+      if (!tabId) return false;
+      const nextUrl = normalizeBrowseUrl(rawUrl);
+      if (!/^https?:\/\//i.test(nextUrl)) return false;
+      const title = browserTitleFromUrl(nextUrl);
+      setBrowserTabs((prev) =>
+        prev.map((t) =>
+          t.id === tabId ? pushBrowserHistory(t, browserEntry(nextUrl, title, null)) : t,
+        ),
+      );
+      return true;
+    };
+    inAppBrowserOpenBridge().handlers.add(handler);
+    return () => {
+      inAppBrowserOpenBridge().handlers.delete(handler);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!focusRequest) return;
+    if (focusRequest.kind === "summary") {
+      setSummaryTabOpen(true);
+      setActiveKind("summary");
+      if (focusRequest.section) {
+        setPinnedSummarySection(focusRequest.section);
+        setOpenSections(exclusiveOpenSections(focusRequest.section));
+      } else {
+        setPinnedSummarySection(null);
+        setOpenSections(overviewOpenSections());
+      }
+      const highlight = String(focusRequest.highlightPath || "").trim();
+      if (highlight) {
+        const base = highlight.replace(/\\/g, "/").replace(/\/+$/, "").split("/").pop() || "";
+        const looksFile = /\.[a-zA-Z0-9]{1,12}$/.test(base);
+        if (looksFile) {
+          setExtraArtifactPaths((prev) => (prev.includes(highlight) ? prev : [...prev, highlight]));
+        }
+        setArtifactHighlightPath(highlight);
+      }
+    } else if (focusRequest.kind === "workspace") {
+      setWorkspaceTabOpen(true);
+      setActiveKind("workspace");
+    } else if (focusRequest.kind === "terminal") {
+      setActiveKind("terminal");
+      if (focusRequest.tabId) setActivePaneTerminalTab(paneId, focusRequest.tabId);
+    } else if (focusRequest.kind === "browser") {
+      const focusUrl = String(focusRequest.url || "").trim();
+      const focusSrcDoc = focusRequest.srcDoc;
+      if (focusUrl && focusSrcDoc != null) {
+        const title =
+          String(focusRequest.title || "").trim() ||
+          artifactBaseName(fileUrlToLocalPath(focusUrl) || focusUrl) ||
+          i18n.t("work.browser", { ns: "workspace" });
+        const nextId = uid();
+        const entry = browserEntry(focusUrl, title, focusSrcDoc);
+        setBrowserTabs((prev) => {
+          const existing = prev.find((t) => t.url === focusUrl);
+          if (existing) {
+            // Activate existing tab after commit.
+            queueMicrotask(() => setActiveBrowserId(existing.id));
+            return prev.map((t) =>
+              t.id === existing.id ? pushBrowserHistory(t, entry) : t,
+            );
+          }
+          queueMicrotask(() => setActiveBrowserId(nextId));
+          return [
+            ...prev,
+            createBrowserTab({ id: nextId, title, url: focusUrl, srcDoc: focusSrcDoc }),
+          ];
+        });
+      } else if (focusUrl) {
+        const title = String(focusRequest.title || "").trim() || focusUrl;
+        const nextId = uid();
+        const entry = browserEntry(focusUrl, title, null);
+        setBrowserTabs((prev) => {
+          const existing = prev.find((t) => t.url === focusUrl && t.srcDoc == null);
+          if (existing) {
+            queueMicrotask(() => setActiveBrowserId(existing.id));
+            return prev.map((t) =>
+              t.id === existing.id ? pushBrowserHistory(t, entry) : t,
+            );
+          }
+          queueMicrotask(() => setActiveBrowserId(nextId));
+          return [
+            ...prev,
+            createBrowserTab({ id: nextId, title, url: focusUrl, srcDoc: null }),
+          ];
+        });
+      } else if (focusRequest.tabId) {
+        setActiveBrowserId(focusRequest.tabId);
+      } else {
+        setBrowserTabs((prev) => {
+          if (prev.length > 0) {
+            const current =
+              prev.find((t) => t.id === activeBrowserIdRef.current) ?? prev[prev.length - 1];
+            queueMicrotask(() => setActiveBrowserId(current.id));
+            return prev;
+          }
+          const id = uid();
+          queueMicrotask(() => setActiveBrowserId(id));
+          return [
+            ...prev,
+            createBrowserTab({
+              id,
+              title: i18n.t("work.newTab", { ns: "workspace" }),
+              url: "about:blank",
+              draftUrl: "",
+            }),
+          ];
+        });
+      }
+      setActiveKind("browser");
+    } else if (focusRequest.kind === "preview") {
+      openLocalFilePreview(
+        focusRequest.absolutePath,
+        focusRequest.title,
+        focusRequest.lineRange,
+        focusRequest.highlightMode,
+      );
+    } else if (focusRequest.kind === "graph") {
+      setGraphTabOpen(true);
+      setActiveKind("graph");
+    } else if (focusRequest.kind === "timeline") {
+      setTimelineTabOpen(true);
+      setActiveKind("timeline");
+      if (focusRequest.sessionId && focusRequest.runId && focusRequest.eventId) {
+        setTimelineFocusTarget({
+          sessionId: focusRequest.sessionId,
+          runId: focusRequest.runId,
+          eventId: focusRequest.eventId,
+        });
+      }
+    } else if (focusRequest.kind === "scratch") {
+      setActiveScratchId(resolveScratchFocusId(scratchChats, focusRequest.chatId, activeScratchId));
+      setActiveKind("scratch");
+    }
+    onFocusRequestHandled?.();
+  }, [focusRequest, onFocusRequestHandled, paneId, setActivePaneTerminalTab, scratchChats, activeScratchId]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(
+        prev,
+        "scratch",
+        scratchChats.length + parkedScratchChats.length > 0,
+        pinnedSummarySectionRef.current,
+      ),
+    );
+  }, [scratchChats.length, parkedScratchChats.length, pinnedSummarySection]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(prev, "spawns", subAgents.length > 0, pinnedSummarySectionRef.current),
+    );
+  }, [subAgents.length, pinnedSummarySection]);
+
+  // Group panes always have Meta + members; keep the summary section expanded by default.
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(prev, "members", isGroupPane, pinnedSummarySectionRef.current),
+    );
+  }, [isGroupPane, pinnedSummarySection]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(
+        prev,
+        "workitems",
+        isGroupPane && workItems.length > 0,
+        pinnedSummarySectionRef.current,
+      ),
+    );
+  }, [isGroupPane, workItems.length, pinnedSummarySection]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(
+        prev,
+        "artifacts",
+        presentArtifactPaths.length > 0,
+        pinnedSummarySectionRef.current,
+      ),
+    );
+  }, [presentArtifactPaths.length, pinnedSummarySection]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(prev, "changes", changeRows.length > 0, pinnedSummarySectionRef.current),
+    );
+  }, [changeRows.length, pinnedSummarySection]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(prev, "refs", !referenceBundle.isEmpty, pinnedSummarySectionRef.current),
+    );
+  }, [referenceBundle.isEmpty, pinnedSummarySection]);
+
+  useEffect(() => {
+    setOpenSections((prev) =>
+      applyPinnedAutoExpand(prev, "todo", hasSessionTodo, pinnedSummarySectionRef.current),
+    );
+  }, [hasSessionTodo, pinnedSummarySection]);
+
+  useEffect(() => {
+    setExtraArtifactPaths([]);
+    setArtifactHighlightPath(null);
+    setPinnedSummarySection(null);
+  }, [sessionId]);
+
+  const toggleSection = (id: SummarySectionId) => {
+    setOpenSections((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const closePlus = () => {
+    setPlusOpen(false);
+    setPlusPos(null);
+  };
+
+  const openPlusMenu = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    const rect = plusBtnRef.current?.getBoundingClientRect();
+    if (rect) {
+      setPlusPos({ left: Math.max(8, rect.left), top: rect.bottom + 4 });
+    }
+    setPlusOpen((v) => !v);
+  };
+
+  const openSummaryTab = () => {
+    setPinnedSummarySection(null);
+    setOpenSections(overviewOpenSections());
+    setSummaryTabOpen(true);
+    setActiveKind("summary");
+    closePlus();
+  };
+
+  const openChangesTab = () => {
+    setPinnedSummarySection("changes");
+    setOpenSections(exclusiveOpenSections("changes"));
+    setSummaryTabOpen(true);
+    setActiveKind("summary");
+    closePlus();
+  };
+
+  const closeSummaryTab = () => {
+    setPinnedSummarySection(null);
+    setSummaryTabOpen(false);
+    if (activeKind === "summary") {
+      setActiveKind(resolveFallbackKind({ excludeSummary: true }));
+    }
+  };
+
+  const openGraphTab = () => {
+    setGraphTabOpen(true);
+    setActiveKind("graph");
+    closePlus();
+  };
+
+  const closeGraphTab = () => {
+    setGraphTabOpen(false);
+    if (activeKind === "graph") {
+      setActiveKind(resolveFallbackKind({ excludeGraph: true }));
+    }
+  };
+
+  const openTimelineTab = () => {
+    setTimelineTabOpen(true);
+    setActiveKind("timeline");
+    closePlus();
+  };
+
+  const closeTimelineTab = () => {
+    setTimelineTabOpen(false);
+    if (activeKind === "timeline") {
+      setActiveKind(resolveFallbackKind({ excludeTimeline: true }));
+    }
+  };
+
+  const openWorkspaceTab = () => {
+    setWorkspaceTabOpen(true);
+    setActiveKind("workspace");
+    closePlus();
+  };
+
+  const openTerminalTab = () => {
+    closePlus();
+    void (async () => {
+      let cwd = (terminalTabs[0]?.cwd ?? "").trim();
+      if (!cwd && sessionId && window.agenticxDesktop?.listTaskspaces) {
+        try {
+          const result = await window.agenticxDesktop.listTaskspaces(sessionId);
+          const workspaces = Array.isArray(result.workspaces) ? result.workspaces : [];
+          const preferred =
+            workspaces.find((w) => String(w.id ?? "") === String(activeTaskspaceId ?? "")) ??
+            workspaces[0];
+          cwd = String(preferred?.path ?? "").trim();
+        } catch {
+          cwd = "";
+        }
+      }
+      if (!cwd) {
+        // No workspace yet — still open a tab; shell will land on default home.
+        cwd = "~";
+      }
+      addPaneTerminalTab(paneId, cwd, "zsh");
+      setActiveKind("terminal");
+    })();
+  };
+
+  const openBrowserTab = () => {
+    const id = uid();
+    const tab = createBrowserTab({
+      id,
+      title: i18n.t("work.newTab", { ns: "workspace" }),
+      url: "about:blank",
+      draftUrl: "",
+    });
+    setBrowserTabs((prev) => [...prev, tab]);
+    setActiveBrowserId(id);
+    setActiveKind("browser");
+    closePlus();
+  };
+
+  /** Open a remote http(s) reference inside the WorkPanel browser tab (Trae-style). */
+  const openWebReferenceInBrowser = (url: string, title: string) => {
+    const nextUrl = normalizeBrowseUrl(url);
+    if (!/^https?:\/\//i.test(nextUrl)) return;
+    const nextTitle = String(title || "").trim() || nextUrl;
+    const nextId = uid();
+    const entry = browserEntry(nextUrl, nextTitle, null);
+    setBrowserTabs((prev) => {
+      const existing = prev.find((t) => t.url === nextUrl && t.srcDoc == null);
+      if (existing) {
+        queueMicrotask(() => setActiveBrowserId(existing.id));
+        return prev.map((t) =>
+          t.id === existing.id ? pushBrowserHistory(t, entry) : t,
+        );
+      }
+      queueMicrotask(() => setActiveBrowserId(nextId));
+      return [
+        ...prev,
+        createBrowserTab({ id: nextId, title: nextTitle, url: nextUrl, srcDoc: null }),
+      ];
+    });
+    setActiveKind("browser");
+  };
+  openWebReferenceInBrowserRef.current = openWebReferenceInBrowser;
+
+  useEffect(() => {
+    ensureBrowserAgentIpc();
+    const execGuest = async (script: string, reindex = true): Promise<BrowserAgentResult> => {
+      const wv = agentWebviewRef.current;
+      if (!wv) {
+        return { ok: false, error: "guest_not_ready" };
+      }
+      try {
+        if (reindex) {
+          await wv.executeJavaScript(BROWSER_AGENT_INDEX_JS);
+        }
+        const raw = await wv.executeJavaScript(script);
+        return parseBrowserAgentResult(raw);
+      } catch {
+        return { ok: false, error: "guest_not_ready" };
+      }
+    };
+    const unregister = registerBrowserAgentController(sessionId, {
+      open: async (url) => {
+        const nextUrl = url.trim();
+        if (!nextUrl) return { ok: false, error: "invalid_url" };
+        openWebReferenceInBrowserRef.current(nextUrl, nextUrl);
+        return { ok: true, url: nextUrl };
+      },
+      snapshot: async () => execGuest(BROWSER_AGENT_INDEX_JS, false),
+      click: async (index) => execGuest(browserAgentClickJs(index)),
+      type: async (index, text, submit) => execGuest(browserAgentTypeJs(index, text, submit)),
+      pressKey: async (key) => execGuest(browserAgentPressKeyJs(key)),
+      extractText: async (query) => {
+        const guest = await execGuest(browserAgentExtractJs(query), false);
+        const wv = agentWebviewRef.current;
+        const id = wv?.getWebContentsId?.();
+        if (typeof id === "number" && id > 0 && window.agenticxDesktop.extractNearBrowserFrames) {
+          try {
+            const framed = await window.agenticxDesktop.extractNearBrowserFrames({
+              webContentsId: id,
+              query,
+            });
+            const framedText = filterExtractedText(framed?.text || "", query);
+            const guestText = guest.text || "";
+            if (framed?.ok && framedText.length > guestText.length) {
+              return {
+                ...guest,
+                ok: true,
+                error: undefined,
+                text: framedText,
+              };
+            }
+          } catch {
+            /* guest JS extract still used */
+          }
+        }
+        return guest;
+      },
+      screenshot: async () => {
+        const wv = agentWebviewRef.current;
+        if (!wv?.capturePage) return { ok: false, error: "guest_not_ready" };
+        try {
+          const image = await wv.capturePage();
+          const dataUrl = image.toDataURL?.();
+          if (!dataUrl) return { ok: false, error: "screenshot_failed" };
+          const saved = await window.agenticxDesktop.saveNearBrowserScreenshot?.({ dataUrl });
+          if (!saved?.ok || !saved.path) {
+            return { ok: false, error: saved?.error ?? "screenshot_failed" };
+          }
+          return { ok: true, path: saved.path };
+        } catch {
+          return { ok: false, error: "screenshot_failed" };
+        }
+      },
+    });
+    return unregister;
+  }, [sessionId]);
+
+  const closeBrowserTab = (tabId: string) => {
+    const next = browserTabs.filter((t) => t.id !== tabId);
+    setBrowserTabs(next);
+    if (activeBrowserId === tabId) {
+      setActiveBrowserId(next[next.length - 1]?.id ?? null);
+      if (activeKind === "browser") {
+        setActiveKind(resolveFallbackKind({ excludeBrowserId: tabId }));
+      }
+    }
+  };
+
+  const openLocalHtmlPreview = (absPath: string) => {
+    const path = String(absPath || "").trim();
+    if (!path || !isInAppHtmlPreviewPath(path)) return;
+    void (async () => {
+      const prepared = await loadPreparedHtmlSrcDoc(path);
+      if (!prepared.ok) {
+        console.warn("[WorkPanel] read HTML failed:", prepared.error);
+        return;
+      }
+      const fileUrl = pathToFileUrl(path);
+      const title = artifactBaseName(path) || "HTML";
+      const nextId = uid();
+      const entry = browserEntry(fileUrl, title, prepared.srcDoc);
+      setBrowserTabs((prev) => {
+        const existing = prev.find((t) => t.url === fileUrl);
+        if (existing) {
+          queueMicrotask(() => setActiveBrowserId(existing.id));
+          return prev.map((t) =>
+            t.id === existing.id ? pushBrowserHistory(t, entry) : t,
+          );
+        }
+        queueMicrotask(() => setActiveBrowserId(nextId));
+        return [
+          ...prev,
+          createBrowserTab({ id: nextId, title, url: fileUrl, srcDoc: prepared.srcDoc }),
+        ];
+      });
+      setActiveKind("browser");
+    })();
+  };
+
+  const navigateBrowser = (tabId: string) => {
+    const tab = browserTabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    const nextUrl = normalizeBrowseUrl(tab.draftUrl || tab.url);
+    const localPath = fileUrlToLocalPath(nextUrl);
+    if (localPath && isInAppHtmlPreviewPath(localPath)) {
+      void (async () => {
+        const prepared = await loadPreparedHtmlSrcDoc(localPath);
+        if (!prepared.ok) {
+          console.warn("[WorkPanel] read HTML failed:", prepared.error);
+          return;
+        }
+        const title = artifactBaseName(localPath) || "HTML";
+        const entry = browserEntry(nextUrl, title, prepared.srcDoc);
+        setBrowserTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? pushBrowserHistory(t, entry) : t)),
+        );
+      })();
+      return;
+    }
+
+    setBrowserTabs((prev) =>
+      prev.map((t) => {
+        if (t.id !== tabId) return t;
+        const title = browserTitleFromUrl(nextUrl, t.title || i18n.t("work.browser", { ns: "workspace" }));
+        return pushBrowserHistory(t, browserEntry(nextUrl, title, null));
+      }),
+    );
+  };
+
+  const goBrowserBack = (tabId: string) => {
+    setBrowserTabs((prev) =>
+      prev.map((t) => {
+        if (t.id !== tabId) return t;
+        return goBrowserHistory(t, -1) ?? t;
+      }),
+    );
+  };
+
+  const goBrowserForward = (tabId: string) => {
+    setBrowserTabs((prev) =>
+      prev.map((t) => {
+        if (t.id !== tabId) return t;
+        return goBrowserHistory(t, 1) ?? t;
+      }),
+    );
+  };
+
+  /** Trae-style refresh: re-read local HTML / remount remote iframe. */
+  const refreshBrowser = (tabId: string) => {
+    const tab = browserTabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    const bump = (t: BrowserTab): BrowserTab => ({
+      ...t,
+      reloadNonce: (t.reloadNonce ?? 0) + 1,
+    });
+    const localPath = fileUrlToLocalPath(tab.url);
+    if (localPath && isInAppHtmlPreviewPath(localPath)) {
+      void (async () => {
+        const prepared = await loadPreparedHtmlSrcDoc(localPath);
+        if (!prepared.ok) {
+          console.warn("[WorkPanel] refresh HTML failed:", prepared.error);
+          setBrowserTabs((prev) => prev.map((t) => (t.id === tabId ? bump(t) : t)));
+          return;
+        }
+        const title = artifactBaseName(localPath) || "HTML";
+        const entry = browserEntry(tab.url, title, prepared.srcDoc);
+        setBrowserTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? bump(pushBrowserHistory(t, entry)) : t)),
+        );
+      })();
+      return;
+    }
+    setBrowserTabs((prev) => prev.map((t) => (t.id === tabId ? bump(t) : t)));
+  };
+
+  useEffect(() => {
+    if (!plusOpen) return;
+    const onDoc = () => closePlus();
+    window.addEventListener("mousedown", onDoc);
+    return () => window.removeEventListener("mousedown", onDoc);
+  }, [plusOpen]);
+
+  const freshTask = isFreshTask(paneMessages);
+  const plusItem = (key: string, icon: ReactNode, label: string, onClick: () => void) => {
+    const locked = workspaceToolLocked(key, freshTask);
+    const button = (
+      <button
+        type="button"
+        className={
+          locked
+            ? "flex w-full cursor-default items-center gap-2.5 px-3 py-2 text-left text-[13px] text-text-faint"
+            : "flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] text-text-strong hover:bg-surface-hover"
+        }
+        aria-disabled={locked || undefined}
+        onClick={() => {
+          if (locked) return;
+          onClick();
+        }}
+      >
+        {icon}
+        {label}
+      </button>
+    );
+    return locked ? (
+      <HoverTip key={key} label={t("work.startLockedHint")} className="w-full">
+        {button}
+      </HoverTip>
+    ) : (
+      <span key={key}>{button}</span>
+    );
+  };
+
+  const plusMenu =
+    plusOpen && plusPos
+      ? createPortal(
+          <div
+            className="fixed z-[120] min-w-[148px] overflow-hidden rounded-xl border border-border bg-surface-popover py-1.5 shadow-lg"
+            style={{ left: plusPos.left, top: plusPos.top }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {plusItem("summary", <ListTodo className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabSummary"), openSummaryTab)}
+            {plusItem("scratch", <ScratchChatIcon className="h-4 w-4 text-text-subtle" />, t("work.tabScratch"), openScratchFromPlus)}
+            {plusItem("changes", <FileDiff className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabChanges"), openChangesTab)}
+            {plusItem("browser", <Globe className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabBrowser"), openBrowserTab)}
+            {plusItem("graph", <Share2 className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabGraph"), openGraphTab)}
+            {plusItem("timeline", <CirclePlay className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabTimeline"), openTimelineTab)}
+            {plusItem("terminal", <TerminalIcon className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabTerminal"), openTerminalTab)}
+            {plusItem("workspace", <FolderOpen className="h-4 w-4 text-text-subtle" strokeWidth={1.7} />, t("work.tabWorkspace"), openWorkspaceTab)}
+          </div>,
+          document.body
+        )
+      : null;
+
+  const startEntries = [
+    {
+      key: "summary",
+      icon: <ListTodo className="h-5 w-5 shrink-0 text-text-subtle" strokeWidth={1.6} />,
+      title: t("work.tabSummary"),
+      subtitle: t("work.subtitleSummary"),
+      onClick: openSummaryTab,
+    },
+    {
+      key: "scratch",
+      icon: <ScratchChatIcon className="h-5 w-5 shrink-0 text-text-subtle" />,
+      title: t("work.tabScratch"),
+      subtitle: t("work.subtitleScratch"),
+      onClick: openScratchFromPlus,
+    },
+    {
+      key: "changes",
+      icon: <FileDiff className="h-5 w-5 shrink-0 text-text-subtle" strokeWidth={1.6} />,
+      title: t("work.tabChanges"),
+      subtitle: t("work.subtitleChanges"),
+      onClick: openChangesTab,
+    },
+    {
+      key: "browser",
+      icon: <Globe className="h-5 w-5 shrink-0 text-text-subtle" strokeWidth={1.6} />,
+      title: t("work.tabBrowser"),
+      subtitle: t("work.subtitleBrowser"),
+      onClick: openBrowserTab,
+    },
+    {
+      key: "graph",
+      icon: <Share2 className="h-5 w-5 shrink-0 text-text-subtle" strokeWidth={1.6} />,
+      title: t("work.tabGraph"),
+      subtitle: t("work.subtitleGraph"),
+      onClick: openGraphTab,
+    },
+    {
+      key: "timeline",
+      icon: <CirclePlay className="h-5 w-5 shrink-0 text-text-subtle" strokeWidth={1.6} />,
+      title: t("work.tabTimeline"),
+      subtitle: t("work.subtitleTimeline"),
+      onClick: openTimelineTab,
+    },
+    {
+      key: "terminal",
+      icon: <TerminalIcon className="h-5 w-5 shrink-0 text-text-subtle" strokeWidth={1.6} />,
+      title: t("work.tabTerminal"),
+      subtitle: t("work.subtitleTerminal"),
+      onClick: openTerminalTab,
+    },
+  ];
+
+  const summaryPillLabel =
+    pinnedSummarySection === "changes"
+      ? t("work.tabChanges")
+      : pinnedSummarySection === "artifacts"
+        ? t("work.artifacts")
+        : t("work.tabSummary");
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-transparent">
+      <div className="flex h-10 shrink-0 items-center border-b border-border">
+        <div
+          ref={tabStripRef}
+          className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto px-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden [&>*]:shrink-0"
+          onWheel={(event) => {
+            const el = tabStripRef.current;
+            if (!el || el.scrollWidth <= el.clientWidth) return;
+            const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+            if (!delta) return;
+            event.preventDefault();
+            el.scrollLeft += delta;
+          }}
+        >
+        {summaryTabOpen ? (
+          <button
+            type="button"
+            className={`flex h-7 max-w-[132px] items-center gap-1.5 rounded-full px-1.5 pr-2.5 text-[12px] ${
+              activeKind === "summary"
+                ? "bg-surface-card-strong text-text-strong"
+                : "bg-surface-hover/70 text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => setActiveKind("summary")}
+          >
+            <HoverTip label={t("work.closeTab", { label: summaryPillLabel })}>
+              <span
+                role="button"
+                tabIndex={0}
+                className="group/close inline-flex shrink-0 items-center justify-center text-text-muted transition hover:text-text-strong"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeSummaryTab();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeSummaryTab();
+                  }
+                }}
+                aria-label={t("work.closeTab", { label: summaryPillLabel })}
+              >
+                <X className="h-3 w-3 stroke-[2] group-hover/close:stroke-[3]" />
+              </span>
+            </HoverTip>
+            <span className="truncate">{summaryPillLabel}</span>
+          </button>
+        ) : null}
+
+        {workspaceTabOpen ? (
+          <button
+            type="button"
+            className={`flex h-7 max-w-[110px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "workspace"
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => setActiveKind("workspace")}
+          >
+            <FolderOpen className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span className="truncate">{t("work.tabWorkspace")}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                setWorkspaceTabOpen(false);
+                if (activeKind === "workspace") {
+                  setActiveKind(resolveFallbackKind({ excludeWorkspace: true }));
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setWorkspaceTabOpen(false);
+                  if (activeKind === "workspace") {
+                    setActiveKind(resolveFallbackKind({ excludeWorkspace: true }));
+                  }
+                }
+              }}
+              aria-label={t("work.closeWorkspaceTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ) : null}
+
+        {graphTabOpen ? (
+          <button
+            type="button"
+            className={`flex h-7 max-w-[110px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "graph"
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => setActiveKind("graph")}
+          >
+            <Share2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span className="truncate">{t("work.tabGraph")}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeGraphTab();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeGraphTab();
+                }
+              }}
+              aria-label={t("work.closeGraphTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ) : null}
+
+        {timelineTabOpen ? (
+          <button
+            type="button"
+            className={`flex h-7 max-w-[120px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "timeline"
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => setActiveKind("timeline")}
+          >
+            <CirclePlay className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span className="truncate">{t("work.tabTimeline")}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeTimelineTab();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeTimelineTab();
+                }
+              }}
+              aria-label={t("work.closeTimelineTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ) : null}
+
+        {terminalTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`flex h-7 max-w-[110px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "terminal" && activeTerminalTabId === tab.id
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => {
+              setActivePaneTerminalTab(paneId, tab.id);
+              setActiveKind("terminal");
+            }}
+          >
+            <TerminalIcon className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span className="truncate">{tab.label || "zsh"}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                removePaneTerminalTab(paneId, tab.id);
+                if (activeKind === "terminal" && activeTerminalTabId === tab.id) {
+                  setActiveKind(resolveFallbackKind({ excludeTerminalId: tab.id }));
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  removePaneTerminalTab(paneId, tab.id);
+                  if (activeKind === "terminal" && activeTerminalTabId === tab.id) {
+                    setActiveKind(resolveFallbackKind({ excludeTerminalId: tab.id }));
+                  }
+                }
+              }}
+              aria-label={t("work.closeTerminalTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ))}
+
+        {browserTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`flex h-7 max-w-[120px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "browser" && activeBrowserId === tab.id
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => {
+              setActiveBrowserId(tab.id);
+              setActiveKind("browser");
+            }}
+          >
+            <Globe className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span className="truncate">{tab.title}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeBrowserTab(tab.id);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeBrowserTab(tab.id);
+                }
+              }}
+              aria-label={t("work.closeBrowserTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ))}
+
+        {previewTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`flex h-7 max-w-[140px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "preview" && activePreviewId === tab.id
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => activatePreviewTab(tab.id)}
+            title={tab.absolutePath}
+          >
+            <FileText className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span className="truncate">{tab.title}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                closePreviewTab(tab.id);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closePreviewTab(tab.id);
+                }
+              }}
+              aria-label={t("work.closePreviewTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ))}
+
+        {scratchChats.map((chat) => (
+          <button
+            key={chat.id}
+            type="button"
+            className={`flex h-7 max-w-[168px] items-center gap-1.5 rounded-full px-2 text-[12px] ${
+              activeKind === "scratch" && activeScratch?.id === chat.id
+                ? "bg-surface-card-strong text-text-strong"
+                : "text-text-subtle hover:bg-surface-hover hover:text-text-strong"
+            }`}
+            onClick={() => {
+              setActiveScratchId(chat.id);
+              setActiveKind("scratch");
+            }}
+          >
+            <ScratchChatIcon className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">{chat.title}</span>
+            {chat.floating ? (
+              <span className="shrink-0 text-[10px] text-text-faint">{t("work.scratchFloated")}</span>
+            ) : (
+              <span
+                role="button"
+                tabIndex={0}
+                data-slot="scratch-tab-float"
+                className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setScratchChatFloating(paneId, chat.id, true);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setScratchChatFloating(paneId, chat.id, true);
+                  }
+                }}
+                aria-label={t("work.scratchFloat")}
+              >
+                <Maximize2 className="h-3 w-3" strokeWidth={2} />
+              </span>
+            )}
+            <span
+              role="button"
+              tabIndex={0}
+              className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+              onClick={(e) => {
+                e.stopPropagation();
+                requestCloseScratch(chat);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  requestCloseScratch(chat);
+                }
+              }}
+              aria-label={t("work.closeScratchTab")}
+            >
+              <X className="h-3 w-3" strokeWidth={2} />
+            </span>
+          </button>
+        ))}
+
+        <button
+          ref={plusBtnRef}
+          type="button"
+          className="agx-topbar-btn !px-[5px]"
+          title={t("work.newTabTip")}
+          aria-label={t("work.newWorkbenchTab")}
+          onClick={openPlusMenu}
+        >
+          <Plus className="h-[16px] w-[16px]" strokeWidth={1.8} />
+        </button>
+        </div>
+
+        <div className="flex shrink-0 items-center pr-3">
+        {onToggleExpand ? (
+          <HoverTip label={expanded ? t("work.restoreWidth") : t("work.expandPanel")}>
+            <button
+              type="button"
+              className={`agx-topbar-btn !px-[5px] ${expanded ? "agx-topbar-btn--active" : ""}`}
+              onClick={onToggleExpand}
+              title={expanded ? t("work.restoreWidth") : t("work.expandPanel")}
+              aria-label={expanded ? t("work.restoreWidth") : t("work.expandPanel")}
+              aria-pressed={expanded}
+            >
+              {expanded ? (
+                <Minimize2 className="h-[16px] w-[16px]" strokeWidth={1.8} />
+              ) : (
+                <Maximize2 className="h-[16px] w-[16px]" strokeWidth={1.8} />
+              )}
+            </button>
+          </HoverTip>
+        ) : null}
+
+        <HoverTip label={t("work.hideTools")}>
+          <button
+            type="button"
+            className="agx-topbar-btn !px-[5px]"
+            onClick={onClose}
+            title={t("work.hideTools")}
+            aria-label={t("work.hideTools")}
+          >
+            <PanelRight className="h-[18px] w-[18px]" strokeWidth={1.8} />
+          </button>
+        </HoverTip>
+        </div>
+      </div>
+
+      {plusMenu}
+
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {!hasAnyTab ? (
+          <div className="flex h-full flex-col px-8 pt-16">
+            <div className="text-[15px] text-text-faint">{t("work.startHere")}</div>
+            <div className="mt-6 flex max-w-[360px] flex-col gap-5">
+              {startEntries.map((entry) => {
+                const locked = workspaceToolLocked(entry.key, freshTask);
+                const button = (
+                  <button
+                    type="button"
+                    className={`flex w-full items-start gap-3 rounded-lg px-1 py-1 text-left ${
+                      locked ? "cursor-default" : "transition hover:bg-surface-hover/50"
+                    }`}
+                    aria-disabled={locked || undefined}
+                    onClick={() => {
+                      if (locked) return;
+                      entry.onClick();
+                    }}
+                  >
+                    <div className={`mt-0.5 ${locked ? "opacity-45" : ""}`}>{entry.icon}</div>
+                    <div className="min-w-0">
+                      <div className={`text-[14px] font-medium ${locked ? "text-text-faint" : "text-text-strong"}`}>
+                        {entry.title}
+                      </div>
+                      <div className="mt-0.5 text-[12px] leading-relaxed text-text-faint">
+                        {entry.subtitle}
+                      </div>
+                    </div>
+                  </button>
+                );
+                return locked ? (
+                  <HoverTip key={entry.key} label={t("work.startLockedHint")} className="w-full">
+                    {button}
+                  </HoverTip>
+                ) : (
+                  <span key={entry.key}>{button}</span>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
+        {hasAnyTab && activeKind === "summary" && summaryTabOpen ? (
+          <div className="flex h-full min-h-0 flex-col overflow-y-auto overscroll-contain">
+            {hasSessionTodo && sessionTodo ? (
+            <Section
+              id="todo"
+              title={t("work.todos")}
+              count={sessionTodo.total}
+              open={openSections.todo}
+              onToggle={toggleSection}
+            >
+                <SessionTodoList
+                  todo={sessionTodo}
+                  onOpenScratch={
+                    onOpenScratchChat
+                      ? (item) =>
+                          onOpenScratchChat(
+                            buildQuotedScratchDraft({
+                              kind: "todo",
+                              rawKey: `${item.index}:${item.content}`,
+                              quotedContent: item.content,
+                              title: scratchAbout(item.content),
+                            }),
+                          )
+                      : undefined
+                  }
+                />
+            </Section>
+            ) : null}
+
+            {isGroupPane && groupId ? (
+              <Section
+                id="workitems"
+                title={t("work.items")}
+                count={workItems.length}
+                open={openSections.workitems}
+                onToggle={toggleSection}
+              >
+                <GroupWorkItemList
+                  groupId={groupId}
+                  items={workItems}
+                  avatars={avatarList}
+                  metaLeaderLabel={metaLeaderLabel}
+                  errorText={workItemError}
+                  onAccept={(item) => void runWorkItemAction(item, "accept")}
+                  onPause={(item) => void runWorkItemAction(item, "pause")}
+                  onResume={(item) => void runWorkItemAction(item, "resume")}
+                  onOpenOwner={openWorkItemOwner}
+                  onCreate={(input) => void runCreateWorkItem(input)}
+                />
+              </Section>
+            ) : null}
+
+            <Section
+              id="artifacts"
+              title={t("work.artifacts")}
+              count={presentArtifactPaths.length}
+              open={openSections.artifacts}
+              onToggle={toggleSection}
+            >
+              {presentArtifactPaths.length === 0 ? (
+                <EmptyBlock
+                  icon={<Boxes className="h-9 w-9" strokeWidth={1.3} />}
+                  title={t("work.emptyArtifacts")}
+                  subtitle={t("work.emptyArtifactsHint")}
+                />
+              ) : (
+                <SessionArtifactList
+                  paths={presentArtifactPaths}
+                  highlightPath={artifactHighlightPath}
+                  onHighlightHandled={() => setArtifactHighlightPath(null)}
+                  onOpenScratch={
+                    onOpenScratchChat
+                      ? (path) =>
+                          onOpenScratchChat(
+                            buildPathScratchDraft({
+                              kind: "artifact",
+                              path,
+                              title: scratchAbout(fileLabelFromPath(path)),
+                            }),
+                          )
+                      : undefined
+                  }
+                  onOpenPath={(path) => {
+                    if (isInAppHtmlPreviewPath(path)) {
+                      openLocalHtmlPreview(path);
+                      return;
+                    }
+                    if (looksLikeDirectoryPath(path)) {
+                      void window.agenticxDesktop?.shellOpenPath?.(path);
+                      return;
+                    }
+                    if (isInAppArtifactPreviewPath(path)) {
+                      // Trae-style: open preview tab in this WorkPanel — never 工作区 / left popup.
+                      openLocalFilePreview(path);
+                      return;
+                    }
+                    void window.agenticxDesktop?.shellOpenPath?.(path);
+                  }}
+                />
+              )}
+            </Section>
+
+            <Section
+              id="changes"
+              title={t("work.tabChanges")}
+              count={changeRows.length}
+              open={openSections.changes}
+              onToggle={toggleSection}
+            >
+              {changeRows.length === 0 ? (
+                <EmptyBlock
+                  icon={<FileText className="h-9 w-9" strokeWidth={1.3} />}
+                  title={t("work.emptyChanges")}
+                  subtitle={t("work.emptyChangesHint")}
+                />
+              ) : (
+                <SessionChangeList
+                  rows={changeRows}
+                  onOpenScratch={
+                    onOpenScratchChat
+                      ? (path) =>
+                          onOpenScratchChat(
+                            buildPathScratchDraft({
+                              kind: "change",
+                              path,
+                              title: scratchAbout(fileLabelFromPath(path)),
+                            }),
+                          )
+                      : undefined
+                  }
+                  onOpenPath={(path) => {
+                    if (isInAppHtmlPreviewPath(path)) {
+                      openLocalHtmlPreview(path);
+                      return;
+                    }
+                    if (looksLikeDirectoryPath(path)) {
+                      void window.agenticxDesktop?.shellOpenPath?.(path);
+                      return;
+                    }
+                    if (isInAppArtifactPreviewPath(path)) {
+                      openLocalFilePreview(path, undefined, undefined, "changes");
+                      return;
+                    }
+                    void window.agenticxDesktop?.shellOpenPath?.(path);
+                  }}
+                />
+              )}
+            </Section>
+
+            <Section
+              id="refs"
+              title={t("work.references")}
+              count={
+                referenceBundle.isEmpty
+                  ? undefined
+                  : referenceBundle.skillCount + referenceBundle.docCount
+              }
+              open={openSections.refs}
+              onToggle={toggleSection}
+            >
+              {referenceBundle.isEmpty ? (
+                <EmptyBlock
+                  icon={<FileCode2 className="h-9 w-9" strokeWidth={1.3} />}
+                  title={t("work.emptyRefs")}
+                  subtitle={t("work.emptyRefsHint")}
+                />
+              ) : (
+                <SessionReferenceList
+                  bundle={referenceBundle}
+                  onOpenWebUrl={openWebReferenceInBrowser}
+                  onOpenScratchRef={
+                    onOpenScratchChat
+                      ? (input) => {
+                          const path = String(input.path || "").trim();
+                          if (path) {
+                            onOpenScratchChat(
+                              buildPathScratchDraft({
+                                kind: "reference",
+                                path,
+                                title: scratchAbout(input.title || fileLabelFromPath(path)),
+                                quotedContent: input.quotedContent,
+                              }),
+                            );
+                            return;
+                          }
+                          onOpenScratchChat(
+                            buildQuotedScratchDraft({
+                              kind: "reference",
+                              rawKey: input.sourceKey,
+                              quotedContent: input.quotedContent,
+                              title: scratchAbout(input.title || input.quotedContent),
+                            }),
+                          );
+                        }
+                      : undefined
+                  }
+                />
+              )}
+            </Section>
+
+            {isGroupPane && groupId ? (
+              <Section
+                id="members"
+                title={t("work.members")}
+                count={1 + groupAvatarIds.length}
+                open={openSections.members}
+                onToggle={toggleSection}
+              >
+                <GroupMembersSummaryList
+                  groupId={groupId}
+                  paneId={paneId}
+                  avatarList={avatarList}
+                  metaLeaderLabel={metaLeaderLabel}
+                  messages={paneMessages}
+                  activeAgentIds={groupActiveAgentIds}
+                  activityHintById={groupActivityHint}
+                  phaseOverrideById={groupMemberPhase}
+                  onAppendDirective={onCrewAppendDirective}
+                  onSwitchModel={onCrewSwitchModel}
+                  onInterrupt={onCrewInterrupt}
+                />
+              </Section>
+            ) : null}
+
+            {summaryScratchChats.length > 0 ? (
+              <Section
+                id="scratch"
+                title={t("work.tabScratch")}
+                count={summaryScratchChats.length}
+                open={openSections.scratch}
+                onToggle={toggleSection}
+                actions={
+                  <button
+                    type="button"
+                    className="rounded px-1.5 py-0.5 text-[11px] text-text-faint hover:bg-surface-hover hover:text-text-strong"
+                    onClick={() => setPendingClearHost(true)}
+                  >
+                    {t("work.scratchClearAll")}
+                  </button>
+                }
+              >
+                <div className="space-y-1">
+                  {summaryScratchChats.map((chat) => {
+                    const preview = scratchParkedPreview(chat);
+                    const canPromote = Boolean(String(chat.sessionId ?? "").trim());
+                    return (
+                      <div
+                        key={chat.id}
+                        className="flex items-center gap-1 rounded-lg px-2 py-1.5 hover:bg-surface-hover"
+                      >
+                        <button
+                          type="button"
+                          className="min-w-0 flex-1 text-left"
+                          onClick={() => openExistingScratch(chat, chat.isParked)}
+                        >
+                          <div className="truncate text-[13px] text-text-strong">{chat.title}</div>
+                          {preview ? (
+                            <div className="truncate text-[11px] text-text-faint">{preview}</div>
+                          ) : null}
+                        </button>
+                        {canPromote ? (
+                          <button
+                            type="button"
+                            className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-text-faint hover:bg-surface-hover hover:text-text-strong"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              commitPromoteScratch(chat);
+                            }}
+                          >
+                            {t("work.scratchPromote")}
+                          </button>
+                        ) : null}
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          className="rounded p-0.5 text-text-faint hover:bg-surface-hover hover:text-text-strong"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPendingDismissParked(chat);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setPendingDismissParked(chat);
+                            }
+                          }}
+                          aria-label={t("work.scratchDismiss")}
+                        >
+                          <X className="h-3.5 w-3.5" strokeWidth={2} />
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Section>
+            ) : null}
+
+            {subAgents.length > 0 ? (
+            <Section
+              id="spawns"
+              title={t("work.subagents")}
+              count={subAgents.length}
+              open={openSections.spawns}
+              onToggle={toggleSection}
+            >
+                <div className="space-y-2">
+                  {subAgents.map((subAgent) => (
+                    <SubAgentCard
+                      key={subAgent.id}
+                      subAgent={subAgent}
+                      parentSessionId={sessionId || undefined}
+                      selected={selectedSubAgent === subAgent.id}
+                      onCancel={onCancelSubAgent}
+                      onRetry={onRetrySubAgent}
+                      onChat={onChatSubAgent}
+                      onModelChange={onModelChangeSubAgent}
+                      onConfirmResolve={onConfirmResolveSubAgent}
+                    />
+                  ))}
+                </div>
+            </Section>
+            ) : null}
+          </div>
+        ) : null}
+
+        {hasAnyTab && activeKind === "preview" ? (
+          <div className="flex h-full min-h-0 flex-col">
+            {!activePreview ? (
+              <EmptyBlock
+                icon={<FileText className="h-9 w-9" strokeWidth={1.3} />}
+                title={t("work.emptyPreview")}
+                subtitle={t("work.emptyPreviewHint")}
+              />
+            ) : activePreview.loading ? (
+              <div className="flex h-full items-center justify-center text-[13px] text-text-muted">
+                {t("work.previewLoading")}
+              </div>
+            ) : activePreview.error || !activePreview.preview ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                <p className="text-[13px] text-rose-300">{activePreview.error || t("work.previewFailed")}</p>
+                <p className="max-w-sm truncate font-mono text-[11px] text-text-faint" title={activePreview.absolutePath}>
+                  {activePreview.absolutePath}
+                </p>
+              </div>
+            ) : (
+              <WorkspaceFilePreview
+                layout="panel"
+                preview={activePreview.preview}
+                copied={activePreview.copied}
+                initialLineRange={activePreview.lineRange}
+                changeHighlight={activeChangeHighlight}
+                onCopy={(text) => {
+                  const value =
+                    text ??
+                    (activePreview.preview
+                      ? activePreview.preview.kind === "text" ||
+                        activePreview.preview.kind === "markdown" ||
+                        activePreview.preview.kind === "code"
+                        ? activePreview.preview.content
+                        : activePreview.absolutePath
+                      : activePreview.absolutePath);
+                  void navigator.clipboard.writeText(value);
+                  setPreviewTabs((prev) =>
+                    prev.map((t) => (t.id === activePreview.id ? { ...t, copied: true } : t)),
+                  );
+                  window.setTimeout(() => {
+                    setPreviewTabs((prev) =>
+                      prev.map((t) => (t.id === activePreview.id ? { ...t, copied: false } : t)),
+                    );
+                  }, 1600);
+                }}
+                onClose={() => forceClosePreviewTab(activePreview.id)}
+                onDirtyChange={(dirty) => {
+                  previewDirtyRef.current = dirty;
+                }}
+                onProvideRequestLeave={(fn) => {
+                  previewRequestLeaveRef.current = fn;
+                }}
+                onQuoteSnippet={onQuotePreviewSnippet}
+                onOpenScratchSnippet={onOpenScratchChat ? openPreviewScratch : undefined}
+                onRevealInFileManager={(abs) => {
+                  void window.agenticxDesktop?.shellShowItemInFolder?.(abs);
+                }}
+                revealInFileManagerLabel={t("revealGeneric")}
+              />
+            )}
+          </div>
+        ) : null}
+
+        {hasAnyTab && activeKind === "workspace" && workspaceTabOpen ? (
+          <WorkspacePanel
+            paneId={paneId}
+            sessionId={sessionId}
+            activeTaskspaceId={activeTaskspaceId}
+            onActiveTaskspaceChange={onActiveTaskspaceChange}
+            autoRefreshKey={autoRefreshKey}
+            tintColor={tintColor}
+            hidePanelClose
+            onFocusTerminalTab={() => {
+              setActiveKind("terminal");
+            }}
+            onPickFileForReference={onPickFileForReference}
+            onPickDirectoryForReference={onPickDirectoryForReference}
+            onQuotePreviewSnippet={onQuotePreviewSnippet}
+            onOpenScratchSnippet={onOpenScratchChat ? openPreviewScratch : undefined}
+            previewOpenRequest={previewOpenRequest}
+            onPreviewOpenRequestHandled={onPreviewOpenRequestHandled}
+            onEnsureSessionForWorkspace={onEnsureSessionForWorkspace}
+          />
+        ) : null}
+
+        {hasAnyTab && activeKind === "graph" && graphTabOpen && paneForGraph ? (
+          <RunGraphPanel
+            pane={paneForGraph}
+            onClose={closeGraphTab}
+            tintColor={tintColor}
+            embedded
+            groupAvatarIds={groupAvatarIds}
+            groupActiveAgentIds={groupActiveAgentIds}
+            groupActivityHint={groupActivityHint}
+            groupMemberPhase={groupMemberPhase}
+          />
+        ) : null}
+
+        {hasAnyTab && activeKind === "timeline" && timelineTabOpen ? (
+          <RunReplayPanel
+            paneId={paneId}
+            sessionId={sessionId}
+            apiBase={apiBase}
+            apiToken={apiToken}
+            agentIds={timelineAgentIds}
+            avatarById={timelineAvatarById}
+            metaLeaderLabel={metaLeaderLabel}
+            focusTarget={replayFocusTargetForSession(
+              timelineFocusTarget,
+              sessionId,
+            )}
+            onOpenSubagentRun={(runId) => openRunDrawer(paneId, runId)}
+            onOpenArtifact={(path) => openLocalFilePreview(path)}
+          />
+        ) : null}
+
+        {hasAnyTab && activeKind === "terminal" ? (
+          <div className="flex h-full min-h-0 flex-col">
+            {terminalTabs.length === 0 ? (
+              <EmptyBlock
+                icon={<TerminalIcon className="h-9 w-9" strokeWidth={1.3} />}
+                title={t("work.emptyTerminal")}
+                subtitle={t("work.emptyTerminalHint")}
+              />
+            ) : (
+              terminalTabs.map((tab) =>
+                tab.id === (activeTerminalTabId ?? terminalTabs[terminalTabs.length - 1]?.id) ? (
+                  <div key={tab.id} className="min-h-0 flex-1">
+                    <TerminalEmbed
+                      tabId={tab.id}
+                      cwd={tab.cwd}
+                      ccBridgePty={tab.ccBridgePty}
+                      onQuoteSelection={onQuoteTerminalSelection}
+                      onOpenScratchSelection={
+                        onOpenScratchChat
+                          ? (text) => {
+                              const clean = String(text || "").trim();
+                              if (!clean) return;
+                              onOpenScratchChat(
+                                buildQuotedScratchDraft({
+                                  kind: "terminal",
+                                  rawKey: "selection",
+                                  quotedContent: clean,
+                                  title: scratchAbout(clean),
+                                }),
+                              );
+                            }
+                          : undefined
+                      }
+                    />
+                  </div>
+                ) : null
+              )
+            )}
+          </div>
+        ) : null}
+
+        {hasAnyTab && activeKind === "browser" && activeBrowser ? (
+          <div className="flex h-full min-h-0 flex-col">
+            <form
+              className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5"
+              onSubmit={(e) => {
+                e.preventDefault();
+                navigateBrowser(activeBrowser.id);
+              }}
+            >
+              {(() => {
+                const canBack = guestHistory.canBack || activeBrowser.historyIndex > 0;
+                const canForward =
+                  guestHistory.canForward ||
+                  activeBrowser.historyIndex < activeBrowser.history.length - 1;
+                const goBack = () => {
+                  const wv = agentWebviewRef.current;
+                  if (wv?.canGoBack?.()) {
+                    wv.goBack?.();
+                    return;
+                  }
+                  goBrowserBack(activeBrowser.id);
+                };
+                const goForward = () => {
+                  const wv = agentWebviewRef.current;
+                  if (wv?.canGoForward?.()) {
+                    wv.goForward?.();
+                    return;
+                  }
+                  goBrowserForward(activeBrowser.id);
+                };
+                const navBtn = (opts: {
+                  label: string;
+                  disabled: boolean;
+                  onClick: () => void;
+                  children: ReactNode;
+                }) => (
+                  <HoverTip label={opts.label}>
+                    <button
+                      type="button"
+                      aria-label={opts.label}
+                      disabled={opts.disabled}
+                      className={[
+                        "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors",
+                        opts.disabled
+                          ? "cursor-not-allowed text-text-faint opacity-40"
+                          : "text-text-muted hover:bg-surface-hover hover:text-text-strong",
+                      ].join(" ")}
+                      onClick={opts.onClick}
+                    >
+                      {opts.children}
+                    </button>
+                  </HoverTip>
+                );
+                return (
+                  <>
+                    {navBtn({
+                      label: t("work.back"),
+                      disabled: !canBack,
+                      onClick: goBack,
+                      children: <ArrowLeft className="h-3.5 w-3.5" strokeWidth={1.8} />,
+                    })}
+                    {navBtn({
+                      label: t("work.forward"),
+                      disabled: !canForward,
+                      onClick: goForward,
+                      children: <ArrowRight className="h-3.5 w-3.5" strokeWidth={1.8} />,
+                    })}
+                    {navBtn({
+                      label: t("work.reload"),
+                      disabled: false,
+                      onClick: () => refreshBrowser(activeBrowser.id),
+                      children: <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.8} />,
+                    })}
+                  </>
+                );
+              })()}
+              <input
+                value={activeBrowser.draftUrl}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setBrowserTabs((prev) =>
+                    prev.map((t) => (t.id === activeBrowser.id ? { ...t, draftUrl: value } : t))
+                  );
+                }}
+                placeholder={t("work.urlPlaceholder")}
+                className="min-w-0 flex-1 rounded-md border border-border bg-surface-hover px-2 py-1 text-[12px] text-text-strong outline-none placeholder:text-text-faint focus:border-[var(--ui-btn-primary-border,#3b82f6)]"
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <HoverTip label={t("work.chromeCookieBannerTitle")}>
+                <button
+                  type="button"
+                  aria-label={t("work.chromeCookieBannerTitle")}
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-hover hover:text-text-strong"
+                  onClick={() => setChromeCookieDialogOpen(true)}
+                >
+                  <Cookie className="h-3.5 w-3.5" strokeWidth={1.8} />
+                </button>
+              </HoverTip>
+            </form>
+            {activeBrowser.srcDoc == null ? (
+              <ChromeCookieImportBanner
+                key={chromeCookieBannerRev}
+                onImport={() => setChromeCookieDialogOpen(true)}
+              />
+            ) : null}
+            {activeBrowser.srcDoc != null ? (
+              <div className="min-h-0 flex-1">
+                <HtmlPreviewShell
+                  content={activeBrowser.srcDoc}
+                  title={activeBrowser.title}
+                  documentPath={fileUrlToLocalPath(activeBrowser.url)}
+                  documentUrl={activeBrowser.url}
+                  onQuoteHtmlElement={onQuotePreviewSnippet}
+                  showChromeRefresh={false}
+                  reloadKey={activeBrowser.reloadNonce ?? 0}
+                />
+              </div>
+            ) : activeBrowser.url && activeBrowser.url !== "about:blank" ? (
+              <div className="relative flex min-h-0 h-full flex-1 flex-col">
+                <RemoteBrowserPane
+                  key={activeBrowser.id}
+                  title={activeBrowser.title}
+                  url={activeBrowser.url}
+                  reloadKey={activeBrowser.reloadNonce ?? 0}
+                  onQuoteSelection={onQuoteBrowserSelection}
+                  onSearchSelection={onSearchBrowserSelection}
+                  onOpenScratchSelection={
+                    onOpenScratchChat
+                      ? (payload) => {
+                          const text = String(payload.text || "").trim();
+                          if (!text) return;
+                          onOpenScratchChat(
+                            buildQuotedScratchDraft({
+                              kind: "browser",
+                              rawKey: payload.url || "page",
+                              quotedContent: text,
+                              title: scratchAbout(text),
+                            }),
+                          );
+                        }
+                      : undefined
+                  }
+                  onWebviewReady={(wv) => {
+                    agentWebviewRef.current = wv;
+                  }}
+                  onNavigate={(nextUrl) => {
+                    const tabId = activeBrowser.id;
+                    const title = browserTitleFromUrl(nextUrl);
+                    setBrowserTabs((prev) =>
+                      prev.map((t) =>
+                        t.id === tabId
+                          ? pushBrowserHistory(t, browserEntry(nextUrl, title, null))
+                          : t,
+                      ),
+                    );
+                  }}
+                  onReplaceNavigate={(nextUrl) => {
+                    const tabId = activeBrowser.id;
+                    const title = browserTitleFromUrl(nextUrl);
+                    setBrowserTabs((prev) =>
+                      prev.map((t) =>
+                        t.id === tabId
+                          ? replaceBrowserHistory(t, browserEntry(nextUrl, title, null))
+                          : t,
+                      ),
+                    );
+                  }}
+                  onGuestHistory={setGuestHistory}
+                  onOpenLinkInNewTab={(url, title) => openWebReferenceInBrowser(url, title)}
+                />
+                <BrowserAgentOverlay sessionId={sessionId} />
+              </div>
+            ) : (
+              <EmptyBlock
+                icon={<Globe className="h-9 w-9" strokeWidth={1.3} />}
+                title={t("work.emptyBrowser")}
+                subtitle={t("work.emptyBrowserHint")}
+              />
+            )}
+            <ChromeCookieImportDialog
+              open={chromeCookieDialogOpen}
+              onClose={() => setChromeCookieDialogOpen(false)}
+              onImported={() => {
+                setChromeCookieBannerRev((n) => n + 1);
+                refreshBrowser(activeBrowser.id);
+              }}
+            />
+          </div>
+        ) : null}
+
+        {hasAnyTab && activeKind === "scratch" && activeScratch ? (
+          <div className="flex h-full min-h-0 flex-col">
+            <ScratchChatCard
+              chat={activeScratch}
+              paneId={paneId}
+              hideHeader
+              onClose={() => requestCloseScratch(activeScratch)}
+              onSend={(text) => sendScratch(activeScratch, text)}
+              onRetry={(userMessageId, editText) =>
+                sendScratch(activeScratch, "", { retryUserId: userMessageId, editText })
+              }
+              sending={scratchSendingIds.includes(activeScratch.id)}
+              error={scratchSendErrors[activeScratch.id]}
+            />
+          </div>
+        ) : null}
+      </div>
+
+      <Modal
+        open={!!pendingDismissParked}
+        title={t("work.scratchDismissConfirmTitle")}
+        onClose={() => setPendingDismissParked(null)}
+        panelClassName="w-full max-w-[400px] bg-surface-panel"
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setPendingDismissParked(null)}>
+              {t("work.scratchDismissConfirmCancel")}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                if (pendingDismissParked) commitDismissParked(pendingDismissParked.id);
+              }}
+            >
+              {t("work.scratchDismissConfirmOk")}
+            </Button>
+          </div>
+        }
+      >
+        <p className="text-sm text-text-subtle">{t("work.scratchDismissConfirm")}</p>
+      </Modal>
+
+      <Modal
+        open={pendingClearHost}
+        title={t("work.scratchClearAllConfirmTitle")}
+        onClose={() => setPendingClearHost(false)}
+        panelClassName="w-full max-w-[400px] bg-surface-panel"
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setPendingClearHost(false)}>
+              {t("work.scratchDismissConfirmCancel")}
+            </Button>
+            <Button variant="danger" onClick={commitClearHost}>
+              {t("work.scratchClearAll")}
+            </Button>
+          </div>
+        }
+      >
+        <p className="text-sm text-text-subtle">{t("work.scratchClearAllConfirm")}</p>
+      </Modal>
+    </div>
+  );
+}

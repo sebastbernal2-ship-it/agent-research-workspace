@@ -1,0 +1,3270 @@
+import { arrayMove } from "@dnd-kit/sortable";
+import { create } from "zustand";
+import { isSettingsFocus, isSettingsTab } from "./settings-tab";
+import type { SettingsFocus, SettingsTab } from "./settings-tab";
+import { clearPaneAwaitingFreshSession } from "./utils/pane-fresh-session";
+import { readScopedLocalStorage, writeScopedLocalStorage } from "./utils/backend-scope";
+import { loadPendingMessageQueues, savePendingMessageQueues } from "./utils/pending-message-queue";
+import { META_AGENT_DISPLAY_NAME } from "./constants/branding";
+import { COMPOSE_PREVIEW_PANE_ID, isComposePreviewPane } from "./utils/compose-preview";
+import {
+  coerceSelectableModel,
+  reconcilePaneModelsWithSettings as reconcilePaneModelsPure,
+  resolveSessionBindingModel,
+} from "./utils/model-options";
+import type { SearchReference } from "./types/search-references";
+import { shouldClearMessagesOnSessionSwitch } from "./utils/pane-session-switch";
+import { nextTaskspacePanelOpenOnSessionBind } from "./utils/workspace-session-visibility";
+import {
+  attachUnhostedScratchChats,
+  clearScratchChatsForHost,
+  closeOrParkScratchChat,
+  deleteScratchChatFromLists,
+  dismissParkedScratchChat as dismissParkedScratchChatList,
+  forgetScratchSessionIds,
+  patchScratchChatList,
+  rememberScratchSessionIds,
+  restoreParkedScratchChat as restoreParkedScratchChatList,
+  scratchHistoryBlocklist,
+  setScratchFloating,
+  upsertScratchChatList,
+  type ScratchChat,
+  type ScratchChatDraft,
+} from "./utils/scratch-chat";
+import { matchesToolCallForSession } from "./utils/pending-tool-result";
+import { findLastOwnedMessageIndex } from "./utils/message-ownership";
+import { cancelInFlightToolMessages } from "./utils/cancel-in-flight-tools";
+import type { PendingActionConfirmation } from "./utils/action-confirmation";
+import { shouldSuppressDuplicatePendingUserEcho } from "./utils/send-dedupe";
+import type { ContentBlock } from "./utils/content-blocks";
+import {
+  ATTACHMENT_ROUTING_OFF,
+  type AttachmentRoutingPolicy,
+  type RoutingModelRef,
+} from "./utils/attachment-routing";
+import {
+  UNRESTRICTED_CAPABILITY_LOCKS,
+  type DesktopCapabilityLocks,
+} from "./utils/enterprise-capability-policy";
+import type { RunMode } from "./constants/confirm-strategy-options";
+import {
+  LOCALE_STORAGE_KEY,
+  isAppLocale,
+  type AppLocale,
+} from "./i18n/locales";
+import type { TurnIntent } from "./utils/turn-intent";
+import { normalizeTurnIntent } from "./utils/turn-intent";
+import { resolveAppLocale } from "./i18n/resolve-locale";
+import { i18n } from "./i18n/i18n";
+import {
+  BRAND_CUBE_COLORWAY_ID,
+  isUserCubeColorwayId,
+} from "./utils/cube-colorway";
+import {
+  isPersistedUserAvatarUrl,
+  resolveMetaAvatarFromColorway,
+} from "./utils/identity-avatar";
+import {
+  CUBE_PORTRAIT_STYLE,
+  loadCollectionPortraitStyle,
+  writeCollectionPortraitStyle,
+  type CollectionStyleId,
+} from "./utils/expert-portrait";
+
+export type { ContentBlock } from "./utils/content-blocks";
+
+export type {
+  ActionConfirmationDecision,
+  ActionConfirmationStatus,
+  ActionConfirmationSummaryRow,
+  PendingActionConfirmation,
+} from "./utils/action-confirmation";
+
+export type UiStatus = "idle" | "listening" | "processing";
+export type MsgRole = "user" | "assistant" | "tool";
+export type SubAgentStatus =
+  | "pending"
+  | "awaiting_confirm"
+  | "awaiting_input"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type { RunMode } from "./constants/confirm-strategy-options";
+export type ThemeMode = "dark" | "light" | "dim";
+export type { AppLocale } from "./i18n/locales";
+export type ThemeColor = "blue" | "green" | "pink" | "yellow" | "white";
+export type ChatStyle = "im" | "terminal" | "clean";
+/** MCP 列表展示态（与 Studio `/api/mcp/servers` 对齐，近似 Cursor 绿/红/灰语义） */
+export type McpServer = {
+  name: string;
+  connected: boolean;
+  command?: string;
+  /** Remote URL for streamable-http / sse transports (empty for stdio entries). */
+  url?: string;
+  /** Transport kind: "stdio" | "streamable_http" | "sse". Defaults to "stdio". */
+  transport?: string;
+  /** healthy=握手且已注册工具；error=仍标记已连但当前无工具（多为子进程失效）；disconnected=未连 */
+  connection_state?: "healthy" | "error" | "disconnected";
+  tool_count?: number;
+  /** Original tool names registered by this server (populated when connected & healthy). */
+  tool_names?: string[];
+  error_detail?: string;
+  /** 最新运维状态：idle/preparing/connecting/healthy/failed/disconnecting */
+  op_phase?: string;
+  /** 每个 MCP 卡片底部展示的简短状态日志 */
+  op_message?: string;
+  op_updated_at?: number;
+};
+
+export type Avatar = {
+  id: string;
+  name: string;
+  role: string;
+  avatarUrl: string;
+  pinned: boolean;
+  createdBy: string;
+  systemPrompt?: string;
+  toolsEnabled?: Record<string, boolean>;
+  /** Per-skill overrides: false = disabled for this avatar; missing = inherit global. */
+  skillsEnabled?: Record<string, boolean>;
+  /** null = global brains only; "*" = all visible; string[] = explicit brain ids */
+  brainsEnabled?: "*" | string[] | null;
+  /** Default LLM provider the avatar uses when a session has no explicit model yet. */
+  defaultProvider?: string;
+  /** Default LLM model the avatar uses when a session has no explicit model yet. */
+  defaultModel?: string;
+  /**
+   * Pane / initials accent. Empty = same as Meta (theme, no tint).
+   * One of: cyan | violet | rose | amber | emerald | fuchsia | sky | orange.
+   */
+  color?: string;
+  /** Filesystem path to this avatar's isolated workspace directory. */
+  workspaceDir?: string;
+  /** Short blurb shown on the gallery card, distinct from systemPrompt (behavior rules). */
+  description?: string;
+  /** Skill tags shown as chips on the gallery card. */
+  tags?: string[];
+  /** near-cube-v3, a collection style id, or custom for an uploaded photo. */
+  portraitStyle?: string;
+};
+
+export type SessionItem = {
+  sessionId: string;
+  avatarId: string | null;
+  sessionName: string | null;
+  updatedAt: number;
+  createdAt?: number;
+  pinned?: boolean;
+  archived?: boolean;
+  /** Last-used LLM provider/model for this session (empty = never picked). */
+  provider?: string;
+  model?: string;
+};
+
+export type TaskspaceMountMode = "reference" | "copy" | "link";
+
+export type Taskspace = {
+  id: string;
+  label: string;
+  path: string;
+  mount_mode?: TaskspaceMountMode;
+  source_path?: string;
+  linked_at?: number;
+};
+
+export type GroupChat = {
+  id: string;
+  name: string;
+  avatarIds: string[];
+  routing: string;
+};
+
+/** Main-area view router state for button-style sidebar navigation. */
+export type MainView = "chat" | "avatars" | "groups" | "collab" | "automation" | "wiki";
+
+/** Sidebar「+」快捷创建：收件人栏意图。不落盘。 */
+export type QuickComposeIntent = "expert" | "group";
+
+export type SidePanelTab = "workspace" | "members" | "graph";
+
+export type PaneTerminalTab = {
+  id: string;
+  cwd: string;
+  label: string;
+  /** When set, embed PTY stream from local cc-bridge (visible_tui) instead of a local shell. */
+  ccBridgePty?: {
+    sessionId: string;
+    baseUrl: string;
+    token: string;
+  };
+};
+
+export type ChatPane = {
+  id: string;
+  avatarId: string | null;
+  avatarName: string;
+  sessionId: string;
+  modelProvider: string;
+  modelName: string;
+  /**
+   * Thinking effort for this pane (`low` | `high` | `max`).
+   * Only sent when the active model accepts a selectable effort ladder.
+   */
+  reasoningEffort?: "low" | "high" | "max";
+  /**
+   * DeepSeek V4 thinking switch. `undefined` means default on.
+   * Ignored for models that do not support the V4 thinking API.
+   */
+  thinkingEnabled?: boolean;
+  /** Client-declared context budget in tokens (e.g. 300000 / 512000 / 1000000). */
+  contextWindowTokens?: number;
+  messages: Message[];
+  historyOpen: boolean;
+  memoryGraphOpen: boolean;
+  contextInherited: boolean;
+  taskspacePanelOpen: boolean;
+  membersPanelOpen: boolean;
+  /** Run Graph God-View panel (right side, SP3). */
+  graphPanelOpen?: boolean;
+  /** Active WorkGraph run id for this pane (from graph.run_created / list). */
+  activeGraphRunId?: string | null;
+  /** Legacy persisted field; no longer used for visibility control. */
+  sidePanelTab: SidePanelTab;
+  activeTaskspaceId: string | null;
+  /** Right column: Spawns list (independent from workspace panel). */
+  spawnsColumnOpen: boolean;
+  /** After user closes Spawns column: suppress auto-open until a new sub-agent id appears. */
+  spawnsColumnSuppressAuto: boolean;
+  /** Sub-agent ids snapshot when user dismissed the column (for detecting "new spawn"). */
+  spawnsColumnBaselineIds: string[];
+  /** Embedded terminals in workspace panel (bottom). */
+  terminalTabs: PaneTerminalTab[];
+  activeTerminalTabId: string | null;
+  /** Cumulative token usage for the current session (resets on new session). */
+  sessionTokens: SessionTokens;
+  /** Temporary highlight terms from session-history search navigation. */
+  historySearchTerms: string[];
+  /** One-shot scroll target: user query message id inside the current session. */
+  historyJumpMessageId?: string | null;
+  /** One-shot cross-pane quote payload set by "引用至新对话"; consumed once on mount then cleared. */
+  pendingQuote?: { messageId: string; body: string; label: string } | null;
+  /** Workspace-only scratch chats. Not listed in sidebar history. */
+  scratchChats?: ScratchChat[];
+  /** Closed scratch chats kept in the workspace until dismissed. */
+  parkedScratchChats?: ScratchChat[];
+  /** Harness mode for this pane's session (code_dev vs daily_office). */
+  sessionMode?: "code_dev" | "daily_office";
+  /** + menu turn intent: default execute / plan first / isolated copy. */
+  turnIntent?: TurnIntent;
+  /** True after Multitask successfully created a worktree for this pane. */
+  isolateActive?: boolean;
+  /** True while messages are being fetched after a session switch (shows skeleton). */
+  loadingMessages?: boolean;
+  /** Absolute index of the earliest loaded row in the full session snapshot (0 = full load). */
+  oldestLoadedIndex?: number;
+  /** True when older rows exist above oldestLoadedIndex. */
+  hasOlderMessages?: boolean;
+  /** True while fetching an older page on scroll-up. */
+  loadingOlderMessages?: boolean;
+  /**
+   * Transient compose-picker preview. Not a tab, not persisted.
+   * Switching experts rebinds this pane; cancel removes it.
+   */
+  composePreview?: boolean;
+  /** Sub-Plan D: right column drawer showing one sub-agent run's activity log + artifacts. */
+  runDrawerOpen?: boolean;
+  /** Run id currently shown in the drawer (persists across restarts so the drawer can restore). */
+  runDrawerRunId?: string | null;
+};
+
+/** Lifecycle for merged tool_call + tool_result rows in chat (desktop Meta pane). */
+export type ToolCallStatus = "pending" | "running" | "done" | "error" | "cancelled";
+
+/** Flat inline notices for context/token budget events (not expandable tool cards). */
+export type ContextNoticeKind =
+  | "budget_compress"
+  | "context_compact"
+  | "compactor_cb"
+  | "compaction_reactive"
+  | "compaction_proactive"
+  | "budget_exceeded"
+  | "widget_flow_retry";
+
+export type MessageUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  turnInputTokens?: number;
+  turnOutputTokens?: number;
+  turnCachedTokens?: number;
+};
+
+export type ModelSelection = "manual" | "auto";
+
+export type Message = {
+  id: string;
+  role: MsgRole;
+  content: string;
+  timestamp?: number;
+  /** Session this message belongs to. Render layer hides messages whose owner
+   * does not match the pane's current session, so a stray cross-session write
+   * can never surface under the wrong conversation. */
+  ownerSessionId?: string;
+  agentId?: string;
+  /** Group-room human speaker. Absent/"user" = desktop owner. */
+  speakerUserId?: string;
+  speakerName?: string;
+  avatarName?: string;
+  avatarUrl?: string;
+  /** Centered muted system line (rename confirmation, etc.). */
+  systemNotice?: boolean;
+  provider?: string;
+  model?: string;
+  /** Per-turn token ledger persisted on the assistant row. */
+  usage?: MessageUsage;
+  /** How this turn's model was chosen. Default / omitted is manual. */
+  modelSelection?: ModelSelection;
+  quotedMessageId?: string;
+  quotedContent?: string;
+  forwardedHistory?: ForwardedHistoryCard;
+  attachments?: MessageAttachment[];
+  inlineConfirm?: PendingConfirm;
+  /** Pending clarification prompt rendered as an inline card (NFR-2 visibility). */
+  clarificationPrompt?: PendingClarification;
+  /** Marks the clarification prompt row as suspended (unattended/automation). */
+  clarificationSuspended?: boolean;
+  /** Generic irreversible/external-write action confirmation card. */
+  actionConfirmation?: PendingActionConfirmation;
+  /** Correlates tool_call / tool_result / tool_progress from runtime SSE (`tool_call_id`). */
+  toolCallId?: string;
+  toolName?: string;
+  toolArgs?: Record<string, unknown>;
+  /** In-memory progressive show_widget arguments preview (not persisted). */
+  toolArgsPartial?: {
+    title?: string;
+    widgetCode?: string;
+    argumentsRaw?: string;
+  };
+  toolStatus?: ToolCallStatus;
+  toolElapsedSec?: number;
+  /** One-line preview for collapsed header while running or after done. */
+  toolResultPreview?: string;
+  /** Consecutive tool messages with the same id render inside one TurnToolGroupCard. */
+  toolGroupId?: string;
+  /** Live stdout/stderr lines for long-running tools (e.g. bash_exec). */
+  toolStreamLines?: string[];
+  /** Parsed from model `<followups>` block; shown as chips after reply completes. */
+  suggestedQuestions?: string[];
+  /** web_search / knowledge_search references for this assistant turn. */
+  references?: SearchReference[];
+  /** Distinct search queries used in this assistant turn. */
+  searchedQueries?: string[];
+  /** Persisted reasoning text ( streamed ``ILD... `` stripped from content ). */
+  reasoning?: string;
+  /** Persisted reasoning duration in seconds, written at finalize. */
+  reasoningSeconds?: number;
+  /** Renders as flat ContextNoticeLine instead of ToolCallCard. */
+  noticeKind?: ContextNoticeKind;
+  /** Token budget exceeded metadata for BudgetExceededCard rendering. */
+  budgetSource?: string;
+  budgetCurrent?: number;
+  budgetMax?: number;
+  /** Composer command that produced this user turn. */
+  command_name?: string;
+  /** messages.json metadata (e.g. view_image_inject). */
+  metadata?: Record<string, unknown>;
+  /** Sub-Plan E: persisted anchor for a historical sub-agent cluster card. */
+  subAgentCluster?: SubAgentClusterAnchor;
+  /** Ordered text/image blocks for inline generated images. */
+  blocks?: ContentBlock[];
+  /** Render-only presentation flag; never persist. */
+  presentationHoldDeliverables?: boolean;
+};
+
+export type SubAgentClusterAnchor = {
+  clusterId: string;
+  runIds: string[];
+  title?: string;
+  createdAt?: number;
+};
+
+/** Extras allowed on tool messages from `addPaneMessage` / `addMessage`. */
+export type MessageToolExtras = Pick<
+  Message,
+  | "toolCallId"
+  | "toolName"
+  | "toolArgs"
+  | "toolArgsPartial"
+  | "toolStatus"
+  | "toolElapsedSec"
+  | "toolResultPreview"
+  | "toolGroupId"
+  | "toolStreamLines"
+  | "inlineConfirm"
+  | "clarificationPrompt"
+  | "clarificationSuspended"
+  | "actionConfirmation"
+  | "suggestedQuestions"
+  | "noticeKind"
+  | "budgetSource"
+  | "budgetCurrent"
+  | "budgetMax"
+>;
+
+export type ForwardedHistoryItem = {
+  sender: string;
+  role: string;
+  content: string;
+  avatarUrl?: string;
+  timestamp?: number;
+  attachments?: MessageAttachment[];
+};
+
+export type ForwardedHistoryCard = {
+  title: string;
+  sourceSession: string;
+  note?: string;
+  items: ForwardedHistoryItem[];
+};
+
+export type MessageAttachment = {
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl?: string;
+  sourcePath?: string;
+  referenceToken?: boolean;
+  composerRefLabel?: string;
+  lineRange?: { start: number; end: number };
+  spreadsheetRef?: { sheet: string; a1: string };
+  snippetRef?: string;
+  snippetContent?: string;
+  /** HTML preview select-element chip (Trae-style). */
+  htmlElementRef?: { tagName: string; selectorHint: string; comment?: string };
+};
+
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  /** Owning session id captured when queued; prevents cross-session replay. */
+  sessionId?: string;
+  attachments: MessageAttachment[];
+  contextFiles: MessageAttachment[];
+  timestamp: number;
+};
+
+export type SubAgentEvent = {
+  id: string;
+  type: string;
+  content: string;
+  ts: number;
+};
+
+export type PendingConfirm = {
+  requestId: string;
+  question: string;
+  agentId: string;
+  sessionId: string;
+  context?: Record<string, unknown>;
+};
+
+export type ClarificationDecision = {
+  id: string;
+  question: string;
+  options: string[];
+  selectionMode: "single" | "multiple";
+  exclusiveOptions: string[];
+};
+
+export type PendingClarification = {
+  requestId: string;
+  prompt: string;
+  options: string[];
+  /** When set, render one option group per independent decision dimension. */
+  decisions?: ClarificationDecision[];
+  allowFreeText: boolean;
+  agentId: string;
+  sessionId: string;
+  context?: Record<string, unknown>;
+};
+
+export type SubAgent = {
+  id: string;
+  name: string;
+  role: string;
+  provider?: string;
+  model?: string;
+  status: SubAgentStatus;
+  task: string;
+  sessionId?: string;
+  progress?: number;
+  currentAction?: string;
+  liveOutput?: string;
+  resultSummary?: string;
+  resultFile?: string;
+  outputFiles?: string[];
+  pendingConfirm?: PendingConfirm;
+  pendingClarification?: PendingClarification;
+  events: SubAgentEvent[];
+};
+
+type ConfirmState = {
+  open: boolean;
+  requestId: string;
+  agentId: string;
+  question: string;
+  diff?: string;
+  context?: Record<string, unknown>;
+};
+
+type ClarificationState = {
+  open: boolean;
+  requestId: string;
+  agentId: string;
+  prompt: string;
+  options: string[];
+  allowFreeText: boolean;
+  context?: Record<string, unknown>;
+};
+
+export type ProviderEntry = {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  models: string[];
+  /** Provider switch: false means hide all models for this provider in pickers. */
+  enabled: boolean;
+  /** When true, persist `drop_params` for LiteLLM (strip unsupported params like tool_choice on some gateways). */
+  dropParams: boolean;
+  /** 自定义服务厂商展示名 */
+  displayName?: string;
+  /** OpenAI 范式接口 */
+  interface?: "openai" | "ollama";
+};
+
+type SettingsState = {
+  open: boolean;
+  /** 打开设置时若指定，则 SettingsPanel 会切换到对应分区并随后清空。 */
+  openToTab?: SettingsTab;
+  /** 打开后滚到 Tab 内某个区块（如安全中心的路径/命令/工具规则）。 */
+  openToFocus?: SettingsFocus;
+  /** 每次带着 focus 打开时递增，便于已打开时再次点「自定义」仍会滚一次。 */
+  focusSeq?: number;
+  defaultProvider: string;
+  providers: Record<string, ProviderEntry>;
+  /** legacy compat */
+  provider: string;
+  model: string;
+  apiKey: string;
+};
+
+export type TokenDashboardRange = "day" | "week" | "month" | "total" | "custom";
+
+type TokenDashboardState = {
+  open: boolean;
+  range: TokenDashboardRange;
+  customFrom: string;
+  customTo: string;
+};
+
+type CollabRoomsState = {
+  open: boolean;
+  activeRoomId: string | null;
+};
+
+type DeliveryPanelState = {
+  open: boolean;
+  selectedTaskId: string | null;
+};
+
+type AppState = {
+  apiBase: string;
+  apiToken: string;
+  sessionId: string;
+  status: UiStatus;
+  messages: Message[];
+  subAgents: SubAgent[];
+  selectedSubAgent: string | null;
+  codePreview: string;
+  confirm: ConfirmState;
+  clarification: ClarificationState;
+  settings: SettingsState;
+  tokenDashboard: TokenDashboardState;
+  collabRooms: CollabRoomsState;
+  deliveryPanel: DeliveryPanelState;
+  activeProvider: string;
+  activeModel: string;
+  userMode: "pro" | "lite";
+  onboardingCompleted: boolean;
+  commandPaletteOpen: boolean;
+  /** Sidebar「+」快捷创建；关闭为 null。 */
+  quickComposeIntent: QuickComposeIntent | null;
+  openQuickCompose: (intent: QuickComposeIntent) => void;
+  closeQuickCompose: () => void;
+  keybindingsPanelOpen: boolean;
+  planMode: boolean;
+  sidebarCollapsed: boolean;
+  focusMode: boolean;
+  /**
+   * 灵巧模式（语音）当前绑定的 pane id。
+   *
+   * 由 `toggleFocusMode(paneId)` / `enterFocusMode(paneId)` 写入；
+   * VoiceFocusMode 读取它解析 sessionId/avatarId，从而：
+   *   1. 把对应 session 最近 ~20 轮历史作为上下文注入 realtime provider；
+   *   2. 把电话中的 user/assistant final 文本追加回该 session（而非硬编码 pane-meta）。
+   * 退出灵巧模式时清空。
+   */
+  focusModePaneId: string | null;
+  /**
+   * 退出灵巧语音模式后，对应 ChatPane 需强制滚到底部一次（绕过 remount 时 flushJumpToBottomFab 误判 unpinned）。
+   * 由 ChatPane 消费后立即清空。
+   */
+  focusExitScrollBottomPaneId: string | null;
+  clearFocusExitScrollBottomPaneId: () => void;
+  theme: ThemeMode;
+  locale: AppLocale;
+  /** Near 官网账号登录状态（与 AccountTab / Topbar 共享，首屏和事件回调同步）。 */
+  agxAccount: { loggedIn: boolean; email: string; displayName: string };
+  chatStyle: ChatStyle;
+  themeColor: ThemeColor;
+  /** Global user nickname shown on all bubbles and sent as context label (empty → 「我」). */
+  userNickname: string;
+  /** Custom avatar for the human user (group chats). Independent of Near's cube costume. */
+  userAvatarUrl: string;
+  /** Near cube colorway. Drives the cube face when the collection style is cubes. */
+  userCubeColorwayId: string;
+  /** Shared portrait style for built-in agents and generated experts. */
+  collectionPortraitStyle: CollectionStyleId;
+  /** Extra Near seeds for non-cube styles. Empty uses the stable default face. */
+  nearSeedsByStyle: Record<string, string>;
+  /** Free-text user preference/style injected into every agent system prompt. Max 500 chars. */
+  userPreference: string;
+  /** 附件路由策略。无企业下发时保持关闭；真正 containment 在 Studio 侧。 */
+  attachmentRouting: AttachmentRoutingPolicy;
+  /** 本客户端已锁定的私有部署目标；空表示尚未因文档锁模。 */
+  attachmentRoutingLock: RoutingModelRef | null;
+  setAttachmentRouting: (policy: AttachmentRoutingPolicy) => void;
+  setAttachmentRoutingLock: (target: RoutingModelRef | null) => void;
+  /** 企业下发的本机自助能力锁；无企业登录时保持全开。 */
+  capabilityLocks: DesktopCapabilityLocks;
+  setCapabilityLocks: (locks: DesktopCapabilityLocks) => void;
+  /** Custom avatar for Meta-Agent (Near). */
+  metaAvatarUrl: string;
+  runMode: RunMode;
+  /** Per-session task-run id used to isolate confirmation allowlists. */
+  confirmRunsBySession: Record<string, { runId: string; workspace: string }>;
+  startConfirmRun: (sessionId: string, workspace: string) => string;
+  mcpServers: McpServer[];
+  avatars: Avatar[];
+  activeAvatarId: string | null;
+  avatarSessions: SessionItem[];
+  /** True after splash preload attempt (success or timeout). */
+  corePreloadAttempted: boolean;
+  /** Sessions list prefetched at startup, keyed by avatar id ("" = Meta). */
+  preloadedSessionsByAvatarKey: Record<string, unknown[]>;
+  /** Taskspaces prefetched at startup for the active session. */
+  preloadedTaskspacesBySessionId: Record<string, Taskspace[]>;
+  groups: GroupChat[];
+  panes: ChatPane[];
+  activePaneId: string;
+  /** Which content the right main area shows (chat / gallery / projects / automation / wiki). */
+  mainView: MainView;
+  setMainView: (view: MainView) => void;
+  /**
+   * Snapshot of the active chat pane when leaving `mainView: "chat"` for a landing
+   * page (avatars / groups / collab / automation). Used by MainViewShell's back button.
+   */
+  chatReturnSnapshot: { paneId: string; sessionId?: string } | null;
+  /** Restore the snapshotted chat pane and switch mainView back to chat. */
+  returnToPreviousChat: () => void;
+  /** Incremented when local session list should refresh (e.g. new session created). SidebarSessionHistory subscribes. */
+  sessionCatalogRevision: number;
+  bumpSessionCatalogRevision: () => void;
+  /** Optimistic last-activity hints so history sidebar moves to Today on send. */
+  sessionHistoryHints: Record<string, { activityAt: number; running: boolean }>;
+  markSessionHistoryActive: (sessionId: string) => void;
+  clearSessionHistoryHint: (sessionId: string) => void;
+  /** Closed/materialized scratch session ids that must never appear in sidebar history. */
+  hiddenScratchSessionIds: string[];
+  rememberHiddenScratchSessionIds: (sessionIds: Iterable<string>) => void;
+  forgetHiddenScratchSessionIds: (sessionIds: Iterable<string>) => void;
+  /** After merge-forward, target pane runs one normal /api/chat with this text (cleared when consumed). */
+  forwardAutoReply: {
+    paneId: string;
+    sessionId: string;
+    text: string;
+    suppressUserEcho?: boolean;
+    skipUserHistory?: boolean;
+  } | null;
+  setForwardAutoReply: (
+    job: {
+      paneId: string;
+      sessionId: string;
+      text: string;
+      suppressUserEcho?: boolean;
+      skipUserHistory?: boolean;
+    } | null
+  ) => void;
+  /** Per-pane queued user messages (sent automatically after current stream ends). */
+  pendingMessages: Record<string, QueuedMessage[]>;
+  /** True when queued follow-ups could not be saved for recovery after restart. */
+  pendingMessagesPersistenceFailed: boolean;
+  enqueuePaneMessage: (paneId: string, msg: QueuedMessage) => void;
+  dequeuePaneMessage: (paneId: string) => QueuedMessage | undefined;
+  dequeuePaneMessageForSession: (paneId: string, sessionId: string) => QueuedMessage | undefined;
+  takePendingMessage: (paneId: string, msgId: string) => QueuedMessage | undefined;
+  removePendingMessage: (paneId: string, msgId: string) => void;
+  editPendingMessage: (paneId: string, msgId: string, newText: string) => void;
+  clearPendingMessages: (paneId: string) => void;
+  setApiBase: (base: string) => void;
+  setApiToken: (token: string) => void;
+  setSessionId: (id: string) => void;
+  setStatus: (status: UiStatus) => void;
+  setActiveModel: (provider: string, model: string) => void;
+  setPaneModel: (paneId: string, provider: string, model: string) => void;
+  /** Persist thinking effort for a pane. */
+  setPaneReasoningEffort: (paneId: string, effort: "low" | "high" | "max") => void;
+  /** Persist DeepSeek V4 thinking switch for a pane. */
+  setPaneThinkingEnabled: (paneId: string, enabled: boolean) => void;
+  /** Persist a client-declared context budget for a pane. */
+  setPaneContextWindow: (paneId: string, tokens: number) => void;
+  /** Migrate pane/global picks that are no longer in the visible model catalog. */
+  reconcilePaneModels: () => { changedPaneIds: string[]; activeChanged: boolean };
+  setUserMode: (mode: "pro" | "lite") => void;
+  setOnboardingCompleted: (v: boolean) => void;
+  setCommandPaletteOpen: (v: boolean) => void;
+  setKeybindingsPanelOpen: (v: boolean) => void;
+  setPlanMode: (v: boolean) => void;
+  setSidebarCollapsed: (v: boolean | ((prev: boolean) => boolean)) => void;
+  enterFocusMode: (paneId?: string) => void;
+  exitFocusMode: () => void;
+  toggleFocusMode: (paneId?: string) => void;
+  setTheme: (theme: ThemeMode) => void;
+  setLocale: (locale: AppLocale) => void;
+  setThemeColor: (color: ThemeColor) => void;
+  setAgxAccount: (acct: { loggedIn: boolean; email: string; displayName: string }) => void;
+  setChatStyle: (style: ChatStyle) => void;
+  setUserNickname: (name: string) => void;
+  setUserAvatarUrl: (url: string) => void;
+  setUserCubeColorwayId: (colorwayId: string) => void;
+  setCollectionPortraitStyle: (style: CollectionStyleId) => void;
+  setNearStyleSeed: (style: CollectionStyleId, seed: string) => void;
+  setUserPreference: (pref: string) => void;
+  setMetaAvatarUrl: (url: string) => void;
+  setRunMode: (v: RunMode) => void;
+  setMcpServers: (servers: McpServer[]) => void;
+  setAvatars: (avatars: Avatar[]) => void;
+  /** Update an avatar's display name in the gallery list and every open pane. */
+  renameAvatarInPanes: (avatarId: string, name: string) => void;
+  applyCorePreloadBundle: (payload: {
+    sessionsKey: string;
+    sessions: unknown[];
+    taskspacesKey?: string;
+    taskspaces?: Taskspace[];
+  }) => void;
+  setActiveAvatarId: (id: string | null) => void;
+  setAvatarSessions: (sessions: SessionItem[]) => void;
+  setGroups: (groups: GroupChat[]) => void;
+  setActivePaneId: (id: string) => void;
+  hydratePanes: (panes: ChatPane[], activePaneId: string) => void;
+  addPane: (avatarId: string | null, avatarName: string, sessionId: string) => string;
+  /**
+   * Show one expert/group in the compose picker without creating a durable tab.
+   * Reuses an already-open pane when one exists; otherwise rebinds a single preview pane.
+   */
+  upsertComposePreviewPane: (
+    avatarId: string | null,
+    avatarName: string,
+  ) => { paneId: string; reusedDurable: boolean };
+  clearComposePreview: (restorePaneId?: string) => void;
+  promoteComposePreview: () => string | null;
+  removePane: (paneId: string) => void;
+  /** 删除定时任务后移除所有绑定该任务的窗格（avatarId 为 automation:<taskId>）。 */
+  removePanesForAutomationTaskId: (taskId: string) => void;
+  reorderPanes: (fromIndex: number, toIndex: number) => void;
+  addPaneMessage: (
+    paneId: string,
+    role: MsgRole,
+    content: string,
+    agentId?: string,
+    provider?: string,
+    model?: string,
+    attachments?: MessageAttachment[],
+    extras?: Partial<
+      Pick<
+        Message,
+        | "avatarName"
+        | "avatarUrl"
+        | "systemNotice"
+        | "quotedMessageId"
+        | "quotedContent"
+        | "timestamp"
+        | "forwardedHistory"
+        | "inlineConfirm"
+        | "clarificationPrompt"
+        | "clarificationSuspended"
+        | "actionConfirmation"
+        | "suggestedQuestions"
+        | "references"
+        | "searchedQueries"
+        | "ownerSessionId"
+        | "metadata"
+        | "command_name"
+        | "blocks"
+        | "usage"
+        | "modelSelection"
+        | "id"
+      >
+    > &
+      Partial<MessageToolExtras>
+  ) => void;
+  /** Merge *patch* into the last pane message with the given *role* owned by *ownerSessionId*. */
+  mergeLastPaneMessageByRole: (
+    paneId: string,
+    role: MsgRole,
+    patch: Partial<Message>,
+    ownerSessionId: string,
+  ) => boolean;
+  /** Merge fields into an existing pane `tool` message by `toolCallId`. */
+  updatePaneMessageByToolCallId: (
+    paneId: string,
+    toolCallId: string,
+    patch: Partial<
+      Pick<
+        Message,
+        | "content"
+        | "toolStatus"
+        | "toolElapsedSec"
+        | "toolResultPreview"
+        | "toolStreamLines"
+        | "toolName"
+        | "toolArgs"
+        | "toolArgsPartial"
+        | "inlineConfirm"
+        | "clarificationPrompt"
+        | "actionConfirmation"
+        | "metadata"
+      >
+    > & {
+      appendStreamLine?: string;
+    },
+    ownerSessionId?: string,
+  ) => boolean;
+  /** Lite / global `messages` list: merge tool rows by `toolCallId` (mirrors pane path). */
+  updateMessageByToolCallId: (
+    toolCallId: string,
+    patch: Partial<
+      Pick<
+        Message,
+        | "content"
+        | "toolStatus"
+        | "toolElapsedSec"
+        | "toolResultPreview"
+        | "toolStreamLines"
+        | "toolName"
+        | "toolArgs"
+        | "toolArgsPartial"
+        | "inlineConfirm"
+        | "clarificationPrompt"
+        | "actionConfirmation"
+        | "metadata"
+      >
+    > & {
+      appendStreamLine?: string;
+    }
+  ) => boolean;
+  /** Stop/barge-in: flip live tool cards to cancelled so timers do not keep ticking. */
+  cancelInFlightPaneTools: (paneId: string, ownerSessionId?: string) => number;
+  /** Lite / global `messages` counterpart of {@link cancelInFlightPaneTools}. */
+  cancelInFlightLiteTools: (ownerSessionId?: string) => number;
+  updateLastPaneMessage: (paneId: string, content: string, ownerSessionId: string) => void;
+  /** Mark the pane message carrying `requestId` (clarificationPrompt) as answered. */
+  markClarificationAnswered: (
+    requestId: string,
+    answer: { answerText: string; selectedOptions: string[] },
+  ) => void;
+  clearPaneMessages: (paneId: string) => void;
+  setPaneSessionId: (paneId: string, sessionId: string, modelHint?: { provider?: string; model?: string }) => void;
+  setPaneSessionMode: (paneId: string, mode: "code_dev" | "daily_office") => void;
+  setPaneTurnIntent: (paneId: string, intent: TurnIntent) => void;
+  setPaneIsolateActive: (paneId: string, active: boolean) => void;
+  setPaneMessages: (paneId: string, messages: Message[]) => void;
+  prependPaneMessages: (paneId: string, messages: Message[]) => void;
+  setPaneLoadingMessages: (paneId: string, loading: boolean) => void;
+  setPaneMessagePaging: (
+    paneId: string,
+    paging: { oldestLoadedIndex?: number; hasOlderMessages?: boolean; loadingOlderMessages?: boolean }
+  ) => void;
+  resetPaneMessagePaging: (paneId: string) => void;
+  /** Per-session messages cache (LRU). Lets repeat session switches skip the IPC roundtrip. */
+  getCachedSessionMessages: (sessionId: string) => Message[] | undefined;
+  cacheSessionMessages: (sessionId: string, messages: Message[]) => void;
+  dropCachedSessionMessages: (sessionId: string | Iterable<string>) => void;
+  setPaneHistorySearchTerms: (paneId: string, terms: string[]) => void;
+  setPaneHistoryJumpMessageId: (paneId: string, messageId: string | null) => void;
+  setPanePendingQuote: (paneId: string, payload: ChatPane["pendingQuote"]) => void;
+  upsertScratchChat: (
+    paneId: string,
+    draft: ScratchChatDraft
+  ) => { chatId: string; reused: boolean };
+  setScratchChatFloating: (paneId: string, chatId: string, floating: boolean) => void;
+  closeScratchChat: (paneId: string, chatId: string) => string[];
+  restoreParkedScratchChat: (paneId: string, chatId: string) => string;
+  dismissParkedScratchChat: (paneId: string, chatId: string) => string;
+  deleteScratchChat: (paneId: string, chatId: string) => string;
+  promoteScratchChat: (paneId: string, chatId: string) => string;
+  clearHostScratchChats: (paneId: string, hostSessionId: string) => string[];
+  patchScratchChat: (paneId: string, chatId: string, patch: Partial<ScratchChat>) => void;
+  togglePaneHistory: (paneId: string) => void;
+  togglePaneMemoryGraph: (paneId: string) => void;
+  /** @deprecated Prefer cycleSidePanel / openSidePanel */
+  toggleTaskspacePanel: (paneId: string) => void;
+  toggleMembersPanel: (paneId: string) => void;
+  cycleSidePanel: (paneId: string, tab: SidePanelTab) => void;
+  openSidePanel: (paneId: string, tab: SidePanelTab) => void;
+  setActiveTaskspace: (paneId: string, taskspaceId: string | null) => void;
+  setPaneContextInherited: (paneId: string, inherited: boolean) => void;
+  setSpawnsColumnOpen: (paneId: string, open: boolean) => void;
+  dismissSpawnsColumn: (paneId: string, baselineSubAgentIds: string[]) => void;
+  clearSpawnsColumnSuppress: (paneId: string) => void;
+  /** Sub-Plan D: open/close the right-column sub-agent run drawer. */
+  openRunDrawer: (paneId: string, runId: string) => void;
+  closeRunDrawer: (paneId: string) => void;
+  addPaneTerminalTab: (
+    paneId: string,
+    cwd: string,
+    labelHint?: string,
+    ccBridgePty?: PaneTerminalTab["ccBridgePty"]
+  ) => void;
+  removePaneTerminalTab: (paneId: string, tabId: string) => void;
+  setActivePaneTerminalTab: (paneId: string, tabId: string | null) => void;
+  accumulatePaneTokens: (paneId: string, input: number, output: number, cached?: number) => void;
+  replacePaneTokens: (paneId: string, tokens: SessionTokens) => void;
+  addMessage: (
+    role: MsgRole,
+    content: string,
+    agentId?: string,
+    provider?: string,
+    model?: string,
+    attachments?: MessageAttachment[],
+    extras?: Partial<
+      Pick<
+        Message,
+        | "avatarName"
+        | "avatarUrl"
+        | "quotedMessageId"
+        | "quotedContent"
+        | "timestamp"
+        | "forwardedHistory"
+        | "inlineConfirm"
+        | "clarificationPrompt"
+        | "clarificationSuspended"
+        | "actionConfirmation"
+        | "references"
+        | "searchedQueries"
+        | "metadata"
+        | "blocks"
+      >
+    > &
+      Partial<MessageToolExtras>
+  ) => void;
+  /** Lite/global list: merge *patch* into the last message with *role* (by id sync to active pane). */
+  mergeLastMessageByRole: (role: MsgRole, patch: Partial<Message>) => boolean;
+  insertMessageAfter: (afterId: string, msg: Omit<Message, "id">) => string;
+  clearMessages: () => void;
+  addSubAgent: (item: Pick<SubAgent, "id" | "name" | "role" | "task" | "provider" | "model"> & { sessionId?: string }) => void;
+  updateSubAgent: (id: string, patch: Partial<SubAgent>) => void;
+  addSubAgentEvent: (id: string, event: Omit<SubAgentEvent, "id" | "ts">) => void;
+  removeSubAgent: (id: string) => void;
+  setSelectedSubAgent: (id: string | null) => void;
+  setCodePreview: (code: string) => void;
+  openConfirm: (
+    requestId: string,
+    question: string,
+    diff?: string,
+    agentId?: string,
+    context?: Record<string, unknown>
+  ) => void;
+  closeConfirm: () => void;
+  openClarification: (
+    requestId: string,
+    prompt: string,
+    options: string[],
+    allowFreeText: boolean,
+    agentId?: string,
+    context?: Record<string, unknown>
+  ) => void;
+  closeClarification: () => void;
+  openSettings: (tab?: SettingsTab, focus?: SettingsFocus) => void;
+  closeSettings: () => void;
+  updateSettings: (
+    patch: Partial<
+      Pick<
+        SettingsState,
+        "provider" | "model" | "apiKey" | "defaultProvider" | "providers" | "openToTab" | "openToFocus"
+      >
+    >
+  ) => void;
+  openTokenDashboard: () => void;
+  closeTokenDashboard: () => void;
+  openCollabRooms: () => void;
+  closeCollabRooms: () => void;
+  setActiveCollabRoomId: (id: string | null) => void;
+  setTokenDashboardRange: (range: TokenDashboardRange) => void;
+  setTokenDashboardCustomRange: (from: string, to: string) => void;
+  openDeliveryPanel: (taskId?: string | null) => void;
+  closeDeliveryPanel: () => void;
+  setDeliverySelectedTaskId: (taskId: string | null) => void;
+};
+
+function uid(): string {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function makeDefaultPane(): ChatPane {
+  return {
+    id: "pane-meta",
+    avatarId: null,
+    avatarName: META_AGENT_DISPLAY_NAME,
+    sessionId: "",
+    modelProvider: "",
+    modelName: "",
+    messages: [],
+    historyOpen: false,
+    memoryGraphOpen: false,
+    contextInherited: false,
+    taskspacePanelOpen: false,
+    membersPanelOpen: false,
+    graphPanelOpen: false,
+    activeGraphRunId: null,
+    sidePanelTab: "workspace",
+    activeTaskspaceId: null,
+    spawnsColumnOpen: false,
+    spawnsColumnSuppressAuto: false,
+    spawnsColumnBaselineIds: [],
+    runDrawerOpen: false,
+    runDrawerRunId: null,
+    terminalTabs: [],
+    activeTerminalTabId: null,
+    sessionTokens: { ...EMPTY_SESSION_TOKENS },
+    historySearchTerms: [],
+    historyJumpMessageId: null,
+    scratchChats: [],
+    parkedScratchChats: [],
+    loadingMessages: false,
+    oldestLoadedIndex: 0,
+    hasOlderMessages: false,
+    loadingOlderMessages: false,
+  };
+}
+
+/** Per-session messages LRU cache shared across panes in this renderer process.
+ *  Reading via Map iteration order works because we delete+re-insert on access
+ *  to bump the entry to the most-recent slot before set().
+ */
+const SESSION_MESSAGE_CACHE_MAX = 10;
+const sessionMessageCache: Map<string, Message[]> = new Map();
+
+const CHAT_STYLE_STORAGE_KEY = "agx-chat-style";
+const THEME_STORAGE_KEY = "agx-theme";
+
+function loadLocale(): AppLocale | null {
+  try {
+    const saved = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+    if (isAppLocale(saved)) return saved;
+  } catch {
+    // ignore storage errors
+  }
+  return null;
+}
+
+function initialLocale(): AppLocale {
+  const osTag = typeof navigator !== "undefined" ? navigator.language : undefined;
+  return resolveAppLocale({ saved: loadLocale(), osTag });
+}
+const THEME_COLOR_STORAGE_KEY = "agx-theme-color";
+const USER_DISPLAY_NAME_KEY = "agx-user-display-name";
+const USER_PREFERENCE_KEY = "agx-user-preference";
+const USER_AVATAR_URL_KEY = "agx-user-avatar-url";
+const NEAR_STYLE_SEEDS_KEY = "agx-near-style-seeds";
+const USER_CUBE_COLORWAY_KEY = "agx-user-cube-colorway";
+
+function loadNearSeedsByStyle(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(NEAR_STYLE_SEEDS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    );
+  } catch {
+    return {};
+  }
+}
+const META_AVATAR_URL_KEY = "agx-meta-avatar-url";
+const SESSION_TOKEN_CACHE_KEY = "agx-session-token-cache-v1";
+
+function loadChatStyle(): ChatStyle {
+  try {
+    const saved = window.localStorage.getItem(CHAT_STYLE_STORAGE_KEY);
+    if (saved === "im" || saved === "terminal" || saved === "clean") return saved;
+  } catch {
+    // ignore storage errors
+  }
+  return "im";
+}
+
+function loadTheme(): ThemeMode {
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (saved === "dark" || saved === "light") return saved;
+    if (saved === "dim") return "dark";
+  } catch {
+    // ignore storage errors
+  }
+  return "dark";
+}
+
+function loadThemeColor(): ThemeColor {
+  try {
+    const saved = window.localStorage.getItem(THEME_COLOR_STORAGE_KEY);
+    if (saved === "blue" || saved === "green" || saved === "pink" || saved === "yellow" || saved === "white") return saved as ThemeColor;
+  } catch {
+    // ignore storage errors
+  }
+  return "white";
+}
+
+function loadUserNickname(): string {
+  try {
+    const saved = window.localStorage.getItem(USER_DISPLAY_NAME_KEY);
+    if (typeof saved === "string") return saved.slice(0, 48);
+  } catch {
+    // ignore storage errors
+  }
+  return "";
+}
+
+function loadUserPreference(): string {
+  try {
+    const saved = window.localStorage.getItem(USER_PREFERENCE_KEY);
+    if (typeof saved === "string") return saved.slice(0, 500);
+  } catch {
+    // ignore storage errors
+  }
+  return "";
+}
+
+function loadUserCubeColorwayId(): string {
+  try {
+    const saved = window.localStorage.getItem(USER_CUBE_COLORWAY_KEY);
+    if (typeof saved === "string" && isUserCubeColorwayId(saved)) return saved;
+  } catch {
+    // ignore storage errors
+  }
+  return BRAND_CUBE_COLORWAY_ID;
+}
+
+function loadUserAvatarUrl(): string {
+  try {
+    const saved = window.localStorage.getItem(USER_AVATAR_URL_KEY);
+    if (isPersistedUserAvatarUrl(saved)) return String(saved).trim();
+  } catch {
+    // ignore storage errors
+  }
+  return "";
+}
+
+function loadMetaAvatarUrl(): string {
+  try {
+    const saved = window.localStorage.getItem(META_AVATAR_URL_KEY);
+    if (typeof saved === "string" && saved.trim()) return saved;
+  } catch {
+    // ignore storage errors
+  }
+  return resolveMetaAvatarFromColorway(loadUserCubeColorwayId());
+}
+
+export type SessionTokens = {
+  input: number;
+  output: number;
+  cached: number;
+  lastInput: number;
+  lastCached: number;
+};
+
+export const EMPTY_SESSION_TOKENS: SessionTokens = {
+  input: 0,
+  output: 0,
+  cached: 0,
+  lastInput: 0,
+  lastCached: 0,
+};
+
+type SessionTokenCache = Record<string, SessionTokens & { updatedAt: number }>;
+
+export function normalizeSessionTokens(raw: unknown): SessionTokens {
+  if (!raw || typeof raw !== "object") return { ...EMPTY_SESSION_TOKENS };
+  const row = raw as Record<string, unknown>;
+  return {
+    input: toNonNegativeInt(row.input),
+    output: toNonNegativeInt(row.output),
+    cached: toNonNegativeInt(row.cached),
+    lastInput: toNonNegativeInt(row.lastInput),
+    lastCached: toNonNegativeInt(row.lastCached),
+  };
+}
+
+function toNonNegativeInt(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
+function readSessionTokenCache(): SessionTokenCache {
+  try {
+    const raw = readScopedLocalStorage(SESSION_TOKEN_CACHE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : {};
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: SessionTokenCache = {};
+    for (const [sid, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!sid || !value || typeof value !== "object") continue;
+      const row = value as Record<string, unknown>;
+      out[sid] = {
+        ...normalizeSessionTokens(row),
+        updatedAt: toNonNegativeInt(row.updatedAt) || Date.now(),
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeSessionTokenCache(cache: SessionTokenCache): void {
+  try {
+    const entries = Object.entries(cache).sort((a, b) => (b[1].updatedAt ?? 0) - (a[1].updatedAt ?? 0));
+    const trimmed = entries.slice(0, 500);
+    const normalized: SessionTokenCache = {};
+    for (const [sid, row] of trimmed) normalized[sid] = row;
+    writeScopedLocalStorage(SESSION_TOKEN_CACHE_KEY, JSON.stringify(normalized));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getSessionTokensFromCache(sessionId: string): SessionTokens | null {
+  const sid = String(sessionId ?? "").trim();
+  if (!sid) return null;
+  const row = readSessionTokenCache()[sid];
+  if (!row) return null;
+  return normalizeSessionTokens(row);
+}
+
+function upsertSessionTokenCache(sessionId: string, tokens: SessionTokens): void {
+  const sid = String(sessionId ?? "").trim();
+  if (!sid) return;
+  const cache = readSessionTokenCache();
+  cache[sid] = {
+    ...normalizeSessionTokens(tokens),
+    updatedAt: Date.now(),
+  };
+  writeSessionTokenCache(cache);
+}
+
+export const useAppStore = create<AppState>((set, get) => ({
+  apiBase: "",
+  apiToken: "",
+  sessionId: "",
+  status: "idle",
+  messages: [],
+  activeProvider: "",
+  activeModel: "",
+  userMode: "pro",
+  onboardingCompleted: true,
+  commandPaletteOpen: false,
+  quickComposeIntent: null,
+  keybindingsPanelOpen: false,
+  planMode: false,
+  sidebarCollapsed: false,
+  focusMode: false,
+  focusModePaneId: null,
+  focusExitScrollBottomPaneId: null,
+  theme: loadTheme(),
+  locale: initialLocale(),
+  themeColor: loadThemeColor(),
+  agxAccount: { loggedIn: false, email: "", displayName: "" },
+  chatStyle: loadChatStyle(),
+  userNickname: loadUserNickname(),
+  userAvatarUrl: loadUserAvatarUrl(),
+  userCubeColorwayId: loadUserCubeColorwayId(),
+  collectionPortraitStyle: loadCollectionPortraitStyle(),
+  nearSeedsByStyle: loadNearSeedsByStyle(),
+  userPreference: loadUserPreference(),
+  attachmentRouting: ATTACHMENT_ROUTING_OFF,
+  attachmentRoutingLock: null,
+  capabilityLocks: UNRESTRICTED_CAPABILITY_LOCKS,
+  metaAvatarUrl: loadMetaAvatarUrl(),
+  runMode: "ask",
+  confirmRunsBySession: {},
+  mcpServers: [],
+  avatars: [],
+  activeAvatarId: null,
+  avatarSessions: [],
+  corePreloadAttempted: false,
+  preloadedSessionsByAvatarKey: {},
+  preloadedTaskspacesBySessionId: {},
+  groups: [],
+  panes: [makeDefaultPane()],
+  activePaneId: "pane-meta",
+  mainView: "chat",
+  setMainView: (view) =>
+    set((state) => {
+      // Leaving chat → landing: remember the active pane so landing pages can offer "back".
+      if (state.mainView === "chat" && view !== "chat") {
+        const pane = state.panes.find((p) => p.id === state.activePaneId);
+        return {
+          mainView: view,
+          chatReturnSnapshot: {
+            paneId: state.activePaneId,
+            sessionId: pane?.sessionId ? String(pane.sessionId) : undefined,
+          },
+        };
+      }
+      // Entering chat via any path clears the snapshot (returnToPreviousChat also clears).
+      if (view === "chat") {
+        return { mainView: view, chatReturnSnapshot: null };
+      }
+      // Landing → landing: keep the original chat snapshot.
+      return { mainView: view };
+    }),
+  chatReturnSnapshot: null,
+  returnToPreviousChat: () => {
+    const { chatReturnSnapshot, panes } = get();
+    const paneId = chatReturnSnapshot?.paneId;
+    if (paneId && panes.some((p) => p.id === paneId)) {
+      set({ activePaneId: paneId, mainView: "chat", chatReturnSnapshot: null });
+      return;
+    }
+    set({ mainView: "chat", chatReturnSnapshot: null });
+  },
+  sessionCatalogRevision: 0,
+  bumpSessionCatalogRevision: () =>
+    set((state) => ({ sessionCatalogRevision: state.sessionCatalogRevision + 1 })),
+  hiddenScratchSessionIds: [],
+  rememberHiddenScratchSessionIds: (sessionIds) => {
+    const incoming = [...sessionIds].map((id) => String(id ?? "").trim()).filter(Boolean);
+    if (incoming.length === 0) return;
+    set((state) => ({
+      hiddenScratchSessionIds: rememberScratchSessionIds(state.hiddenScratchSessionIds, incoming),
+    }));
+  },
+  forgetHiddenScratchSessionIds: (sessionIds) => {
+    const incoming = [...sessionIds].map((id) => String(id ?? "").trim()).filter(Boolean);
+    if (incoming.length === 0) return;
+    set((state) => ({
+      hiddenScratchSessionIds: forgetScratchSessionIds(state.hiddenScratchSessionIds, incoming),
+    }));
+  },
+  sessionHistoryHints: {},
+  markSessionHistoryActive: (sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return;
+    const nowSec = Date.now() / 1000;
+    set((state) => ({
+      sessionHistoryHints: {
+        ...state.sessionHistoryHints,
+        [sid]: { activityAt: nowSec, running: true },
+      },
+    }));
+  },
+  clearSessionHistoryHint: (sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return;
+    set((state) => {
+      if (!state.sessionHistoryHints[sid]) return state;
+      const next = { ...state.sessionHistoryHints };
+      delete next[sid];
+      return { sessionHistoryHints: next };
+    });
+  },
+  forwardAutoReply: null,
+  subAgents: [],
+  selectedSubAgent: null,
+  codePreview: "",
+  confirm: { open: false, requestId: "", question: "", agentId: "meta" },
+  clarification: {
+    open: false,
+    requestId: "",
+    agentId: "meta",
+    prompt: "",
+    options: [],
+    allowFreeText: true,
+  },
+  settings: { open: false, provider: "", model: "", apiKey: "", defaultProvider: "", providers: {}, focusSeq: 0 },
+  tokenDashboard: { open: false, range: "month", customFrom: "", customTo: "" },
+  collabRooms: { open: false, activeRoomId: null },
+  deliveryPanel: { open: false, selectedTaskId: null },
+  setApiBase: (apiBase) => set({ apiBase }),
+  setApiToken: (apiToken) => set({ apiToken }),
+  setSessionId: (sessionId) => set({ sessionId }),
+  setStatus: (status) => set({ status }),
+  setActiveModel: (activeProvider, activeModel) => set({ activeProvider, activeModel }),
+  setPaneModel: (paneId, provider, model) =>
+    set((state) => {
+      const rawProvider = String(provider ?? "").trim();
+      const rawModel = String(model ?? "").trim();
+      let nextProvider = rawProvider;
+      let nextModel = rawModel;
+      if (rawProvider || rawModel) {
+        const coerced = coerceSelectableModel(
+          state.settings.providers,
+          rawProvider,
+          rawModel,
+          rawProvider,
+        );
+        if (coerced) {
+          nextProvider = coerced.provider;
+          nextModel = coerced.model;
+        } else {
+          nextProvider = "";
+          nextModel = "";
+        }
+      }
+      const paneExists = state.panes.some((pane) => pane.id === paneId);
+      if (!paneExists) return state;
+      const nextPanes = state.panes.map((pane) =>
+        pane.id === paneId
+          ? { ...pane, modelProvider: nextProvider, modelName: nextModel }
+          : pane
+      );
+      if (state.activePaneId !== paneId) {
+        return { panes: nextPanes };
+      }
+      return {
+        panes: nextPanes,
+        activeProvider: nextProvider,
+        activeModel: nextModel,
+      };
+    }),
+  setPaneReasoningEffort: (paneId, effort) =>
+    set((state) => {
+      const next =
+        effort === "low" || effort === "high" || effort === "max" ? effort : "max";
+      return {
+        panes: state.panes.map((pane) =>
+          pane.id === paneId ? { ...pane, reasoningEffort: next } : pane,
+        ),
+      };
+    }),
+  setPaneThinkingEnabled: (paneId, enabled) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, thinkingEnabled: enabled } : pane,
+      ),
+    })),
+  setPaneContextWindow: (paneId, tokens) =>
+    set((state) => {
+      const next = Number(tokens);
+      if (!Number.isFinite(next) || next <= 0) return state;
+      return {
+        panes: state.panes.map((pane) =>
+          pane.id === paneId ? { ...pane, contextWindowTokens: Math.floor(next) } : pane,
+        ),
+      };
+    }),
+  reconcilePaneModels: () => {
+    let changedPaneIds: string[] = [];
+    let activeChanged = false;
+    set((state) => {
+      const result = reconcilePaneModelsPure({
+        panes: state.panes,
+        activePaneId: state.activePaneId,
+        activeProvider: state.activeProvider,
+        activeModel: state.activeModel,
+        providers: state.settings.providers,
+      });
+      changedPaneIds = result.changedPaneIds;
+      activeChanged = result.activeChanged;
+      if (changedPaneIds.length === 0 && !activeChanged) return state;
+      const paneById = new Map(result.panes.map((pane) => [pane.id, pane]));
+      return {
+        panes: state.panes.map((pane) => {
+          const next = paneById.get(pane.id);
+          if (!next) return pane;
+          return {
+            ...pane,
+            modelProvider: next.modelProvider ?? "",
+            modelName: next.modelName ?? "",
+          };
+        }),
+        activeProvider: result.activeProvider,
+        activeModel: result.activeModel,
+      };
+    });
+    return { changedPaneIds, activeChanged };
+  },
+  setUserMode: (userMode) => set({ userMode }),
+  setOnboardingCompleted: (onboardingCompleted) => set({ onboardingCompleted }),
+  setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
+  openQuickCompose: (intent) => set({ quickComposeIntent: intent, commandPaletteOpen: false }),
+  closeQuickCompose: () => set({ quickComposeIntent: null }),
+  setKeybindingsPanelOpen: (keybindingsPanelOpen) => set({ keybindingsPanelOpen }),
+  setPlanMode: (planMode) => set({ planMode }),
+  setSidebarCollapsed: (next) =>
+    set((state) => ({
+      sidebarCollapsed:
+        typeof next === "function" ? next(state.sidebarCollapsed) : next,
+    })),
+  enterFocusMode: (paneId?: string) => {
+    const state = get();
+    // 解析触发 pane：显式入参 > 当前 activePaneId > 默认 pane-meta。
+    // 群聊 pane 的语音多路由场景暂未支持，统一回落到 pane-meta（与 ChatPane 顶栏按钮的可见性策略保持一致）。
+    const candidate = (paneId || state.activePaneId || "pane-meta").trim();
+    const targetPane = state.panes.find((p) => p.id === candidate);
+    const isGroup = Boolean(targetPane?.avatarId && targetPane.avatarId.startsWith("group:"));
+    const resolved = !targetPane || isGroup ? "pane-meta" : targetPane.id;
+    const already = state.focusMode;
+    if (!already) {
+      set({ focusMode: true, focusModePaneId: resolved });
+      try {
+        void window.agenticxDesktop?.focusModeEnter?.();
+      } catch {
+        /* ignore IPC errors */
+      }
+    } else if (state.focusModePaneId !== resolved) {
+      set({ focusModePaneId: resolved });
+    }
+  },
+  exitFocusMode: () => {
+    const state = get();
+    const wasActive = state.focusMode;
+    if (!wasActive) return;
+    const paneForScroll = (state.focusModePaneId ?? state.activePaneId ?? "").trim();
+    set({
+      focusMode: false,
+      focusModePaneId: null,
+      focusExitScrollBottomPaneId: paneForScroll || null,
+    });
+    try {
+      void window.agenticxDesktop?.focusModeExit?.();
+    } catch {
+      /* ignore IPC errors */
+    }
+  },
+  clearFocusExitScrollBottomPaneId: () => set({ focusExitScrollBottomPaneId: null }),
+  toggleFocusMode: (paneId?: string) => {
+    const state = get();
+    if (state.focusMode) {
+      state.exitFocusMode();
+      return;
+    }
+    state.enterFocusMode(paneId);
+  },
+  setTheme: (theme) =>
+    set(() => {
+      try {
+        window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+      } catch {
+        // ignore storage errors
+      }
+      try {
+        void window.agenticxDesktop.saveUiPrefs({ theme });
+      } catch {
+        // ignore when not running inside Electron (e.g. unit tests)
+      }
+      return { theme };
+    }),
+  setLocale: (locale) =>
+    set(() => {
+      try {
+        window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+      } catch {
+        // ignore storage errors
+      }
+      try {
+        void window.agenticxDesktop.saveUiPrefs({ locale });
+      } catch {
+        // ignore when not running inside Electron (e.g. unit tests)
+      }
+      try {
+        void i18n.changeLanguage(locale);
+      } catch {
+        // ignore when i18n is not ready
+      }
+      return { locale };
+    }),
+  setThemeColor: (themeColor) =>
+    set(() => {
+      try {
+        window.localStorage.setItem(THEME_COLOR_STORAGE_KEY, themeColor);
+      } catch {
+        // ignore storage errors
+      }
+      return { themeColor };
+    }),
+  setAgxAccount: (agxAccount) => set({ agxAccount }),
+  setChatStyle: (chatStyle) =>
+    set(() => {
+      try {
+        window.localStorage.setItem(CHAT_STYLE_STORAGE_KEY, chatStyle);
+      } catch {
+        // ignore storage errors
+      }
+      return { chatStyle };
+    }),
+  setUserNickname: (name) =>
+    set(() => {
+      const next = String(name ?? "").slice(0, 48);
+      try {
+        if (next.trim()) window.localStorage.setItem(USER_DISPLAY_NAME_KEY, next);
+        else window.localStorage.removeItem(USER_DISPLAY_NAME_KEY);
+      } catch {
+        // ignore storage errors
+      }
+      return { userNickname: next };
+    }),
+  setUserAvatarUrl: (url) =>
+    set(() => {
+      const next = String(url ?? "");
+      try {
+        if (next.trim()) window.localStorage.setItem(USER_AVATAR_URL_KEY, next);
+        else window.localStorage.removeItem(USER_AVATAR_URL_KEY);
+      } catch {
+        // ignore storage errors
+      }
+      return { userAvatarUrl: next };
+    }),
+  setUserCubeColorwayId: (colorwayId) =>
+    set(() => {
+      const next = isUserCubeColorwayId(colorwayId) ? colorwayId : BRAND_CUBE_COLORWAY_ID;
+      const avatarUrl = resolveMetaAvatarFromColorway(next);
+      try {
+        if (next === BRAND_CUBE_COLORWAY_ID) {
+          window.localStorage.removeItem(USER_CUBE_COLORWAY_KEY);
+          window.localStorage.removeItem(META_AVATAR_URL_KEY);
+        } else {
+          window.localStorage.setItem(USER_CUBE_COLORWAY_KEY, next);
+          window.localStorage.setItem(META_AVATAR_URL_KEY, avatarUrl);
+        }
+      } catch {
+        // ignore storage errors
+      }
+      return { userCubeColorwayId: next, metaAvatarUrl: avatarUrl };
+    }),
+  setCollectionPortraitStyle: (style) =>
+    set(() => {
+      const next = style || CUBE_PORTRAIT_STYLE;
+      writeCollectionPortraitStyle(next);
+      return { collectionPortraitStyle: next };
+    }),
+  setNearStyleSeed: (style, seed) =>
+    set((state) => {
+      const next = { ...state.nearSeedsByStyle, [style]: seed };
+      try {
+        window.localStorage.setItem(NEAR_STYLE_SEEDS_KEY, JSON.stringify(next));
+      } catch {
+        // ignore storage errors
+      }
+      return { nearSeedsByStyle: next };
+    }),
+  setUserPreference: (pref) =>
+    set(() => {
+      const next = String(pref ?? "").slice(0, 500);
+      try {
+        if (next.trim()) window.localStorage.setItem(USER_PREFERENCE_KEY, next);
+        else window.localStorage.removeItem(USER_PREFERENCE_KEY);
+      } catch {
+        // ignore storage errors
+      }
+      return { userPreference: next };
+    }),
+  setAttachmentRouting: (attachmentRouting) => set({ attachmentRouting }),
+  setAttachmentRoutingLock: (attachmentRoutingLock) => set({ attachmentRoutingLock }),
+  setCapabilityLocks: (capabilityLocks) => set({ capabilityLocks }),
+  setMetaAvatarUrl: (url) =>
+    set(() => {
+      const next = String(url ?? "");
+      try {
+        if (next.trim()) window.localStorage.setItem(META_AVATAR_URL_KEY, next);
+        else window.localStorage.removeItem(META_AVATAR_URL_KEY);
+      } catch {
+        // ignore storage errors
+      }
+      return { metaAvatarUrl: next };
+    }),
+  setRunMode: (runMode) => set({ runMode }),
+  startConfirmRun: (sessionId, workspace) => {
+    const sid = String(sessionId ?? "").trim();
+    const runId = crypto.randomUUID();
+    if (sid) {
+      set((state) => ({
+        confirmRunsBySession: {
+          ...state.confirmRunsBySession,
+          [sid]: { runId, workspace: String(workspace ?? "") },
+        },
+      }));
+    }
+    return runId;
+  },
+  setMcpServers: (mcpServers) => set({ mcpServers }),
+  setAvatars: (avatars) => set({ avatars }),
+  renameAvatarInPanes: (avatarId, name) =>
+    set((state) => {
+      const id = String(avatarId ?? "").trim();
+      const nextName = String(name ?? "").trim();
+      if (!id || !nextName) return state;
+      return {
+        avatars: state.avatars.map((avatar) =>
+          avatar.id === id ? { ...avatar, name: nextName } : avatar,
+        ),
+        panes: state.panes.map((pane) =>
+          pane.avatarId === id ? { ...pane, avatarName: nextName } : pane,
+        ),
+      };
+    }),
+  applyCorePreloadBundle: (payload) =>
+    set((state) => {
+      const sessionsKey = String(payload.sessionsKey ?? "");
+      const nextSessions = { ...state.preloadedSessionsByAvatarKey };
+      if (sessionsKey && Array.isArray(payload.sessions)) {
+        nextSessions[sessionsKey] = payload.sessions;
+      }
+      const nextTaskspaces = { ...state.preloadedTaskspacesBySessionId };
+      const taskspacesKey = String(payload.taskspacesKey ?? "").trim();
+      if (taskspacesKey && Array.isArray(payload.taskspaces)) {
+        nextTaskspaces[taskspacesKey] = payload.taskspaces;
+      }
+      return {
+        corePreloadAttempted: true,
+        preloadedSessionsByAvatarKey: nextSessions,
+        preloadedTaskspacesBySessionId: nextTaskspaces,
+      };
+    }),
+  setActiveAvatarId: (activeAvatarId) => set({ activeAvatarId }),
+  setAvatarSessions: (avatarSessions) => set({ avatarSessions }),
+  setGroups: (groups) => set({ groups }),
+  setActivePaneId: (activePaneId) =>
+    set((state) => {
+      const target = state.panes.find((pane) => pane.id === activePaneId);
+      if (!target) return state;
+      let provider = (target.modelProvider || "").trim();
+      let model = (target.modelName || "").trim();
+      if (!provider || !model) {
+        const avatar = target.avatarId
+          ? state.avatars.find((a) => a.id === target.avatarId)
+          : null;
+        const avatarProvider = (avatar?.defaultProvider || "").trim();
+        const avatarModel = (avatar?.defaultModel || "").trim();
+        const defaultProvider = (state.settings.defaultProvider || "").trim();
+        if (avatarProvider && avatarModel) {
+          provider = avatarProvider;
+          model = avatarModel;
+        } else {
+          const fallback = coerceSelectableModel(
+            state.settings.providers,
+            defaultProvider,
+            "",
+            defaultProvider,
+          );
+          if (fallback) {
+            provider = fallback.provider;
+            model = fallback.model;
+          }
+        }
+        const coerced = coerceSelectableModel(
+          state.settings.providers,
+          provider,
+          model,
+          provider,
+        );
+        if (coerced) {
+          provider = coerced.provider;
+          model = coerced.model;
+        } else {
+          provider = "";
+          model = "";
+        }
+        if (provider && model) {
+          return {
+            activePaneId,
+            activeProvider: provider,
+            activeModel: model,
+            panes: state.panes.map((pane) =>
+              pane.id === activePaneId
+                ? { ...pane, modelProvider: provider, modelName: model }
+                : pane
+            ),
+          };
+        }
+        return { activePaneId };
+      }
+      const coerced = coerceSelectableModel(
+        state.settings.providers,
+        provider,
+        model,
+        provider,
+      );
+      if (coerced) {
+        provider = coerced.provider;
+        model = coerced.model;
+      } else {
+        provider = "";
+        model = "";
+      }
+      if (!provider || !model) {
+        return { activePaneId };
+      }
+      const paneNeedsPatch =
+        (target.modelProvider || "").trim() !== provider ||
+        (target.modelName || "").trim() !== model;
+      return {
+        activePaneId,
+        activeProvider: provider,
+        activeModel: model,
+        ...(paneNeedsPatch
+          ? {
+              panes: state.panes.map((pane) =>
+                pane.id === activePaneId
+                  ? { ...pane, modelProvider: provider, modelName: model }
+                  : pane
+              ),
+            }
+          : {}),
+      };
+    }),
+  hydratePanes: (panes, activePaneId) =>
+    set((state) => {
+      if (!Array.isArray(panes) || panes.length === 0) return state;
+      const nextPanes = panes
+        .filter((p) => !isComposePreviewPane(p))
+        .map((p) => ({ ...makeDefaultPane(), ...p }));
+      if (nextPanes.length === 0) return state;
+      const hasActive = nextPanes.some((p) => p.id === activePaneId);
+      const nextActiveId = hasActive ? activePaneId : nextPanes[0]?.id ?? state.activePaneId;
+      const active = nextPanes.find((p) => p.id === nextActiveId) ?? nextPanes[0];
+      const reconciled = reconcilePaneModelsPure({
+        panes: nextPanes,
+        activePaneId: nextActiveId,
+        activeProvider: (active?.modelProvider || "").trim() || state.activeProvider,
+        activeModel: (active?.modelName || "").trim() || state.activeModel,
+        providers: state.settings.providers,
+      });
+      const paneById = new Map(reconciled.panes.map((pane) => [pane.id, pane]));
+      return {
+        panes: nextPanes.map((pane) => {
+          const next = paneById.get(pane.id);
+          if (!next) return pane;
+          return {
+            ...pane,
+            modelProvider: next.modelProvider ?? pane.modelProvider,
+            modelName: next.modelName ?? pane.modelName,
+          };
+        }),
+        activePaneId: nextActiveId,
+        activeProvider: reconciled.activeProvider,
+        activeModel: reconciled.activeModel,
+      };
+    }),
+  setForwardAutoReply: (forwardAutoReply) => set({ forwardAutoReply }),
+  pendingMessages: loadPendingMessageQueues(),
+  pendingMessagesPersistenceFailed: false,
+  enqueuePaneMessage: (paneId, msg) =>
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: [...(state.pendingMessages[paneId] ?? []), msg],
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    }),
+  dequeuePaneMessage: (paneId) => {
+    const queue = get().pendingMessages[paneId];
+    if (!queue?.length) return undefined;
+    const first = queue[0];
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: (state.pendingMessages[paneId] ?? []).slice(1),
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    });
+    return first;
+  },
+  dequeuePaneMessageForSession: (paneId, sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return undefined;
+    const queue = get().pendingMessages[paneId] ?? [];
+    const idx = queue.findIndex((m) => String(m.sessionId ?? "").trim() === sid);
+    if (idx < 0) return undefined;
+    const item = queue[idx];
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: (state.pendingMessages[paneId] ?? []).filter((_, i) => i !== idx),
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    });
+    return item;
+  },
+  takePendingMessage: (paneId, msgId) => {
+    const queue = get().pendingMessages[paneId] ?? [];
+    const item = queue.find((m) => m.id === msgId);
+    if (!item) return undefined;
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: (state.pendingMessages[paneId] ?? []).filter((m) => m.id !== msgId),
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    });
+    return item;
+  },
+  removePendingMessage: (paneId, msgId) =>
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: (state.pendingMessages[paneId] ?? []).filter((m) => m.id !== msgId),
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    }),
+  editPendingMessage: (paneId, msgId, newText) =>
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: (state.pendingMessages[paneId] ?? []).map((m) =>
+          m.id === msgId ? { ...m, text: newText } : m
+        ),
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    }),
+  clearPendingMessages: (paneId) =>
+    set((state) => {
+      const pendingMessages = {
+        ...state.pendingMessages,
+        [paneId]: [],
+      };
+      return {
+        pendingMessages,
+        pendingMessagesPersistenceFailed:
+          typeof window !== "undefined" && !savePendingMessageQueues(pendingMessages),
+      };
+    }),
+  addPane: (avatarId, avatarName, sessionId) => {
+    const paneId = uid();
+    set((state) => {
+      const av = avatarId ? state.avatars.find((a) => a.id === avatarId) : null;
+      const defaultProvider = (state.settings.defaultProvider || "").trim();
+      const coerced = resolveSessionBindingModel({
+        providers: state.settings.providers,
+        sessionModelKnown: false,
+        avatarProvider: av?.defaultProvider,
+        avatarModel: av?.defaultModel,
+        defaultProvider,
+        defaultModel: state.settings.providers[defaultProvider]?.model,
+        activeProvider: state.activeProvider,
+        activeModel: state.activeModel,
+      });
+      const modelProvider = coerced?.provider ?? "";
+      const modelName = coerced?.model ?? "";
+      return {
+      // New pane should prefer avatar defaults so "click avatar" does not
+      // inherit a random model from the currently active pane.
+      panes: [
+        ...state.panes,
+        {
+          id: paneId,
+          avatarId,
+          avatarName,
+          sessionId,
+          modelProvider,
+          modelName,
+          messages: [],
+          historyOpen: false,
+          memoryGraphOpen: false,
+          contextInherited: false,
+          taskspacePanelOpen: false,
+          membersPanelOpen: false,
+          graphPanelOpen: false,
+          activeGraphRunId: null,
+          sidePanelTab: "workspace",
+          activeTaskspaceId: null,
+          spawnsColumnOpen: false,
+          spawnsColumnSuppressAuto: false,
+          spawnsColumnBaselineIds: [],
+          runDrawerOpen: false,
+          runDrawerRunId: null,
+          terminalTabs: [],
+          activeTerminalTabId: null,
+          sessionTokens: { ...EMPTY_SESSION_TOKENS },
+          historySearchTerms: [],
+          historyJumpMessageId: null,
+          scratchChats: [],
+          parkedScratchChats: [],
+        },
+      ],
+      activePaneId: paneId,
+    };
+    });
+    return paneId;
+  },
+  upsertComposePreviewPane: (avatarId, avatarName) => {
+    const state = get();
+    const durable = state.panes.find(
+      (pane) => !isComposePreviewPane(pane) && pane.avatarId === avatarId,
+    );
+    if (durable) {
+      set({
+        panes: state.panes.filter((pane) => !isComposePreviewPane(pane)),
+        activePaneId: durable.id,
+      });
+      return { paneId: durable.id, reusedDurable: true };
+    }
+
+    const av = avatarId ? state.avatars.find((item) => item.id === avatarId) : null;
+    const defaultProvider = (state.settings.defaultProvider || "").trim();
+    const coerced = resolveSessionBindingModel({
+      providers: state.settings.providers,
+      sessionModelKnown: false,
+      avatarProvider: av?.defaultProvider,
+      avatarModel: av?.defaultModel,
+      defaultProvider,
+      defaultModel: state.settings.providers[defaultProvider]?.model,
+      activeProvider: state.activeProvider,
+      activeModel: state.activeModel,
+    });
+    const existingPreview = state.panes.find((pane) => isComposePreviewPane(pane));
+    const previewId = existingPreview?.id ?? COMPOSE_PREVIEW_PANE_ID;
+    const sameTarget = existingPreview && existingPreview.avatarId === avatarId;
+    const nextPreview: ChatPane = sameTarget
+      ? existingPreview
+      : {
+          ...(existingPreview ?? makeDefaultPane()),
+          id: previewId,
+          avatarId,
+          avatarName,
+          sessionId: "",
+          messages: [],
+          composePreview: true,
+          sessionTokens: { ...EMPTY_SESSION_TOKENS },
+          modelProvider: coerced?.provider ?? "",
+          modelName: coerced?.model ?? "",
+          historySearchTerms: [],
+          historyJumpMessageId: null,
+          loadingMessages: false,
+        };
+    set({
+      panes: [...state.panes.filter((pane) => !isComposePreviewPane(pane)), nextPreview],
+      activePaneId: previewId,
+    });
+    return { paneId: previewId, reusedDurable: false };
+  },
+  clearComposePreview: (restorePaneId) =>
+    set((state) => {
+      const next = state.panes.filter((pane) => !isComposePreviewPane(pane));
+      if (next.length === state.panes.length) {
+        if (restorePaneId && next.some((pane) => pane.id === restorePaneId)) {
+          return { activePaneId: restorePaneId };
+        }
+        return state;
+      }
+      if (next.length === 0) return state;
+      const restore =
+        (restorePaneId && next.some((pane) => pane.id === restorePaneId) && restorePaneId) ||
+        (next.some((pane) => pane.id === state.activePaneId) && state.activePaneId) ||
+        next[0].id;
+      return { panes: next, activePaneId: restore };
+    }),
+  promoteComposePreview: () => {
+    const preview = get().panes.find((pane) => isComposePreviewPane(pane));
+    if (!preview) return null;
+    const paneId = uid();
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === preview.id ? { ...pane, id: paneId, composePreview: false } : pane,
+      ),
+      activePaneId: state.activePaneId === preview.id ? paneId : state.activePaneId,
+    }));
+    return paneId;
+  },
+  removePane: (paneId) =>
+    set((state) => {
+      if (state.panes.length <= 1) return state;
+      const nextPanes = state.panes.filter((pane) => pane.id !== paneId);
+      if (nextPanes.length === state.panes.length) return state;
+      const nextActive =
+        state.activePaneId === paneId
+          ? nextPanes[Math.max(0, nextPanes.length - 1)]?.id ?? nextPanes[0].id
+          : state.activePaneId;
+      const activePane = nextPanes.find((pane) => pane.id === nextActive) ?? nextPanes[0];
+      const provider = (activePane?.modelProvider || "").trim();
+      const model = (activePane?.modelName || "").trim();
+      const nextAv = activePane?.avatarId ?? null;
+      const activeAvatarId =
+        nextAv &&
+        !String(nextAv).startsWith("automation:") &&
+        !String(nextAv).startsWith("group:")
+          ? String(nextAv)
+          : null;
+      return {
+        panes: nextPanes,
+        activePaneId: nextActive,
+        activeAvatarId,
+        ...(provider && model
+          ? { activeProvider: provider, activeModel: model }
+          : {}),
+      };
+    }),
+  removePanesForAutomationTaskId: (taskId) =>
+    set((state) => {
+      const tid = String(taskId ?? "").trim();
+      if (!tid) return state;
+      const aid = `automation:${tid}`;
+      const nextPanes = state.panes.filter((p) => p.avatarId !== aid);
+      if (nextPanes.length === state.panes.length) return state;
+      if (nextPanes.length === 0) {
+        const fresh = makeDefaultPane();
+        return {
+          panes: [fresh],
+          activePaneId: fresh.id,
+          activeAvatarId: null,
+        };
+      }
+      const removedActive = !nextPanes.some((p) => p.id === state.activePaneId);
+      const nextActive = removedActive
+        ? (nextPanes[nextPanes.length - 1]?.id ?? nextPanes[0].id)
+        : state.activePaneId;
+      const activePane = nextPanes.find((p) => p.id === nextActive) ?? nextPanes[0];
+      const provider = (activePane?.modelProvider || "").trim();
+      const model = (activePane?.modelName || "").trim();
+      const nextAv = activePane?.avatarId ?? null;
+      const activeAvatarId =
+        nextAv &&
+        !String(nextAv).startsWith("automation:") &&
+        !String(nextAv).startsWith("group:")
+          ? String(nextAv)
+          : null;
+      return {
+        panes: nextPanes,
+        activePaneId: nextActive,
+        activeAvatarId,
+        ...(provider && model ? { activeProvider: provider, activeModel: model } : {}),
+      };
+    }),
+  reorderPanes: (fromIndex, toIndex) =>
+    set((state) => {
+      if (fromIndex === toIndex) return state;
+      const n = state.panes.length;
+      if (fromIndex < 0 || toIndex < 0 || fromIndex >= n || toIndex >= n) return state;
+      return { panes: arrayMove(state.panes, fromIndex, toIndex) };
+    }),
+  addPaneMessage: (paneId, role, content, agentId, provider, model, attachments, extras) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        // Guard against duplicate user messages: if the pane already has a user
+        // message with the same canonical content and ownerSessionId, skip the append.
+        // This prevents a visible duplicate when a bootstrap disk-load races with
+        // the optimistic addPaneMessage called from sendChat.
+        if (role === "user" && String(content ?? "").trim()) {
+          const ownerSid = String(extras?.ownerSessionId ?? pane.sessionId ?? "").trim() || undefined;
+          const lastNonTool = [...pane.messages].reverse().find((message) => message.role !== "tool");
+          if (lastNonTool?.role === "user") {
+            const ownerNorm = (value: string) => value.replace(/^dlgpoll-/, "").trim();
+            const existingOwner = String(lastNonTool.ownerSessionId ?? "").trim();
+            const sameOwner = ownerSid
+              ? Boolean(existingOwner) && ownerNorm(existingOwner) === ownerNorm(ownerSid)
+              : !existingOwner;
+            if (
+              sameOwner &&
+              shouldSuppressDuplicatePendingUserEcho(
+                pane.messages,
+                String(content ?? ""),
+                attachments,
+                String(extras?.metadata?.client_turn_id ?? ""),
+              )
+            ) {
+              return pane;
+            }
+          }
+        }
+        return {
+          ...pane,
+          messages: [
+            ...pane.messages,
+            {
+              id: uid(),
+              role,
+              content,
+              timestamp: Date.now(),
+              // Stamp the owning session so the render layer can never show
+              // this row under a different conversation. Callers on hot
+              // streaming paths pass an explicit ownerSessionId (the request
+              // session) via extras; everyone else defaults to the pane's
+              // current session, which is correct for all guarded writes.
+              ownerSessionId: String(pane.sessionId ?? "").trim() || undefined,
+              agentId,
+              provider,
+              model,
+              attachments,
+              ...extras,
+            },
+          ],
+        };
+      }),
+    })),
+  updatePaneMessageByToolCallId: (paneId, toolCallId, patch, ownerSessionId) => {
+    let found = false;
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const idx = pane.messages.findIndex((message) =>
+          ownerSessionId
+            ? matchesToolCallForSession(message, toolCallId, ownerSessionId)
+            : message.role === "tool" && message.toolCallId === toolCallId
+        );
+        if (idx < 0) return pane;
+        found = true;
+        const msgs = [...pane.messages];
+        const prev = msgs[idx];
+        const { appendStreamLine, ...rest } = patch;
+        let nextStream = prev.toolStreamLines;
+        if (appendStreamLine !== undefined && appendStreamLine !== "") {
+          nextStream = [...(prev.toolStreamLines ?? []), appendStreamLine].slice(-200);
+        } else if (rest.toolStreamLines !== undefined) {
+          nextStream = rest.toolStreamLines;
+        }
+        msgs[idx] = {
+          ...prev,
+          ...rest,
+          ...(nextStream !== undefined ? { toolStreamLines: nextStream } : {}),
+        };
+        return { ...pane, messages: msgs };
+      }),
+    }));
+    return found;
+  },
+  updateMessageByToolCallId: (toolCallId, patch) => {
+    let found = false;
+    set((state) => {
+      const idx = state.messages.findIndex((m) => m.role === "tool" && m.toolCallId === toolCallId);
+      if (idx < 0) return state;
+      found = true;
+      const prev = state.messages[idx];
+      const { appendStreamLine, ...rest } = patch;
+      let nextStream = prev.toolStreamLines;
+      if (appendStreamLine !== undefined && appendStreamLine !== "") {
+        nextStream = [...(prev.toolStreamLines ?? []), appendStreamLine].slice(-200);
+      } else if (rest.toolStreamLines !== undefined) {
+        nextStream = rest.toolStreamLines;
+      }
+      const updated: Message = {
+        ...prev,
+        ...rest,
+        ...(nextStream !== undefined ? { toolStreamLines: nextStream } : {}),
+      };
+      const messages = [...state.messages];
+      messages[idx] = updated;
+      const msgId = updated.id;
+      return {
+        messages,
+        panes: state.panes.map((pane) => {
+          const pi = pane.messages.findIndex((m) => m.id === msgId);
+          if (pi < 0) return pane;
+          const pm = [...pane.messages];
+          pm[pi] = updated;
+          return { ...pane, messages: pm };
+        }),
+      };
+    });
+    return found;
+  },
+  cancelInFlightPaneTools: (paneId, ownerSessionId) => {
+    let cancelledCount = 0;
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const next = cancelInFlightToolMessages(pane.messages ?? [], { ownerSessionId });
+        cancelledCount = next.cancelledCount;
+        if (next.cancelledCount === 0) return pane;
+        return { ...pane, messages: next.messages };
+      }),
+    }));
+    return cancelledCount;
+  },
+  cancelInFlightLiteTools: (ownerSessionId) => {
+    let cancelledCount = 0;
+    set((state) => {
+      const next = cancelInFlightToolMessages(state.messages ?? [], { ownerSessionId });
+      cancelledCount = next.cancelledCount;
+      if (next.cancelledCount === 0) return state;
+      const byId = new Map(next.messages.map((message) => [message.id, message]));
+      return {
+        messages: next.messages,
+        panes: state.panes.map((pane) => ({
+          ...pane,
+          messages: (pane.messages ?? []).map((message) => byId.get(message.id) ?? message),
+        })),
+      };
+    });
+    return cancelledCount;
+  },
+  updateLastPaneMessage: (paneId, content, ownerSessionId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        if (pane.messages.length === 0) return pane;
+        const owner = String(ownerSessionId ?? "").trim();
+        const msgs = [...pane.messages];
+        const idx = findLastOwnedMessageIndex(msgs, "assistant", owner);
+        if (idx < 0) return pane;
+        msgs[idx] = { ...msgs[idx], content };
+        return { ...pane, messages: msgs };
+      }),
+    })),
+  markClarificationAnswered: (requestId, answer) => {
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        const idx = (pane.messages ?? []).findIndex(
+          (m) =>
+            m.clarificationPrompt?.requestId === requestId ||
+            m.actionConfirmation?.requestId === requestId,
+        );
+        if (idx < 0) return pane;
+        const msgs = [...(pane.messages ?? [])];
+        const prev = msgs[idx];
+        const prevMeta =
+          prev.metadata && typeof prev.metadata === "object"
+            ? (prev.metadata as Record<string, unknown>)
+            : {};
+        let nextAction = prev.actionConfirmation;
+        if (nextAction) {
+          const selected = (answer.selectedOptions ?? []).map((o) => String(o).trim()).filter(Boolean);
+          const approve = nextAction.approveLabel;
+          const reject = nextAction.rejectLabel;
+          const approved =
+            selected.some((o) => o === approve || ["确认", "确认发送", "同意", "继续", "yes", "y", "ok"].includes(o.toLowerCase())) ||
+            ["确认", "确认发送", "同意", "继续", "yes", "y", "ok"].includes((answer.answerText ?? "").trim().toLowerCase());
+          const rejected =
+            selected.some((o) => o === reject || ["取消", "拒绝", "不用了", "no", "n"].includes(o.toLowerCase())) ||
+            ["取消", "拒绝", "不用了", "no", "n"].includes((answer.answerText ?? "").trim().toLowerCase());
+          nextAction = {
+            ...nextAction,
+            status: approved ? "approved" : rejected ? "rejected" : "rejected",
+          };
+        }
+        msgs[idx] = {
+          ...prev,
+          toolStatus: "done",
+          ...(nextAction ? { actionConfirmation: nextAction } : {}),
+          metadata: {
+            ...prevMeta,
+            clarification_answered: true,
+            clarification_answer: {
+              answer_text: answer.answerText ?? "",
+              selected_options: answer.selectedOptions ?? [],
+            },
+          },
+        };
+        return { ...pane, messages: msgs };
+      }),
+    }));
+  },
+  mergeLastPaneMessageByRole: (paneId, role, patch, ownerSessionId) => {
+    let found = false;
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const owner = String(ownerSessionId ?? "").trim();
+        const msgs = [...pane.messages];
+        const idx = findLastOwnedMessageIndex(msgs, role, owner);
+        if (idx < 0) return pane;
+        msgs[idx] = { ...msgs[idx], ...patch };
+        found = true;
+        return { ...pane, messages: msgs };
+      }),
+    }));
+    return found;
+  },
+  clearPaneMessages: (paneId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, messages: [], sessionTokens: { ...EMPTY_SESSION_TOKENS } } : pane
+      ),
+    })),
+  accumulatePaneTokens: (paneId, input, output, cached = 0) =>
+    set((state) => {
+      let targetSessionId = "";
+      let nextTokens: SessionTokens = { ...EMPTY_SESSION_TOKENS };
+      const addInput = toNonNegativeInt(input);
+      const addOutput = toNonNegativeInt(output);
+      const addCached = toNonNegativeInt(cached);
+      const nextPanes = state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const prev = normalizeSessionTokens(pane.sessionTokens);
+        const merged: SessionTokens = {
+          input: prev.input + addInput,
+          output: prev.output + addOutput,
+          cached: prev.cached + addCached,
+          lastInput: addInput,
+          lastCached: addCached,
+        };
+        targetSessionId = String(pane.sessionId ?? "").trim();
+        nextTokens = merged;
+        return { ...pane, sessionTokens: merged };
+      });
+      if (targetSessionId) {
+        upsertSessionTokenCache(targetSessionId, nextTokens);
+      }
+      return { panes: nextPanes };
+    }),
+  replacePaneTokens: (paneId, tokens) =>
+    set((state) => {
+      const nextTokens = normalizeSessionTokens(tokens);
+      let targetSessionId = "";
+      const nextPanes = state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        targetSessionId = String(pane.sessionId ?? "").trim();
+        return { ...pane, sessionTokens: nextTokens };
+      });
+      if (targetSessionId) {
+        upsertSessionTokenCache(targetSessionId, nextTokens);
+      }
+      return { panes: nextPanes };
+    }),
+  setPaneSessionId: (paneId, sessionId, modelHint) => {
+    // Any time the pane gets bound to a real session id, the "awaiting fresh
+    // session" intent is satisfied — clear the flag so subsequent auto-
+    // restore effects behave normally again.
+    if (String(sessionId ?? "").trim()) {
+      clearPaneAwaitingFreshSession(paneId);
+    }
+    const hintProvider = String(modelHint?.provider ?? "").trim();
+    const hintModel = String(modelHint?.model ?? "").trim();
+    set((state) => {
+      const pane = state.panes.find((p) => p.id === paneId);
+      const paneProvider = (pane?.modelProvider || "").trim();
+      const paneModel = (pane?.modelName || "").trim();
+      const avatar = pane?.avatarId
+        ? state.avatars.find((a) => a.id === pane.avatarId)
+        : null;
+      const defaultProvider = (state.settings.defaultProvider || "").trim();
+      const resolved = resolveSessionBindingModel({
+        providers: state.settings.providers,
+        sessionModelKnown: modelHint !== undefined,
+        sessionProvider: hintProvider,
+        sessionModel: hintModel,
+        paneProvider,
+        paneModel,
+        avatarProvider: avatar?.defaultProvider,
+        avatarModel: avatar?.defaultModel,
+        defaultProvider,
+        defaultModel: state.settings.providers[defaultProvider]?.model,
+        activeProvider: state.activeProvider,
+        activeModel: state.activeModel,
+      });
+      const resolvedProvider = resolved?.provider ?? "";
+      const resolvedModel = resolved?.model ?? "";
+      const isActive = state.activePaneId === paneId;
+      const nextTrimmed = String(sessionId ?? "").trim();
+      const nextPanes = state.panes.map((p) => {
+        if (p.id !== paneId) return p;
+        const prevTrimmed = String(p.sessionId ?? "").trim();
+        // Switching to a *different* non-empty session clears the previous
+        // session's messages here so no async path (history switch, 404
+        // migration, binding re-bind, automation reuse, etc.) can leave a stale
+        // pane that visually merges two sessions. The workspace chrome follows
+        // the same switch: close the panel so the previous session's file /
+        // terminal view does not stay on screen. Callers that immediately
+        // re-apply messages (cache hit / reload) still work — React batches the
+        // follow-up setPaneMessages within the same tick. This centralizes the
+        // "one pane shows exactly one session" invariant instead of relying on
+        // every call site to remember to wipe messages.
+        const isSwitchToDifferentSession = shouldClearMessagesOnSessionSwitch(
+          prevTrimmed,
+          nextTrimmed,
+        );
+        const cached = getSessionTokensFromCache(sessionId);
+        const baseTokens =
+          cached
+            ? cached
+            : prevTrimmed === nextTrimmed
+              ? normalizeSessionTokens(p.sessionTokens)
+              : { ...EMPTY_SESSION_TOKENS };
+        const blocked = scratchHistoryBlocklist(
+          state.panes,
+          state.hiddenScratchSessionIds,
+        );
+        const shouldAttachHost = Boolean(nextTrimmed) && !blocked.has(nextTrimmed);
+        return {
+          ...p,
+          sessionId,
+          sessionTokens: baseTokens,
+          scratchChats: shouldAttachHost
+            ? attachUnhostedScratchChats(p.scratchChats ?? [], nextTrimmed)
+            : p.scratchChats,
+          parkedScratchChats: shouldAttachHost
+            ? attachUnhostedScratchChats(p.parkedScratchChats ?? [], nextTrimmed)
+            : p.parkedScratchChats,
+          taskspacePanelOpen: nextTaskspacePanelOpenOnSessionBind({
+            prevSessionId: prevTrimmed,
+            nextSessionId: nextTrimmed,
+            currentlyOpen: !!p.taskspacePanelOpen,
+          }),
+          ...(isSwitchToDifferentSession
+            ? {
+                messages: [],
+                oldestLoadedIndex: 0,
+                hasOlderMessages: false,
+                loadingOlderMessages: false,
+              }
+            : {}),
+          ...(resolvedProvider && resolvedModel
+            ? { modelProvider: resolvedProvider, modelName: resolvedModel }
+            : {}),
+        };
+      });
+      const next: Partial<AppState> = { panes: nextPanes };
+      if (isActive && resolvedProvider && resolvedModel) {
+        next.activeProvider = resolvedProvider;
+        next.activeModel = resolvedModel;
+      }
+      return next as AppState;
+    });
+  },
+  setPaneSessionMode: (paneId, mode) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, sessionMode: mode } : pane
+      ),
+    })),
+  setPaneTurnIntent: (paneId, intent) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, turnIntent: normalizeTurnIntent(intent) } : pane,
+      ),
+    })),
+  setPaneIsolateActive: (paneId, active) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, isolateActive: active } : pane,
+      ),
+    })),
+  setPaneMessages: (paneId, messages) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const sid = String(pane.sessionId ?? "").trim();
+        if (!sid) return { ...pane, messages };
+        const stamped = messages.map((m) => {
+          if (String(m.ownerSessionId ?? "").trim()) return m;
+          return { ...m, ownerSessionId: sid };
+        });
+        return { ...pane, messages: stamped };
+      }),
+    })),
+  prependPaneMessages: (paneId, messages) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, messages: [...messages, ...(pane.messages ?? [])] } : pane
+      ),
+    })),
+  setPaneLoadingMessages: (paneId, loading) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, loadingMessages: loading } : pane,
+      ),
+    })),
+  setPaneMessagePaging: (paneId, paging) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              ...(paging.oldestLoadedIndex !== undefined
+                ? { oldestLoadedIndex: paging.oldestLoadedIndex }
+                : {}),
+              ...(paging.hasOlderMessages !== undefined
+                ? { hasOlderMessages: paging.hasOlderMessages }
+                : {}),
+              ...(paging.loadingOlderMessages !== undefined
+                ? { loadingOlderMessages: paging.loadingOlderMessages }
+                : {}),
+            }
+          : pane
+      ),
+    })),
+  resetPaneMessagePaging: (paneId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              oldestLoadedIndex: 0,
+              hasOlderMessages: false,
+              loadingOlderMessages: false,
+            }
+          : pane
+      ),
+    })),
+  getCachedSessionMessages: (sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return undefined;
+    const entry = sessionMessageCache.get(sid);
+    if (!entry) return undefined;
+    sessionMessageCache.delete(sid);
+    sessionMessageCache.set(sid, entry);
+    return entry;
+  },
+  cacheSessionMessages: (sessionId, messages) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return;
+    sessionMessageCache.delete(sid);
+    sessionMessageCache.set(sid, messages);
+    while (sessionMessageCache.size > SESSION_MESSAGE_CACHE_MAX) {
+      const oldest = sessionMessageCache.keys().next().value;
+      if (oldest === undefined) break;
+      sessionMessageCache.delete(oldest);
+    }
+  },
+  dropCachedSessionMessages: (sessionId) => {
+    if (typeof sessionId === "string") {
+      const sid = sessionId.trim();
+      if (sid) sessionMessageCache.delete(sid);
+      return;
+    }
+    for (const item of sessionId) {
+      const sid = String(item ?? "").trim();
+      if (sid) sessionMessageCache.delete(sid);
+    }
+  },
+  setPaneHistorySearchTerms: (paneId, terms) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              historySearchTerms: Array.from(
+                new Set(
+                  (terms ?? [])
+                    .map((t) => String(t ?? "").trim())
+                    .filter((t) => t.length > 0)
+                )
+              ),
+            }
+          : pane
+      ),
+    })),
+  setPaneHistoryJumpMessageId: (paneId, messageId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              historyJumpMessageId: messageId ? String(messageId).trim() || null : null,
+            }
+          : pane
+      ),
+    })),
+  setPanePendingQuote: (paneId, payload) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, pendingQuote: payload ?? null } : pane
+      ),
+    })),
+  upsertScratchChat: (paneId, draft) => {
+    let chatId = "";
+    let reused = false;
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const next = upsertScratchChatList(
+          pane.scratchChats ?? [],
+          draft,
+          uid(),
+          pane.parkedScratchChats ?? [],
+          String(pane.sessionId ?? "").trim(),
+        );
+        chatId = next.chat.id;
+        reused = next.reused;
+        return { ...pane, scratchChats: next.chats, parkedScratchChats: next.parked };
+      }),
+    }));
+    return { chatId, reused };
+  },
+  setScratchChatFloating: (paneId, chatId, floating) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? { ...pane, scratchChats: setScratchFloating(pane.scratchChats ?? [], chatId, floating) }
+          : pane
+      ),
+    })),
+  closeScratchChat: (paneId, chatId) => {
+    const evictedIds: string[] = [];
+    set((state) => {
+      const pane = state.panes.find((item) => item.id === paneId);
+      const closing = pane?.scratchChats?.find((chat) => chat.id === chatId);
+      const result = closeOrParkScratchChat(
+        pane?.scratchChats ?? [],
+        pane?.parkedScratchChats ?? [],
+        chatId,
+      );
+      for (const item of result.evicted) {
+        const sid = String(item.sessionId ?? "").trim();
+        if (sid) evictedIds.push(sid);
+      }
+      const sid = String(closing?.sessionId ?? "").trim();
+      return {
+        hiddenScratchSessionIds: rememberScratchSessionIds(
+          state.hiddenScratchSessionIds,
+          [sid, ...evictedIds],
+        ),
+        panes: state.panes.map((item) =>
+          item.id === paneId
+            ? { ...item, scratchChats: result.open, parkedScratchChats: result.parked }
+            : item
+        ),
+      };
+    });
+    return evictedIds;
+  },
+  restoreParkedScratchChat: (paneId, chatId) => {
+    let restoredId = "";
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const next = restoreParkedScratchChatList(pane.scratchChats ?? [], pane.parkedScratchChats ?? [], chatId);
+        restoredId = next.chat?.id ?? "";
+        return { ...pane, scratchChats: next.open, parkedScratchChats: next.parked };
+      }),
+    }));
+    return restoredId;
+  },
+  dismissParkedScratchChat: (paneId, chatId) => {
+    let removedSid = "";
+    set((state) => {
+      const pane = state.panes.find((item) => item.id === paneId);
+      const next = dismissParkedScratchChatList(pane?.parkedScratchChats ?? [], chatId);
+      removedSid = String(next.removed?.sessionId ?? "").trim();
+      return {
+        hiddenScratchSessionIds: removedSid
+          ? rememberScratchSessionIds(state.hiddenScratchSessionIds, [removedSid])
+          : state.hiddenScratchSessionIds,
+        panes: state.panes.map((item) =>
+          item.id === paneId ? { ...item, parkedScratchChats: next.parked } : item
+        ),
+      };
+    });
+    return removedSid;
+  },
+  deleteScratchChat: (paneId, chatId) => {
+    let removedSid = "";
+    set((state) => {
+      const pane = state.panes.find((item) => item.id === paneId);
+      const next = deleteScratchChatFromLists(
+        pane?.scratchChats ?? [],
+        pane?.parkedScratchChats ?? [],
+        chatId,
+      );
+      removedSid = String(next.removed?.sessionId ?? "").trim();
+      return {
+        hiddenScratchSessionIds: removedSid
+          ? rememberScratchSessionIds(state.hiddenScratchSessionIds, [removedSid])
+          : state.hiddenScratchSessionIds,
+        panes: state.panes.map((item) =>
+          item.id === paneId
+            ? { ...item, scratchChats: next.open, parkedScratchChats: next.parked }
+            : item
+        ),
+      };
+    });
+    return removedSid;
+  },
+  promoteScratchChat: (paneId, chatId) => {
+    let promotedSid = "";
+    set((state) => {
+      const pane = state.panes.find((item) => item.id === paneId);
+      const next = deleteScratchChatFromLists(
+        pane?.scratchChats ?? [],
+        pane?.parkedScratchChats ?? [],
+        chatId,
+      );
+      promotedSid = String(next.removed?.sessionId ?? "").trim();
+      if (!promotedSid) return state;
+      return {
+        hiddenScratchSessionIds: forgetScratchSessionIds(state.hiddenScratchSessionIds, [promotedSid]),
+        panes: state.panes.map((item) =>
+          item.id === paneId
+            ? { ...item, scratchChats: next.open, parkedScratchChats: next.parked }
+            : item
+        ),
+      };
+    });
+    return promotedSid;
+  },
+  clearHostScratchChats: (paneId, hostSessionId) => {
+    const removedIds: string[] = [];
+    set((state) => {
+      const pane = state.panes.find((item) => item.id === paneId);
+      const next = clearScratchChatsForHost(
+        pane?.scratchChats ?? [],
+        pane?.parkedScratchChats ?? [],
+        hostSessionId,
+      );
+      for (const item of next.removed) {
+        const sid = String(item.sessionId ?? "").trim();
+        if (sid) removedIds.push(sid);
+      }
+      return {
+        hiddenScratchSessionIds: rememberScratchSessionIds(state.hiddenScratchSessionIds, removedIds),
+        panes: state.panes.map((item) =>
+          item.id === paneId
+            ? { ...item, scratchChats: next.open, parkedScratchChats: next.parked }
+            : item
+        ),
+      };
+    });
+    return removedIds;
+  },
+  patchScratchChat: (paneId, chatId, patch) =>
+    set((state) => {
+      const sid = String(patch.sessionId ?? "").trim();
+      return {
+        hiddenScratchSessionIds: sid
+          ? rememberScratchSessionIds(state.hiddenScratchSessionIds, [sid])
+          : state.hiddenScratchSessionIds,
+        panes: state.panes.map((pane) =>
+          pane.id === paneId
+            ? { ...pane, scratchChats: patchScratchChatList(pane.scratchChats ?? [], chatId, patch) }
+            : pane
+        ),
+      };
+    }),
+  togglePaneHistory: (paneId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, historyOpen: !pane.historyOpen } : pane
+      ),
+    })),
+  togglePaneMemoryGraph: (paneId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, memoryGraphOpen: !pane.memoryGraphOpen } : pane
+      ),
+    })),
+  cycleSidePanel: (paneId, tab) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        if (tab === "workspace") {
+          return { ...pane, taskspacePanelOpen: !pane.taskspacePanelOpen, sidePanelTab: "workspace" };
+        }
+        if (tab === "graph") {
+          return {
+            ...pane,
+            graphPanelOpen: !pane.graphPanelOpen,
+            sidePanelTab: "graph",
+          };
+        }
+        return { ...pane, membersPanelOpen: !pane.membersPanelOpen, sidePanelTab: "members" };
+      }),
+    })),
+  openSidePanel: (paneId, tab) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        if (tab === "workspace") {
+          return { ...pane, taskspacePanelOpen: true, sidePanelTab: "workspace" };
+        }
+        if (tab === "graph") {
+          return {
+            ...pane,
+            graphPanelOpen: true,
+            sidePanelTab: "graph",
+            taskspacePanelOpen: false,
+            membersPanelOpen: false,
+            memoryGraphOpen: false,
+          };
+        }
+        return { ...pane, membersPanelOpen: true, sidePanelTab: "members" };
+      }),
+    })),
+  toggleTaskspacePanel: (paneId) => {
+    get().cycleSidePanel(paneId, "workspace");
+  },
+  toggleMembersPanel: (paneId) => {
+    get().cycleSidePanel(paneId, "members");
+  },
+  setActiveTaskspace: (paneId, taskspaceId) =>
+    set((state) => {
+      const pane = state.panes.find((item) => item.id === paneId);
+      if (!pane || pane.activeTaskspaceId === taskspaceId) return state;
+      return {
+        panes: state.panes.map((item) =>
+          item.id === paneId ? { ...item, activeTaskspaceId: taskspaceId } : item
+        ),
+      };
+    }),
+  setPaneContextInherited: (paneId, inherited) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => (pane.id === paneId ? { ...pane, contextInherited: inherited } : pane)),
+    })),
+  setSpawnsColumnOpen: (paneId, open) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              spawnsColumnOpen: open,
+              ...(open ? { spawnsColumnSuppressAuto: false, spawnsColumnBaselineIds: [] } : {}),
+            }
+          : pane
+      ),
+    })),
+  dismissSpawnsColumn: (paneId, baselineSubAgentIds) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              spawnsColumnOpen: false,
+              spawnsColumnSuppressAuto: true,
+              spawnsColumnBaselineIds: [...baselineSubAgentIds],
+            }
+          : pane
+      ),
+    })),
+  clearSpawnsColumnSuppress: (paneId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? { ...pane, spawnsColumnSuppressAuto: false, spawnsColumnBaselineIds: [] }
+          : pane
+      ),
+    })),
+  openRunDrawer: (paneId, runId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              runDrawerOpen: true,
+              runDrawerRunId: runId,
+              // FR-6: mutually exclude with the other right-column panels so the
+              // drawer does not stack on top of workspace/members/memory-graph.
+              taskspacePanelOpen: false,
+              membersPanelOpen: false,
+              graphPanelOpen: false,
+              memoryGraphOpen: false,
+            }
+          : pane
+      ),
+    })),
+  closeRunDrawer: (paneId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, runDrawerOpen: false, runDrawerRunId: null } : pane
+      ),
+    })),
+  addPaneTerminalTab: (paneId, cwd, labelHint, ccBridgePty) =>
+    set((state) => {
+      const pane = state.panes.find((p) => p.id === paneId);
+      if (!pane) return state;
+      const trimmed = (cwd || "").trim();
+      if (!trimmed) return state;
+      const baseRaw = (labelHint ?? "").trim() || trimmed.split(/[/\\]/).filter(Boolean).pop() || "terminal";
+      const sameCwd = pane.terminalTabs.filter((t) => t.cwd === trimmed).length;
+      const label = sameCwd === 0 ? baseRaw : `${baseRaw} (#${sameCwd + 1})`;
+      const id = uid();
+      const tab: PaneTerminalTab = ccBridgePty
+        ? { id, cwd: trimmed, label, ccBridgePty }
+        : { id, cwd: trimmed, label };
+      return {
+        panes: state.panes.map((p) =>
+          p.id === paneId
+            ? {
+                ...p,
+                terminalTabs: [...p.terminalTabs, tab],
+                activeTerminalTabId: id,
+              }
+            : p
+        ),
+      };
+    }),
+  removePaneTerminalTab: (paneId, tabId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const nextTabs = pane.terminalTabs.filter((t) => t.id !== tabId);
+        let nextActive = pane.activeTerminalTabId;
+        if (nextActive === tabId) {
+          nextActive = nextTabs[nextTabs.length - 1]?.id ?? null;
+        }
+        return { ...pane, terminalTabs: nextTabs, activeTerminalTabId: nextActive };
+      }),
+    })),
+  setActivePaneTerminalTab: (paneId, tabId) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, activeTerminalTabId: tabId } : pane
+      ),
+    })),
+  addMessage: (role, content, agentId, provider, model, attachments, extras) =>
+    set((state) => {
+      const activePane = state.panes.find((pane) => pane.id === state.activePaneId);
+      if (role === "user" && String(content ?? "").trim() && activePane) {
+        if (
+          shouldSuppressDuplicatePendingUserEcho(
+            activePane.messages ?? [],
+            String(content ?? ""),
+            attachments,
+            String(extras?.metadata?.client_turn_id ?? ""),
+          )
+        ) {
+          return state;
+        }
+      }
+      const nextMessage: Message = {
+        id: uid(),
+        role,
+        content,
+        timestamp: Date.now(),
+        agentId,
+        provider,
+        model,
+        attachments,
+        ...extras,
+      };
+      return {
+        messages: [...state.messages, nextMessage],
+        panes: state.panes.map((pane) =>
+          pane.id === state.activePaneId ? { ...pane, messages: [...pane.messages, nextMessage] } : pane
+        ),
+      };
+    }),
+  mergeLastMessageByRole: (role, patch) => {
+    let found = false;
+    set((state) => {
+      const msgs = [...state.messages];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role !== role) continue;
+        const updated = { ...msgs[i], ...patch };
+        msgs[i] = updated;
+        found = true;
+        const mid = updated.id;
+        return {
+          messages: msgs,
+          panes: state.panes.map((pane) =>
+            pane.id === state.activePaneId
+              ? {
+                  ...pane,
+                  messages: pane.messages.map((m) => (m.id === mid ? { ...m, ...patch } : m)),
+                }
+              : pane
+          ),
+        };
+      }
+      return state;
+    });
+    return found;
+  },
+  insertMessageAfter: (afterId, msg) => {
+    const newId = uid();
+    set((state) => {
+      const idx = state.messages.findIndex((m) => m.id === afterId);
+      const insertAt = idx >= 0 ? idx + 1 : state.messages.length;
+      const next = [...state.messages];
+      next.splice(insertAt, 0, { ...msg, id: newId });
+      const activePane = state.panes.find((pane) => pane.id === state.activePaneId);
+      const paneMessages = activePane?.messages ?? [];
+      const paneIdx = paneMessages.findIndex((m) => m.id === afterId);
+      const paneInsertAt = paneIdx >= 0 ? paneIdx + 1 : paneMessages.length;
+      const nextPaneMessages = [...paneMessages];
+      nextPaneMessages.splice(paneInsertAt, 0, { ...msg, id: newId });
+      return {
+        messages: next,
+        panes: state.panes.map((pane) =>
+          pane.id === state.activePaneId ? { ...pane, messages: nextPaneMessages } : pane
+        ),
+      };
+    });
+    return newId;
+  },
+  clearMessages: () =>
+    set((state) => ({
+      messages: [],
+      panes: state.panes.map((pane) =>
+        pane.id === state.activePaneId ? { ...pane, messages: [] } : pane
+      ),
+    })),
+  addSubAgent: (item) =>
+    set((state) => {
+      const exists = state.subAgents.some((sub) => sub.id === item.id);
+      if (exists) {
+        console.debug("[store] addSubAgent SKIP (dup)", item.id, "existing:", state.subAgents.length);
+        return state;
+      }
+      const next: SubAgent = {
+        ...item,
+        status: "running",
+        liveOutput: "",
+        resultSummary: "",
+        outputFiles: [],
+        events: []
+      };
+      console.debug("[store] addSubAgent OK", item.id, item.name, "sid:", item.sessionId, "total:", state.subAgents.length + 1);
+      return { subAgents: [...state.subAgents, next] };
+    }),
+  updateSubAgent: (id, patch) =>
+    set((state) => ({
+      subAgents: state.subAgents.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    })),
+  addSubAgentEvent: (id, event) =>
+    set((state) => ({
+      subAgents: state.subAgents.map((item) => {
+        if (item.id !== id) return item;
+        const recent = item.events.slice(-30);
+        const isDup = recent.some(
+          (e) => e.type === event.type && e.content === event.content
+        );
+        if (isDup) return item;
+        return {
+          ...item,
+          events: [
+            ...item.events,
+            { id: uid(), ts: Date.now(), type: event.type, content: event.content }
+          ].slice(-100)
+        };
+      })
+    })),
+  removeSubAgent: (id) =>
+    set((state) => ({
+      subAgents: state.subAgents.filter((item) => item.id !== id),
+      selectedSubAgent: state.selectedSubAgent === id ? null : state.selectedSubAgent
+    })),
+  setSelectedSubAgent: (selectedSubAgent) => set({ selectedSubAgent }),
+  setCodePreview: (codePreview) => set({ codePreview }),
+  openConfirm: (requestId, question, diff, agentId, context) =>
+    set({ confirm: { open: true, requestId, question, diff, agentId: agentId ?? "meta", context } }),
+  closeConfirm: () =>
+    set((state) => ({ confirm: { ...state.confirm, open: false, requestId: "" } })),
+  openClarification: (requestId, prompt, options, allowFreeText, agentId, context) =>
+    set({
+      clarification: {
+        open: true,
+        requestId,
+        prompt,
+        options,
+        allowFreeText,
+        agentId: agentId ?? "meta",
+        context,
+      },
+    }),
+  closeClarification: () =>
+    set((state) => ({ clarification: { ...state.clarification, open: false, requestId: "" } })),
+  openSettings: (tab, focus) =>
+    set((state) => {
+      const openToTab =
+        tab !== undefined && isSettingsTab(tab) ? tab : undefined;
+      const openToFocus =
+        focus !== undefined && isSettingsFocus(focus) ? focus : undefined;
+      return {
+        settings: {
+          ...state.settings,
+          open: true,
+          openToTab,
+          openToFocus,
+          focusSeq: openToFocus
+            ? (state.settings.focusSeq ?? 0) + 1
+            : state.settings.focusSeq,
+        },
+      };
+    }),
+  closeSettings: () =>
+    set((state) => ({
+      settings: {
+        ...state.settings,
+        open: false,
+        openToTab: undefined,
+        openToFocus: undefined,
+      },
+    })),
+  updateSettings: (patch) =>
+    set((state) => ({ settings: { ...state.settings, ...patch } })),
+  openTokenDashboard: () =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, open: true },
+    })),
+  closeTokenDashboard: () =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, open: false },
+    })),
+  openCollabRooms: () => {
+    get().setMainView("collab");
+    set((state) => ({
+      collabRooms: { ...state.collabRooms, open: true },
+    }));
+  },
+  closeCollabRooms: () => {
+    set((state) => ({
+      collabRooms: { ...state.collabRooms, open: false, activeRoomId: null },
+    }));
+    get().returnToPreviousChat();
+  },
+  setActiveCollabRoomId: (id) =>
+    set((state) => ({
+      collabRooms: { ...state.collabRooms, activeRoomId: id ?? null },
+    })),
+  setTokenDashboardRange: (range) =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, range },
+    })),
+  setTokenDashboardCustomRange: (customFrom, customTo) =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, customFrom, customTo, range: "custom" },
+    })),
+  openDeliveryPanel: (taskId) =>
+    set((state) => ({
+      deliveryPanel: {
+        open: true,
+        selectedTaskId: taskId !== undefined ? taskId : state.deliveryPanel.selectedTaskId,
+      },
+    })),
+  closeDeliveryPanel: () =>
+    set((state) => ({
+      deliveryPanel: { ...state.deliveryPanel, open: false },
+    })),
+  setDeliverySelectedTaskId: (taskId) =>
+    set((state) => ({
+      deliveryPanel: { ...state.deliveryPanel, selectedTaskId: taskId },
+    })),
+}));

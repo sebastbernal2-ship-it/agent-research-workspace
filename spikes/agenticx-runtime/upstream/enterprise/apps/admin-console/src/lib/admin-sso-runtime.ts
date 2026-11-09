@@ -1,0 +1,207 @@
+import "server-only";
+import {
+  OidcClientService,
+  type OidcProviderConfig,
+  type SamlSpProviderConfig,
+  registerOidcDiscoveryDegradedReporter,
+} from "@agenticx/auth";
+import { decryptSecret } from "@agenticx/auth";
+import { getSsoProviderByProviderId, insertAuditEvent } from "@agenticx/iam-core";
+
+type SsoProviderOption = {
+  id: string;
+  name: string;
+};
+
+export function parseSsoProviders(raw: string | undefined): SsoProviderOption[] {
+  const source = raw?.trim();
+  if (!source) return [];
+  return source
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const [id, ...rest] = item.split(":");
+      const providerId = id?.trim() ?? "";
+      const name = rest.join(":").trim() || providerId;
+      return providerId ? { id: providerId, name } : null;
+    })
+    .filter((item): item is SsoProviderOption => Boolean(item));
+}
+
+export function getAdminSsoProviderOptions(): SsoProviderOption[] {
+  return parseSsoProviders(process.env.NEXT_PUBLIC_SSO_PROVIDERS);
+}
+
+function envKey(providerId: string, suffix: string): string {
+  const normalized = providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+  return `SSO_OIDC_${normalized}_${suffix}`;
+}
+
+function asClaimString(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function requiredEnv(providerId: string, suffix: string): string {
+  const value = process.env[envKey(providerId, suffix)]?.trim();
+  if (!value) {
+    throw new Error("oidc.provider_not_configured");
+  }
+  if (suffix === "ISSUER" && isExampleIssuer(value)) {
+    throw new Error("oidc.provider_not_configured");
+  }
+  return value;
+}
+
+function optionalEnv(providerId: string, suffix: string): string | undefined {
+  return process.env[envKey(providerId, suffix)]?.trim() || undefined;
+}
+
+function isExampleIssuer(value: string): boolean {
+  try {
+    return new URL(value).hostname === "idp.example.com";
+  } catch {
+    return false;
+  }
+}
+
+export function getAdminSsoProviderConfig(providerId: string): OidcProviderConfig {
+  const scopesRaw = optionalEnv(providerId, "SCOPES");
+  const scopes = scopesRaw
+    ? scopesRaw
+        .split(/[,\s]+/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : ["openid", "profile", "email"];
+
+  return {
+    providerId,
+    issuer: requiredEnv(providerId, "ISSUER"),
+    clientId: requiredEnv(providerId, "CLIENT_ID"),
+    clientSecret: optionalEnv(providerId, "CLIENT_SECRET"),
+    redirectUri: optionalEnv(providerId, "ADMIN_REDIRECT_URI") ?? requiredEnv(providerId, "REDIRECT_URI"),
+    scopes,
+    claimMapping: {
+      email: optionalEnv(providerId, "CLAIM_EMAIL") ?? "email",
+      name: optionalEnv(providerId, "CLAIM_NAME") ?? "name",
+      dept: optionalEnv(providerId, "CLAIM_DEPT") ?? "department",
+      roles: optionalEnv(providerId, "CLAIM_ROLES") ?? "roles",
+      externalId: optionalEnv(providerId, "CLAIM_EXTERNAL_ID") ?? "sub",
+    },
+  };
+}
+
+export async function getAdminSsoProviderConfigServer(providerId: string): Promise<OidcProviderConfig> {
+  const tenantId = process.env.DEFAULT_TENANT_ID?.trim();
+  const secretKey = process.env.SSO_PROVIDER_SECRET_KEY?.trim();
+  if (tenantId) {
+    const dbProvider = await getSsoProviderByProviderId(tenantId, providerId);
+    if (dbProvider) {
+      if (!dbProvider.enabled) {
+        throw new Error("oidc.provider_disabled");
+      }
+      if (dbProvider.protocol !== "oidc") {
+        throw new Error("oidc.provider_not_configured");
+      }
+      if (!dbProvider.issuer || !dbProvider.clientId || !dbProvider.redirectUri) {
+        throw new Error("oidc.provider_not_configured");
+      }
+      if (isExampleIssuer(dbProvider.issuer)) {
+        throw new Error("oidc.provider_not_configured");
+      }
+      return {
+        providerId: dbProvider.providerId,
+        issuer: dbProvider.issuer,
+        clientId: dbProvider.clientId,
+        clientSecret:
+          dbProvider.clientSecretEncrypted && secretKey
+            ? decryptSecret(dbProvider.clientSecretEncrypted, secretKey)
+            : undefined,
+        redirectUri: dbProvider.redirectUri,
+        scopes: dbProvider.scopes,
+        claimMapping: {
+          email: asClaimString(dbProvider.claimMapping.email, "email"),
+          name: asClaimString(dbProvider.claimMapping.name, "name"),
+          dept: asClaimString(dbProvider.claimMapping.dept, "department"),
+          roles: asClaimString(dbProvider.claimMapping.roles, "roles"),
+          externalId: asClaimString(dbProvider.claimMapping.externalId, "sub"),
+        },
+      };
+    }
+  }
+  return getAdminSsoProviderConfig(providerId);
+}
+
+export async function getAdminSamlProviderConfigServer(providerId: string): Promise<SamlSpProviderConfig> {
+  const tenantId = process.env.DEFAULT_TENANT_ID?.trim();
+  if (!tenantId) {
+    throw new Error("saml.provider_not_configured");
+  }
+  const dbProvider = await getSsoProviderByProviderId(tenantId, providerId);
+  if (!dbProvider) {
+    throw new Error("saml.provider_not_configured");
+  }
+  if (!dbProvider.enabled) {
+    throw new Error("saml.provider_disabled");
+  }
+  if (dbProvider.protocol !== "saml" || !dbProvider.samlConfig) {
+    throw new Error("saml.provider_not_configured");
+  }
+  const cfg = dbProvider.samlConfig;
+  if (!cfg.idpEntityId || !cfg.idpSsoUrl || !cfg.spEntityId || !cfg.acsUrl) {
+    throw new Error("saml.provider_not_configured");
+  }
+  return {
+    providerId: dbProvider.providerId,
+    idpEntityId: cfg.idpEntityId,
+    idpSsoUrl: cfg.idpSsoUrl,
+    idpSloUrl: cfg.idpSloUrl ?? null,
+    idpCertPemList: cfg.idpCertPemList ?? [],
+    spEntityId: cfg.spEntityId,
+    acsUrl: cfg.acsUrl,
+    nameIdFormat: cfg.nameIdFormat ?? null,
+    wantAssertionsSigned: cfg.wantAssertionsSigned !== false,
+    wantResponseSigned: cfg.wantResponseSigned === true,
+    clockSkewSeconds: typeof cfg.clockSkewSeconds === "number" ? cfg.clockSkewSeconds : 60,
+    attributeMapping: {
+      email: cfg.attributeMapping?.email ?? "email",
+      displayName: cfg.attributeMapping?.displayName,
+      firstName: cfg.attributeMapping?.firstName,
+      lastName: cfg.attributeMapping?.lastName,
+      dept: cfg.attributeMapping?.dept,
+      roles: cfg.attributeMapping?.roles,
+      externalId: cfg.attributeMapping?.externalId,
+    },
+  };
+}
+
+let singleton: OidcClientService | null = null;
+
+export function getOidcClientService(): OidcClientService {
+  singleton ??= new OidcClientService();
+  return singleton;
+}
+
+(() => {
+  if (typeof globalThis === "undefined") return;
+  const g = globalThis as typeof globalThis & { __agxOidcDiscoveryRep?: boolean };
+  if (g.__agxOidcDiscoveryRep) return;
+  const tenantId = process.env.DEFAULT_TENANT_ID?.trim();
+  if (!tenantId) return;
+  g.__agxOidcDiscoveryRep = true;
+  registerOidcDiscoveryDegradedReporter(async (detail) => {
+    if (!process.env.DATABASE_URL?.trim()) return;
+    try {
+      await insertAuditEvent({
+        tenantId,
+        actorUserId: null,
+        eventType: "auth.sso.discovery_degraded",
+        targetKind: "sso_provider",
+        targetId: detail.providerId,
+        detail: { issuer: detail.issuer, consecutiveStaleCount: detail.consecutiveStaleCount },
+      });
+    } catch (err) {
+      console.error("[sso] discovery_degraded audit failed:", err);
+    }
+  });
+})();

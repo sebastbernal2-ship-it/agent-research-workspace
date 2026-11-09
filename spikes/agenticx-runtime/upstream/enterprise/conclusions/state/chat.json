@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "module_id": "chat",
+  "generation": "b852624951e749dd85be93bbcf2a72b6",
+  "mapping_revision": 1,
+  "baseline_commit": "30e57496990b0e2acb18978091d9e623210eaba3",
+  "baseline_tree": "9e11bd92dc6c05fbdd0ce563ef6bb404616a70af",
+  "source_fingerprint": "sha256:92133a427e1f6784ff433730de4b1e7ac7bc1572ffdb5004f8614ea0f807c8ac",
+  "summary_path": "enterprise/conclusions/features/chat_conclusion.md",
+  "summary_sha256": "sha256:bbb9ad4a32a692941a64a033d808cf9d980a4639819fab82bf05028d1f6a47cd",
+  "updated_at": "2026-09-17T23:53:57.228329+00:00"
+}

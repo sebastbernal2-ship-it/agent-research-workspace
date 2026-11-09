@@ -2,7 +2,7 @@
 
 **Purpose:** Test AG2 as a candidate for the agent-message / discussion layer—not as the whole product.
 
-**Upstream:** `upstream/` is a Git submodule pinned to tag `v1.0.0`, commit `22f5d2e156dde56f61145bd4c9b10fca9d3e25cc` (Apache-2.0).
+**Upstream:** `upstream/` is the complete vendored source snapshot from tag `v1.0.0`, commit `22f5d2e156dde56f61145bd4c9b10fca9d3e25cc`.
 **Environment:** Linux, CPython 3.12.3. No provider credentials or real model calls.
 
 ## Why this component
@@ -13,7 +13,7 @@ This is a substantially better **message exchange primitive** for our needs than
 
 ## Reproduction / installation
 
-The v1.0.0 repo explicitly separates the new `ag2` API from the maintained `ag2-classic`/`autogen` namespace; this spike evaluates the new Network API. Python >=3.10; Apache-2.0.
+The v1.0.0 repo explicitly separates the new `ag2` API from the maintained `ag2-classic`/`autogen` namespace; this spike evaluates the new Network API. Python >=3.10.
 
 ```bash
 cd spikes/ag2-collaboration
@@ -74,10 +74,10 @@ cd upstream
 
 ## Composition hypothesis
 
-AG2 may be the strongest current candidate for the **collaboration transport/protocol**. Keep the product control plane authoritative and expose work/project/decision identities in a versioned envelope contract. Initially use AG2 `AgentClient` agents end-to-end. Only after that is stable should we test an AgenticX-to-AG2 bridge; wrapping AgenticX now would combine two runtimes before either's product role is proven. If the whole team eventually uses AG2 agents, this avoids the bridge and treats AgenticX as a set of optional worker capabilities instead.
+AG2 supplies the **agent-message transport and turn protocol** in the combined workflow. The product control plane remains authoritative; project/work/run identities are mapped into canonical events by the local mirror. AgenticX is bridged to AG2 as a deterministic critic in the offline composition, while Meldwork V4 runs a separate dependent collaboration/verification stage. This composes all three sources across a single project DAG without pretending they share an internal database or native agent protocol.
 
-**Decision:** continue AG2 as the message-transport candidate behind a local canonical adapter. Do not make it the project database or product security boundary. A real-model non-coding pilot is future optional work requiring explicit provider/model/spend approval; it does not block the current offline harness.
+**Decision:** use AG2 as the message-transport component behind the canonical adapter. Do not make its Hub/WAL the project database or product security boundary. The tested composition is local and deterministic; remote Hub authentication, adapter outbox/reconciliation, real-model quality, and deployment remain separate gates. A real-model non-coding pilot requires explicit provider/model/spend approval and does not block offline integration.
 
 ## Harness follow-up (2026-11-07)
 
-A separate adapter now mirrors accepted AG2 discussion envelopes into canonical project/work events. Tests run the pinned in-process round-robin Hub, AgenticX mock-worker challenge/revision, persistent DiskKnowledgeStore WAL restart/replay, idempotency, and canonical history after deleting AG2 state. A combined test also routes a synthetic Meldwork V4 verification receipt into the same project stream. These validate protocol/storage convergence only; no remote Hub, network auth deployment, provider, or model reasoning was tested. Upstream HubListener callbacks swallow errors, so the adapter exposes degradation and WAL replay remains the recovery path; a production outbox/reconciliation boundary is still open.
+`harness.integration_tests.test_offline_organization_run` runs a human-gated project DAG with an AG2 proposal → AgenticX subprocess critique → AG2 specialist revision, then invokes Meldwork V4 for the dependent verification task with AgenticX workers. AG2 WAL messages and Meldwork phase receipts are both imported into the same canonical project history with run attribution and restart replay. This demonstrates adapter composition—not native Meldwork/AG2 shared transport, remote auth, provider quality, or production outbox guarantees. Upstream HubListener callbacks swallow errors, so the adapter exposes degradation and WAL replay remains the recovery path.

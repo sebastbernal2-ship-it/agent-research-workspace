@@ -1,0 +1,2187 @@
+#!/usr/bin/env python3
+"""Agent Team manager for sub-agent lifecycle and scheduling.
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+
+from agenticx.cli.agent_tools import STUDIO_TOOLS, merge_computer_use_tools_into
+from agenticx.cli.config_manager import ConfigManager
+from agenticx.cli.studio import StudioSession
+from agenticx.llms.provider_resolver import ProviderResolver
+from agenticx.runtime import (
+    AgentRuntime,
+    AsyncClarifyGate,
+    ConfirmGate,
+    EventType,
+    RiskAwareAutoConfirmGate,
+    RuntimeEvent,
+)
+from agenticx.runtime.prompts.current_time import build_current_time_block
+from agenticx.runtime.resource_monitor import ResourceMonitor
+from agenticx.runtime.agent_runtime import STOP_MESSAGE
+from agenticx.runtime.subagent_runs import SubAgentRunStore
+
+_log = logging.getLogger(__name__)
+
+EventEmitter = Callable[[RuntimeEvent], Awaitable[None]]
+SummarySink = Callable[[str, "SubAgentContext"], Awaitable[None]]
+
+
+def _resolve_max_tool_rounds() -> int:
+    raw = str(os.getenv("AGX_MAX_TOOL_ROUNDS", "")).strip()
+    if not raw:
+        try:
+            global_data = ConfigManager._load_yaml(ConfigManager.GLOBAL_CONFIG_PATH)
+            project_data = ConfigManager._load_yaml(ConfigManager.PROJECT_CONFIG_PATH)
+            merged = ConfigManager._deep_merge(global_data, project_data)
+            cfg_val: Any = ConfigManager._get_nested(merged, "runtime.max_tool_rounds")
+        except Exception:
+            cfg_val = None
+        if cfg_val is not None:
+            raw = str(cfg_val).strip()
+    if not raw:
+        raw = "30"
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 30
+    return max(10, min(120, value))
+
+
+def _resolve_subagent_min_run_timeout_seconds() -> int:
+    """Minimum wall-clock timeout for a sub-agent run (seconds).
+
+    Meta-agents often pass 300s for ``run_timeout_seconds``, which is too low for
+    multi-round tool use plus confirm gates. Set ``AGX_SUBAGENT_MIN_RUN_TIMEOUT_SECONDS=0``
+    to disable clamping.
+    """
+    raw = str(os.getenv("AGX_SUBAGENT_MIN_RUN_TIMEOUT_SECONDS", "")).strip()
+    if raw == "0":
+        return 0
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 60:
+                return min(parsed, 86400)
+        except ValueError:
+            pass
+    return 1200  # 多步 PDF/文档解析类任务 600s 偏短，抬到 20min（env 可覆盖）
+
+
+class SubAgentStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class SpawnConfig:
+    max_spawn_depth: int = 2
+    max_children_per_agent: int = 5
+    max_concurrent: int = 8
+    run_timeout_seconds: int = 600
+    cleanup: str = "keep"  # keep | delete
+    mode: str = "run"  # run | session
+
+
+def _resolve_max_escalation() -> int:
+    """Max failure-escalation attempts before final circuit-break."""
+    raw = os.environ.get("AGX_SUBAGENT_MAX_ESCALATION", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 1
+
+
+@dataclass
+class SubAgentContext:
+    agent_id: str
+    name: str
+    role: str
+    task: str
+    source_tool_call_id: str = ""
+    status: SubAgentStatus = SubAgentStatus.PENDING
+    agent_messages: List[Dict[str, Any]] = field(default_factory=list)
+    artifacts: Dict[Path, str] = field(default_factory=dict)
+    context_files: Dict[str, str] = field(default_factory=dict)
+    confirm_gate: ConfirmGate = field(
+        default_factory=lambda: RiskAwareAutoConfirmGate(unattended=True)
+    )
+    clarify_gate: AsyncClarifyGate = field(default_factory=AsyncClarifyGate)
+    result_summary: str = ""
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    final_text: str = ""
+    error_text: str = ""
+    recent_events: List[Dict[str, Any]] = field(default_factory=list)
+    parent_agent_id: str = "meta"
+    depth: int = 1
+    mode: str = "run"
+    cleanup: str = "keep"
+    run_timeout_seconds: int = 600
+    attachments: Dict[str, str] = field(default_factory=dict)
+    allowed_tool_names: List[str] = field(default_factory=list)
+    spawn_tree_path: str = ""
+    provider_name: str = ""
+    model_name: str = ""
+    output_files: List[str] = field(default_factory=list)
+    workspace_dir: str = ""
+    persona_prompt: str = ""
+    avatar_id: str = ""
+    inherit_parent_context: bool = True
+    failure_count: int = 0
+    escalation_level: int = 0
+    result_file: str = ""
+    pause_detector: str = ""
+    pause_retryable: bool = False
+    cluster_id: str = ""
+    badge_seq: str = ""
+
+
+class AgentTeamManager:
+    """Manage a pool of sub-agents with isolated context and bounded concurrency."""
+    _registry: Dict[str, "AgentTeamManager"] = {}
+
+    def __init__(
+        self,
+        *,
+        llm_factory: Callable[[], Any],
+        base_session: StudioSession,
+        owner_session_id: Optional[str] = None,
+        event_emitter: Optional[EventEmitter] = None,
+        summary_sink: Optional[SummarySink] = None,
+        max_concurrent_subagents: int = 4,
+        resource_monitor: Optional[ResourceMonitor] = None,
+        spawn_config: Optional[SpawnConfig] = None,
+        confirm_gate_factory: Optional[Callable[[str], ConfirmGate]] = None,
+    ) -> None:
+        self._manager_id = uuid.uuid4().hex
+        AgentTeamManager._registry[self._manager_id] = self
+        self.owner_session_id = (owner_session_id or "").strip() or None
+        self.llm_factory = llm_factory
+        self.base_session = base_session
+        self.event_emitter = event_emitter
+        self.summary_sink = summary_sink
+        self.max_concurrent_subagents = max_concurrent_subagents
+        self.resource_monitor = resource_monitor or ResourceMonitor()
+        self.spawn_config = spawn_config or SpawnConfig(max_concurrent=max_concurrent_subagents)
+        self.confirm_gate_factory = confirm_gate_factory or (
+            lambda _agent_id: RiskAwareAutoConfirmGate(unattended=True)
+        )
+
+        self._lock = asyncio.Lock()
+        self._agents: Dict[str, SubAgentContext] = {}
+        self._tasks: Dict[str, asyncio.Task[None]] = {}
+        self._cancelled: set[str] = set()
+        self._agent_sessions: Dict[str, StudioSession] = {}
+        self._archived_agents: Dict[str, SubAgentContext] = {}
+        self._archive_limit = 200
+        self._run_store = SubAgentRunStore(self.owner_session_id)
+
+    @classmethod
+    def collect_global_statuses(
+        cls,
+        session_id: Optional[str] = None,
+        *,
+        allow_cross_session_fallback: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Collect merged statuses across registered managers.
+
+        When ``session_id`` is set, only managers with matching
+        ``owner_session_id`` are merged (strict session isolation for Desktop).
+
+        If ``allow_cross_session_fallback`` is True and the restricted pass
+        returns nothing, merges from **all** managers (debug / legacy only;
+        breaks multi-pane isolation and must not be default).
+        """
+        merged: Dict[str, Dict[str, Any]] = {}
+        stale_ids: List[str] = []
+        sid = (session_id or "").strip() or None
+
+        def _merge_from_managers(*, restrict_sid: Optional[str]) -> None:
+            for manager_id, manager in cls._registry.items():
+                if manager is None:
+                    stale_ids.append(manager_id)
+                    continue
+                if restrict_sid is not None and manager.owner_session_id != restrict_sid:
+                    continue
+                payload = manager.get_status_with_task_fallback()
+                if not payload.get("ok"):
+                    continue
+                for item in payload.get("subagents", []) or []:
+                    aid = str(item.get("agent_id", "")).strip()
+                    if not aid:
+                        continue
+                    prev = merged.get(aid)
+                    if prev is None:
+                        merged[aid] = item
+                        continue
+                    prev_status = str(prev.get("status", ""))
+                    curr_status = str(item.get("status", ""))
+                    active = {"running", "pending"}
+                    if curr_status in active and prev_status not in active:
+                        merged[aid] = item
+                    elif curr_status in active and prev_status in active:
+                        prev_updated = float(prev.get("updated_at", 0) or 0)
+                        curr_updated = float(item.get("updated_at", 0) or 0)
+                        if curr_updated >= prev_updated:
+                            merged[aid] = item
+
+        _merge_from_managers(restrict_sid=sid)
+        if not merged and sid is not None and allow_cross_session_fallback:
+            _log.warning(
+                "[collect_global] cross-session fallback enabled; widening past session %s",
+                sid,
+            )
+            _merge_from_managers(restrict_sid=None)
+        for manager_id in stale_ids:
+            cls._registry.pop(manager_id, None)
+        return list(merged.values())
+
+    @classmethod
+    def lookup_global_status(cls, agent_id: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        aid = (agent_id or "").strip()
+        if not aid:
+            return None
+        sid = (session_id or "").strip() or None
+        for manager in cls._registry.values():
+            if manager is None:
+                continue
+            if sid is not None and manager.owner_session_id != sid:
+                continue
+            payload = manager.get_status(aid)
+            if payload.get("ok"):
+                return payload.get("subagent")
+        if sid is not None:
+            for manager in cls._registry.values():
+                if manager is None:
+                    continue
+                if manager.owner_session_id == sid:
+                    continue
+                payload = manager.get_status(aid)
+                if payload.get("ok"):
+                    _log.info("[lookup_global] cross-session hit for '%s' in tm=%s", aid, manager._manager_id)
+                    return payload.get("subagent")
+        return None
+
+    @classmethod
+    def find_manager_for_agent(
+        cls,
+        agent_id: str,
+        *,
+        include_archived: bool = True,
+        session_id: Optional[str] = None,
+    ) -> Optional["AgentTeamManager"]:
+        aid = (agent_id or "").strip()
+        if not aid:
+            return None
+        sid = (session_id or "").strip() or None
+        for manager in cls._registry.values():
+            if manager is None:
+                continue
+            if sid is not None and manager.owner_session_id != sid:
+                continue
+            if aid in manager._agents:
+                return manager
+            if include_archived and aid in manager._archived_agents:
+                return manager
+        return None
+
+    def _unregister(self) -> None:
+        AgentTeamManager._registry.pop(self._manager_id, None)
+
+    def _build_isolated_session(self, workspace_dir: Optional[str] = None) -> StudioSession:
+        resolved_workspace_dir = (
+            str(workspace_dir or "").strip()
+            or self.base_session.workspace_dir
+        )
+        session = StudioSession(
+            provider_name=self.base_session.provider_name,
+            model_name=self.base_session.model_name,
+            workspace_dir=resolved_workspace_dir,
+        )
+        # MCP clients are shared, while per-agent messages/artifacts remain isolated.
+        session.mcp_hub = self.base_session.mcp_hub
+        session.mcp_configs = self.base_session.mcp_configs
+        session.connected_servers = self.base_session.connected_servers
+        session.context_files = dict(self.base_session.context_files)
+        try:
+            session.todo_manager.load_payload(self.base_session.todo_manager.to_payload())
+        except Exception:
+            pass
+        session.scratchpad = dict(getattr(self.base_session, "scratchpad", {}) or {})
+        return session
+
+    def _build_parent_context_summary(self) -> str:
+        """Build a truncated summary of the parent session's recent chat history."""
+        chat_history = getattr(self.base_session, "chat_history", None) or []
+        recent = chat_history[-10:]
+        lines: List[str] = []
+        for msg in recent:
+            role = msg.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            content = str(msg.get("content", ""))[:200]
+            lines.append(f"- {role}: {content}")
+        if not lines:
+            return ""
+        block = "\n".join(lines)
+        while len(block) > 800 and lines:
+            lines.pop(0)
+            block = "\n".join(lines)
+        return block
+
+    def _build_subagent_system_prompt(self, context: SubAgentContext, session: StudioSession) -> str:
+        from agenticx.workspace.loader import resolve_default_session_workspace_dir
+
+        workspace_dir = str(
+            resolve_default_session_workspace_dir(
+                avatar_workspace_dir=(session.workspace_dir or "").strip() or None,
+            )
+        )
+        context_file_keys = list(context.context_files.keys())
+        context_hint = (
+            "\n".join(f"- {item}" for item in context_file_keys[:20])
+            if context_file_keys
+            else "(empty)"
+        )
+        parent_summary = (
+            self._build_parent_context_summary()
+            if getattr(context, "inherit_parent_context", True)
+            else ""
+        )
+        parent_section = (
+            f"## 父智能体对话上下文（最近摘要）\n{parent_summary}\n\n"
+            if parent_summary
+            else ""
+        )
+        persona_section = (
+            f"- persona: {context.persona_prompt}\n"
+            if context.persona_prompt
+            else ""
+        )
+        credential_safety = ""
+        try:
+            from agenticx.runtime.prompts.credential_safety import CREDENTIAL_SAFETY_BLOCK
+
+            credential_safety = f"{CREDENTIAL_SAFETY_BLOCK}\n\n"
+        except Exception:
+            pass
+        try:
+            from agenticx.runtime.prompts.meta_agent import _build_widget_capability_block
+
+            widget_block = _build_widget_capability_block()
+        except Exception:
+            widget_block = ""
+        base = (
+            "你是 AgenticX Studio 的子智能体。\n"
+            "你的核心目标：在指定工作目录中完成被委派任务，并持续汇报可验证进展。\n\n"
+            f"{build_current_time_block()}"
+            f"{credential_safety}"
+            "## 你的身份\n"
+            f"- agent_id: {context.agent_id}\n"
+            f"- name: {context.name}\n"
+            f"- role: {context.role}\n"
+            f"- delegated_task: {context.task}\n\n"
+            f"{persona_section}"
+            "## 模型配置\n"
+            f"- provider: {context.provider_name or session.provider_name or '(inherit)'}\n"
+            f"- model: {context.model_name or session.model_name or '(inherit)'}\n\n"
+            "## ⚠️ 高效执行（严格遵守）\n"
+            "- 你有有限的工具调用轮次预算，务必高效利用，不做无意义重复调用。\n"
+            "- 按任务性质行事：读多份文档/检索类任务，允许充分读取所需材料后再产出；"
+            "代码类任务则尽早开始写文件、边写边推进。\n"
+            "- 不在探索上无限打转；确认目标路径后即进入实质产出。\n"
+            "- 批量处理多份文档/数据时：每处理完一份就立即记录该份的结论（评分/要点），"
+            "不要等全部处理完才回忆总结——早期读取的原始内容可能因上下文预算被归档，"
+            "届时无需也不应重新调用工具找回，直接使用你已记录的结论继续。\n\n"
+            "## 工作目录约束\n"
+            f"- 工作目录: {workspace_dir}\n"
+            "- 所有文件读写必须限定在该目录或其子目录\n"
+            "- 产出文件必须写到任务指定的目标目录（绝对路径），严禁写到 /tmp、/private/tmp 等临时目录。\n"
+            "- 禁止扫描 `/Users`、`~`、`/` 等系统路径\n\n"
+            "## 已注入上下文文件\n"
+            f"{context_hint}\n\n"
+            f"{parent_section}"
+            "## 执行要求\n"
+            "- 优先产出文件，边写边推进，不要等规划完毕才动手。\n"
+            "- 在 Desktop 服务模式下，不要要求用户输入 A/B，也不要调用不存在的 `confirm_*` 工具。\n"
+            "- 需要确认高风险命令时，直接发起真实工具调用（如 bash_exec）；系统会自动弹出 confirm_required。\n"
+            "- 当你需要用户做开放式决策（方案确认、二选一、偏好、缺失参数）时，调用 `request_clarification` 工具发起阻塞提问；用户答复会作为工具结果返回，你须在同一回合继续执行。禁止把开放式问题写进正文然后结束回合。\n"
+            "- 只有在收到工具返回 `OK: wrote ...` / `OK: edited ...` 后，才能宣称已落盘。\n"
+            "- 对外汇报文件产出时，引用工具返回的绝对路径。\n"
+            "- 不做无关全盘扫描，直接在目标目录下工作。\n\n"
+            "## 反模式规则（关键）\n"
+            "- 除非任务明确要求产出文档，否则禁止创建说明类、报告类、状态类文件（例如 TODO_FINAL.md、REPORT.md、完成确认.md）。\n"
+            "- 禁止用多个相似文件名「确认完成」；完成时以正文总结回复并停止调用工具，不要用新建文件证明完成。\n"
+            "- 若收到 todo_write 提醒，只更新现有待办一次，不要为此再写确认文件。\n"
+            "- 每次工具调用必须直接推进 delegated_task；禁止为响应系统提醒而堆叠无意义文件。\n"
+        )
+        if widget_block:
+            return base + "\n" + widget_block
+        return base
+
+    async def _emit(self, event: RuntimeEvent) -> None:
+        if self.event_emitter is not None:
+            await self.event_emitter(event)
+
+    def _build_toolset(self, allowed_names: Optional[Sequence[str]]) -> Sequence[Dict[str, Any]]:
+        if allowed_names is None:
+            return merge_computer_use_tools_into(list(STUDIO_TOOLS))
+        allowed = {name.strip() for name in allowed_names if name and name.strip()}
+        if not allowed:
+            return merge_computer_use_tools_into(list(STUDIO_TOOLS))
+        filtered = [tool for tool in STUDIO_TOOLS if tool.get("function", {}).get("name") in allowed]
+        if not filtered:
+            _log.warning(
+                "tools whitelist %s matched nothing in STUDIO_TOOLS; falling back to full toolset",
+                allowed,
+            )
+            return merge_computer_use_tools_into(list(STUDIO_TOOLS))
+        return filtered
+
+    def _get_depth(self, agent_id: str) -> int:
+        if agent_id == "meta":
+            return 0
+        context = self._agents.get(agent_id)
+        if context is None:
+            return 0
+        return context.depth
+
+    def _active_children_count(self, parent_agent_id: str) -> int:
+        return sum(
+            1
+            for item in self._agents.values()
+            if item.parent_agent_id == parent_agent_id and item.status == SubAgentStatus.RUNNING
+        )
+
+    def _active_running_count(self) -> int:
+        return sum(1 for item in self._agents.values() if item.status == SubAgentStatus.RUNNING)
+
+    async def spawn_subagent(
+        self,
+        *,
+        name: str,
+        role: str,
+        task: str,
+        tools: Optional[Sequence[str]] = None,
+        source_tool_call_id: str = "",
+        parent_agent_id: str = "meta",
+        mode: Optional[str] = None,
+        cleanup: Optional[str] = None,
+        run_timeout_seconds: Optional[int] = None,
+        attachments: Optional[Sequence[Dict[str, Any]]] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        workspace_dir: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        avatar_id: Optional[str] = None,
+        inherit_parent_context: bool = True,
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            active = self._active_running_count()
+            max_concurrent = self.spawn_config.max_concurrent
+            if active >= max_concurrent:
+                return {
+                    "ok": False,
+                    "error": "max_concurrency_reached",
+                    "message": f"当前并行子智能体已达上限({max_concurrent})",
+                }
+            parent_depth = self._get_depth(parent_agent_id)
+            if parent_depth + 1 > self.spawn_config.max_spawn_depth:
+                return {
+                    "ok": False,
+                    "error": "max_spawn_depth_reached",
+                    "message": "已达到子智能体嵌套深度上限",
+                }
+            parent_children = self._active_children_count(parent_agent_id)
+            if parent_children >= self.spawn_config.max_children_per_agent:
+                return {
+                    "ok": False,
+                    "error": "max_children_reached",
+                    "message": "当前父智能体的活跃子智能体数达到上限",
+                }
+            if active > 0:
+                spawn_check = self.resource_monitor.can_spawn(active_subagents=active)
+                if not spawn_check["allowed"]:
+                    return {
+                        "ok": False,
+                        "error": "resource_limit",
+                        "message": "当前资源占用较高，暂不建议继续启动子智能体",
+                        "resource": spawn_check,
+                    }
+
+            allowed_tools = self._build_toolset(tools)
+            agent_id = f"sa-{uuid.uuid4().hex[:8]}"
+            resolved_mode = (mode or self.spawn_config.mode).strip().lower()
+            if resolved_mode not in {"run", "session"}:
+                resolved_mode = "run"
+            resolved_cleanup = (cleanup or self.spawn_config.cleanup).strip().lower()
+            if resolved_cleanup not in {"keep", "delete"}:
+                resolved_cleanup = "keep"
+            resolved_timeout = int(run_timeout_seconds or self.spawn_config.run_timeout_seconds or 0)
+            timeout_floor = _resolve_subagent_min_run_timeout_seconds()
+            if timeout_floor > 0:
+                cfg_default = int(self.spawn_config.run_timeout_seconds or 600)
+                if resolved_timeout <= 0:
+                    resolved_timeout = max(cfg_default, timeout_floor)
+                else:
+                    resolved_timeout = max(resolved_timeout, timeout_floor)
+            attached_payload: Dict[str, str] = {}
+            if attachments:
+                for item in attachments[:20]:
+                    if not isinstance(item, dict):
+                        continue
+                    name_key = str(item.get("name", "")).strip()
+                    content_val = str(item.get("content", ""))
+                    if not name_key:
+                        continue
+                    attached_payload[name_key] = content_val
+            parent_ctx = self._agents.get(parent_agent_id)
+            parent_path = parent_ctx.spawn_tree_path if parent_ctx and parent_ctx.spawn_tree_path else "meta"
+            display_name = (name.strip() or agent_id)
+            spawn_tree_path = f"{parent_path}/{display_name}-{agent_id[:6]}"
+            context = SubAgentContext(
+                agent_id=agent_id,
+                name=display_name,
+                role=role.strip() or "worker",
+                task=task.strip(),
+                source_tool_call_id=source_tool_call_id,
+                context_files=dict(self.base_session.context_files),
+                confirm_gate=self.confirm_gate_factory(agent_id),
+                parent_agent_id=parent_agent_id,
+                depth=parent_depth + 1,
+                mode=resolved_mode,
+                cleanup=resolved_cleanup,
+                run_timeout_seconds=resolved_timeout,
+                attachments=attached_payload,
+                allowed_tool_names=[
+                    str(item.get("function", {}).get("name", "")).strip()
+                    for item in allowed_tools
+                    if isinstance(item, dict)
+                ],
+                spawn_tree_path=spawn_tree_path,
+                provider_name=str(provider or "").strip(),
+                model_name=str(model or "").strip(),
+                workspace_dir=str(workspace_dir or "").strip(),
+                persona_prompt=str(system_prompt or "").strip(),
+                avatar_id=str(avatar_id or "").strip(),
+                inherit_parent_context=bool(inherit_parent_context),
+            )
+            self._agents[agent_id] = context
+            context.status = SubAgentStatus.RUNNING
+            context.updated_at = time.time()
+            self._run_store_open(context)
+            self._tasks[agent_id] = asyncio.create_task(
+                self._run_subagent(context, allowed_tools=allowed_tools)
+            )
+
+        started_event = RuntimeEvent(
+            type=EventType.SUBAGENT_STARTED.value,
+            data={
+                "agent_id": context.agent_id,
+                "name": context.name,
+                "role": context.role,
+                "task": context.task,
+                "status": context.status.value,
+                "depth": context.depth,
+                "mode": context.mode,
+                "cluster_id": context.cluster_id,
+                "badge_seq": context.badge_seq,
+                "provider": context.provider_name or self.base_session.provider_name or "",
+                "model": context.model_name or self.base_session.model_name or "",
+            },
+            agent_id=context.agent_id,
+        )
+        _log.info(
+            "[spawn_subagent] emitting SUBAGENT_STARTED agent=%s emitter=%s",
+            context.agent_id,
+            "yes" if self.event_emitter is not None else "NO_EMITTER",
+        )
+        await self._emit(started_event)
+        status_probe = self.get_status(context.agent_id)
+        if not status_probe.get("ok"):
+            _log.error(
+                "[spawn_subagent] status probe failed right after spawn: tm=%s owner_sid=%s agent=%s agents=%s archived=%s tasks=%s",
+                id(self),
+                self.owner_session_id,
+                context.agent_id,
+                list(self._agents.keys()),
+                list(self._archived_agents.keys()),
+                list(self._tasks.keys()),
+            )
+        return {
+            "ok": True,
+            "agent_id": context.agent_id,
+            "name": context.name,
+            "role": context.role,
+            "task": context.task,
+            "depth": context.depth,
+            "mode": context.mode,
+            "cluster_id": context.cluster_id,
+            "badge_seq": context.badge_seq,
+            "provider": context.provider_name or self.base_session.provider_name or "",
+            "model": context.model_name or self.base_session.model_name or "",
+            "workspace_dir": context.workspace_dir or self.base_session.workspace_dir or "",
+        }
+
+    async def cancel_subagent(self, agent_id: str) -> Dict[str, Any]:
+        context = self._agents.get(agent_id)
+        if context is None:
+            context = self._find_by_name_or_avatar(agent_id)
+            if context is not None:
+                agent_id = context.agent_id
+        if context is None:
+            return {"ok": False, "error": "not_found", "message": f"未找到子智能体: {agent_id}"}
+        self._cancelled.add(agent_id)
+        context.status = SubAgentStatus.CANCELLED
+        context.updated_at = time.time()
+        try:
+            self._run_store.update_status(
+                agent_id,
+                status=context.status.value,
+                error_text="任务已取消",
+                completed_at=context.updated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] cancel update failed for %s: %s", agent_id, exc)
+        task = self._tasks.get(agent_id)
+        if task is not None and not task.done():
+            task.cancel()
+        await self._emit(
+            RuntimeEvent(
+                type=EventType.SUBAGENT_ERROR.value,
+                data={"agent_id": agent_id, "status": context.status.value, "text": "已取消子智能体"},
+                agent_id=agent_id,
+            )
+        )
+        return {"ok": True, "agent_id": agent_id, "status": context.status.value}
+
+    async def send_message_to_subagent(self, agent_id: str, message: str) -> Dict[str, Any]:
+
+        context = self._agents.get(agent_id)
+        if context is None:
+            archived = self._archived_agents.pop(agent_id, None)
+            if archived is not None:
+                self._agents[agent_id] = archived
+                context = archived
+        if context is None:
+            context = self._find_by_name_or_avatar(agent_id)
+            if context is not None:
+                aid = context.agent_id
+                if aid in self._archived_agents:
+                    self._archived_agents.pop(aid, None)
+                if aid not in self._agents:
+                    self._agents[aid] = context
+                agent_id = aid
+        if context is None:
+            _log.warning(
+                "send_message_to_subagent: agent_id=%s not in _agents (keys=%s)",
+                agent_id,
+                list(self._agents.keys()),
+            )
+            return {"ok": False, "error": "not_found", "message": f"未找到子智能体: {agent_id}"}
+        text = message.strip()
+        if not text:
+            return {"ok": False, "error": "empty_message", "message": "消息不能为空"}
+
+        if context.status == SubAgentStatus.RUNNING:
+            session = self._agent_sessions.get(agent_id)
+            if session is None:
+                _log.warning("send_message: agent %s is RUNNING but session missing, rebuilding", agent_id)
+                session = self._rebuild_agent_session(context)
+            session.agent_messages.append({"role": "user", "content": text})
+            session.chat_history.append({"role": "user", "content": text})
+        else:
+            _log.info("send_message: resuming agent %s (was %s, mode=%s)", agent_id, context.status.value, context.mode)
+            self._ensure_agent_session(context)
+            context.status = SubAgentStatus.RUNNING
+            context.error_text = ""
+            allowed_tools = self._build_toolset(context.allowed_tool_names)
+            task = asyncio.create_task(
+                self._run_subagent(
+                    context,
+                    allowed_tools=allowed_tools,
+                    resume_input=text,
+                )
+            )
+            self._tasks[agent_id] = task
+
+        context.updated_at = time.time()
+        try:
+            self._run_store.update_status(agent_id, status=context.status.value)
+            self._run_store.append_activity(
+                agent_id,
+                event_type="note",
+                title="收到追问",
+                detail=text,
+                ts=context.updated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] follow-up update failed for %s: %s", agent_id, exc)
+        await self._emit(
+            RuntimeEvent(
+                type=EventType.SUBAGENT_PROGRESS.value,
+                data={"agent_id": agent_id, "text": f"收到用户追问: {text}"},
+                agent_id=agent_id,
+            )
+        )
+        return {"ok": True, "agent_id": agent_id, "status": context.status.value}
+
+    def _ensure_agent_session(self, context: SubAgentContext) -> StudioSession:
+        """Ensure an active session exists for the agent, rebuilding if necessary."""
+        session = self._agent_sessions.get(context.agent_id)
+        if session is not None:
+            return session
+        return self._rebuild_agent_session(context)
+
+    def _rebuild_agent_session(self, context: SubAgentContext) -> StudioSession:
+        """Rebuild a session from saved context (used when resuming completed/failed agents)."""
+        session = self._build_isolated_session(workspace_dir=context.workspace_dir)
+        session.context_files.update(context.context_files)
+        session.artifacts.update(context.artifacts)
+        self._seed_session_history(session, context)
+        if context.attachments:
+            session.scratchpad.update(
+                {f"attachment::{k}": v for k, v in context.attachments.items()}
+            )
+        setattr(session, "_team_manager", self)
+        self._agent_sessions[context.agent_id] = session
+        return session
+
+    @staticmethod
+    def _seed_session_history(session: StudioSession, context: "SubAgentContext") -> None:
+        """Carry forward prior agent_messages into a freshly built session.
+
+        Used when retrying/escalating a failed sub-agent so the model retains
+        memory of already-parsed files and already-derived conclusions instead
+        of restarting from a blank context (which forces full re-parsing of
+        every document on each retry).
+        """
+        if context.agent_messages:
+            session.agent_messages = list(context.agent_messages)
+
+    def _resolve_subagent_context(self, agent_id: str) -> tuple[Optional[SubAgentContext], str]:
+        """Resolve a sub-agent context from active, archived, or alias lookup."""
+        query = agent_id.strip()
+        context = self._agents.get(query)
+        if context is None:
+            archived = self._archived_agents.pop(query, None)
+            if archived is not None:
+                self._agents[query] = archived
+                context = archived
+        if context is None:
+            context = self._find_by_name_or_avatar(query)
+            if context is not None:
+                resolved_id = context.agent_id
+                if resolved_id in self._archived_agents:
+                    self._archived_agents.pop(resolved_id, None)
+                if resolved_id not in self._agents:
+                    self._agents[resolved_id] = context
+                return context, resolved_id
+        if context is not None:
+            return context, context.agent_id
+        return None, query
+
+    async def retry_subagent(
+        self,
+        agent_id: str,
+        refined_task: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        context, agent_id = self._resolve_subagent_context(agent_id)
+        if context is None:
+            return {"ok": False, "error": "not_found", "message": f"未找到子智能体: {agent_id}"}
+        if context.status == SubAgentStatus.RUNNING:
+            return {"ok": False, "error": "still_running", "message": "子智能体仍在运行，无法重试"}
+
+        new_task = (refined_task or "").strip() or context.task
+        if context.error_text:
+            new_task = (
+                f"{new_task}\n\n"
+                "请参考上次失败信息并避免重复问题：\n"
+                f"{context.error_text}"
+            )
+
+        async with self._lock:
+            active = self._active_running_count()
+            max_concurrent = self.spawn_config.max_concurrent
+            if active >= max_concurrent:
+                return {
+                    "ok": False,
+                    "error": "max_concurrency_reached",
+                    "message": f"当前并行子智能体已达上限({max_concurrent})",
+                }
+            if active > 0:
+                spawn_check = self.resource_monitor.can_spawn(active_subagents=active)
+                if not spawn_check["allowed"]:
+                    return {
+                        "ok": False,
+                        "error": "resource_limit",
+                        "message": "当前资源占用较高，暂不建议继续启动子智能体",
+                        "resource": spawn_check,
+                    }
+
+            context.task = new_task
+            if provider is not None:
+                context.provider_name = str(provider).strip()
+            if model is not None:
+                context.model_name = str(model).strip()
+            context.status = SubAgentStatus.RUNNING
+            context.error_text = ""
+            context.final_text = ""
+            context.result_summary = ""
+            context.updated_at = time.time()
+            self._cancelled.discard(agent_id)
+            self._agent_sessions.pop(agent_id, None)
+
+            allowed_tools = self._build_toolset(context.allowed_tool_names)
+            self._tasks[agent_id] = asyncio.create_task(
+                self._run_subagent(context, allowed_tools=allowed_tools)
+            )
+
+        started_event = RuntimeEvent(
+            type=EventType.SUBAGENT_STARTED.value,
+            data={
+                "agent_id": context.agent_id,
+                "name": context.name,
+                "role": context.role,
+                "task": context.task,
+                "status": context.status.value,
+                "depth": context.depth,
+                "mode": context.mode,
+                "provider": context.provider_name or self.base_session.provider_name or "",
+                "model": context.model_name or self.base_session.model_name or "",
+                "retried": True,
+            },
+            agent_id=context.agent_id,
+        )
+        await self._emit(started_event)
+        return {
+            "ok": True,
+            "agent_id": context.agent_id,
+            "name": context.name,
+            "role": context.role,
+            "task": context.task,
+            "depth": context.depth,
+            "mode": context.mode,
+            "provider": context.provider_name or self.base_session.provider_name or "",
+            "model": context.model_name or self.base_session.model_name or "",
+            "workspace_dir": context.workspace_dir or self.base_session.workspace_dir or "",
+            "retried": True,
+        }
+
+    async def update_subagent_model(
+        self,
+        agent_id: str,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        context, agent_id = self._resolve_subagent_context(agent_id)
+        if context is None:
+            return {"ok": False, "error": "not_found", "message": f"未找到子智能体: {agent_id}"}
+        prov = str(provider or "").strip()
+        mod = str(model or "").strip()
+        if not prov and not mod:
+            return {"ok": False, "error": "invalid_args", "message": "provider or model is required"}
+        async with self._lock:
+            if prov:
+                context.provider_name = prov
+            if mod:
+                context.model_name = mod
+            context.updated_at = time.time()
+        return {
+            "ok": True,
+            "agent_id": agent_id,
+            "provider": context.provider_name or self.base_session.provider_name or "",
+            "model": context.model_name or self.base_session.model_name or "",
+        }
+
+    async def submit_for_longrun(self, entry: Any) -> Dict[str, Any]:
+        """Run one long-running task entry via :meth:`spawn_subagent` and await completion."""
+        payload = getattr(entry, "payload", None)
+        if not isinstance(payload, dict):
+            payload = {}
+        workspace_obj = getattr(entry, "workspace", None)
+        ws_path = ""
+        if workspace_obj is not None:
+            p = getattr(workspace_obj, "path", None)
+            if p is not None:
+                ws_path = str(p)
+        task_text = str(payload.get("task") or payload.get("prompt") or "").strip()
+        if not task_text:
+            raise ValueError("longrun payload requires non-empty task or prompt")
+        name = str(payload.get("name") or "longrun").strip() or "longrun"
+        role = str(payload.get("role") or "worker").strip() or "worker"
+        spawn_res = await self.spawn_subagent(
+            name=name,
+            role=role,
+            task=task_text,
+            workspace_dir=ws_path or None,
+            provider=str(payload.get("provider") or "").strip() or None,
+            model=str(payload.get("model") or "").strip() or None,
+        )
+        if not spawn_res.get("ok"):
+            raise RuntimeError(str(spawn_res.get("error") or spawn_res))
+        agent_id = str(spawn_res.get("agent_id", "") or "").strip()
+        sub_task = self._tasks.get(agent_id)
+        if sub_task is not None:
+            await sub_task
+        ctx = self._agents.get(agent_id) or self._archived_agents.get(agent_id)
+        if ctx is None:
+            raise RuntimeError("subagent context missing after run")
+        if ctx.status == SubAgentStatus.FAILED:
+            raise RuntimeError(ctx.error_text or "subagent_failed")
+        if ctx.status == SubAgentStatus.CANCELLED:
+            raise asyncio.CancelledError()
+        text = (ctx.final_text or "").strip()
+        wants = bool(payload.get("wants_continuation"))
+        if not wants and "[longrun:continue]" in text.lower():
+            wants = True
+        return {
+            "ok": True,
+            "wants_continuation": wants,
+            "agent_id": agent_id,
+            "final_text": ctx.final_text,
+            "status": ctx.status.value,
+        }
+
+    def _find_by_name_or_avatar(self, query: str) -> Optional[SubAgentContext]:
+        """Fallback lookup by name (case-insensitive) or avatar_id."""
+        q = query.strip().lower()
+        for ctx in list(self._agents.values()) + list(self._archived_agents.values()):
+            if ctx.avatar_id and ctx.avatar_id.lower() == q:
+                return ctx
+            if ctx.name and ctx.name.lower() == q:
+                return ctx
+        return None
+
+    def get_status(self, agent_id: Optional[str] = None) -> Dict[str, Any]:
+        _log.debug(
+            "[get_status] tm_id=%s, _agents=%s, _archived=%s, query_agent_id=%s",
+            id(self),
+            list(self._agents.keys()),
+            list(self._archived_agents.keys()),
+            agent_id,
+        )
+        if agent_id:
+            context = self._agents.get(agent_id)
+            if context is None:
+                context = self._archived_agents.get(agent_id)
+            if context is None:
+                context = self._find_by_name_or_avatar(agent_id)
+            if context is None:
+                return {"ok": False, "error": "not_found"}
+            return {"ok": True, "subagent": self._serialize_status(context)}
+        merged: Dict[str, SubAgentContext] = {}
+        merged.update(self._archived_agents)
+        merged.update(self._agents)
+        return {
+            "ok": True,
+            "subagents": [self._serialize_status(item) for item in merged.values()],
+        }
+
+    def get_status_with_task_fallback(self, agent_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return status and synthesize running entries from tasks when needed."""
+        status = self.get_status(agent_id)
+        if agent_id:
+            if status.get("ok"):
+                return status
+            task = self._tasks.get(agent_id)
+            if task is None or task.done():
+                return status
+            context = self._agents.get(agent_id)
+            if context is not None:
+                return {"ok": True, "subagent": self._serialize_status(context)}
+            return {
+                "ok": True,
+                "subagent": {
+                    "agent_id": agent_id,
+                    "name": agent_id,
+                    "role": "worker",
+                    "task": "",
+                    "status": SubAgentStatus.RUNNING.value,
+                    "updated_at": time.time(),
+                    "result_summary": "",
+                    "error_text": "",
+                    "recent_events": [],
+                    "depth": 1,
+                    "parent_agent_id": "meta",
+                    "mode": "run",
+                    "cleanup": "keep",
+                    "spawn_tree_path": "",
+                    "provider": self.base_session.provider_name or "",
+                    "model": self.base_session.model_name or "",
+                    "pending_confirm": None,
+                    "source": "task_fallback",
+                },
+            }
+
+        rows = list(status.get("subagents", [])) if status.get("ok") else []
+        known_ids = {str(item.get("agent_id", "")).strip() for item in rows}
+        running_task_ids = [aid for aid, task in self._tasks.items() if not task.done()]
+        if not running_task_ids:
+            return status
+
+        fallback_rows: List[Dict[str, Any]] = []
+        for aid in running_task_ids:
+            if aid in known_ids:
+                continue
+            context = self._agents.get(aid)
+            if context is not None:
+                row = self._serialize_status(context)
+                row["source"] = "task_fallback"
+                fallback_rows.append(row)
+                continue
+            fallback_rows.append(
+                {
+                    "agent_id": aid,
+                    "name": aid,
+                    "role": "worker",
+                    "task": "",
+                    "status": SubAgentStatus.RUNNING.value,
+                    "updated_at": time.time(),
+                    "result_summary": "",
+                    "error_text": "",
+                    "recent_events": [],
+                    "depth": 1,
+                    "parent_agent_id": "meta",
+                    "mode": "run",
+                    "cleanup": "keep",
+                    "spawn_tree_path": "",
+                    "provider": self.base_session.provider_name or "",
+                    "model": self.base_session.model_name or "",
+                    "pending_confirm": None,
+                    "source": "task_fallback",
+                }
+            )
+        if not fallback_rows:
+            return status
+        merged_rows = rows + fallback_rows
+        _log.warning(
+            "[get_status_with_task_fallback] synthesized %d rows from running tasks: tm=%s owner_sid=%s tasks=%s",
+            len(fallback_rows),
+            id(self),
+            self.owner_session_id,
+            running_task_ids,
+        )
+        return {"ok": True, "subagents": merged_rows}
+
+    def get_confirm_gate(self, agent_id: str) -> Optional[ConfirmGate]:
+        context = self._agents.get(agent_id)
+        if context is None:
+            return None
+        return context.confirm_gate
+
+    def get_clarify_gate(self, agent_id: str) -> Optional[AsyncClarifyGate]:
+        context = self._agents.get(agent_id)
+        if context is None:
+            return None
+        return context.clarify_gate
+
+    async def shutdown(self) -> None:
+        tasks = list(self._tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._cancelled.clear()
+        self._unregister()
+
+    def shutdown_now(self) -> None:
+        for task in list(self._tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+        self._cancelled.clear()
+        self._unregister()
+
+    def _serialize_status(self, context: SubAgentContext) -> Dict[str, Any]:
+        pending_confirm = None
+        confirm_gate = context.confirm_gate
+        confirm_request = getattr(confirm_gate, "last_request", None)
+        confirm_pending = getattr(confirm_gate, "_pending", {})
+        if confirm_request and isinstance(confirm_pending, dict):
+            req = confirm_request
+            if confirm_pending.get(str(req.get("id", ""))):
+                pending_confirm = {
+                    "request_id": req.get("id", ""),
+                    "question": req.get("question", ""),
+                    "context": req.get("context"),
+                }
+        pending_clarification = None
+        if context.clarify_gate and context.clarify_gate.last_request:
+            req = context.clarify_gate.last_request
+            if context.clarify_gate._pending.get(str(req.get("id", ""))):
+                pending_clarification = {
+                    "request_id": req.get("id", ""),
+                    "prompt": req.get("prompt", ""),
+                    "options": list(req.get("options", []) or []),
+                    "allow_free_text": bool(req.get("allow_free_text", True)),
+                    "context": req.get("context"),
+                }
+        return {
+            "agent_id": context.agent_id,
+            "name": context.name,
+            "role": context.role,
+            "task": context.task,
+            "status": context.status.value,
+            "updated_at": context.updated_at,
+            "result_summary": context.result_summary,
+            "error_text": context.error_text,
+            "recent_events": list(context.recent_events[-20:]),
+            "depth": context.depth,
+            "parent_agent_id": context.parent_agent_id,
+            "mode": context.mode,
+            "cleanup": context.cleanup,
+            "spawn_tree_path": context.spawn_tree_path,
+            "cluster_id": context.cluster_id,
+            "badge_seq": context.badge_seq,
+            "provider": context.provider_name or self.base_session.provider_name or "",
+            "model": context.model_name or self.base_session.model_name or "",
+            "output_files": list(context.output_files[:200]),
+            "result_file": context.result_file or "",
+            "pending_confirm": pending_confirm,
+            "pending_clarification": pending_clarification,
+            "avatar_id": context.avatar_id or None,
+        }
+
+    def _archive_context(self, context: SubAgentContext) -> None:
+        """Keep a lightweight finished snapshot for status queries."""
+        snapshot = replace(
+            context,
+            # Avoid retaining heavy runtime payloads after completion.
+            agent_messages=[],
+            artifacts={},
+            context_files={},
+            attachments={},
+        )
+        self._archived_agents[context.agent_id] = snapshot
+        if len(self._archived_agents) <= self._archive_limit:
+            return
+        # Drop oldest snapshots first to avoid unbounded growth.
+        overflow = len(self._archived_agents) - self._archive_limit
+        if overflow <= 0:
+            return
+        old_ids = sorted(
+            self._archived_agents.keys(),
+            key=lambda item: self._archived_agents[item].updated_at,
+        )[:overflow]
+        for agent_id in old_ids:
+            self._archived_agents.pop(agent_id, None)
+
+    def _run_store_open(self, context: SubAgentContext) -> None:
+        """Open persisted run record for one spawned sub-agent."""
+        try:
+            record = self._run_store.open_run(
+                run_id=context.agent_id,
+                kind="spawn",
+                name=context.name,
+                role=context.role,
+                task=context.task,
+                status=context.status.value,
+                provider=context.provider_name or self.base_session.provider_name or "",
+                model=context.model_name or self.base_session.model_name or "",
+                persona=context.persona_prompt or "",
+                avatar_id=context.avatar_id or "",
+                source_tool_call_id=context.source_tool_call_id or "",
+                started_at=context.updated_at or time.time(),
+                detail_refs={
+                    "scratchpad_key": f"subagent_result::{context.agent_id}",
+                },
+            )
+            context.cluster_id = record.cluster_id
+            context.badge_seq = record.badge_seq
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] open_run failed for %s: %s", context.agent_id, exc)
+
+    def _run_store_append_runtime_event(self, context: SubAgentContext, event: RuntimeEvent) -> None:
+        """Append one runtime event into persisted run activity timeline."""
+        try:
+            self._run_store.append_runtime_event(
+                context.agent_id,
+                event_type=event.type,
+                data=dict(event.data or {}),
+                ts=time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] append_runtime_event failed for %s: %s", context.agent_id, exc)
+
+    def _run_store_close(self, context: SubAgentContext, produced_files: List[str]) -> None:
+        """Finalize persisted run record after the sub-agent terminal status is known."""
+        artifacts: List[Dict[str, Any]] = []
+        for path in produced_files:
+            p = str(path or "").strip()
+            if not p:
+                continue
+            artifacts.append({"path": p, "kind": "file"})
+        detail_refs = {
+            "result_md_path": str(context.result_file or "").strip() or None,
+            "scratchpad_key": f"subagent_result::{context.agent_id}",
+        }
+        try:
+            self._run_store.close_run(
+                context.agent_id,
+                status=context.status.value,
+                result_summary=context.result_summary,
+                error_text=context.error_text,
+                result_file=context.result_file,
+                output_files=produced_files,
+                artifacts=artifacts,
+                detail_refs=detail_refs,
+                completed_at=context.updated_at or time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] close_run failed for %s: %s", context.agent_id, exc)
+
+    async def _run_subagent(
+        self,
+        context: SubAgentContext,
+        *,
+        allowed_tools: Sequence[Dict[str, Any]],
+        resume_input: Optional[str] = None,
+    ) -> None:
+        existing_session = self._agent_sessions.get(context.agent_id)
+        if context.mode == "session" and existing_session is not None:
+            session = existing_session
+        else:
+            session = self._build_isolated_session(workspace_dir=context.workspace_dir)
+            session.context_files.update(context.context_files)
+            session.artifacts.update(context.artifacts)
+            setattr(session, "_team_manager", self)
+            if context.attachments:
+                session.scratchpad.update(
+                    {f"attachment::{k}": v for k, v in context.attachments.items()}
+                )
+            self._seed_session_history(session, context)
+            self._agent_sessions[context.agent_id] = session
+        setattr(session, "_team_manager", self)
+        resolved_provider = context.provider_name or session.provider_name or self.base_session.provider_name
+        resolved_model = context.model_name or session.model_name or self.base_session.model_name
+        if resolved_provider or resolved_model:
+            llm = ProviderResolver.resolve(provider_name=resolved_provider, model=resolved_model)
+            session.provider_name = resolved_provider
+            session.model_name = resolved_model
+        else:
+            llm = self.llm_factory()
+        runtime = AgentRuntime(
+            llm,
+            context.confirm_gate,
+            max_tool_rounds=_resolve_max_tool_rounds(),
+            loop_warning_threshold=8,
+            loop_critical_threshold=16,
+            team_manager=self,
+            clarify_gate=context.clarify_gate,
+        )
+        system_prompt = self._build_subagent_system_prompt(context, session)
+        started_at = time.time()
+        cancelled_by_request = False
+        timed_out = False
+        paused_at_limit = False
+        heartbeat_stop = asyncio.Event()
+        token_buffer = ""
+        token_last_emit_at = time.time()
+        pending_activity_events: List[RuntimeEvent] = []
+        last_activity_flush_at = time.time()
+
+        async def _emit_progress(text: str) -> None:
+            await self._emit(
+                RuntimeEvent(
+                    type=EventType.SUBAGENT_PROGRESS.value,
+                    data={"agent_id": context.agent_id, "text": text},
+                    agent_id=context.agent_id,
+                )
+            )
+
+        async def _heartbeat() -> None:
+            # Emit lightweight heartbeat so UI can show liveness even when model is thinking.
+            while not heartbeat_stop.is_set():
+                await asyncio.sleep(3)
+                if heartbeat_stop.is_set():
+                    break
+                elapsed = int(time.time() - started_at)
+                await _emit_progress(f"执行中（{elapsed}s）…")
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
+
+        async def _flush_token_buffer() -> None:
+            nonlocal token_buffer, token_last_emit_at
+            if not token_buffer:
+                return
+            await self._emit(
+                RuntimeEvent(
+                    type=EventType.TOKEN.value,
+                    data={"agent_id": context.agent_id, "text": token_buffer},
+                    agent_id=context.agent_id,
+                )
+            )
+            token_buffer = ""
+            token_last_emit_at = time.time()
+
+        def _flush_activity_events(force: bool = False) -> None:
+            nonlocal last_activity_flush_at
+            if not pending_activity_events:
+                return
+            now = time.time()
+            if not force and len(pending_activity_events) < 5 and (now - last_activity_flush_at) < 3.0:
+                return
+            for evt in pending_activity_events:
+                self._run_store_append_runtime_event(context, evt)
+            pending_activity_events.clear()
+            last_activity_flush_at = now
+
+        try:
+            def _should_stop() -> bool:
+                nonlocal cancelled_by_request, timed_out
+                if context.agent_id in self._cancelled:
+                    cancelled_by_request = True
+                    return True
+                if context.run_timeout_seconds > 0 and (time.time() - started_at) > context.run_timeout_seconds:
+                    timed_out = True
+                    return True
+                return False
+
+            async for event in runtime.run_turn(
+                resume_input or context.task,
+                session,
+                should_stop=_should_stop,
+                agent_id=context.agent_id,
+                tools=allowed_tools,
+                system_prompt=system_prompt,
+                usage_session_id=str(self.owner_session_id or ""),
+                usage_avatar_id=str(context.avatar_id or ""),
+            ):
+                context.updated_at = time.time()
+                if event.type == EventType.TOKEN.value:
+                    tok = str(event.data.get("text", ""))
+                    if tok:
+                        token_buffer += tok
+                        now = time.time()
+                        if len(token_buffer) >= 120 or (now - token_last_emit_at) >= 0.2:
+                            await _flush_token_buffer()
+                    continue
+                await _flush_token_buffer()
+                if event.type == EventType.FINAL.value:
+                    context.final_text = str(event.data.get("text", ""))
+                if event.type == EventType.ERROR.value:
+                    context.error_text = str(event.data.get("text", ""))
+                if event.type == EventType.SUBAGENT_PAUSED.value:
+                    paused_at_limit = True
+                    context.pause_detector = str(event.data.get("detector", "") or "").strip()
+                    context.pause_retryable = bool(event.data.get("retryable", False))
+                    context.final_text = context.final_text or str(event.data.get("text", ""))
+                if event.type == EventType.ROUND_START.value:
+                    round_no = int(event.data.get("round", 0) or 0)
+                    max_rounds = int(event.data.get("max_rounds", 0) or 0)
+                    elapsed = int(time.time() - started_at)
+                    await _emit_progress(f"第 {round_no}/{max_rounds} 轮分析中（{elapsed}s）")
+                if event.type in {
+                    EventType.TOOL_CALL.value,
+                    EventType.TOOL_RESULT.value,
+                    EventType.CONFIRM_REQUIRED.value,
+                    EventType.CONFIRM_RESPONSE.value,
+                    EventType.CLARIFICATION_REQUIRED.value,
+                    EventType.CLARIFICATION_RESPONSE.value,
+                    EventType.SUBAGENT_CHECKPOINT.value,
+                    EventType.SUBAGENT_PAUSED.value,
+                    EventType.SUBAGENT_PROGRESS.value,
+                    EventType.ERROR.value,
+                }:
+                    context.recent_events.append({"type": event.type, "data": event.data})
+                    pending_activity_events.append(event)
+                    _flush_activity_events()
+                if event.type in {EventType.TOOL_CALL.value, EventType.TOOL_RESULT.value}:
+                    tool_name = str(event.data.get("name", "tool"))
+                    args = event.data.get("arguments") or event.data.get("args") or {}
+                    path_hint = ""
+                    if isinstance(args, dict):
+                        path_val = str(args.get("path", "")).strip()
+                        if path_val:
+                            path_hint = f" -> {path_val}"
+                    action = (
+                        f"调用工具 {tool_name}{path_hint}"
+                        if event.type == EventType.TOOL_CALL.value
+                        else f"完成工具 {tool_name}"
+                    )
+                    await _emit_progress(action)
+                await self._emit(event)
+            _flush_activity_events(force=True)
+
+            await _flush_token_buffer()
+
+            if context.status != SubAgentStatus.CANCELLED:
+                if context.error_text == STOP_MESSAGE and cancelled_by_request:
+                    context.status = SubAgentStatus.CANCELLED
+                    context.error_text = "任务已取消"
+                elif context.error_text == STOP_MESSAGE and timed_out:
+                    context.status = SubAgentStatus.FAILED
+                    context.error_text = f"子智能体执行超时（>{context.run_timeout_seconds}s）"
+                elif context.error_text == STOP_MESSAGE:
+                    context.status = SubAgentStatus.CANCELLED
+                    context.error_text = "任务已中断"
+                elif paused_at_limit:
+                    context.status = SubAgentStatus.PAUSED
+                    context.error_text = ""
+                else:
+                    context.status = (
+                        SubAgentStatus.FAILED
+                        if bool(context.error_text and not context.final_text)
+                        else SubAgentStatus.COMPLETED
+                    )
+            context.updated_at = time.time()
+        except asyncio.CancelledError:
+            context.status = SubAgentStatus.CANCELLED
+            context.error_text = context.error_text or "任务已取消"
+            context.updated_at = time.time()
+        except Exception as exc:
+            context.status = SubAgentStatus.FAILED
+            context.error_text = f"{exc}"
+            context.updated_at = time.time()
+            await self._emit(
+                RuntimeEvent(
+                    type=EventType.SUBAGENT_ERROR.value,
+                    data={"agent_id": context.agent_id, "text": context.error_text},
+                    agent_id=context.agent_id,
+                )
+            )
+        finally:
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            context.agent_messages = list(session.agent_messages)
+            context.artifacts = dict(session.artifacts)
+            context.context_files = dict(session.context_files)
+            context.output_files = self._finalize_output_files(context)
+            context.result_summary = self._build_result_summary(context)
+            context.result_file = self._persist_result_file(context)
+            produced_files = self._merge_output_files(context)
+            declared_paths = self._extract_declared_output_paths(context.task)
+
+            if context.status == SubAgentStatus.COMPLETED and declared_paths:
+                missing_declared = [
+                    p for p in declared_paths if not Path(p).expanduser().exists()
+                ]
+                if missing_declared:
+                    context.status = SubAgentStatus.FAILED
+                    context.error_text = (
+                        "Declared output path(s) not found on disk: "
+                        + ", ".join(missing_declared[:10])
+                    )
+                    context.result_summary = self._build_result_summary(context)
+                merged = list(produced_files)
+                for p in declared_paths:
+                    if p not in merged:
+                        merged.append(p)
+                produced_files = merged
+            else:
+                text_paths = self._extract_paths_from_text(context.final_text or "")
+                if text_paths:
+                    known = set(produced_files)
+                    for p in text_paths:
+                        if p not in known:
+                            known.add(p)
+                            produced_files.append(p)
+                missing_files = self._missing_output_files(produced_files)
+                did_write_action = self._had_write_or_copy_action(context.agent_messages)
+                if (
+                    context.status == SubAgentStatus.COMPLETED
+                    and self._task_expects_file_output(context.task)
+                    and not produced_files
+                    and not did_write_action
+                ):
+                    context.status = SubAgentStatus.FAILED
+                    context.error_text = (
+                        "Task completed without file artifact. Expected an output file "
+                        "but none was detected from tool results or final text."
+                    )
+                    context.result_summary = self._build_result_summary(context)
+                elif (
+                    context.status == SubAgentStatus.COMPLETED
+                    and self._task_expects_file_output(context.task)
+                    and not produced_files
+                    and did_write_action
+                ):
+                    _log.warning(
+                        "[team_manager] %s completed with write/copy actions but no detected "
+                        "output path; keeping COMPLETED to avoid false failure",
+                        context.agent_id,
+                    )
+                elif missing_files:
+                    _log.debug(
+                        "[team_manager] %s missing reported artifacts (not downgrading): %s",
+                        context.agent_id,
+                        missing_files[:10],
+                    )
+            self.base_session.scratchpad[f"subagent_result::{context.agent_id}"] = (
+                f"[{context.name}] 状态={context.status.value}, "
+                f"摘要: {(context.result_summary or '(无)')[:500]}, "
+                f"产出文件: {', '.join(produced_files[:20]) if produced_files else '(无)'}"
+            )
+            self._tasks.pop(context.agent_id, None)
+            if context.mode != "session" or context.cleanup == "delete":
+                self._agent_sessions.pop(context.agent_id, None)
+            self._cancelled.discard(context.agent_id)
+            self._archive_context(context)
+            if context.cleanup == "delete":
+                self._agents.pop(context.agent_id, None)
+            if context.status == SubAgentStatus.FAILED:
+                escalated = await self._auto_escalate(context, allowed_tools=allowed_tools)
+                if escalated:
+                    return
+            self._run_store_close(context, produced_files)
+
+            if self.summary_sink is not None:
+                await self.summary_sink(context.result_summary, context)
+            if context.status == SubAgentStatus.COMPLETED:
+                event_type = EventType.SUBAGENT_COMPLETED.value
+            elif context.status == SubAgentStatus.PAUSED:
+                event_type = EventType.SUBAGENT_PAUSED.value
+            else:
+                event_type = EventType.SUBAGENT_ERROR.value
+            await self._emit(
+                RuntimeEvent(
+                    type=event_type,
+                    data={
+                        "agent_id": context.agent_id,
+                        "name": context.name,
+                        "status": context.status.value,
+                        "summary": context.result_summary,
+                        "result_file": context.result_file,
+                        "text": context.final_text or context.error_text or context.result_summary,
+                        "detector": context.pause_detector,
+                        "retryable": context.pause_retryable,
+                    },
+                    agent_id=context.agent_id,
+                )
+            )
+
+    @staticmethod
+    def _task_expects_file_output(task: str) -> bool:
+        """Heuristic: whether a task explicitly asks for a file artifact."""
+        t = str(task or "").lower()
+        if not t:
+            return False
+        indicators = (
+            ".md",
+            ".markdown",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".html",
+            ".csv",
+            ".pdf",
+            "report",
+            "save to",
+            "write to",
+            "output file",
+            "生成报告",
+            "保存到",
+            "输出文件",
+            "落盘",
+        )
+        return any(key in t for key in indicators)
+
+    async def _auto_escalate(
+        self,
+        context: SubAgentContext,
+        *,
+        allowed_tools: Sequence[Dict[str, Any]],
+    ) -> bool:
+        """Automatic failure escalation: retry -> escalate model -> circuit-break.
+
+        Returns True if an escalation retry was launched (caller should return
+        early to avoid emitting a duplicate completion event).
+        """
+        existing = self._collect_existing_task_artifacts(context)
+        if existing and self._task_expects_file_output(context.task):
+            context.status = SubAgentStatus.COMPLETED
+            context.error_text = ""
+            context.output_files = list(dict.fromkeys(existing))
+            context.result_summary = self._build_result_summary(context)
+            _log.info(
+                "[team_manager] %s: disk artifacts present (%d); marking COMPLETED, skip escalation",
+                context.agent_id,
+                len(existing),
+            )
+            return False
+
+        max_escalation = _resolve_max_escalation()
+        context.failure_count += 1
+
+        if context.failure_count > max_escalation:
+            if existing and self._task_expects_file_output(context.task):
+                context.status = SubAgentStatus.COMPLETED
+                context.error_text = ""
+                context.output_files = list(dict.fromkeys(existing))
+                context.result_summary = self._build_result_summary(context)
+                _log.info(
+                    "[team_manager] %s: circuit-breaker skipped; disk artifacts present (%d)",
+                    context.agent_id,
+                    len(existing),
+                )
+                return False
+            _log.warning(
+                "Sub-agent %s circuit-breaker tripped after %d failures",
+                context.agent_id, context.failure_count,
+            )
+            context.error_text = (
+                f"Circuit-breaker: {context.failure_count} consecutive failures. "
+                f"Last error: {context.error_text} "
+                "建议：缩小单次任务的文档/数据批量后重新触发，"
+                "或直接向用户确认是否需要人工介入完成剩余部分。"
+            )
+            return False
+
+        context.escalation_level += 1
+        error_summary = (context.error_text or "unknown error")[:300]
+
+        if context.failure_count <= 2:
+            _log.info(
+                "Sub-agent %s failed (attempt %d/%d), retrying with focused scope",
+                context.agent_id, context.failure_count, max_escalation,
+            )
+            retry_task = (
+                f"RETRY (attempt {context.failure_count}/{max_escalation}): "
+                f"Previous attempt failed with: {error_summary}\n\n"
+                f"Original task: {context.task}\n\n"
+                "你的历史消息中已包含此前的工作进度（已解析的文件内容、已生成的部分结论）。"
+                "请先检查哪些文件/条目已经处理过、哪些结论已经得出，"
+                "只需完成剩余未处理的部分并产出最终文件，不要重复解析已处理过的文件。"
+            )
+            context.status = SubAgentStatus.RUNNING
+            context.error_text = ""
+            context.final_text = ""
+            context.recent_events.clear()
+            context.updated_at = time.time()
+            try:
+                self._run_store.update_status(context.agent_id, status=context.status.value)
+                self._run_store.append_activity(
+                    context.agent_id,
+                    event_type="note",
+                    title=f"自动重试 {context.failure_count}/{max_escalation}",
+                    detail=error_summary,
+                    ts=context.updated_at,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("[subagent_runs] retry update failed for %s: %s", context.agent_id, exc)
+            self._tasks[context.agent_id] = asyncio.create_task(
+                self._run_subagent(
+                    context,
+                    allowed_tools=allowed_tools,
+                    resume_input=retry_task,
+                )
+            )
+            await self._emit(
+                RuntimeEvent(
+                    type=EventType.SUBAGENT_PROGRESS.value,
+                    data={
+                        "agent_id": context.agent_id,
+                        "text": f"Retry {context.failure_count}/{max_escalation}: re-attempting with focused scope",
+                    },
+                    agent_id=context.agent_id,
+                )
+            )
+            return True
+
+        _log.info(
+            "Sub-agent %s escalating (attempt %d/%d), spawning stronger replacement",
+            context.agent_id, context.failure_count, max_escalation,
+        )
+        escalation_task = (
+            f"ESCALATION (attempt {context.failure_count}/{max_escalation}): "
+            f"Previous {context.failure_count - 1} attempts all failed.\n"
+            f"Last error: {error_summary}\n\n"
+            f"Original task: {context.task}\n\n"
+            "你的历史消息中已包含此前的工作进度（已解析的文件内容、已生成的部分结论）。"
+            "这是升级重试：请分析之前失败的原因，但不要重新解析已经处理过的文件，"
+            "直接基于已有结论完成剩余部分。"
+        )
+        context.status = SubAgentStatus.RUNNING
+        context.error_text = ""
+        context.final_text = ""
+        context.recent_events.clear()
+        context.updated_at = time.time()
+        try:
+            self._run_store.update_status(context.agent_id, status=context.status.value)
+            self._run_store.append_activity(
+                context.agent_id,
+                event_type="note",
+                title=f"自动升级重试 {context.failure_count}/{max_escalation}",
+                detail=error_summary,
+                ts=context.updated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] escalation update failed for %s: %s", context.agent_id, exc)
+        self._tasks[context.agent_id] = asyncio.create_task(
+            self._run_subagent(
+                context,
+                allowed_tools=allowed_tools,
+                resume_input=escalation_task,
+            )
+        )
+        await self._emit(
+            RuntimeEvent(
+                type=EventType.SUBAGENT_PROGRESS.value,
+                data={
+                    "agent_id": context.agent_id,
+                    "text": f"Escalation {context.failure_count}/{max_escalation}: trying different approach",
+                },
+                agent_id=context.agent_id,
+            )
+        )
+        return True
+
+    def _persist_result_file(self, context: SubAgentContext) -> str:
+        """Write the subagent final output to disk and return the file path.
+
+        Saved under:
+            ~/.agenticx/sessions/<owner_session_id>/subagent_results/<agent_id>.md
+
+        Falls back to ~/.agenticx/subagent_results/ when no owner session is known.
+        Returns the absolute path string, or "" on any write failure.
+        """
+        text = (context.final_text or context.result_summary or "").strip()
+        if not text:
+            return ""
+        sid = (self.owner_session_id or "").strip()
+        if sid:
+            base = Path.home() / ".agenticx" / "sessions" / sid / "subagent_results"
+        else:
+            base = Path.home() / ".agenticx" / "subagent_results"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^\w\-.]", "_", context.agent_id or "agent")
+            target = base / f"{safe_name}.md"
+            target.write_text(text, encoding="utf-8")
+            return str(target)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[team_manager] failed to persist result file for %s: %s", context.agent_id, exc)
+            return ""
+
+    def _build_result_summary(self, context: SubAgentContext) -> str:
+        file_list = self._merge_output_files(context)
+        name = (context.name or context.agent_id or "子智能体").strip()
+        if context.status == SubAgentStatus.COMPLETED:
+            text = (context.final_text or "任务执行完成").strip()
+            parts = [f"**{name}** 已完成。"]
+            if text:
+                parts.extend(["", text])
+            if file_list:
+                parts.extend(["", "产出文件："])
+                parts.extend(f"{idx}. {path}" for idx, path in enumerate(file_list, start=1))
+            summary = "\n".join(parts)
+        elif context.status == SubAgentStatus.PAUSED:
+            text = (context.final_text or "任务已暂停，可基于当前进展继续。").strip()
+            reason = f"暂停原因: {context.pause_detector or 'runtime_pause'}"
+            retry = "可稍后继续。" if context.pause_retryable else "请根据提示继续指示。"
+            parts = [f"**{name}** 已暂停。", f"{reason}；{retry}"]
+            if text:
+                parts.extend(["", text])
+            if file_list:
+                parts.extend(["", "产出文件："])
+                parts.extend(f"{idx}. {path}" for idx, path in enumerate(file_list, start=1))
+            summary = "\n".join(parts)
+        elif context.status == SubAgentStatus.CANCELLED:
+            summary = f"**{name}** 已取消。"
+        else:
+            err = (context.error_text or "未知错误").strip()
+            summary = f"**{name}** 执行失败：{err}"
+        return summary
+
+    def _finalize_output_files(self, context: SubAgentContext) -> List[str]:
+        """Collect paths created or modified during this sub-agent run."""
+        tool_paths = self._extract_output_files_from_messages(context.agent_messages)
+        bash_paths = self._extract_bash_output_paths(context.agent_messages, context.workspace_dir)
+        copy_paths = self._extract_bash_copy_paths(context.agent_messages, context.workspace_dir)
+        mkdir_paths = self._extract_bash_mkdir_paths(context.agent_messages, context.workspace_dir)
+        artifact_paths = [str(path) for path in context.artifacts.keys()]
+        trusted: set[str] = set()
+        for raw in tool_paths:
+            if not raw:
+                continue
+            trusted.add(raw)
+            try:
+                trusted.add(str(Path(raw).expanduser().resolve()))
+            except OSError:
+                pass
+        for raw in copy_paths:
+            if raw:
+                trusted.add(raw)
+        return self._filter_task_produced_paths(
+            tool_paths + bash_paths + copy_paths + mkdir_paths + artifact_paths,
+            task_started_at=context.created_at,
+            trusted_paths=trusted,
+        )
+
+    @staticmethod
+    def _filter_task_produced_paths(
+        paths: Sequence[str],
+        *,
+        task_started_at: float,
+        trusted_paths: Optional[set[str]] = None,
+    ) -> List[str]:
+        """Keep only files/dirs written during the task; skip pre-existing scan targets."""
+        trusted = trusted_paths or set()
+        slack = 5.0
+        kept: List[str] = []
+        seen: set[str] = set()
+        for raw in paths:
+            if not raw:
+                continue
+            try:
+                candidate = Path(raw).expanduser()
+                if not candidate.exists():
+                    continue
+                resolved = str(candidate.resolve())
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            if resolved in trusted or raw in trusted:
+                seen.add(resolved)
+                kept.append(resolved)
+                continue
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            if candidate.is_file():
+                if stat.st_mtime >= task_started_at - slack:
+                    seen.add(resolved)
+                    kept.append(resolved)
+            elif candidate.is_dir() and stat.st_mtime >= task_started_at - slack:
+                # Directory only if touched during the task (e.g. mkdir -p), not pre-existing roots.
+                seen.add(resolved)
+                kept.append(resolved)
+        return kept
+
+    def _extract_output_files_from_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
+        paths: List[str] = []
+        seen: set[str] = set()
+        for msg in messages:
+            if str(msg.get("role", "")) != "tool":
+                continue
+            tool_name = str(msg.get("name", "") or "").strip()
+            if tool_name not in {"file_write", "file_edit"}:
+                continue
+            content = str(msg.get("content", "") or "")
+            if not content:
+                continue
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                match = re.match(r"^OK:\s*(?:wrote|edited)\s+(.+?)(?:\s+\(\d+\s+chars\))?$", line)
+                if not match:
+                    continue
+                path = str(match.group(1) or "").strip()
+                if path and path not in seen:
+                    seen.add(path)
+                    paths.append(path)
+        return paths
+
+    def _extract_bash_output_paths(
+        self, messages: List[Dict[str, Any]], workspace_dir: str
+    ) -> List[str]:
+        """Extract disk-verified output file paths from bash_exec redirections.
+
+        Scans assistant tool_calls for ``bash_exec`` commands and pulls targets of
+        ``>`` / ``>>`` / ``tee`` redirections. Only paths that actually exist on
+        disk are returned, so a mis-parsed or read-only path can never introduce a
+        false "missing artifact" failure. Relative paths resolve against
+        ``workspace_dir``.
+        """
+        base = Path(workspace_dir).expanduser() if str(workspace_dir or "").strip() else None
+        paths: List[str] = []
+        seen: set[str] = set()
+        redirect_re = re.compile(r"(?:>>?|\btee\b(?:\s+-a)?)\s+(['\"]?)([^\s'\"|;&<>]+)\1")
+        for msg in messages:
+            if str(msg.get("role", "")) != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                if str(fn.get("name", "") or "").strip() != "bash_exec":
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        continue
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    continue
+                command = str(args.get("command", "") or "")
+                if not command:
+                    continue
+                for match in redirect_re.finditer(command):
+                    raw = match.group(2).strip()
+                    if not raw or raw.startswith("/dev/"):
+                        continue
+                    candidate = Path(raw).expanduser()
+                    if not candidate.is_absolute() and base is not None:
+                        candidate = base / candidate
+                    try:
+                        if not candidate.exists() or candidate.is_dir():
+                            continue
+                    except Exception:
+                        continue
+                    resolved = str(candidate)
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        paths.append(resolved)
+        return paths
+
+    def _extract_bash_mkdir_paths(
+        self, messages: List[Dict[str, Any]], workspace_dir: str
+    ) -> List[str]:
+        """Extract directories explicitly created via mkdir in bash_exec."""
+        base = Path(workspace_dir).expanduser() if str(workspace_dir or "").strip() else None
+        paths: List[str] = []
+        seen: set[str] = set()
+        mkdir_re = re.compile(r"\bmkdir\s+(?:-(?:p|m)\s+)*(['\"]?)([^\s'\"|;&<>]+)\1")
+        for msg in messages:
+            if str(msg.get("role", "")) != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                if str(fn.get("name", "") or "").strip() != "bash_exec":
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        continue
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    continue
+                command = str(args.get("command", "") or "")
+                if not command:
+                    continue
+                for match in mkdir_re.finditer(command):
+                    raw = match.group(2).strip()
+                    if not raw:
+                        continue
+                    candidate = Path(raw).expanduser()
+                    if not candidate.is_absolute() and base is not None:
+                        candidate = base / candidate
+                    try:
+                        if not candidate.is_dir():
+                            continue
+                    except Exception:
+                        continue
+                    resolved = str(candidate.resolve())
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        paths.append(resolved)
+        return paths
+
+    def _extract_bash_copy_paths(
+        self, messages: List[Dict[str, Any]], workspace_dir: str
+    ) -> List[str]:
+        """Extract destination paths from cp/mv/rsync/install in bash_exec.
+
+        Handles: ``cp a b dest/``、``cp -r src dst``、``mv a b``、
+        ``install -m755 a bin/``、``cp -t <dir> a b``、``rsync src dst/``。
+        仅返回磁盘真实存在的路径；相对路径按 workspace_dir 解析。
+        命令的**最后一个非 flag token** 视为目标（`-t <dir>` 例外，dir 即目标）。
+        """
+        base = Path(workspace_dir).expanduser() if str(workspace_dir or "").strip() else None
+        paths: List[str] = []
+        seen: set[str] = set()
+        cmd_re = re.compile(r"\b(?:cp|mv|rsync|install)\b([^\n;|&]*)")
+        tflag_re = re.compile(r"-t\s+(['\"]?)([^\s'\"]+)\1")
+        for msg in messages:
+            if str(msg.get("role", "")) != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                if str(fn.get("name", "") or "").strip() != "bash_exec":
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        continue
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    continue
+                command = str(args.get("command", "") or "")
+                if not command:
+                    continue
+                for m in cmd_re.finditer(command):
+                    tail = m.group(1) or ""
+                    targets: List[str] = []
+                    tflag = tflag_re.search(tail)
+                    if tflag:
+                        targets.append(tflag.group(2))
+                    else:
+                        toks = [t.strip("'\"") for t in tail.split() if t and not t.startswith("-")]
+                        if len(toks) >= 2:
+                            targets.append(toks[-1])
+                    for raw in targets:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        candidate = Path(raw).expanduser()
+                        if not candidate.is_absolute() and base is not None:
+                            candidate = base / candidate
+                        try:
+                            if not candidate.exists():
+                                continue
+                        except Exception:
+                            continue
+                        resolved = str(candidate.resolve())
+                        if resolved not in seen:
+                            seen.add(resolved)
+                            paths.append(resolved)
+        return paths
+
+    def _merge_output_files(self, context: SubAgentContext) -> List[str]:
+        merged: List[str] = []
+        seen: set[str] = set()
+        for path in context.artifacts.keys():
+            p = str(path)
+            if p and p not in seen:
+                seen.add(p)
+                merged.append(p)
+        for p in context.output_files:
+            if p and p not in seen:
+                seen.add(p)
+                merged.append(p)
+        return merged
+
+    @staticmethod
+    def _extract_paths_from_text(text: str) -> List[str]:
+        """Extract existing absolute file/dir paths mentioned in free text."""
+        if not text:
+            return []
+        out: List[str] = []
+        seen: set[str] = set()
+        path_re = re.compile(r"(?<![\w])([~/][^\s`'\"()<>，。；、]+)")
+        for m in path_re.finditer(str(text)):
+            raw = m.group(1).rstrip(".,;:)】」』")
+            try:
+                candidate = Path(raw).expanduser()
+                if not candidate.exists():
+                    continue
+                resolved = str(candidate.resolve())
+            except Exception:
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                out.append(resolved)
+        return out
+
+    def _collect_existing_task_artifacts(self, context: SubAgentContext) -> List[str]:
+        """Paths that count as on-disk task artifacts for escalation early-exit."""
+        declared_paths = self._extract_declared_output_paths(context.task)
+        if declared_paths:
+            existing = [p for p in declared_paths if Path(p).expanduser().exists()]
+        else:
+            existing = self._merge_output_files(context)
+            existing += self._extract_paths_from_text(context.final_text or "")
+            existing = [p for p in existing if p and Path(p).expanduser().exists()]
+        return list(dict.fromkeys(existing))
+
+    @staticmethod
+    def _extract_declared_output_paths(task: str) -> List[str]:
+        """Extract explicitly declared output paths from task text."""
+        if not task:
+            return []
+        out: List[str] = []
+        seen: set[str] = set()
+        patterns = [
+            r"(?:输出|保存|写入|生成)[^\n。]{0,10}?(?:到|至)\s*([~/][^\s，。；、\n]+)",
+            r"(?:save|write|output)\s+(?:it\s+)?to\s+([~/][^\s,;\n]+)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, str(task), flags=re.IGNORECASE):
+                raw = m.group(1).rstrip(".,;:)】」』")
+                if raw and raw not in seen:
+                    seen.add(raw)
+                    out.append(raw)
+        return out
+
+    @staticmethod
+    def _had_write_or_copy_action(messages: List[Dict[str, Any]]) -> bool:
+        """True if the run invoked file_write/file_edit or bash copy/write commands."""
+        write_tools = {"file_write", "file_edit"}
+        bash_write_re = re.compile(r"(?:>>?|\btee\b|\bcp\b|\bmv\b|\brsync\b|\binstall\b)")
+        for msg in messages:
+            role = str(msg.get("role", ""))
+            if role == "tool" and str(msg.get("name", "") or "").strip() in write_tools:
+                return True
+            if role == "assistant":
+                for call in msg.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function") or {}
+                    if str(fn.get("name", "") or "").strip() != "bash_exec":
+                        continue
+                    raw = fn.get("arguments")
+                    cmd = ""
+                    if isinstance(raw, str):
+                        try:
+                            cmd = str(json.loads(raw).get("command", ""))
+                        except Exception:
+                            cmd = raw
+                    elif isinstance(raw, dict):
+                        cmd = str(raw.get("command", ""))
+                    if cmd and bash_write_re.search(cmd):
+                        return True
+        return False
+
+    @staticmethod
+    def _missing_output_files(paths: Sequence[str]) -> List[str]:
+        """Return output file paths that were reported but do not exist on disk."""
+        missing: List[str] = []
+        for raw in paths:
+            p = str(raw or "").strip()
+            if not p:
+                continue
+            try:
+                if not Path(p).expanduser().exists():
+                    missing.append(p)
+            except Exception:
+                missing.append(p)
+        return missing

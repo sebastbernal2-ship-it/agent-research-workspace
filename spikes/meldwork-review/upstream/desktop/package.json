@@ -1,0 +1,101 @@
+{
+  "name": "meldwork-desktop",
+  "version": "1.0.9",
+  "private": true,
+  "description": "A local-first desktop workspace for multi-Agent collaboration",
+  "author": "Ryder-MHumble",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "main": "src/main.cjs",
+  "scripts": {
+    "build:frontend": "npm --prefix ../frontend run build:desktop",
+    "dev": "npm run build:frontend && electron .",
+    "connector:conformance": "node --test test/agents/connectors/agent-connector-manifest.test.cjs test/agents/connectors/agent-connector-registry.test.cjs test/agents/connectors/agent-connector-runtime.test.cjs test/agents/connectors/agent-connector-instance-store.test.cjs test/agents/connectors/agent-connector-package-store.test.cjs test/agents/connectors/agent-connector-sdk.test.cjs",
+    "eval:deterministic": "node scripts/run-evals.cjs --suite deterministic",
+    "eval:provider": "node scripts/run-evals.cjs --suite provider",
+    "test": "node scripts/run-tests.cjs",
+    "test:agents": "node scripts/run-tests.cjs --suite agents",
+    "test:runs": "node scripts/run-tests.cjs --suite runs",
+    "test:workspace": "node scripts/run-tests.cjs --suite workspace",
+    "test:security": "node scripts/run-tests.cjs --suite security",
+    "pack": "npm run build:frontend && electron-builder --dir",
+    "dist": "npm run build:frontend && electron-builder --mac dmg zip",
+    "dist:public": "node scripts/public-release-preflight.cjs && npm run build:frontend && electron-builder --config electron-builder.public.cjs --mac dmg zip"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "0.23.0",
+    "@streamparser/json": "0.0.22",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "electron": "39.8.10",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.rydersun.meldwork",
+    "productName": "Meldwork",
+    "artifactName": "Meldwork-${version}-${arch}.${ext}",
+    "afterPack": "scripts/after-pack.cjs",
+    "afterAllArtifactBuild": "scripts/after-all-artifact-build.cjs",
+    "files": [
+      "src/**/*",
+      "samples/**/*",
+      "package.json",
+      {
+        "from": "../frontend/dist",
+        "to": "frontend"
+      }
+    ],
+    "extraResources": [
+      {
+        "from": "../LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "../NOTICE",
+        "to": "NOTICE"
+      },
+      {
+        "from": "../COMMERCIAL_USE.md",
+        "to": "COMMERCIAL_USE.md"
+      },
+      {
+        "from": "build/dmg-background-ai-v4.tiff",
+        "to": "dmg-background.tiff"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "../frontend/public/logos/meldwork-app.png",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "background": "build/dmg-background-ai-v4.png",
+      "icon": null,
+      "writeUpdateInfo": false,
+      "window": {
+        "width": 640,
+        "height": 420
+      },
+      "iconSize": 112,
+      "contents": [
+        {
+          "x": 110,
+          "y": 205,
+          "type": "file"
+        },
+        {
+          "x": 520,
+          "y": 205,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
+  }
+}

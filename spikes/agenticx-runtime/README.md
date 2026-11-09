@@ -1,7 +1,7 @@
 # AgenticX runtime spike
 
 **Purpose:** Isolated first-component evaluation of AgenticX 0.6.5. Not product integration.  
-**Upstream:** `upstream/` is a Git submodule pinned to tag `v0.6.5`, commit `0fc089ec6bf0b45f48a7beda06907932ebc98998` (Apache-2.0).  
+**Upstream:** `upstream/` is the complete vendored source snapshot from tag `v0.6.5`, commit `0fc089ec6bf0b45f48a7beda06907932ebc98998`. The AgenticX `FinnewsHunter` example source is included at commit `d7a20a1f7ee891feee98a3cc8150614b96cb4f4e`.
 **Environment tested:** Linux, CPython 3.12.3. No provider credentials, user data, or external model calls.
 
 ## Reproduce
@@ -86,7 +86,7 @@ Using FastAPI's in-process `TestClient` (no socket/server, no lifespan integrati
 
 ### Revised decision
 
-**Keep AgenticX as a conditional execution/workflow candidate; do not integrate the product yet.** Its Studio group team path has materially more orchestration than the legacy demo, and targeted tests pass. But its main team path does not establish the user's desired adversarial, evidence-citing, revisable agent discussion; separate collaboration semantics/control plane and safety policy are still needed. The API token is optional and binding defaults to all interfaces, so remote use needs wrapper-level fail-closed configuration and a complete route/auth review.
+**Use AgenticX as the bounded worker runtime, not as the project control plane or sole collaboration orchestrator.** The vendored `AgentExecutor` is already called through `harness/agenticx_bridge.py` and is injected as a deterministic worker into Meldwork V4 and the AG2 critic workflow. Its Studio group path remains an optional candidate; it does not itself establish the desired evidence-citing peer review loop. The API token is optional and binding defaults to all interfaces, so the Studio server is not exposed by this product composition and would require wrapper-level fail-closed configuration and a complete route/auth review before use.
 
 ## Harness follow-up (2026-11-07)
 
@@ -94,4 +94,4 @@ Using FastAPI's in-process `TestClient` (no socket/server, no lifespan integrati
 
 ## Cleanup / reset
 
-The local environment is disposable: `rm -rf .venv`. Submodule checkout: `git submodule update --init --recursive`. Do not edit `upstream/` for the initial evaluation; changes belong in a separately documented patch or adapter.
+The local environment is disposable: `rm -rf .venv`. The vendored upstream source snapshot is included directly in this repository; keep product integration changes in `harness/` or a documented patch rather than silently modifying the source mirror.

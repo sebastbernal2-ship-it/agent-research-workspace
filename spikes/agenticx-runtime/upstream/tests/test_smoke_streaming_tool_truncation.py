@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Smoke tests for streamed tool-call truncation handling (FR-C).
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+import sys
+
+import pytest
+
+sys.path.insert(0, str(__file__).rsplit("/tests", 1)[0])
+
+from agenticx.runtime.agent_runtime import (
+    _build_streamed_tool_truncation_hint,
+    _resolve_round_max_tokens,
+    _streamed_tool_call_truncated,
+)
+
+
+class TestStreamedToolCallTruncated:
+    """FR-C: required-param tools with empty parsed args must be flagged truncated."""
+
+    def test_file_write_with_empty_args_is_truncated(self):
+        assert _streamed_tool_call_truncated("file_write", {}) is True
+
+    def test_file_write_with_path_only_not_truncated(self):
+        # Has at least one key → don't drop. Downstream dispatch will surface a
+        # missing-content error which still routes through FR-B guidance.
+        assert (
+            _streamed_tool_call_truncated("file_write", {"path": "/tmp/x"}) is False
+        )
+
+    def test_tool_without_required_params_is_never_truncated(self):
+        # bash_exec has required params; pick a known no-required tool instead.
+        # `list_skills` typically has no required parameters.
+        from agenticx.cli.agent_tools import _TOOL_REQUIRED_PARAMS
+
+        for tname, required in _TOOL_REQUIRED_PARAMS.items():
+            if not required:
+                assert _streamed_tool_call_truncated(tname, {}) is False
+                return
+        # If every tool has required params, fall back to an unknown tool name.
+        assert _streamed_tool_call_truncated("__no_such_tool__", {}) is False
+
+    def test_empty_name_is_not_truncated(self):
+        assert _streamed_tool_call_truncated("", {}) is False
+
+    def test_non_dict_args_are_not_truncated(self):
+        # Defensive: only empty dict triggers; other shapes are ignored.
+        assert _streamed_tool_call_truncated("file_write", []) is False  # type: ignore[arg-type]
+
+
+class TestBuildTruncationHint:
+    """FR-C: retry hint must be directive and mention required-field guidance."""
+
+    def test_hint_mentions_dropped_tool_names_unique_sorted(self):
+        text = _build_streamed_tool_truncation_hint(
+            ["file_write", "file_write", "file_edit"]
+        )
+        # Names appear once, alphabetically sorted
+        assert "file_edit, file_write" in text
+
+    def test_hint_uses_directive_language(self):
+        text = _build_streamed_tool_truncation_hint(["file_write"])
+        assert "立即重新调用" in text
+        assert "required" in text
+        # Must explicitly mention path/content to nudge the model
+        assert "path" in text
+        assert "content" in text
+
+    def test_hint_handles_empty_list(self):
+        text = _build_streamed_tool_truncation_hint([])
+        assert "立即重新调用" in text
+
+    def test_hint_file_write_mentions_chunked_write(self):
+        text = _build_streamed_tool_truncation_hint(["file_write"])
+        assert "小块写入" in text or "file_edit 追加" in text
+
+    def test_hint_bash_exec_omits_chunked_write(self):
+        text = _build_streamed_tool_truncation_hint(["bash_exec"])
+        assert "小块写入" not in text
+        assert "file_edit 追加" not in text
+
+
+def test_repair_file_edit_aliases_old_str_new_str() -> None:
+    from agenticx.cli.agent_tools import _repair_malformed_file_tool_arguments
+
+    repaired = _repair_malformed_file_tool_arguments(
+        "file_edit",
+        {"path": "p", "old_str": "a", "new_str": "b"},
+    )
+    assert repaired["path"] == "p"
+    assert repaired["old_text"] == "a"
+    assert repaired["new_text"] == "b"
+    assert "old_str" not in repaired
+    assert "new_str" not in repaired
+
+
+def test_resolve_round_max_tokens_default_and_write_heavy() -> None:
+    assert _resolve_round_max_tokens(8192, ["file_read"]) == 8192
+    write_budget = _resolve_round_max_tokens(8192, ["file_write"])
+    assert 12288 <= write_budget <= 16384
+    assert _resolve_round_max_tokens(8192, ["file_write"], provider="minimax") <= 4096
+
+
+def test_resolve_round_max_tokens_deepseek_v4_thinking_floor() -> None:
+    """Thinking shares the completion cap, so 8192 must not stay the ceiling."""
+    raised = _resolve_round_max_tokens(
+        8192,
+        [],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        thinking=True,
+    )
+    assert raised >= 24576
+    assert (
+        _resolve_round_max_tokens(
+            8192,
+            [],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            thinking=False,
+        )
+        == 8192
+    )
+    # A vendor downshift below the default must not be raised back up.
+    assert (
+        _resolve_round_max_tokens(
+            1024,
+            [],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            thinking=True,
+        )
+        == 1024
+    )
+    assert (
+        _resolve_round_max_tokens(
+            8192,
+            ["file_write"],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            thinking=True,
+        )
+        >= 24576
+    )

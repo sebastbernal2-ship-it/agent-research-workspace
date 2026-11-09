@@ -1,0 +1,244 @@
+import { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { AlertTriangle, ChevronDown, ChevronUp, ListChecks, Circle, CircleCheck, Loader2 } from "lucide-react";
+import type { Message } from "../store";
+import {
+  isFutileResume,
+  isTodoSnapshotSuperseded,
+  resolveDisplayedTodoFromMessages,
+} from "../utils/task-stall-policy";
+import type { SessionExecutionState } from "../utils/streaming-stop-policy";
+import { TRAE_TODO_CHECK_CLASS } from "./work-panel/SessionTodoList";
+
+type HarnessPhase = "explore" | "read" | "author";
+
+interface StickyTaskBarProps {
+  messages: Message[];
+  liveness?: "active" | "stalled" | "idle";
+  executionState?: SessionExecutionState | string;
+  silentSeconds?: number;
+  onResume?: () => void;
+  codeDevMode?: boolean;
+  phase?: HarnessPhase;
+  toolBudget?: { used: number; total: number };
+  readFiles?: number;
+}
+
+/**
+ * Sticky task progress card shown directly above the chat composer.
+ *
+ * Visual reference: Manus / Cursor — a card with a header row ("任务进度  N/M"
+ * + 折叠箭头) and a checklist underneath. Each item shows status:
+ *   - completed → ✓ (emerald)
+ *   - in_progress → spinner (theme accent)
+ *   - pending → empty circle (muted)
+ * Completed items render with strikethrough.
+ *
+ * Default: expanded when there is at least one in-progress / pending item;
+ * auto-collapses once everything is done so it does not eat composer space.
+ */
+export function StickyTaskBar({
+  messages,
+  liveness = "idle",
+  executionState,
+  silentSeconds = 0,
+  onResume,
+  codeDevMode = false,
+  phase,
+  toolBudget,
+  readFiles,
+}: StickyTaskBarProps) {
+  const { t } = useTranslation("chat");
+  const { t: tCommon } = useTranslation("common");
+  const phaseLabel = (p: HarnessPhase) =>
+    p === "explore" ? t("taskBar.phaseExplore") : p === "read" ? t("taskBar.phaseRead") : t("taskBar.phaseAuthor");
+  const displayed = useMemo(
+    () => resolveDisplayedTodoFromMessages(messages, liveness, executionState),
+    [messages, liveness, executionState],
+  );
+  const todoSuperseded = useMemo(() => {
+    if (!displayed) return false;
+    return isTodoSnapshotSuperseded(messages, displayed.index);
+  }, [messages, displayed]);
+  const parsed = displayed?.parsed ?? null;
+  const rawTotal = parsed?.total;
+  const [expanded, setExpanded] = useState(true);
+  const [dismissed, setDismissed] = useState(false);
+
+  const allDone = !!parsed && parsed.total > 0 && parsed.completed === parsed.total;
+  const runEnded = liveness === "idle";
+  const parkedOnUser = useMemo(() => isFutileResume(messages), [messages]);
+  const runIncomplete = runEnded && !allDone && executionState !== "interrupted" && !parkedOnUser;
+
+  // Guard against ghost task cards: when the model called `todo_write` but
+  // never actually advanced any item (all pending, 0 in_progress, 0 completed)
+  // and the agent has already returned, the list is just clutter and should
+  // be hidden. Typical trigger: user asked for a doc/plan and the model
+  // wrongly mirrored the doc's milestone checklist into todo_write.
+  const hasAnyProgress = !!parsed && parsed.items.some(
+    (item) => item.status === "in_progress" || item.status === "completed",
+  );
+
+  // Auto-collapse only when the run finishes; keep expanded while user is
+  // watching progress live.
+  useEffect(() => {
+    if (allDone) setExpanded(false);
+    else setExpanded(true);
+  }, [allDone, parsed?.total, parsed?.completed]);
+
+  useEffect(() => {
+    if (!runEnded) setDismissed(false);
+  }, [runEnded, rawTotal]);
+
+  if (!parsed) return null;
+  if (todoSuperseded) return null;
+  if (!hasAnyProgress) return null;
+  if (dismissed && runEnded) return null;
+
+  return (
+    <div className="mb-2 overflow-hidden rounded-2xl border border-transparent bg-surface-card text-text-primary">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center gap-2 py-1.5 pl-4 pr-3 text-left transition hover:bg-surface-hover focus:outline-none focus-visible:ring-1 focus-visible:ring-[rgba(var(--theme-color-rgb,59,130,246),0.4)]"
+        aria-expanded={expanded}
+        aria-label={expanded ? t("taskBar.collapse") : t("taskBar.expand")}
+      >
+        <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden>
+          <ListChecks className="h-4 w-4 text-[rgb(var(--theme-color-rgb,59,130,246))]" />
+        </span>
+        <span className="text-[12px] font-semibold text-text-strong">{t("taskBar.title")}</span>
+        <span
+          className={
+            allDone
+              ? "rounded bg-[color-mix(in_srgb,var(--status-success)_15%,transparent)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--status-success)]"
+              : "rounded bg-[rgba(var(--theme-color-rgb,59,130,246),0.15)] px-1.5 py-0.5 text-[10px] font-medium text-[rgb(var(--theme-color-rgb,59,130,246))]"
+          }
+        >
+          {parsed.completed} / {parsed.total}
+        </span>
+        {codeDevMode && phase ? (
+          <span className="rounded bg-surface-panel px-1.5 py-0.5 text-[10px] text-text-muted">
+            {t("taskBar.phase", { phase: phaseLabel(phase) })}
+            {toolBudget ? t("taskBar.tools", { used: toolBudget.used, total: toolBudget.total }) : ""}
+            {typeof readFiles === "number" ? t("taskBar.readFiles", { count: readFiles }) : ""}
+          </span>
+        ) : null}
+        {liveness === "stalled" && silentSeconds > 0 ? (
+          <span className="text-[10px] text-amber-300/90">{t("taskBar.noResponse", { seconds: silentSeconds })}</span>
+        ) : null}
+        {liveness === "stalled" && onResume && !parkedOnUser ? (
+          <button
+            type="button"
+            className="text-[10px] font-medium text-amber-300 hover:text-amber-200"
+            onClick={(e) => {
+              e.stopPropagation();
+              onResume();
+            }}
+          >
+            {t("taskBar.resume")}
+          </button>
+        ) : null}
+        {runIncomplete && onResume ? (
+          <button
+            type="button"
+            className="text-[10px] font-medium text-[rgb(var(--theme-color-rgb,59,130,246))] hover:opacity-80"
+            onClick={(e) => {
+              e.stopPropagation();
+              onResume();
+            }}
+          >
+            {t("taskBar.continue")}
+          </button>
+        ) : null}
+        {runEnded ? (
+          <span className="text-[10px] text-text-muted">
+            {executionState === "interrupted"
+              ? t("taskBar.interrupted")
+              : allDone
+                ? t("taskBar.ended")
+                : t("taskBar.incomplete")}
+          </span>
+        ) : null}
+        {runEnded ? (
+          <button
+            type="button"
+            className="rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:bg-surface-hover hover:text-text-strong"
+            onClick={(e) => {
+              e.stopPropagation();
+              setDismissed(true);
+            }}
+          >
+            {tCommon("close")}
+          </button>
+        ) : null}
+        <span className="flex-1" />
+        <span className="inline-flex h-4 w-4 items-center justify-center text-text-faint" aria-hidden>
+          {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        </span>
+      </button>
+      {expanded && codeDevMode && phase ? (
+        <div className="border-b border-border px-3 py-1.5 text-[11px] text-text-muted">
+          <span
+            className={
+              phase === "explore"
+                ? "text-sky-400"
+                : phase === "read"
+                  ? "text-indigo-400"
+                  : "text-cyan-400"
+            }
+          >
+            {t("taskBar.currentPhase", { phase: phaseLabel(phase) })}
+          </span>
+        </div>
+      ) : null}
+      {expanded ? (
+        <ul className="max-h-[40vh] space-y-0.5 overflow-y-auto px-3 pb-2">
+          {parsed.items.map((item, idx) => (
+            <li
+              key={`${item.content}-${idx}`}
+              className="flex items-start gap-2 rounded px-1 py-1"
+            >
+              <span
+                className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center"
+                aria-hidden
+              >
+                {item.status === "completed" ? (
+                  <CircleCheck className={`h-4 w-4 ${TRAE_TODO_CHECK_CLASS}`} strokeWidth={1.75} />
+                ) : item.status === "in_progress" && liveness === "stalled" ? (
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+                ) : item.status === "in_progress" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[rgb(var(--theme-color-rgb,59,130,246))]" />
+                ) : (
+                  <Circle className="h-3.5 w-3.5 text-text-faint" strokeWidth={1.75} />
+                )}
+              </span>
+              <div className="min-w-0 flex-1">
+                <div
+                  className={
+                    item.status === "completed"
+                      ? "text-[12px] leading-snug text-text-muted line-through"
+                      : item.status === "in_progress"
+                        ? "text-[12px] font-medium leading-snug text-text-strong"
+                        : "text-[12px] leading-snug text-text-muted"
+                  }
+                >
+                  {item.content}
+                </div>
+                {item.status === "in_progress" && liveness === "stalled" && silentSeconds > 0 ? (
+                  <div className="mt-0.5 text-[11px] text-amber-300/80">{t("taskBar.noResponse", { seconds: silentSeconds })}</div>
+                ) : null}
+                {executionState === "interrupted" && item.status === "pending" ? (
+                  <div className="mt-0.5 text-[11px] text-text-muted">{t("taskBar.taskInterrupted")}</div>
+                ) : null}
+                {item.status === "in_progress" && item.activeForm && item.activeForm !== item.content ? (
+                  <div className="mt-0.5 text-[11px] text-[rgba(var(--theme-color-rgb,59,130,246),0.8)]">{item.activeForm}</div>
+                ) : null}
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}

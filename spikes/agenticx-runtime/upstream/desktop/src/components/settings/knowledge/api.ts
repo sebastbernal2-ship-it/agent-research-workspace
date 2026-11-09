@@ -1,0 +1,267 @@
+// Plan-Id: machi-kb-stage1-local-mvp
+// Thin fetch helpers that reuse the studio API base + desktop token.
+
+import type {
+  EmbeddingSpec,
+  IngestJob,
+  KBConfig,
+  KBDocument,
+  KBStats,
+  PreviewChunk,
+  RetrievalHit,
+} from "./types";
+import { studioFetch } from "../../../utils/studio-fetch";
+
+export type EmbeddingTestResult = {
+  ok: boolean;
+  stage: "build" | "embed" | "dim_mismatch" | "done";
+  provider?: string;
+  model?: string;
+  expected_dim?: number;
+  actual_dim?: number;
+  latency_ms?: number;
+  error?: string | null;
+};
+
+export type ParserStatus = {
+  ok: boolean;
+  liteparse: {
+    available: boolean;
+    version: string | null;
+    path: string | null;
+  };
+  libreoffice?: {
+    available: boolean;
+    path: string | null;
+    required_for: string[];
+    install_hint: string;
+  };
+  native_ready: boolean;
+  install_hint: string;
+};
+
+export type KBApi = {
+  readConfig: () => Promise<{ config: KBConfig; stats: KBStats }>;
+  writeConfig: (
+    config: KBConfig,
+  ) => Promise<{ config: KBConfig; rebuild_required: boolean }>;
+  listDocuments: () => Promise<KBDocument[]>;
+  addDocumentByPath: (path: string) => Promise<{ document: KBDocument; job_id: string }>;
+  addDocumentByFile: (file: File) => Promise<{ document: KBDocument; job_id: string }>;
+  deleteDocument: (id: string) => Promise<void>;
+  rebuildDocument: (id: string) => Promise<{ job_id: string }>;
+  getJob: (id: string) => Promise<IngestJob>;
+  cancelJob: (id: string) => Promise<IngestJob>;
+  listJobs: () => Promise<IngestJob[]>;
+  search: (query: string, topK?: number) => Promise<{ hits: RetrievalHit[]; used_top_k: number }>;
+  previewChunks: (
+    path: string,
+    chunking: { strategy: string; chunk_size: number; chunk_overlap: number },
+  ) => Promise<PreviewChunk[]>;
+  getStats: () => Promise<KBStats>;
+  testEmbedding: (embedding: EmbeddingSpec) => Promise<EmbeddingTestResult>;
+  getParserStatus: () => Promise<ParserStatus>;
+  listWikiPages: () => Promise<{ path: string; title: string; type: string }[]>;
+  getWikiGraph: () => Promise<{
+    nodes: { id: string; title: string; type: string; path: string; sources: string[] }[];
+    edges: { source: string; target: string }[];
+  }>;
+  getWikiPage: (path: string) => Promise<string>;
+  getPurpose: () => Promise<string>;
+  savePurpose: (content: string) => Promise<void>;
+  draftPurpose: (content: string) => Promise<string>;
+  createSampleWiki: () => Promise<string[]>;
+  clearSampleWiki: () => Promise<string[]>;
+  listWikiCompiles: () => Promise<WikiCompileStatus[]>;
+  backfillWiki: () => Promise<string[]>;
+  cancelWikiCompile: (documentId?: string) => Promise<string[]>;
+};
+
+export type WikiCompileStatus = {
+  document_id: string;
+  source_name: string;
+  status: string;
+  message: string;
+  stage?: string;
+  progress?: number;
+  model?: string;
+};
+
+type ResolveBase = () => Promise<string>;
+
+export type KbApiPathMode = "legacy" | "brain";
+
+export function createKbApi(
+  apiToken: string,
+  resolveApiBase: ResolveBase,
+  pathMode: KbApiPathMode = "legacy",
+): KBApi {
+  const p = (suffix: string) => (pathMode === "brain" ? suffix : `/api/kb${suffix}`);
+
+  async function doJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const headers: Record<string, string> = {
+      ...(init.headers as Record<string, string> | undefined ?? {}),
+    };
+    if (apiToken) headers["x-agx-desktop-token"] = apiToken;
+    if (init.body && !(init.body instanceof FormData) && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    const res = await studioFetch(path, { ...init, headers, storeBase: await resolveApiBase() });
+    if (!res.ok) {
+      let detail: string;
+      try {
+        const body = await res.json();
+        detail = String(body?.detail ?? body?.error ?? res.statusText);
+      } catch {
+        detail = res.statusText;
+      }
+      throw new Error(`${res.status} ${detail}`);
+    }
+    return (await res.json()) as T;
+  }
+
+  return {
+    async readConfig() {
+      const body = await doJson<{ config: KBConfig; stats: KBStats }>(p("/config"));
+      return body;
+    },
+    async writeConfig(config: KBConfig) {
+      const body = await doJson<{ config: KBConfig; rebuild_required: boolean }>(p("/config"), {
+        method: "PUT",
+        body: JSON.stringify(config),
+      });
+      return body;
+    },
+    async listDocuments() {
+      const body = await doJson<{ documents: KBDocument[] }>(p("/materials"));
+      return body.documents;
+    },
+    async addDocumentByPath(path: string) {
+      const form = new FormData();
+      form.append("path", path);
+      return doJson<{ document: KBDocument; job_id: string }>(p("/materials"), {
+        method: "POST",
+        body: form,
+      });
+    },
+    async addDocumentByFile(file: File) {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      return doJson<{ document: KBDocument; job_id: string }>(p("/materials"), {
+        method: "POST",
+        body: form,
+      });
+    },
+    async deleteDocument(id: string) {
+      await doJson(p(`/materials/${encodeURIComponent(id)}`), { method: "DELETE" });
+    },
+    async rebuildDocument(id: string) {
+      return doJson<{ job_id: string }>(p(`/materials/${encodeURIComponent(id)}/rebuild`), {
+        method: "POST",
+      });
+    },
+    async getJob(id: string) {
+      const body = await doJson<{ job: IngestJob }>(p(`/jobs/${encodeURIComponent(id)}`));
+      return body.job;
+    },
+    async cancelJob(id: string) {
+      const body = await doJson<{ job: IngestJob }>(p(`/jobs/${encodeURIComponent(id)}/cancel`), {
+        method: "POST",
+      });
+      return body.job;
+    },
+    async listJobs() {
+      const body = await doJson<{ jobs: IngestJob[] }>(p("/jobs"));
+      return body.jobs ?? [];
+    },
+    async search(query: string, topK?: number, retrievalMode?: string) {
+      const body = await doJson<{ hits: RetrievalHit[]; used_top_k: number }>(p("/search"), {
+        method: "POST",
+        body: JSON.stringify({
+          query,
+          top_k: topK,
+          retrieval_mode: retrievalMode,
+        }),
+      });
+      return body;
+    },
+    async previewChunks(path, chunking) {
+      const body = await doJson<{ chunks: PreviewChunk[] }>(p("/debug/preview"), {
+        method: "POST",
+        body: JSON.stringify({ path, chunking }),
+      });
+      return body.chunks;
+    },
+    async getStats() {
+      const body = await doJson<{ stats: KBStats }>(p("/stats"));
+      return body.stats;
+    },
+    async testEmbedding(embedding: EmbeddingSpec) {
+      return doJson<EmbeddingTestResult>(p("/test_embedding"), {
+        method: "POST",
+        body: JSON.stringify({ embedding }),
+      });
+    },
+    async getParserStatus() {
+      return doJson<ParserStatus>(p("/parser_status"));
+    },
+    async listWikiPages() {
+      const body = await doJson<{ pages: { path: string; title: string; type: string }[] }>(
+        p("/wiki/pages"),
+      );
+      return body.pages ?? [];
+    },
+    async getWikiGraph() {
+      const body = await doJson<{
+        nodes?: { id: string; title: string; type: string; path: string; sources: string[] }[];
+        edges?: { source: string; target: string }[];
+      }>(p("/wiki/graph"));
+      return { nodes: body.nodes ?? [], edges: body.edges ?? [] };
+    },
+    async getWikiPage(path: string) {
+      const qs = new URLSearchParams({ path });
+      const body = await doJson<{ content: string }>(`${p("/wiki/page")}?${qs.toString()}`);
+      return body.content;
+    },
+    async getPurpose() {
+      const body = await doJson<{ content: string }>(p("/wiki/purpose"));
+      return body.content ?? "";
+    },
+    async savePurpose(content: string) {
+      await doJson(p("/wiki/purpose"), {
+        method: "PUT",
+        body: JSON.stringify({ content }),
+      });
+    },
+    async draftPurpose(content: string) {
+      const body = await doJson<{ content?: string }>(p("/wiki/purpose/draft"), {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      });
+      return body.content ?? "";
+    },
+    async createSampleWiki() {
+      const body = await doJson<{ written?: string[] }>(p("/wiki/sample"), { method: "POST" });
+      return body.written ?? [];
+    },
+    async clearSampleWiki() {
+      const body = await doJson<{ removed?: string[] }>(p("/wiki/sample"), { method: "DELETE" });
+      return body.removed ?? [];
+    },
+    async listWikiCompiles() {
+      const body = await doJson<{ compiles?: WikiCompileStatus[] }>(p("/wiki/compiles"));
+      return body.compiles ?? [];
+    },
+    async backfillWiki() {
+      const body = await doJson<{ queued?: string[] }>(p("/wiki/backfill"), { method: "POST" });
+      return body.queued ?? [];
+    },
+    async cancelWikiCompile(documentId?: string) {
+      const body = await doJson<{ cancelled?: string[] }>(p("/wiki/compiles/cancel"), {
+        method: "POST",
+        body: JSON.stringify(documentId ? { document_id: documentId } : {}),
+      });
+      return body.cancelled ?? [];
+    },
+  };
+}

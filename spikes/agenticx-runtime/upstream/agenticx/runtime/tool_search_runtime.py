@@ -1,0 +1,202 @@
+"""Runtime helpers for ToolSearch: config load and context assembly."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence
+
+from agenticx.runtime.model_context_window import (
+    declared_window_for_session,
+    resolve_effective_context_window,
+)
+from agenticx.runtime.tool_search import (
+    CORE_ALWAYS_LOAD_TOOLS,
+    DEFAULT_AUTO_SCHEMA_TOKEN_THRESHOLD,
+    DEFAULT_CONTEXT_BUDGET_RATIO,
+    TOOL_SEARCH_DECISION_KEY,
+    TOOL_SEARCH_TOOL_NAME,
+    ToolCatalog,
+    ToolDescriptor,
+    ToolSearchConfig,
+    ToolSearchRuntimeContext,
+    ToolSearchStateV1,
+    build_catalog,
+    estimate_schema_tokens,
+    load_state_from_scratchpad,
+    prune_state_to_catalog,
+    resolve_apply_threshold,
+    resolve_effective_threshold,
+    should_apply_tool_search,
+)
+
+
+def read_tool_search_config() -> ToolSearchConfig:
+    """Read ``runtime.tool_search`` from merged config; default mode=auto."""
+    mode = "auto"
+    threshold = DEFAULT_AUTO_SCHEMA_TOKEN_THRESHOLD
+    strategy = "adaptive"
+    ratio = DEFAULT_CONTEXT_BUDGET_RATIO
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+
+        raw = ConfigManager.get_value("runtime.tool_search")
+        if isinstance(raw, dict):
+            mode = str(raw.get("mode") or "auto").strip().lower() or "auto"
+            try:
+                threshold = int(
+                    raw.get("auto_schema_token_threshold")
+                    or DEFAULT_AUTO_SCHEMA_TOKEN_THRESHOLD
+                )
+            except (TypeError, ValueError):
+                threshold = DEFAULT_AUTO_SCHEMA_TOKEN_THRESHOLD
+            strategy = str(raw.get("threshold_strategy") or "adaptive").strip().lower()
+            try:
+                ratio = float(raw.get("context_budget_ratio") or DEFAULT_CONTEXT_BUDGET_RATIO)
+            except (TypeError, ValueError):
+                ratio = DEFAULT_CONTEXT_BUDGET_RATIO
+        # Flat legacy keys (read-only compat)
+        flat_mode = ConfigManager.get_value("runtime.tool_search_mode")
+        if isinstance(flat_mode, str) and flat_mode.strip() and not isinstance(raw, dict):
+            mode = flat_mode.strip().lower()
+    except Exception:
+        pass
+    return ToolSearchConfig(
+        mode=mode,
+        auto_schema_token_threshold=threshold,
+        threshold_strategy=strategy,
+        context_budget_ratio=ratio,
+    ).normalized()
+
+
+def _openai_tool_name(tool: dict) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    if not isinstance(fn, dict):
+        return ""
+    return str(fn.get("name") or "").strip()
+
+
+def build_builtin_catalog(openai_tools: list[dict]) -> ToolCatalog:
+    """Wrap policy-filtered OpenAI tools into builtin ToolDescriptors."""
+    descriptors: List[ToolDescriptor] = []
+    seen: set[str] = set()
+    for tool in openai_tools:
+        name = _openai_tool_name(tool)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        fn = tool.get("function") if isinstance(tool, dict) else {}
+        if not isinstance(fn, dict):
+            fn = {}
+        desc = str(fn.get("description") or "")
+        params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+        always = name in CORE_ALWAYS_LOAD_TOOLS
+        descriptors.append(
+            ToolDescriptor(
+                stable_id=f"builtin:{name}",
+                name=name,
+                kind="builtin",
+                description=desc,
+                input_schema=dict(params),
+                always_load=always,
+            )
+        )
+    return build_catalog(descriptors)
+
+
+def build_runtime_context(
+    *,
+    session: Any,
+    full_openai_tools: list[dict],
+    mcp_descriptors: Sequence[ToolDescriptor] = (),
+    config: Optional[ToolSearchConfig] = None,
+) -> ToolSearchRuntimeContext:
+    """Merge builtin + mcp descriptors; load/prune scratchpad state."""
+    cfg = config or read_tool_search_config()
+    builtin_cat = build_builtin_catalog(list(full_openai_tools))
+    merged: List[ToolDescriptor] = list(builtin_cat.descriptors)
+    seen_ids = {d.stable_id for d in merged}
+    for d in mcp_descriptors:
+        if d.stable_id in seen_ids:
+            continue
+        seen_ids.add(d.stable_id)
+        merged.append(d)
+    catalog = build_catalog(merged)
+
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        scratchpad = {}
+        try:
+            setattr(session, "scratchpad", scratchpad)
+        except Exception:
+            pass
+    state = load_state_from_scratchpad(scratchpad)
+    state = prune_state_to_catalog(state, catalog)
+
+    pool_names = {_openai_tool_name(t) for t in full_openai_tools}
+    tool_search_allowed = TOOL_SEARCH_TOOL_NAME in pool_names
+
+    window = resolve_effective_context_window(
+        str(getattr(session, "model_name", "") or ""),
+        declared_window_for_session(session),
+    )
+    apply_threshold = resolve_apply_threshold(cfg)
+    effective_threshold = resolve_effective_threshold(cfg, context_window=window)
+    prev_raw = scratchpad.get(TOOL_SEARCH_DECISION_KEY)
+    prev_applied = (
+        bool(prev_raw.get("applied"))
+        if isinstance(prev_raw, dict) and "applied" in prev_raw
+        else None
+    )
+    pool_tokens = estimate_schema_tokens(list(full_openai_tools))
+    applied = should_apply_tool_search(
+        cfg,
+        full_pool_schema_tokens=pool_tokens,
+        tool_search_allowed=tool_search_allowed,
+        effective_threshold=apply_threshold,
+        prev_applied=prev_applied,
+    )
+    scratchpad[TOOL_SEARCH_DECISION_KEY] = {
+        "version": 1,
+        "applied": bool(applied),
+        "pool_tokens": int(pool_tokens),
+        "effective_threshold": int(effective_threshold),
+        "apply_threshold": int(apply_threshold),
+        "context_window": int(window),
+        "threshold_strategy": cfg.normalized().threshold_strategy,
+    }
+
+    return ToolSearchRuntimeContext(
+        config=cfg,
+        catalog=catalog,
+        state=state,
+        tool_search_allowed=tool_search_allowed,
+        effective_threshold=effective_threshold,
+        apply_threshold=apply_threshold,
+        prev_applied=prev_applied,
+        resolved_applied=applied,
+    )
+
+
+def empty_state() -> ToolSearchStateV1:
+    return ToolSearchStateV1()
+
+
+def collect_mcp_descriptors(
+    session: Any,
+    full_openai_tools: list[dict],
+) -> list[ToolDescriptor]:
+    """Build MCP ToolDescriptors from the session hub (parent-gated on mcp_call)."""
+    pool_names = {_openai_tool_name(t) for t in full_openai_tools}
+    if "mcp_call" not in pool_names:
+        return []
+    hub = getattr(session, "mcp_hub", None)
+    if hub is None:
+        return []
+    try:
+        from agenticx.runtime.mcp_tool_catalog import snapshots_to_descriptors
+
+        snapshots = hub.list_tool_snapshots()
+    except Exception:
+        return []
+    return snapshots_to_descriptors(snapshots, mcp_call_allowed=True)

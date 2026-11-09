@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Avatar registry with YAML-backed persistence.
+
+Each avatar is stored as ~/.agenticx/avatars/<id>/avatar.yaml
+with its own workspace directory for isolated identity and memory.
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+import shutil
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import yaml
+from agenticx.utils.agx_home import agx_home, lazy_home_path
+
+from agenticx.avatar.portrait import (
+    COLLECTION_STYLE_IDS,
+    PORTRAIT_STYLE,
+    PORTRAIT_STYLE_CUSTOM,
+    collection_fetch_enabled,
+    extract_cube_colorway_id,
+    fetch_collection_portrait_url,
+    generate_avatar_portrait_url,
+    is_near_cube_svg,
+    needs_portrait_refresh,
+)
+
+
+def _avatars_root() -> Path:
+    """``~/.agenticx/avatars``，按调用时的 HOME 解析。
+
+    原来是模块级常量，import 时就被 Path.home() 定死；测试的 HOME 重定向拦不住，
+    数据会写进开发者真实的 ~/.agenticx。见 agenticx/utils/agx_home.py。
+    """
+    return lazy_home_path(__name__, "AVATARS_ROOT", "avatars")
+
+
+def __getattr__(name: str):
+    # PEP 562：给外部读取用；模块内部一律调 _avatars_root()。
+    if name == "AVATARS_ROOT":
+        return agx_home().joinpath("avatars")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+AVATAR_CONFIG_FILE = "avatar.yaml"
+
+# Must stay aligned with desktop/src/utils/avatar-color.ts AVATAR_PALETTE.
+AVATAR_COLOR_KEYS = frozenset(
+    {"cyan", "violet", "rose", "amber", "emerald", "fuchsia", "sky", "orange"}
+)
+
+
+def normalize_avatar_color(value: Any) -> str:
+    """Return a valid palette key or empty string (Meta / theme default)."""
+    key = str(value or "").strip().lower()
+    return key if key in AVATAR_COLOR_KEYS else ""
+
+
+AVATAR_TAGS_MAX_COUNT = 8
+AVATAR_TAG_MAX_LEN = 24
+
+
+def normalize_avatar_tags(value: Any) -> List[str]:
+    """Sanitize gallery-card skill tags: trim, dedupe, cap count/length."""
+    if not isinstance(value, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in value:
+        tag = str(item or "").strip()[:AVATAR_TAG_MAX_LEN]
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        out.append(tag)
+        if len(out) >= AVATAR_TAGS_MAX_COUNT:
+            break
+    return out
+
+IDENTITY_TEMPLATE = """# IDENTITY.md - {name}
+
+- Name: {name}
+- Role: {role}
+- Vibe: Pragmatic, structured, concise, execution-first
+- Language: Chinese by default
+"""
+
+MEMORY_TEMPLATE = """# MEMORY.md - Long-Term Anchors
+
+## 用户偏好（本主体理解）
+- （本分身所理解的用户偏好，可由 agent 动态更新或用户手动编辑）
+
+## Agent Notes
+- Avatar created: {created_at}
+- Keep this file short and curated.
+"""
+
+
+@dataclass
+class AvatarConfig:
+    """Persistent avatar definition."""
+
+    id: str
+    name: str
+    role: str = ""
+    avatar_url: str = ""
+    # near-cube-v3 = soft official-mark cube; custom = user upload; older styles migrate.
+    portrait_style: str = ""
+    system_prompt: str = ""
+    # Short blurb shown on the gallery card, distinct from system_prompt (behavior rules).
+    description: str = ""
+    # Skill tags shown as chips on the gallery card, e.g. ["PyTorch优化", "GPU性能调优"].
+    tags: List[str] = field(default_factory=list)
+    workspace_dir: str = ""
+    created_by: str = "manual"
+    default_provider: str = ""
+    default_model: str = ""
+    pinned: bool = False
+    # Empty = same as Meta (no pane tint / theme accent). Else an AVATAR_PALETTE key.
+    color: str = ""
+    tools_enabled: Dict[str, bool] = field(default_factory=dict)
+    skills_enabled: Optional[Dict[str, bool]] = None
+    # None = mount global brains only; "*" = all visible brains; list = explicit ids
+    brains_enabled: Optional[Any] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {k: v for k, v in asdict(self).items() if v or k in {"id", "name", "pinned"}}
+        if self.brains_enabled is not None:
+            d["brains_enabled"] = self.brains_enabled
+        if self.skills_enabled is not None:
+            d["skills_enabled"] = self.skills_enabled
+        # Always persist color so clearing back to Meta ("") removes a prior key.
+        d["color"] = normalize_avatar_color(self.color)
+        if self.tags:
+            d["tags"] = normalize_avatar_tags(self.tags)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> AvatarConfig:
+        known = set(cls.__dataclass_fields__.keys())
+        filtered = {k: v for k, v in data.items() if k in known}
+        if "color" in filtered:
+            filtered["color"] = normalize_avatar_color(filtered.get("color"))
+        if "tags" in filtered:
+            filtered["tags"] = normalize_avatar_tags(filtered.get("tags"))
+        return cls(**filtered)
+
+
+class AvatarRegistry:
+    """CRUD operations for avatars with YAML persistence."""
+
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = Path(root) if root else _avatars_root()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _avatar_dir(self, avatar_id: str) -> Path:
+        return self.root / avatar_id
+
+    def _config_path(self, avatar_id: str) -> Path:
+        return self._avatar_dir(avatar_id) / AVATAR_CONFIG_FILE
+
+    def _read_config(self, avatar_id: str) -> Optional[AvatarConfig]:
+        path = self._config_path(avatar_id)
+        if not path.exists():
+            return None
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if not isinstance(raw, dict):
+                return None
+            raw.setdefault("id", avatar_id)
+            return AvatarConfig.from_dict(raw)
+        except Exception:
+            return None
+
+    def _write_config(self, config: AvatarConfig) -> None:
+        avatar_dir = self._avatar_dir(config.id)
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        path = self._config_path(config.id)
+        path.write_text(
+            yaml.dump(config.to_dict(), sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
+    def list_avatars(self) -> List[AvatarConfig]:
+        """Return all avatars sorted by pinned-first then created_at desc."""
+        avatars: List[AvatarConfig] = []
+        if not self.root.exists():
+            return avatars
+        for child in sorted(self.root.iterdir()):
+            if not child.is_dir():
+                continue
+            cfg = self._read_config(child.name)
+            if cfg is not None:
+                avatars.append(cfg)
+        missing = [
+            item
+            for item in avatars
+            if needs_portrait_refresh(item.avatar_url, portrait_style=item.portrait_style)
+        ]
+        if missing and collection_fetch_enabled():
+            workers = min(6, len(missing))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(self._ensure_portrait, missing))
+        self._dedupe_cube_colorways(avatars)
+        avatars.sort(key=lambda a: (not a.pinned, a.created_at or ""), reverse=False)
+        return avatars
+
+    def _occupied_colorways(self, *, exclude_id: str = "") -> list[str]:
+        taken: list[str] = []
+        skip = str(exclude_id or "").strip()
+        if not self.root.exists():
+            return taken
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            cfg = self._read_config(child.name)
+            if cfg is None or cfg.id == skip:
+                continue
+            if str(cfg.portrait_style or "").strip() == PORTRAIT_STYLE_CUSTOM:
+                continue
+            colorway = extract_cube_colorway_id(cfg.avatar_url)
+            if colorway:
+                taken.append(colorway)
+        return taken
+
+    def _dedupe_cube_colorways(self, avatars: List[AvatarConfig]) -> None:
+        """Keep the earliest cube; recolor later exact duplicates. Custom uploads stay."""
+        used: set[str] = set()
+        ordered = sorted(avatars, key=lambda item: (item.created_at or "", item.id))
+        for cfg in ordered:
+            if str(cfg.portrait_style or "").strip() == PORTRAIT_STYLE_CUSTOM:
+                continue
+            if not is_near_cube_svg(cfg.avatar_url):
+                continue
+            colorway = extract_cube_colorway_id(cfg.avatar_url)
+            if colorway and colorway not in used:
+                used.add(colorway)
+                continue
+            cfg.avatar_url = generate_avatar_portrait_url(
+                name=cfg.name,
+                role=cfg.role,
+                description=str(cfg.description or "").strip(),
+                tags=list(cfg.tags or []),
+                avatar_id=cfg.id,
+                color=cfg.color,
+                taken_colorways=sorted(used),
+            )
+            cfg.portrait_style = PORTRAIT_STYLE
+            self._write_config(cfg)
+            next_id = extract_cube_colorway_id(cfg.avatar_url)
+            if next_id:
+                used.add(next_id)
+
+    def _ensure_portrait(self, config: AvatarConfig) -> AvatarConfig:
+        """Fill or migrate an illustrated portrait when the collection is reachable."""
+        if not needs_portrait_refresh(
+            config.avatar_url, portrait_style=config.portrait_style
+        ):
+            return config
+        if not collection_fetch_enabled():
+            return config
+        fetched = fetch_collection_portrait_url(
+            name=config.name,
+            role=config.role,
+            description=config.description,
+            tags=list(config.tags or []),
+            avatar_id=config.id,
+            color=config.color,
+        )
+        if not fetched:
+            return config
+        config.avatar_url = fetched
+        config.portrait_style = PORTRAIT_STYLE
+        self._write_config(config)
+        return config
+
+    def get_avatar(self, avatar_id: str) -> Optional[AvatarConfig]:
+        return self._read_config(avatar_id)
+
+    def create_avatar(
+        self,
+        name: str,
+        role: str = "",
+        *,
+        avatar_url: str = "",
+        system_prompt: str = "",
+        description: str = "",
+        tags: Optional[List[str]] = None,
+        created_by: str = "manual",
+        default_provider: str = "",
+        default_model: str = "",
+        tools_enabled: Optional[Dict[str, bool]] = None,
+        skills_enabled: Optional[Dict[str, bool]] = None,
+        brains_enabled: Optional[Any] = None,
+        workspace_dir: str = "",
+        color: str = "",
+        portrait_style: str = "",
+    ) -> AvatarConfig:
+        """Create a new avatar with isolated workspace.
+
+        When ``workspace_dir`` is a non-empty string it is used as the avatar's
+        working directory (user-chosen, optional). Otherwise it defaults to the
+        per-avatar ``~/.agenticx/avatars/<id>/workspace``.
+        """
+        avatar_id = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        custom_ws = str(workspace_dir or "").strip()
+        if custom_ws:
+            workspace_dir = str(Path(custom_ws).expanduser().resolve())
+        else:
+            workspace_dir = str(self._avatar_dir(avatar_id) / "workspace")
+        se: Optional[Dict[str, bool]] = None
+        if skills_enabled is not None and len(skills_enabled) > 0:
+            se = {str(k): bool(v) for k, v in skills_enabled.items() if str(k).strip()}
+        requested = str(portrait_style or "").strip()
+        resolved_avatar_url = str(avatar_url or "").strip()
+        if resolved_avatar_url:
+            if requested in COLLECTION_STYLE_IDS and requested != PORTRAIT_STYLE:
+                resolved_style = requested
+            elif requested == PORTRAIT_STYLE_CUSTOM:
+                resolved_style = PORTRAIT_STYLE_CUSTOM
+            else:
+                resolved_style = PORTRAIT_STYLE_CUSTOM
+        else:
+            resolved_avatar_url = generate_avatar_portrait_url(
+                name=name,
+                role=role,
+                description=str(description or "").strip(),
+                tags=normalize_avatar_tags(tags),
+                avatar_id=avatar_id,
+                color=normalize_avatar_color(color),
+                taken_colorways=self._occupied_colorways(),
+            )
+            resolved_style = PORTRAIT_STYLE
+        config = AvatarConfig(
+            id=avatar_id,
+            name=name,
+            role=role,
+            avatar_url=resolved_avatar_url,
+            portrait_style=resolved_style,
+            system_prompt=system_prompt,
+            description=str(description or "").strip(),
+            tags=normalize_avatar_tags(tags),
+            workspace_dir=workspace_dir,
+            created_by=created_by,
+            default_provider=default_provider,
+            default_model=default_model,
+            tools_enabled=dict(tools_enabled or {}),
+            skills_enabled=se,
+            brains_enabled=brains_enabled,
+            color=normalize_avatar_color(color),
+            created_at=now,
+            updated_at=now,
+        )
+        self._write_config(config)
+        self._ensure_avatar_workspace(config)
+        return config
+
+    def update_avatar(self, avatar_id: str, patch: Dict[str, Any]) -> Optional[AvatarConfig]:
+        """Update avatar fields. Returns updated config or None if not found."""
+        config = self._read_config(avatar_id)
+        if config is None:
+            return None
+        original_url = str(config.avatar_url or "").strip()
+        original_color = config.color
+        immutable = {"id", "created_at", "workspace_dir"}
+        for key, value in patch.items():
+            if key in immutable:
+                continue
+            if key == "skills_enabled":
+                if value is None or (isinstance(value, dict) and len(value) == 0):
+                    config.skills_enabled = None
+                elif isinstance(value, dict):
+                    config.skills_enabled = {
+                        str(k): bool(v) for k, v in value.items() if str(k).strip()
+                    }
+                continue
+            if key == "brains_enabled":
+                if value is None or value == "":
+                    config.brains_enabled = None
+                elif value == "*":
+                    config.brains_enabled = "*"
+                elif isinstance(value, list):
+                    config.brains_enabled = [str(x).strip() for x in value if str(x).strip()]
+                else:
+                    config.brains_enabled = value
+                continue
+            if key == "color":
+                config.color = normalize_avatar_color(value)
+                continue
+            if key == "tags":
+                config.tags = normalize_avatar_tags(value)
+                continue
+            if key == "portrait_style":
+                continue
+            if hasattr(config, key):
+                setattr(config, key, value)
+        if "avatar_url" in patch:
+            new_url = str(config.avatar_url or "").strip()
+            requested = str(patch.get("portrait_style") or "").strip()
+            if not new_url:
+                config.avatar_url = generate_avatar_portrait_url(
+                    name=config.name,
+                    role=config.role,
+                    description=str(config.description or "").strip(),
+                    tags=list(config.tags or []),
+                    avatar_id=config.id,
+                    color=config.color,
+                    taken_colorways=self._occupied_colorways(exclude_id=config.id),
+                )
+                config.portrait_style = PORTRAIT_STYLE
+            elif requested in COLLECTION_STYLE_IDS and requested != PORTRAIT_STYLE:
+                config.portrait_style = requested
+            elif requested == PORTRAIT_STYLE:
+                config.portrait_style = PORTRAIT_STYLE
+            elif new_url != original_url:
+                config.portrait_style = PORTRAIT_STYLE_CUSTOM
+        elif "portrait_style" in patch:
+            requested = str(patch.get("portrait_style") or "").strip()
+            if requested in COLLECTION_STYLE_IDS or requested == PORTRAIT_STYLE_CUSTOM:
+                config.portrait_style = requested
+        elif (
+            "color" in patch
+            and config.color != original_color
+            and str(config.portrait_style or "").strip()
+            not in {PORTRAIT_STYLE_CUSTOM, *(COLLECTION_STYLE_IDS - {PORTRAIT_STYLE})}
+        ):
+            config.avatar_url = generate_avatar_portrait_url(
+                name=config.name,
+                role=config.role,
+                description=str(config.description or "").strip(),
+                tags=list(config.tags or []),
+                avatar_id=config.id,
+                color=config.color,
+                taken_colorways=self._occupied_colorways(exclude_id=config.id),
+            )
+            config.portrait_style = PORTRAIT_STYLE
+        config.updated_at = datetime.now(timezone.utc).isoformat()
+        self._write_config(config)
+        return config
+
+    def delete_avatar(self, avatar_id: str) -> bool:
+        """Delete avatar and its workspace."""
+        avatar_dir = self._avatar_dir(avatar_id)
+        if not avatar_dir.exists():
+            return False
+        try:
+            from agenticx.brain.registry import BrainRegistry
+
+            BrainRegistry.instance().delete_private_brains_for_avatar(avatar_id)
+            shutil.rmtree(avatar_dir)
+        except OSError:
+            return False
+        return True
+
+    def _ensure_avatar_workspace(self, config: AvatarConfig) -> Path:
+        """Create workspace directory with default identity files."""
+        ws = Path(config.workspace_dir)
+        ws.mkdir(parents=True, exist_ok=True)
+        memory_dir = ws / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+
+        identity_path = ws / "IDENTITY.md"
+        if not identity_path.exists():
+            identity_path.write_text(
+                IDENTITY_TEMPLATE.format(name=config.name, role=config.role or "General Assistant"),
+                encoding="utf-8",
+            )
+
+        memory_path = ws / "MEMORY.md"
+        if not memory_path.exists():
+            memory_path.write_text(
+                MEMORY_TEMPLATE.format(created_at=config.created_at or "unknown"),
+                encoding="utf-8",
+            )
+        return ws

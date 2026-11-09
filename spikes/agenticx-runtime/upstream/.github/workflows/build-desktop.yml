@@ -1,0 +1,392 @@
+# Build Near Desktop: macOS DMG + Windows NSIS (bundled agx-server + wechat sidecar).
+# Optional secrets: CSC_LINK, CSC_KEY_PASSWORD, APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID
+# APPLE_APP_SPECIFIC_PASSWORD is mirrored from APPLE_ID_PASSWORD at runtime (electron-builder 25 convention).
+
+name: Near Desktop Build
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Near Desktop Build manual {0}', github.event.inputs.arch)
+      || format('Near Desktop Build {0}', github.ref_name) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "macOS arch (arm64/x64) or windows-amd64 for NSIS + embedded backend"
+        required: true
+        default: arm64
+        type: choice
+        options:
+          - arm64
+          - x64
+          - windows-amd64
+  push:
+    tags:
+      # Desktop 专属前缀：只 bump desktop 时用 `desktop-v0.2.5` 独立触发，不必绑 agenticx 版本。
+      - "desktop-v*"
+      # 兼容旧的单线联合 tag（agenticx 发版顺带构建 desktop）。
+      - "v*"
+
+jobs:
+  build-tag:
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          # macos-13 已退役；Intel/x64 使用 macos-15-intel（至约 2027-08）
+          - os: macos-15-intel
+            arch: x64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Python 3.12 removed stdlib distutils; node-gyp (node-pty rebuild) still imports it.
+      - name: Install setuptools for node-gyp
+        run: python3 -m pip install --upgrade pip setuptools
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.22"
+          cache-dependency-path: packaging/wechat-sidecar/go.sum
+
+      - name: Build agx-server (single arch)
+        run: packaging/build_backend.sh ${{ matrix.arch }}
+
+      - name: Build wechat-sidecar
+        working-directory: packaging/wechat-sidecar
+        run: |
+          GOARCH=${{ matrix.arch == 'x64' && 'amd64' || 'arm64' }} GOOS=darwin \
+            go build -ldflags "-s -w" -o agx-wechat-sidecar .
+
+      - name: Stage bundled backend (arm64 / x64)
+        run: |
+          mkdir -p "desktop/bundled-backend/${{ matrix.arch }}"
+          # onedir: 复制整个目录内容（agx-server 可执行 + _internal/）
+          cp -R "packaging/dist/${{ matrix.arch }}/agx-server/." "desktop/bundled-backend/${{ matrix.arch }}/"
+          chmod +x "desktop/bundled-backend/${{ matrix.arch }}/agx-server"
+          cp "packaging/wechat-sidecar/agx-wechat-sidecar" "desktop/bundled-backend/${{ matrix.arch }}/agx-wechat-sidecar"
+          chmod +x "desktop/bundled-backend/${{ matrix.arch }}/agx-wechat-sidecar"
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build renderer + main
+        working-directory: desktop
+        run: npm run build
+
+      - name: Clean old DMG artifacts
+        working-directory: desktop
+        run: rm -f release/*.dmg
+
+      - name: Package (electron-builder, arm64 / x64)
+        working-directory: desktop
+        env:
+          DEBUG: electron-builder
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/mac/ci-package-mac.sh "${{ matrix.arch }}"
+
+      - name: Verify bundled backend in app
+        working-directory: desktop
+        run: |
+          APP_DIR="release/mac-${{ matrix.arch }}/Near.app/Contents/Resources/backend"
+          test -x "${APP_DIR}/agx-server"
+          test -x "${APP_DIR}/agx-wechat-sidecar"
+          test -d "${APP_DIR}/_internal"
+          echo "Verified backend binaries in ${APP_DIR}:"
+          ls -l "${APP_DIR}"
+
+      - name: Read desktop version
+        id: desktop_version
+        shell: bash
+        run: |
+          version="$(python -c "import json; print(json.load(open('desktop/package.json'))['version'])")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: near-${{ steps.desktop_version.outputs.version }}-${{ matrix.arch }}
+          path: desktop/release/*-${{ matrix.arch }}.dmg
+
+  build-tag-windows:
+    if: github.event_name == 'push'
+    # Pin to windows-2022: node-gyp + node-pty needs stable VS2022 C++ workload.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install setuptools for node-gyp
+        run: python -m pip install --upgrade pip setuptools
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.22"
+          cache-dependency-path: packaging/wechat-sidecar/go.sum
+
+      # node-pty is a native module; node-gyp needs cl.exe from VS Build Tools.
+      - name: Setup MSVC (node-pty / node-gyp)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Windows installer (bundled)
+        shell: pwsh
+        env:
+          GYP_MSVS_VERSION: "2022"
+        run: ./packaging/build_windows_installer.ps1
+
+      - name: Verify bundled backend in win-unpacked
+        shell: pwsh
+        run: |
+          $be = "desktop/release/win-unpacked/resources/backend/agx-server.exe"
+          $wx = "desktop/release/win-unpacked/resources/backend/agx-wechat-sidecar.exe"
+          $it = "desktop/release/win-unpacked/resources/backend/_internal"
+          if (-not (Test-Path $be)) { throw "missing $be" }
+          if (-not (Test-Path $wx)) { throw "missing $wx" }
+          if (-not (Test-Path $it)) { throw "missing $it" }
+          Get-ChildItem "desktop/release/win-unpacked/resources/backend"
+
+      - name: Read desktop version
+        id: desktop_version
+        shell: bash
+        run: |
+          version="$(python -c "import json; print(json.load(open('desktop/package.json'))['version'])")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: near-${{ steps.desktop_version.outputs.version }}-windows-x64
+          path: desktop/release/Near-*-win-x64.exe
+
+  build-dispatch:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.arch != 'windows-amd64'
+    runs-on: ${{ github.event.inputs.arch == 'x64' && 'macos-15-intel' || 'macos-14' }}
+    env:
+      ARCH: ${{ github.event.inputs.arch }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install setuptools for node-gyp
+        run: python3 -m pip install --upgrade pip setuptools
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.22"
+          cache-dependency-path: packaging/wechat-sidecar/go.sum
+
+      - name: Build agx-server
+        run: packaging/build_backend.sh "${{ env.ARCH }}"
+
+      - name: Build wechat-sidecar
+        working-directory: packaging/wechat-sidecar
+        run: |
+          GOARCH=${{ env.ARCH == 'x64' && 'amd64' || 'arm64' }} GOOS=darwin \
+            go build -ldflags "-s -w" -o agx-wechat-sidecar .
+
+      - name: Stage bundled backend
+        run: |
+          mkdir -p "desktop/bundled-backend/${{ env.ARCH }}"
+          # onedir: 复制整个目录内容（agx-server 可执行 + _internal/）
+          cp -R "packaging/dist/${{ env.ARCH }}/agx-server/." "desktop/bundled-backend/${{ env.ARCH }}/"
+          chmod +x "desktop/bundled-backend/${{ env.ARCH }}/agx-server"
+          cp "packaging/wechat-sidecar/agx-wechat-sidecar" "desktop/bundled-backend/${{ env.ARCH }}/agx-wechat-sidecar"
+          chmod +x "desktop/bundled-backend/${{ env.ARCH }}/agx-wechat-sidecar"
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build renderer + main
+        working-directory: desktop
+        run: npm run build
+
+      - name: Clean old DMG artifacts
+        working-directory: desktop
+        run: rm -f release/*.dmg
+
+      - name: Pre-flight check
+        working-directory: desktop
+        run: |
+          echo "=== bundled-backend ==="
+          ls -lR bundled-backend/ || echo "bundled-backend missing!"
+          echo "=== dist + dist-electron ==="
+          ls dist/ | head -10
+          ls dist-electron/ | head -10
+          echo "=== package.json author ==="
+          node -e "console.log(require('./package.json').author)"
+
+      - name: Package (electron-builder)
+        working-directory: desktop
+        env:
+          DEBUG: electron-builder
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/mac/ci-package-mac.sh "${{ env.ARCH }}"
+
+      - name: Verify bundled backend in app
+        working-directory: desktop
+        run: |
+          APP_DIR="release/mac-${{ env.ARCH }}/Near.app/Contents/Resources/backend"
+          test -x "${APP_DIR}/agx-server"
+          test -x "${APP_DIR}/agx-wechat-sidecar"
+          test -d "${APP_DIR}/_internal"
+          echo "Verified backend binaries in ${APP_DIR}:"
+          ls -l "${APP_DIR}"
+
+      - name: Read desktop version
+        id: desktop_version
+        shell: bash
+        run: |
+          version="$(python -c "import json; print(json.load(open('desktop/package.json'))['version'])")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: near-${{ steps.desktop_version.outputs.version }}-${{ env.ARCH }}
+          path: desktop/release/*-${{ env.ARCH }}.dmg
+
+  build-dispatch-windows:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.arch == 'windows-amd64'
+    # Pin to windows-2022: avoid toolchain drift on windows-latest images.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install setuptools for node-gyp
+        run: python -m pip install --upgrade pip setuptools
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.22"
+          cache-dependency-path: packaging/wechat-sidecar/go.sum
+
+      # node-pty is a native module; node-gyp needs cl.exe from VS Build Tools.
+      - name: Setup MSVC (node-pty / node-gyp)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Windows installer (bundled)
+        shell: pwsh
+        env:
+          GYP_MSVS_VERSION: "2022"
+        run: ./packaging/build_windows_installer.ps1
+
+      - name: Verify bundled backend in win-unpacked
+        shell: pwsh
+        run: |
+          $be = "desktop/release/win-unpacked/resources/backend/agx-server.exe"
+          $wx = "desktop/release/win-unpacked/resources/backend/agx-wechat-sidecar.exe"
+          $it = "desktop/release/win-unpacked/resources/backend/_internal"
+          if (-not (Test-Path $be)) { throw "missing $be" }
+          if (-not (Test-Path $wx)) { throw "missing $wx" }
+          if (-not (Test-Path $it)) { throw "missing $it" }
+          Get-ChildItem "desktop/release/win-unpacked/resources/backend"
+
+      - name: Read desktop version
+        id: desktop_version
+        shell: bash
+        run: |
+          version="$(python -c "import json; print(json.load(open('desktop/package.json'))['version'])")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: near-${{ steps.desktop_version.outputs.version }}-windows-x64
+          path: desktop/release/Near-*-win-x64.exe
+
+  # Attach whatever DMG/EXE succeeded to the pushed tag. Intel may fail
+  # independently; this job still publishes arm64 + Windows.
+  publish-github-release:
+    if: github.event_name == 'push' && always() && !cancelled()
+    needs: [build-tag, build-tag-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: release-assets
+          pattern: near-*
+          merge-multiple: true
+
+      - name: Attach installers to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s globstar nullglob
+          files=(release-assets/**/*.dmg release-assets/**/*.exe)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No DMG/EXE artifacts to attach"
+            exit 0
+          fi
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "$tag" \
+              --notes "Desktop installers for \`${tag}\`. Edit this release to add notes."
+          fi

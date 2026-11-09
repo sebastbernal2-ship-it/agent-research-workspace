@@ -1,0 +1,10503 @@
+#!/usr/bin/env python3
+"""Tool definitions and dispatchers for Studio agent loop.
+
+Author: Damon Li
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import difflib
+import fnmatch
+import hashlib
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import uuid
+from dataclasses import dataclass
+from urllib.parse import urlparse
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
+
+from agenticx.cli.config_manager import ConfigManager
+from agenticx.cli.codegen_engine import CodeGenEngine, infer_output_path, write_generated_file
+from agenticx.cli.studio_mcp import (
+    import_mcp_config,
+    load_available_servers,
+    mcp_call_tool_async,
+    mcp_connect,
+)
+from agenticx.cli.studio_skill import (
+    get_all_skill_summaries,
+    skill_is_allowed_for_session,
+    skill_use as studio_skill_use,
+)
+from agenticx.llms.provider_resolver import ProviderResolver
+from agenticx.runtime.plan_artifacts import (
+    create_plan_artifact,
+    update_plan_artifact,
+)
+from agenticx.runtime.plan_mode import turn_intent_denial_message
+from agenticx.runtime.tool_result_budget import recall_tool_observation
+from agenticx.memory.session_store import SessionStore
+from agenticx.memory.workspace_memory import WorkspaceMemoryStore
+from agenticx.skills.guard import scan_skill, should_allow
+from agenticx.tools.skill_bundle import SkillBundleLoader
+from agenticx.tools.adapters.video_frames import VideoFrameExtractor
+from agenticx.runtime.confirm import (
+    ConfirmGate,
+    SyncConfirmGate,
+    confirm_denial_note,
+    is_protected_confirm,
+    protected_confirm_reason,
+)
+from agenticx.runtime.clarify import (
+    AsyncClarifyGate,
+    AutoSuspendClarifyGate,
+    ClarifyGate,
+)
+from agenticx.workspace.loader import (
+    append_daily_memory,
+    append_long_term_memory,
+    ensure_workspace,
+)
+
+if TYPE_CHECKING:
+    from agenticx.cli.studio import StudioSession
+else:
+    StudioSession = Any
+
+_log = logging.getLogger(__name__)
+_CC_BRIDGE_AUTO_PROC: Optional[subprocess.Popen[str]] = None
+_CC_BRIDGE_IDLE_TASK: Optional[asyncio.Task[Any]] = None
+_CC_BRIDGE_LAST_ACTIVE_MONO: float = 0.0
+
+
+MAX_READ_CHARS = 20_000
+MAX_READ_CHARS_CODE_DEV = 8_000
+# Cap bash_exec command string size (defense in depth; matches audit remediation).
+MAX_BASH_EXEC_COMMAND_CHARS = 65536
+PATH_GUARDED_READ_COMMANDS = {"cat", "head", "tail", "grep", "find", "wc", "ls", "tree"}
+
+# Tools safe to run concurrently when appearing in the same assistant tool_calls batch.
+def tool_denied_by_session_permissions(tool_name: str) -> Optional[str]:
+    """Return a denial message if ``permissions.denied_tools`` matches the tool.
+
+    Policy deny must short-circuit before confirm gates (see ADR 0001).
+    Patterns use :func:`fnmatch.fnmatch` (e.g. ``bash_*``).
+    """
+    raw = ConfigManager.get_value("permissions.denied_tools")
+    if not isinstance(raw, list):
+        return None
+    name = str(tool_name or "").strip()
+    if not name:
+        return None
+    for entry in raw:
+        pat = str(entry or "").strip()
+        if not pat:
+            continue
+        if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(name.lower(), pat.lower()):
+            return f"工具「{name}」已被会话权限策略拒绝（匹配规则: {pat}）。"
+    return None
+
+
+def tool_allowed_without_confirm(
+    tool_name: str,
+    risk_codes: Iterable[str] = (),
+) -> bool:
+    """Whether ``permissions.allowed_tools`` says this tool needs no prompt.
+
+    This is skip-confirmation, not "only these tools exist". Deny still
+    wins earlier. Categories in ``NEVER_AUTO_APPROVED_CATEGORIES`` are
+    never waived.
+    """
+    from agenticx.runtime.command_safety import NEVER_AUTO_APPROVED_CATEGORIES
+
+    codes = {str(code).strip() for code in risk_codes}
+    if codes & NEVER_AUTO_APPROVED_CATEGORIES:
+        return False
+    try:
+        raw = ConfigManager.get_value("permissions.allowed_tools")
+    except Exception:
+        return False
+    if not isinstance(raw, list):
+        return False
+    name = str(tool_name or "").strip()
+    if not name:
+        return False
+    for entry in raw:
+        pattern = str(entry or "").strip()
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(name.lower(), pattern.lower()):
+            return True
+    return False
+
+
+def _configured_command_permissions(session: Optional[StudioSession] = None) -> str:
+    from agenticx.runtime.command_sandbox import normalize_command_permissions
+
+    raw = getattr(session, "command_permissions", None) if session is not None else None
+    if raw is None:
+        try:
+            raw = ConfigManager.get_value("permissions.command_permissions")
+        except Exception:
+            raw = None
+    return normalize_command_permissions(raw)
+
+
+def _dispatch_path_rule_denial(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession],
+) -> Optional[str]:
+    """Reject path-like arguments that hit a deny rule, before confirm."""
+    for key in ("path", "from_path"):
+        raw = arguments.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            resolved = _resolve_workspace_path(raw, session)
+        except ValueError as exc:
+            message = str(exc)
+            if "blocked by permissions.path_rules" in message:
+                return message
+            continue
+        deny = _path_denied_by_rules(resolved, session)
+        if deny:
+            return deny
+    return None
+
+
+_CONCURRENCY_SAFE_STUDIO_TOOLS = frozenset(
+    {
+        "file_read",
+        "tool_result_recall",
+        "skill_list",
+        "scratchpad_read",
+        "memory_search",
+        "memory_forget",
+        "session_search",
+        "plugin_usage",
+        "list_files",
+        "liteparse",
+        "video_understand",
+        "lsp_goto_definition",
+        "lsp_find_references",
+        "lsp_hover",
+        "lsp_diagnostics",
+        "code_outline",
+        "list_scheduled_tasks",
+        "get_automation_task_logs",
+        "cc_bridge_list",
+        "wb_bridge_list",
+        "wb_bridge_describe",
+        "bash_bg_poll",
+        "knowledge_search",  # Plan-Id: machi-kb-stage1-local-mvp — read-only vector search.
+        "knowledge_synthesize",
+        "web_search",
+        "get_current_datetime",
+        "web_fetch",
+        "view_image",
+        "show_images",
+        "show_widget",
+        "list_data_sources",
+    }
+)
+
+
+def _bash_exec_is_read_only(arguments: Dict[str, Any]) -> bool:
+    """True when every segment is already contained by the workspace sandbox."""
+    from agenticx.runtime.command_safety import assess_command
+
+    verdict = assess_command(str(arguments.get("command") or ""))
+    return verdict.is_contained
+
+
+def _bash_exec_safety_confirm(
+    command: str,
+) -> Optional[Tuple[str, str, List[str], List[str]]]:
+    """Return ``(risk, cancel_what, reasons, codes)`` when confirmation is required.
+
+    Contained commands with no absolute redirect skip the confirm gate.
+    Opaque / unrecognized names use ``non_whitelisted``; writes, publishes,
+    and absolute redirects use ``high``.
+    """
+    from agenticx.runtime.command_safety import (
+        absolute_redirect_targets,
+        assess_command,
+    )
+
+    verdict = assess_command(command)
+    abs_targets = absolute_redirect_targets(command)
+    if verdict.is_contained and not abs_targets:
+        return None
+
+    reasons = [item.evidence for item in verdict.findings]
+    codes = [item.code for item in verdict.findings]
+    if abs_targets:
+        reasons.append("absolute redirect: " + ", ".join(abs_targets))
+        codes.append("absolute_redirect")
+
+    high_codes = {
+        "destructive_filesystem",
+        "arbitrary_code_execution",
+        "version_control_change",
+        "dependency_change",
+        "absolute_redirect",
+        "external_publish",
+        "system_disruption",
+        "host_full_access",
+    }
+    if any(code in high_codes for code in codes):
+        return ("high", "高风险命令未执行", reasons, codes)
+    return ("non_whitelisted", "非白名单命令未执行", reasons, codes)
+
+
+def _bash_exec_confirm_question(
+    command_name: str, risk: str, reasons: List[str]
+) -> str:
+    """User-facing confirm copy for bash_exec gates (Chinese, matches Desktop UI)."""
+    joined_reasons = "；".join(reasons) if reasons else command_name
+    if risk == "non_whitelisted":
+        return (
+            f"命令 **{command_name}** 不在已知只读集合中，仍要执行吗？"
+            f"（{joined_reasons}）"
+        )
+    return f"检测到高风险命令（{joined_reasons}），仍要执行吗？"
+
+
+def studio_tool_is_concurrency_safe(tool_name: str, arguments: Dict[str, Any]) -> bool:
+    """Return True if this invocation may run in parallel with other safe tools."""
+    name = str(tool_name or "").strip().lower()
+    if not name or name == "none":
+        return False
+    if name == "bash_exec":
+        return _bash_exec_is_read_only(arguments)
+    return name in _CONCURRENCY_SAFE_STUDIO_TOOLS
+
+
+def _workspace_root() -> Path:
+    configured = os.getenv("AGX_WORKSPACE_ROOT", "").strip()
+    if configured:
+        try:
+            return Path(configured).expanduser().resolve(strict=False)
+        except Exception:
+            pass
+    from agenticx.workspace.loader import resolve_workspace_dir
+
+    return resolve_workspace_dir()
+
+
+def _load_default_workspace_mounts(default_root: Path) -> List[Dict[str, Any]]:
+    """Load ``.agx-mounts.json`` from a session default workspace root."""
+    mounts_file = Path(default_root) / ".agx-mounts.json"
+    try:
+        raw = json.loads(mounts_file.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = raw.get("mounts") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in rows:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def _session_workspace_root_sets(
+    session: Optional[StudioSession],
+) -> tuple[List[Path], List[Path]]:
+    """Return ``(read_roots, write_roots)`` for this session.
+
+    - ``write_roots``: session default workspace + link mounts' source paths +
+      non-reference taskspace roots.
+    - ``read_roots``: user-attached extra taskspaces and directory reference
+      mounts first, then write_roots, then remaining read-only roots
+      (so ``list_files(".")`` prefers the folder the user just attached).
+    """
+    write_roots: List[Path] = []
+    read_only_roots: List[Path] = []
+    seen_write: set[str] = set()
+    seen_read: set[str] = set()
+
+    def _add(raw: str, *, writable: bool) -> None:
+        text = (raw or "").strip()
+        if not text:
+            return
+        try:
+            candidate = Path(text).expanduser().resolve(strict=False)
+        except Exception:
+            return
+        key = str(candidate)
+        if writable:
+            if key in seen_write:
+                return
+            seen_write.add(key)
+            write_roots.append(candidate)
+        if key in seen_read:
+            return
+        seen_read.add(key)
+        if not writable:
+            read_only_roots.append(candidate)
+
+    default_paths: List[str] = []
+    if session is not None:
+        taskspaces = getattr(session, "taskspaces", None)
+        if isinstance(taskspaces, list):
+            for item in taskspaces:
+                if not isinstance(item, dict):
+                    continue
+                raw_path = str(item.get("path", "") or "").strip()
+                if not raw_path:
+                    continue
+                ts_id = str(item.get("id", "") or "").strip()
+                mode = str(item.get("mount_mode") or "link").strip().lower()
+                source_path = str(item.get("source_path") or "").strip()
+                if ts_id == "default":
+                    # 先记下、循环结束后再加。Desktop 传过来的 taskspaces 里"默认工作区"
+                    # 恒在第一位，如果在这里就 _add，它会占住 write_roots[0]，于是
+                    # list_files(".")、相对路径的 file_write 全都落到数字专家自己的
+                    # ~/.agenticx/avatars/<id>/workspace，而不是用户在工作区面板里绑定的
+                    # 目录。c33a31c0 当初就是为这件事把 extra/default 分开收集的，
+                    # ee5b7d6c 重写成 read/write 两套 root 时把这个顺序丢了。
+                    # 注意这条路径只在用户没点过工作区页签（active_taskspace_id 为空，
+                    # 也就是 Desktop 的默认状态）时生效；点过就走下面的 active 置顶。
+                    default_paths.append(raw_path)
+                    continue
+                if mode == "reference":
+                    _add(source_path or raw_path, writable=False)
+                else:
+                    _add(raw_path, writable=True)
+                    if mode == "link" and source_path:
+                        _add(source_path, writable=True)
+        for raw_path in default_paths:
+            _add(raw_path, writable=True)
+        _add(str(getattr(session, "workspace_dir", "") or ""), writable=True)
+
+    mount_scan_paths = list(default_paths)
+    if session is not None:
+        workspace_dir = str(getattr(session, "workspace_dir", "") or "").strip()
+        if workspace_dir:
+            mount_scan_paths.append(workspace_dir)
+    seen_mount_roots: set[str] = set()
+    for p in mount_scan_paths:
+        try:
+            default_root = Path(p).expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        mount_key = str(default_root)
+        if mount_key in seen_mount_roots:
+            continue
+        seen_mount_roots.add(mount_key)
+        for mount in _load_default_workspace_mounts(default_root):
+            mode = str(mount.get("mode") or "link").strip().lower()
+            source_path = str(mount.get("source_path") or "").strip()
+            if not source_path:
+                continue
+            if mode == "reference":
+                _add(source_path, writable=False)
+            elif mode == "link":
+                _add(source_path, writable=True)
+            # copy mode: destination already under default_root (writable)
+
+    # Fallback only. Desktop sets AGX_WORKSPACE_ROOT to the user home, so adding
+    # it unconditionally would make everything under $HOME writable and defeat
+    # per-mount permissions.
+    if not write_roots:
+        _add(str(_workspace_root()), writable=True)
+    if not write_roots and not read_only_roots:
+        _add(str(Path.cwd().resolve(strict=False)), writable=True)
+
+    if session is not None:
+        raw_active = getattr(session, "active_taskspace_id", None)
+        active_id = str(raw_active).strip() if raw_active is not None else ""
+        if active_id:
+            taskspaces_active = getattr(session, "taskspaces", None)
+            if isinstance(taskspaces_active, list):
+                for item in taskspaces_active:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("id", "") or "").strip() != active_id:
+                        continue
+                    raw_path = str(item.get("path", "") or "").strip()
+                    if not raw_path:
+                        break
+                    try:
+                        target = Path(raw_path).expanduser().resolve(strict=False)
+                    except Exception:
+                        break
+                    tkey = str(target)
+                    write_roots = [r for r in write_roots if str(r) != tkey]
+                    write_roots.insert(0, target)
+                    seen_write.add(tkey)
+                    break
+
+    # Computer Use screenshots: always allow reading files under ~/.agenticx/desktop-use
+    try:
+        _agx_desktop = (Path.home() / ".agenticx" / "desktop-use").resolve(strict=False)
+        _add(str(_agx_desktop), writable=False)
+    except Exception:
+        pass
+
+    default_keys: set[str] = set()
+    for p in default_paths:
+        try:
+            default_keys.add(str(Path(p).expanduser().resolve(strict=False)))
+        except Exception:
+            continue
+    if session is not None:
+        workspace_dir = str(getattr(session, "workspace_dir", "") or "").strip()
+        if workspace_dir:
+            try:
+                default_keys.add(str(Path(workspace_dir).expanduser().resolve(strict=False)))
+            except Exception:
+                pass
+    try:
+        desktop_use_key = str((Path.home() / ".agenticx" / "desktop-use").resolve(strict=False))
+    except Exception:
+        desktop_use_key = ""
+
+    preferred_read: List[Path] = []
+    seen_preferred: set[str] = set()
+
+    def _prefer_dir(path: Path) -> None:
+        key = str(path)
+        if not key or key in seen_preferred or key in default_keys or key == desktop_use_key:
+            return
+        try:
+            if not path.is_dir():
+                return
+        except OSError:
+            return
+        seen_preferred.add(key)
+        preferred_read.append(path)
+
+    for root in write_roots:
+        _prefer_dir(root)
+    for root in read_only_roots:
+        _prefer_dir(root)
+
+    read_roots: List[Path] = []
+    seen_read_roots: set[str] = set()
+
+    def _push_read(path: Path) -> None:
+        key = str(path)
+        if key in seen_read_roots:
+            return
+        seen_read_roots.add(key)
+        read_roots.append(path)
+
+    for root in preferred_read:
+        _push_read(root)
+    for root in write_roots:
+        _push_read(root)
+    for root in read_only_roots:
+        if str(root) not in seen_write:
+            _push_read(root)
+    from agenticx.runtime.isolate_run import apply_isolate_roots
+
+    return apply_isolate_roots(read_roots, write_roots, session)
+
+
+def _default_bash_cwd(session: Optional[StudioSession]) -> Optional[Path]:
+    """Writable root used when bash_exec/bash_bg omit cwd.
+
+    Must use write_roots, not read_roots: a reference mount is readable
+    but cannot be the launch directory. Order already prefers the
+    user-bound folder and active_taskspace_id.
+    """
+    if session is None:
+        return None
+    _read_roots, write_roots = _session_workspace_root_sets(session)
+    for root in write_roots:
+        try:
+            if root.is_dir():
+                return root
+        except OSError:
+            continue
+    return None
+
+
+def _context_files_read_allowlist(session: Optional[StudioSession]) -> List[Path]:
+    """Exact files the user attached / @-referenced this session (read-only)."""
+    if session is None:
+        return []
+    raw = getattr(session, "context_files", None)
+    if not isinstance(raw, dict) or not raw:
+        return []
+    from agenticx.studio.context_file_keys import disk_path_from_context_file_key
+
+    out: List[Path] = []
+    seen: set[str] = set()
+    for key in raw.keys():
+        disk = disk_path_from_context_file_key(str(key))
+        if not disk:
+            continue
+        path = Path(disk)
+        try:
+            if path.exists() and not path.is_file():
+                continue
+        except OSError:
+            continue
+        if disk in seen:
+            continue
+        seen.add(disk)
+        out.append(path)
+    return out
+
+
+def _is_context_file_read_allowed(resolved: Path, session: Optional[StudioSession]) -> bool:
+    want = str(_safe_resolve_path(resolved))
+    for allowed in _context_files_read_allowlist(session):
+        if str(_safe_resolve_path(allowed)) == want:
+            return True
+    return False
+
+
+def _session_workspace_roots(session: Optional[StudioSession]) -> List[Path]:
+    """Ordered filesystem roots for this session (read-capable)."""
+    read_roots, _write_roots = _session_workspace_root_sets(session)
+    return read_roots
+
+
+def _session_default_workspace_roots(session: Optional[StudioSession]) -> List[Path]:
+    """Session default workspace directories that may contain ``.agx-mounts.json``."""
+    scan: List[str] = []
+    if session is None:
+        return []
+    taskspaces = getattr(session, "taskspaces", None)
+    if isinstance(taskspaces, list):
+        for item in taskspaces:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id", "") or "").strip() != "default":
+                continue
+            raw_path = str(item.get("path", "") or "").strip()
+            if raw_path:
+                scan.append(raw_path)
+    workspace_dir = str(getattr(session, "workspace_dir", "") or "").strip()
+    if workspace_dir:
+        scan.append(workspace_dir)
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for raw in scan:
+        try:
+            root = Path(raw).expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
+    return roots
+
+
+def _session_mount_aliases(session: Optional[StudioSession]) -> dict[str, tuple[Path, str]]:
+    """Map taskspace id/label and ``.agx-mounts.json`` names to ``(source_path, mode)``.
+
+    Taskspace ids (including ``default``) are registered first so a mount with the
+    same display name cannot hide the virtual workspace root.
+    """
+    aliases: dict[str, tuple[Path, str]] = {}
+    taskspaces = getattr(session, "taskspaces", None) if session is not None else None
+    items = [item for item in taskspaces if isinstance(item, dict)] if isinstance(taskspaces, list) else []
+    label_counts: dict[str, int] = {}
+    for item in items:
+        label = str(item.get("label") or "").strip()
+        if label and "/" not in label and "\\" not in label:
+            label_counts[label] = label_counts.get(label, 0) + 1
+    for item in items:
+        ts_id = str(item.get("id") or "").strip()
+        raw_path = str(item.get("path") or item.get("source_path") or "").strip()
+        mode = str(item.get("mount_mode") or "link").strip().lower() or "link"
+        if not raw_path:
+            continue
+        try:
+            src = Path(raw_path).expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        if ts_id:
+            aliases.setdefault(ts_id, (src, mode))
+        label = str(item.get("label") or "").strip()
+        if label and "/" not in label and "\\" not in label and label_counts.get(label) == 1:
+            aliases.setdefault(label, (src, mode))
+    for root in _session_default_workspace_roots(session):
+        for mount in _load_default_workspace_mounts(root):
+            name = str(mount.get("name") or "").strip()
+            source = str(mount.get("source_path") or "").strip()
+            mode = str(mount.get("mode") or "link").strip().lower()
+            if not name or not source:
+                continue
+            try:
+                src = Path(source).expanduser().resolve(strict=False)
+            except Exception:
+                continue
+            aliases.setdefault(name, (src, mode))
+    return aliases
+
+
+def _map_virtual_reference_path(
+    resolved: Path, session: Optional[StudioSession]
+) -> Optional[tuple[Path, str]]:
+    """Map ``<default>/<mount_name>/...`` (no dest dir) onto the reference source."""
+    aliases = _session_mount_aliases(session)
+    if not aliases:
+        return None
+    for default_root in _session_default_workspace_roots(session):
+        try:
+            rel = resolved.relative_to(default_root)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if not parts:
+            continue
+        hit = aliases.get(parts[0])
+        if hit is None:
+            continue
+        source_root, mode = hit
+        rest = Path(*parts[1:]) if len(parts) > 1 else Path()
+        mapped = _safe_resolve_path(source_root / rest) if rest.parts else source_root
+        if mapped != source_root and not _is_path_under_root(mapped, source_root):
+            continue
+        return mapped, mode
+    return None
+
+
+def _resolve_prefixed_workspace_relpath(
+    raw_path: Path, session: Optional[StudioSession]
+) -> Optional[tuple[Path, str]]:
+    """If the first relative segment is a taskspace/mount alias, map to that root."""
+    if raw_path.is_absolute():
+        return None
+    parts = tuple(part for part in raw_path.parts if part not in {".", ""})
+    if not parts or parts[0] == "..":
+        return None
+    hit = _session_mount_aliases(session).get(parts[0])
+    if hit is None:
+        return None
+    source_root, mode = hit
+    rest = Path(*parts[1:]) if len(parts) > 1 else Path()
+    resolved = _safe_resolve_path(source_root / rest) if rest.parts else _safe_resolve_path(source_root)
+    if resolved != source_root and not _is_path_under_root(resolved, source_root):
+        return None
+    mapped = _map_virtual_reference_path(resolved, session)
+    if mapped is not None:
+        return mapped
+    return resolved, mode
+
+
+def _is_path_under_root(candidate: Path, root: Path) -> bool:
+    try:
+        cand = _safe_resolve_path(candidate)
+        base = _safe_resolve_path(root)
+        cand.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_resolve_path(path: Path) -> Path:
+    """Resolve path; for missing leaves, resolve the nearest existing ancestor."""
+    expanded = path.expanduser()
+    try:
+        return expanded.resolve(strict=False)
+    except Exception:
+        return expanded.absolute()
+
+
+def _desktop_unrestricted_fs_enabled() -> bool:
+    value = os.getenv("AGX_DESKTOP_UNRESTRICTED_FS", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _detect_target(text: str) -> str:
+    lowered = text.lower()
+    if "workflow" in lowered or "工作流" in lowered or "pipeline" in lowered:
+        return "workflow"
+    if "tool" in lowered or "工具" in lowered:
+        return "tool"
+    if "skill" in lowered or "技能" in lowered:
+        return "skill"
+        return "agent"
+
+
+from agenticx.runtime.prompts.tool_discipline import (
+    QUERY_DATA_SOURCE_USAGE,
+    SHOW_WIDGET_USAGE,
+    SKILL_MANAGE_USAGE,
+)
+
+STUDIO_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "request_clarification",
+            "description": (
+                "Ask the user an open-ended question and BLOCK until they answer. Use this whenever you need a "
+                "human decision before proceeding: plan sign-off, choosing between options, missing parameters, "
+                "color/style/preference, scope confirmation. Do NOT write the question as plain text and end the "
+                "turn -- call this tool instead so the user gets a blocking prompt with option buttons and a free-"
+                "text box, and your turn continues from their answer. The tool result text is the user's answer; "
+                "continue the same turn based on it. In unattended/automation sessions this returns a suspended "
+                "sentinel -- wrap up the turn and persist the pending question as a todo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The question to ask the user, in natural language. Be specific.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Flat preset options (0-8) when all choices are independent toggles "
+                            "or a single combined question. User may select multiple. Prefer "
+                            "`decisions` instead when you need separate answers per dimension."
+                        ),
+                    },
+                    "decisions": {
+                        "type": "array",
+                        "description": (
+                            "Structured multi-part sign-off: one entry per independent decision "
+                            "(e.g. duration / copy / color). Each item has its own question and "
+                            "options; the UI renders a decision chain. Use this when prompt mentions "
+                            "multiple key decisions — do NOT flatten into one options list."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Stable id, e.g. duration / copy / palette.",
+                                },
+                                "question": {
+                                    "type": "string",
+                                    "description": "The decision question for this dimension.",
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "2-6 options for this dimension. Mutually exclusive when "
+                                        "selection_mode is single (default); combinable when multiple."
+                                    ),
+                                },
+                                "selection_mode": {
+                                    "type": "string",
+                                    "enum": ["single", "multiple"],
+                                    "description": "Selection behavior for this decision. Defaults to single.",
+                                },
+                                "exclusive_options": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Exact option labels that cannot be combined with other selections. "
+                                        "Only used when selection_mode is multiple."
+                                    ),
+                                },
+                            },
+                            "required": ["question", "options"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "allow_free_text": {
+                        "type": "boolean",
+                        "description": "Whether the user can type a custom answer (default true).",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Optional extra context to show in the prompt card (e.g. plan summary).",
+                    },
+                },
+                "required": ["prompt"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_action_confirmation",
+            "description": (
+                "Ask the user to confirm or cancel an irreversible / external write action and BLOCK until they "
+                "decide. Use for sending email, submitting approvals, publishing content, deleting remote "
+                "resources, etc. Do NOT end the turn with plain-text 'please confirm' — call this tool so the UI "
+                "shows equal-width Confirm/Cancel buttons (and typed 确认/取消 still works). The tool result tells "
+                "you whether to proceed in the SAME turn. Do NOT put secrets, OAuth tokens, or confirmation "
+                "tokens in arguments. Permission confirms for shell/file tools still use confirm_required."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short confirmation title shown on the card (1-200 chars).",
+                    },
+                    "summary": {
+                        "type": "array",
+                        "description": "0-12 summary rows shown to the user before they confirm.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "value": {"type": "string"},
+                            },
+                            "required": ["label", "value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "approve_label": {
+                        "type": "string",
+                        "description": "Primary button label (default 确认执行, max 20 chars).",
+                    },
+                    "reject_label": {
+                        "type": "string",
+                        "description": "Secondary button label (default 取消, max 20 chars).",
+                    },
+                    "expires_in_seconds": {
+                        "type": "integer",
+                        "description": "TTL for this confirmation (clamped 30-1800). Default 300.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional human-readable source label (e.g. Agent Mail).",
+                    },
+                },
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_exec",
+            "description": (
+                "Execute a shell command in the session workspace. Prefer the cwd parameter for the working "
+                "directory instead of leading `cd ... &&` (cd && is auto-peeled when cwd is omitted). "
+                "After headless `claude -p` / codegen, verify artifacts with list_files or `test -f` — do not "
+                "trust exit_code alone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Command to execute."},
+                    "cwd": {"type": "string", "description": "Working directory (preferred over cd in command)."},
+                    "timeout_sec": {"type": "integer", "description": "Timeout seconds, default 30."},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_bg_start",
+            "description": (
+                "Start an interactive or long-running shell command in background without timeout kill. "
+                "Use for QR/auth/login commands that wait for user actions. Returns job_id, first-screen output, "
+                "and extracted auth URLs. "
+                "转述 auth_urls 给用户完成扫码/授权；确认完成前最多每 15-30 秒 bash_bg_poll 一次，"
+                "禁止高频轮询，禁止此时 bash_bg_stop。需要键入用 bash_bg_input；确认完成后再 poll 读 exit_code，不得谎报成功。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Command to run in background."},
+                    "cwd": {"type": "string", "description": "Working directory (preferred over cd in command)."},
+                    "first_wait_sec": {
+                        "type": "integer",
+                        "description": "Collect initial output for this many seconds before returning (default 4, max 15).",
+                    },
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_bg_poll",
+            "description": (
+                "Poll incremental output and status for a background bash job started by bash_bg_start."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Background bash job id."},
+                },
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_bg_input",
+            "description": "Write one line of text to stdin of a running background bash job.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Background bash job id."},
+                    "text": {"type": "string", "description": "One line input to send."},
+                },
+                "required": ["job_id", "text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_bg_stop",
+            "description": "Stop a background bash job by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Background bash job id."},
+                    "force": {"type": "boolean", "description": "If true, kill instead of terminate."},
+                },
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_read",
+            "description": "Read file content with optional line range.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path."},
+                    "start_line": {"type": "integer", "description": "Start line (1-based)."},
+                    "end_line": {"type": "integer", "description": "End line (inclusive)."},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_result_recall",
+            "description": (
+                "Recall exact text from a previously compacted tool result in the current session. "
+                "Use the observation id from [tool-result-observation]. "
+                "Page with offset_bytes, or search with a literal query. "
+                "Do not pass file paths."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "offset_bytes": {"type": "integer", "minimum": 0},
+                    "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "context_lines": {"type": "integer", "minimum": 0, "maximum": 3},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stage_context_file",
+            "description": (
+                "Copy one explicitly attached/read-only context file into a hidden session workspace "
+                "location. Use this before bash/Python needs raw binary access to a referenced PDF, "
+                "DOCX, archive, or image. The source stays unchanged and sibling files remain denied."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Exact absolute path from context_files.",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_outline",
+            "description": (
+                "Return class/function signatures and one-line docstrings for code files "
+                "(no function bodies). Prefer this before file_read to save context. "
+                "Supports single file or directory (max 50 files)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace file or directory path.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional filter by symbol or path substring.",
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Max files when path is a directory (default 50).",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_write",
+            "description": (
+                "Write full file content; show unified diff and ask confirmation before writing. "
+                "Use from_path to copy from a local file instead of inline content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path."},
+                    "content": {"type": "string", "description": "New full content (omit when using from_path)."},
+                    "from_path": {
+                        "type": "string",
+                        "description": "Copy content from this local file path (workspace-relative or absolute).",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_edit",
+            "description": "Replace text in file; show unified diff and ask confirmation before writing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path."},
+                    "old_text": {"type": "string", "description": "Text to replace."},
+                    "new_text": {"type": "string", "description": "Replacement text."},
+                    "occurrence": {
+                        "type": "integer",
+                        "description": "Which occurrence to replace (1-based). Default replaces first.",
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "codegen",
+            "description": "Generate code artifact using existing CodeGenEngine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Generation target: agent/workflow/tool/skill.",
+                    },
+                    "description": {"type": "string", "description": "Generation requirement text."},
+                    "output_path": {
+                        "type": "string",
+                        "description": "Optional explicit output file path. If omitted, the tool will propose a default path and ask user confirmation before writing.",
+                    },
+                },
+                "required": ["description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_connect",
+            "description": (
+                "Connect one configured MCP server. API keys belong in Near Settings → MCP "
+                "(~/.agenticx/mcp.json env) or OS environment—never ask the user to paste secrets in chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "MCP server name from config."},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cc_bridge_start",
+            "description": (
+                "Start a local Claude Code headless session via the CC bridge HTTP server (run "
+                "`agx cc-bridge serve` in another terminal). Token is read from AGX_CC_BRIDGE_TOKEN or "
+                "~/.agenticx/config.yaml cc_bridge.token (auto-generated on first use). Then cc_bridge_send "
+                "with the returned session_id; verify output files on disk afterward."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for claude child; defaults to session workspace_dir.",
+                    },
+                    "auto_allow_permissions": {
+                        "type": "boolean",
+                        "description": "If true, bridge auto-approves can_use_tool control_request lines.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["headless", "visible_tui"],
+                        "description": (
+                            "Optional explicit mode override. If omitted, runtime auto-selects by intent: "
+                            "autonomous/report tasks prefer headless; interactive terminal tasks prefer visible_tui."
+                        ),
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cc_bridge_send",
+            "description": (
+                "Send a user turn to an existing CC bridge session. In headless mode it waits for result/timeout; "
+                "in visible_tui mode it only writes input to PTY and returns immediately (no final result inference). "
+                "Requires bridge at cc_bridge.url (default 127.0.0.1:9742) and matching bearer token. "
+                "Afterward confirm any expected files with file_read or bash_exec test -f. "
+                "可见模式强约束：返回 mode=visible_tui 且 interactive=true 时任务已投递到交互终端；"
+                "禁止 bash_exec 轮询 cc-bridge 日志、禁止重复 cc_bridge_send 追问进度、禁止擅自 cc_bridge_stop；"
+                "直接向用户报告已投递并等待终端交互。 "
+                "证据门禁：parsed_response 为空、ok=false 或仅有 tail/log 时不得称分析完成，只能汇报状态、阻塞原因与下一步。 "
+                "模式路由：headless 走 /message，visible_tui 走 /write。"
+                "若返回 write is only for visible_tui，工具层至多纠偏一次（可能出现 mode_corrected）；"
+                "禁止在同一失败点连续多次重试。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Bridge session UUID."},
+                    "prompt": {"type": "string", "description": "User message text."},
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Max wait for stream-json result success line (default 120).",
+                    },
+                },
+                "required": ["session_id", "prompt"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cc_bridge_list",
+            "description": "List active CC bridge sessions (pid, cwd) from the local bridge HTTP server.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cc_bridge_stop",
+            "description": "Terminate a CC bridge session by session_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Bridge session UUID."},
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force stop even when visible_tui is still active.",
+                    },
+                },
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cc_bridge_permission",
+            "description": (
+                "Reply to a pending can_use_tool control_request when auto_allow is off. "
+                "Use request_id from bridge logs or captured NDJSON."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "request_id": {"type": "string"},
+                    "allow": {"type": "boolean"},
+                    "deny_message": {"type": "string", "description": "Used when allow is false."},
+                    "tool_use_id": {"type": "string", "description": "Optional; echo from control_request."},
+                    "tool_input": {
+                        "type": "object",
+                        "description": "When allow is true, pass the tool input object from control_request.",
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["session_id", "request_id", "allow"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wb_bridge_start",
+            "description": (
+                "Start a local CodeBuddy headless session via the WB bridge HTTP server at "
+                "127.0.0.1:9743 (token from AGX_WB_BRIDGE_TOKEN or ~/.agenticx/config.yaml "
+                "wb_bridge.token). Studio autostarts loopback `agx wb-bridge serve` if needed. "
+                "Do NOT start serve via bash/bash_bg (sandbox cannot import agenticx). "
+                "Then wb_bridge_send with the returned session_id. "
+                "IMPORTANT unattended contract: permission_mode=default (the API default) will "
+                "pause on Write/Bash approval and this bridge has NO approval channel "
+                "(cc_bridge_permission belongs to the Claude Code bridge and does not work "
+                "here). For any task that writes files or runs commands without a human "
+                "watching, pass permission_mode=acceptEdits (file edits only) or "
+                "dontAsk / bypassPermissions (edits + commands). Use default/plan only for "
+                "read-only or planning turns. The create response returns unattended_ok and a "
+                "hint field; read them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for codebuddy child; defaults to session workspace_dir.",
+                    },
+                    "permission_mode": {
+                        "type": "string",
+                        "enum": [
+                            "default",
+                            "acceptEdits",
+                            "bypassPermissions",
+                            "dontAsk",
+                            "plan",
+                            "auto",
+                        ],
+                        "description": (
+                            "Session-level --permission-mode. Invalid values fall back to default. "
+                            "default/plan are NOT usable for unattended write/exec tasks: they stall on an "
+                            "approval prompt that this bridge cannot answer."
+                        ),
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wb_bridge_send",
+            "description": (
+                "Send a user turn to an existing WB bridge session and wait for result/timeout. "
+                "Requires bridge at wb_bridge.url (default 127.0.0.1:9743) and matching bearer token. "
+                "Studio autostarts loopback serve if needed. Do NOT use bash to start serve. "
+                "Returns status = success | blocked | error | exited | running, plus "
+                "usage_totals, observed_tools and next_action. On status=running the turn is "
+                "STILL EXECUTING: poll wb_bridge_describe with the same session_id and never "
+                "resend the same instruction (a resend while a turn is in flight is rejected "
+                "with HTTP 409). On status=blocked the session hit a permission prompt: check "
+                "observed_tools first, because side effects before the block are already "
+                "committed on disk, then start a NEW session with an unattended "
+                "permission_mode instead of resending. Pass idempotency_key to make a retry "
+                "safe: an identical key is not re-dispatched."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "text": {"type": "string", "description": "User prompt to send."},
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": (
+                            "Seconds to wait for this turn to end (default 180). Pass 0 to dispatch and "
+                            "return immediately, then poll wb_bridge_describe."
+                        ),
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": (
+                            "Optional retry-safety token. Reusing the key of the current or "
+                            "last turn returns that turn's snapshot instead of re-dispatching."
+                        ),
+                    },
+                },
+                "required": ["session_id", "text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wb_bridge_list",
+            "description": (
+                "List WB bridge sessions. Studio autostarts loopback serve if needed. "
+                "Do NOT start serve via bash."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wb_bridge_describe",
+            "description": (
+                "Describe one WB bridge session by session_id. Studio autostarts loopback serve "
+                "if needed. Do NOT start serve via bash. "
+                "Returns live turn state, last tool activity, observed_tools, cumulative token "
+                "usage and terminal kind. Do NOT try to read ~/.agenticx/logs/wb-bridge/*.log "
+                "from bash: the agent workspace sandbox blocks it and describe already carries "
+                "the same data. Also returns written_paths (absolute files from Write/Edit this "
+                "turn). Treat written_paths plus result_text as delivery evidence; do not "
+                "bash_exec or file_read the WB cwd or /tmp to verify."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                },
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wb_bridge_stop",
+            "description": (
+                "Stop a WB bridge session. Studio autostarts loopback serve if needed. "
+                "Do NOT start serve via bash. "
+                "This terminates the child process immediately. If a turn is still running "
+                "(turn_state=running), in-flight file writes may be incomplete. The tool "
+                "refuses to stop a running turn unless force=true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "force": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, terminate even when turn_state=running. "
+                            "Default false: return a warning and do not kill the child."
+                        ),
+                    },
+                },
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_call",
+            "description": (
+                "Call one connected MCP tool by exact name with JSON arguments. "
+                "Before using this, call list_mcps and pick tool_name from returned mcp_tool_names; "
+                "do not invent names like web.fetch.* or list_tools."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string", "description": "Connected MCP tool name."},
+                    "arguments": {
+                        "type": "object",
+                        "description": "Tool arguments object.",
+                        "additionalProperties": True,
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Alias of arguments; accepted for compatibility.",
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["tool_name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_search",
+            "description": (
+                "Search deferred tools (builtin and connected MCP) by keyword. "
+                "Matched tool schemas become available on the NEXT model round. "
+                "Use select:<exact_name> for exact match; +token requires token."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_import",
+            "description": (
+                "Import MCP server configs from external mcp.json into AgenticX workspace config. "
+                "Do not collect API keys in chat; user fills env in Settings → MCP."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string", "description": "Source path to mcp.json."},
+                },
+                "required": ["source_path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_use",
+            "description": (
+                "Activate a skill into current context_files (key: skill:<name>). "
+                "After calling this tool, use the injected content directly; do not guess paths or run bash to cat SKILL.md."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name."},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_list",
+            "description": (
+                "List available skills with source/location/path metadata. "
+                "Use these returned paths when you must inspect files; avoid hardcoded ~/.agenticx/skills guesses."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_manage",
+            "description": (
+                "Create, patch, or delete skills stored under ~/.agenticx/skills/. "
+                "For 'create': provide action + name + content, or use from_path/from_url "
+                "instead of inline content for large SKILL.md files. "
+                "For 'patch': provide action + name + old_string + new_string. "
+                "For 'delete': provide action + name. "
+                "Sub-paths are supported (e.g. name='ima/notes'). "
+                "IMPORTANT: never call with empty arguments — action and name are always required."
+                + SKILL_MANAGE_USAGE
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "patch", "delete", "history", "rollback"],
+                        "description": "Operation: create/patch/delete/history/rollback.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Skill directory name under ~/.agenticx/skills/. "
+                            "Simple names like 'ima' or sub-paths like 'ima/notes' are both valid. "
+                            "Each segment must be alphanumeric with optional hyphens/underscores (no spaces, no leading dots)."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': full SKILL.md text with YAML frontmatter. "
+                            "Prefer from_path/from_url for large files instead of inline content."
+                        ),
+                    },
+                    "from_path": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': read SKILL.md from this local path (workspace or ~/.agenticx/). "
+                            "Mutually exclusive with content/from_url."
+                        ),
+                    },
+                    "from_url": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': download SKILL.md from an allowlisted https URL "
+                            "(raw.githubusercontent.com, gist, registry.clawhub.ai). "
+                            "Mutually exclusive with content/from_path."
+                        ),
+                    },
+                    "old_string": {"type": "string", "description": "Required for 'patch': exact substring to find and replace in the existing SKILL.md."},
+                    "new_string": {"type": "string", "description": "Required for 'patch': replacement text for old_string."},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["preview", "apply"],
+                        "description": "Patch mode. preview only computes diff/token and does not write; apply writes changes.",
+                    },
+                    "patch_token": {
+                        "type": "string",
+                        "description": "Token returned by preview; when provided to apply, must match current content hash and patch payload.",
+                    },
+                    "before_context": {
+                        "type": "string",
+                        "description": "Optional context before old_string for disambiguation.",
+                    },
+                    "after_context": {
+                        "type": "string",
+                        "description": "Optional context after old_string for disambiguation.",
+                    },
+                    "target_index": {
+                        "type": "integer",
+                        "description": "Optional index in multi-match candidates; required when preview returns multiple matches and replace_all is false.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "If true, patch all matches. Default false.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "For history action: number of versions to return (1-200).",
+                    },
+                    "to_version": {
+                        "type": "string",
+                        "description": "For rollback action: target version id from history.",
+                    },
+                },
+                "required": ["action", "name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hook_manage",
+            "description": (
+                "Create, delete, list, or toggle declarative hooks persisted to "
+                "~/.agenticx/config.yaml (hooks.declarative[]). "
+                "Declarative hooks run shell commands, HTTP webhooks, model prompts, or "
+                "agent reasoning at key lifecycle events (before_tool_call, after_tool_call, "
+                "session_start, session_end). "
+                "command-type hooks are scanned for dangerous patterns before being saved. "
+                "IMPORTANT: action and name are always required except for action='list'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "delete", "list", "toggle"],
+                        "description": (
+                            "'create': add a new declarative hook; "
+                            "'delete': remove by name; "
+                            "'list': return all declarative hooks; "
+                            "'toggle': enable or disable a hook by name."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Unique hook name (required for create/delete/toggle).",
+                    },
+                    "event": {
+                        "type": "string",
+                        "enum": ["before_tool_call", "after_tool_call", "session_start", "session_end"],
+                        "description": "Lifecycle event that fires this hook (required for create).",
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["command", "http", "prompt", "agent"],
+                        "description": "Hook execution type (required for create). Default: 'command'.",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run (for type='command'). Supports {tool} placeholder.",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP endpoint to POST to (for type='http').",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Model prompt text (for type='prompt' or 'agent').",
+                    },
+                    "matcher": {
+                        "type": "string",
+                        "description": "Glob pattern to filter which tool names trigger this hook (optional).",
+                    },
+                    "block_on_failure": {
+                        "type": "boolean",
+                        "description": "If true, abort the tool call when the hook fails. Default: false.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Hook execution timeout in seconds (1-600). Default: 30.",
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "For 'toggle': set to true to enable or false to disable the hook.",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_import_repo",
+            "description": (
+                "Bulk install skills from a GitHub repository into ~/.agenticx/skills/. "
+                "Use dry_run=true first to list pending skills without writing. "
+                "Preferred for installing many skills (e.g. mattpocock/skills)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "GitHub repo as owner/name (e.g. mattpocock/skills).",
+                    },
+                    "branch": {"type": "string", "description": "Branch name (default main)."},
+                    "path_glob": {
+                        "type": "string",
+                        "description": "Glob for SKILL.md paths in the repo tree (default skills/**/SKILL.md).",
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns to exclude (default deprecated/in-progress).",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, only return pending/skipped lists without installing.",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "If true, replace existing skills with the same name.",
+                    },
+                },
+                "required": ["repo"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_create",
+            "description": (
+                "Create the approved implementation plan as a durable Markdown artifact under "
+                "the active project's .agenticx/plans directory. Use exactly once for a multi-step "
+                "implementation request in Plan mode; do not use for simple questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "overview": {"type": "string"},
+                    "todos": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                                },
+                                "content": {"type": "string", "maxLength": 300},
+                            },
+                            "required": ["id", "content"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "body_markdown": {
+                        "type": "string",
+                        "description": (
+                            "Self-contained implementation plan with exact files, anchors, "
+                            "behavior, risks, scope boundaries, and executable acceptance tests."
+                        ),
+                    },
+                },
+                "required": ["name", "overview", "todos", "body_markdown"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_update",
+            "description": (
+                "Atomically update lifecycle or todo status in an existing project-local Plan. "
+                "During Build, call start first, then mark each todo in_progress and completed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string"},
+                    "plan_path": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "set_todo", "cancel"],
+                    },
+                    "todo_id": {"type": "string"},
+                    "todo_status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "cancelled"],
+                    },
+                    "outcome": {"type": "string"},
+                },
+                "required": ["plan_id", "plan_path", "action"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": "Update structured task list for current agent session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                                "active_form": {"type": "string"},
+                                "activeForm": {"type": "string"},
+                            },
+                            "required": ["content", "status"],
+                            "additionalProperties": True,
+                        },
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scratchpad_write",
+            "description": "Write intermediate result to session scratchpad.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scratchpad_read",
+            "description": "Read one scratchpad key or list all keys.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "list_only": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_append",
+            "description": (
+                "Append note to the current subject's workspace memory (meta/avatar/group) "
+                "or global user baseline. Default scope=subject writes to this pane's MEMORY.md; "
+                "use scope=user_global only when the user wants all subjects to remember "
+                "(e.g. a lesson from avatar A that avatar B should also avoid). "
+                "Content must be a concise, self-contained fact (max ~400 chars)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": ["daily", "long_term"]},
+                    "content": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["subject", "user_global"],
+                        "description": "subject (default) = current meta/avatar/group; user_global = ~/.agenticx/workspace/USER.md baseline for all subjects.",
+                    },
+                },
+                "required": ["target", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": (
+                "Search workspace Markdown memory (MEMORY.md, memory/*.md). "
+                "When memory graph is enabled, merges graph facts for the current pane partition. "
+                "Chinese keywords use substring matching; English supports FTS."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["fts", "semantic", "hybrid"]},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_forget",
+            "description": (
+                "Forget memories matching a topic in the current subject (meta/avatar/group). "
+                "Removes matching graph episodes and MEMORY.md bullets (default scope=both). "
+                "Pinned episodes are protected. Irreversible."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["graph", "text", "both"]},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_search",
+            "description": (
+                "Search past conversation sessions by keyword. "
+                "Returns matching message excerpts grouped by session."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search keywords (FTS5 syntax supported). Empty returns recent sessions.",
+                    },
+                    "role_filter": {
+                        "type": "string",
+                        "description": "Comma-separated roles to filter: user,assistant,tool,system",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max sessions to return (1-5, default 3).",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plugin_usage",
+            "description": (
+                "Look up usage for any model/provider plugin. "
+                "Pass a model name, date range, and/or session_id to see call counts, "
+                "timeouts, retries, consecutive failures, and why a session failed. "
+                "plugin=all (default) reads the local usage ledger; plugin=jev reads "
+                "structured-decision cards. Use when the user asks how often a model "
+                "ran, which calls timed out or failed, or why a session needs retry. "
+                "Read-only; these rows are not injected into normal chat context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plugin": {
+                        "type": "string",
+                        "description": "all (default), jev, a provider id, or a model name.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name or substring, e.g. gpt-4o, claude, jev-1.",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider id, e.g. openai, anthropic, zhipu.",
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Start day YYYY-MM-DD, or today/yesterday.",
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "End day YYYY-MM-DD, or today/yesterday.",
+                    },
+                    "range": {
+                        "type": "string",
+                        "description": "day, week, month (default for all models), or total.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "all (default) or current session.",
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": (
+                            "all (default), failed, timeout, retry, adopted/ok, "
+                            "routing, or kb."
+                        ),
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session folder name. Use with model to diagnose that pair.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max recent rows (1-30, default 8).",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "List files/directories under a path. path='.' lists the user's attached "
+                "folder when one exists — that is the answer to 'what is in the folder'. "
+                "Do not also list the session default workspace, and do not re-check with "
+                "bash_exec ls. Reference mounts are not physically under the default "
+                "taskspace path; use the mount name or listed root, not default/name/..."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path, default current directory."},
+                    "recursive": {"type": "boolean", "description": "Whether to recurse into subdirectories."},
+                    "limit": {"type": "integer", "description": "Maximum entries to return, default 200."},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "liteparse",
+            "description": (
+                "Parse a document file (PDF, DOCX, PPTX, XLSX, images) via LiteParse "
+                "and return extracted text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or workspace-relative path to the document.",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "video_understand",
+            "description": (
+                "Understand a local video file (mp4/mov/mkv/webm/avi). Probes metadata "
+                "(duration, resolution, audio track) and extracts representative frames "
+                "adaptively based on duration, then attaches them for the vision model to "
+                "view in the next turn. Prefer this over calling ffmpeg via bash_exec: it is "
+                "one atomic call with adaptive sampling. Requires a vision-capable model. "
+                "Optionally pass `question` to bias sampling toward what the user asks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or workspace-relative path to the video file.",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional: what the user wants to know about the video.",
+                    },
+                    "max_frames": {
+                        "type": "integer",
+                        "description": "Optional cap on extracted frames (clamped to server hard max).",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_data_sources",
+            "description": (
+                "List enabled external data source plugins (finance/macro/academic/"
+                "enterprise/legal domains) and their available APIs. Call this first "
+                "when unsure which data_source_name or api_name to use with "
+                "query_data_source."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Optional filter, e.g. 'finance', 'macro', 'academic'.",
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "If true, include full params_schema for each API.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_data_source",
+            "description": (
+                "Unified gateway to query an external data source plugin (stock prices, "
+                "macro indicators, academic papers, company registry, legal statutes, etc). "
+                "Call list_data_sources first if you don't know the exact api_name or "
+                "params shape. Returns structured JSON; follow up with show_widget to "
+                "visualize when appropriate (e.g. price history as a chart)."
+                + QUERY_DATA_SOURCE_USAGE
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data_source_name": {
+                        "type": "string",
+                        "description": "Plugin id, e.g. 'akshare', 'world_bank', 'tushare'.",
+                    },
+                    "api_name": {
+                        "type": "string",
+                        "description": "API id exposed by the plugin, from list_data_sources.",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "API-specific parameters.",
+                    },
+                },
+                "required": ["data_source_name", "api_name", "params"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_widget",
+            "description": (
+                "Render an inline visualization in the chat. REQUIRED whenever you "
+                "would show a flow, pipeline, sequence, architecture, MitM/proxy path, or any "
+                "A->B->C style diagram — including simple 3-node chains. NEVER substitute "
+                "markdown text/code blocks (```text```, ```mermaid```, arrow chains, ↓ lines). "
+                "Default to the most visually effective format: SVG for static flow / "
+                "architecture / pipeline / sequence / comparison diagrams; HTML for "
+                "interactive or data-driven charts. Use widget_format='mermaid' ONLY when "
+                "the user explicitly asks for a Mermaid diagram. "
+                "Before calling: output 1-3 sentences of visible intro prose in the same turn "
+                "(not in reasoning/thinking). Then call show_widget, then explain in detail. "
+                "For structured stock/macro charts, widget_code MUST be JSON starting with "
+                '\'{"type": "stock_chart", ...}\' — the "type" field is REQUIRED, omitting it '
+                "will render as unreadable raw text instead of a chart."
+                + SHOW_WIDGET_USAGE
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Widget title shown on the card.",
+                    },
+                    "widget_code": {
+                        "type": "string",
+                        "description": (
+                            "SVG string starting with '<svg', an HTML fragment, "
+                            "OR Mermaid source when the user explicitly asked for Mermaid. "
+                            "SVG: viewBox='0 0 680 H' width='100%' and CSS vars like "
+                            "var(--text-primary), var(--text-muted). "
+                            "Mermaid: no Markdown fence."
+                        ),
+                    },
+                    "widget_format": {
+                        "type": "string",
+                        "enum": ["svg", "html", "mermaid"],
+                        "description": (
+                            "Explicit widget source format. Default svg for static "
+                            "structure diagrams or html for interactive / data-driven "
+                            "widgets. Use mermaid only when the user explicitly asks."
+                        ),
+                    },
+                    "loading_messages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional rotating loading messages shown before render.",
+                    },
+                },
+                "required": ["title", "widget_code"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp_goto_definition",
+            "description": (
+                "Jump to symbol definition at given file position. "
+                "理解函数/类来源时优先用本工具，不要先 grep。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Absolute or workspace-relative file path."},
+                    "line": {"type": "integer", "description": "Line number (1-based)."},
+                    "column": {"type": "integer", "description": "Column number (1-based)."},
+                },
+                "required": ["file", "line", "column"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp_find_references",
+            "description": (
+                "Find all references to a symbol at given file position. "
+                "重构前评估影响面时优先用本工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Absolute or workspace-relative file path."},
+                    "line": {"type": "integer", "description": "Line number (1-based)."},
+                    "column": {"type": "integer", "description": "Column number (1-based)."},
+                },
+                "required": ["file", "line", "column"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp_hover",
+            "description": (
+                "Get type info and documentation for a symbol at given file position. "
+                "判断 API 参数/返回值时优先用本工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Absolute or workspace-relative file path."},
+                    "line": {"type": "integer", "description": "Line number (1-based)."},
+                    "column": {"type": "integer", "description": "Column number (1-based)."},
+                },
+                "required": ["file", "line", "column"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp_diagnostics",
+            "description": (
+                "Get lint/type diagnostics for a file or all opened files. "
+                "改动代码后验证质量时调用；首次调用可能需要几秒启动语言服务器。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Optional file path."},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_task",
+            "description": (
+                "Create a persistent scheduled/automated task. "
+                "The task is saved to disk and executed automatically by the Desktop scheduler at the specified time. "
+                "The user can also view, edit and manage the task in the sidebar '定时' section. "
+                "Before calling this tool: if the task runs Python scripts, prepare the runtime under the task root only — "
+                "the root is the user-provided workspace if set, else ~/.agenticx/crontask/<task_id>/. "
+                "Create <task_root>/.venv, pip install there, smoke-run with <task_root>/.venv/bin/python, and reference that path in instruction. "
+                "名称 + 频率/时间/日期 + instruction + workspace 齐了必须同一轮直接调用；"
+                "禁止先说“我先加载某个 skill/脚本”。除非用户明确要求复用 skill 源码，"
+                "不要先 file_read ~/.cursor/skills/* 大文件。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable task name (e.g. 'A股大盘收盘价日报')"},
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "Prompt for the automation runner on each trigger. Write it in the language the user asked for; "
+                            "the auto-injected Execution Contract follows that language. "
+                            "Must use the same Python/paths as verified during setup. "
+                            "Meta-Agent should have already installed deps (pip) in the task workspace or a dedicated venv and confirmed the script runs."
+                        ),
+                    },
+                    "frequency_type": {
+                        "type": "string",
+                        "enum": ["daily", "interval", "once"],
+                        "description": "Schedule type. 'daily' = run at a fixed time on selected days; 'interval' = every N hours; 'once' = one-time on a specific date. Default: 'daily'",
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "Trigger time in HH:MM 24h format (e.g. '22:15'). Required for 'daily' and 'once'. Default: '09:00'",
+                    },
+                    "days": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Days of week to run (1=Mon … 7=Sun). Default: [1,2,3,4,5,6,7] (every day). For 'once' this is ignored.",
+                    },
+                    "interval_hours": {
+                        "type": "integer",
+                        "description": "For frequency_type='interval': run every N hours. Default: 4",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "For frequency_type='once': the date in YYYY-MM-DD format",
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": (
+                            "Task root directory: all scripts, venv (.venv inside this path), logs, and temp files for this job belong here. "
+                            "If omitted, defaults to ~/.agenticx/crontask/<task_id>/ (one directory per task, created automatically)."
+                        ),
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Whether the task is enabled immediately. Default: true",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Studio LLM provider id (must be set together with model). Optional.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name for this task (must be set together with provider). Optional.",
+                    },
+                },
+                "required": ["name", "instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scheduled_tasks",
+            "description": "List all persistent scheduled/automated tasks from disk, including their status, frequency and last run info.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_scheduled_task",
+            "description": "Disable or remove a scheduled task by task_id. The task will no longer execute automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "ID of the task to disable/cancel"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_scheduled_task",
+            "description": (
+                "Partially update an existing scheduled/automated task by task_id. "
+                "Only fields explicitly provided will be changed; omitted fields keep their current value. "
+                "Use this to tweak an existing task's name, prompt, frequency, workspace, enabled flag or effective date range "
+                "via natural-language dialog — no need to delete and recreate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "ID of the task to update (obtain via list_scheduled_tasks)."},
+                    "name": {"type": "string", "description": "New human-readable task name."},
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "New prompt for the automation runner. Write it in the language the user asked for. "
+                            "When provided, the tool re-runs MCP preflight and re-injects the Execution Contract "
+                            "in that same language, replacing any previously auto-injected contract block."
+                        ),
+                    },
+                    "frequency_type": {
+                        "type": "string",
+                        "enum": ["daily", "interval", "once"],
+                        "description": "If provided, rebuilds the frequency. Omitted frequency fields fall back to the task's current values.",
+                    },
+                    "time": {"type": "string", "description": "HH:MM 24h time for daily/once."},
+                    "days": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Days of week (1=Mon … 7=Sun) for daily/interval.",
+                    },
+                    "interval_hours": {"type": "integer", "description": "Run every N hours when frequency_type='interval'."},
+                    "date": {"type": "string", "description": "YYYY-MM-DD date when frequency_type='once'."},
+                    "workspace": {
+                        "type": "string",
+                        "description": "New task root directory. Pass empty string to reset to default (~/.agenticx/crontask/<task_id>/).",
+                    },
+                    "enabled": {"type": "boolean", "description": "Enable/disable the task."},
+                    "effective_date_range_start": {"type": "string", "description": "Optional effective start date (YYYY-MM-DD). Empty string clears it."},
+                    "effective_date_range_end": {"type": "string", "description": "Optional effective end date (YYYY-MM-DD). Empty string clears it."},
+                    "provider": {
+                        "type": "string",
+                        "description": "LLM provider for scheduled runs (set together with model; empty clears both).",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "LLM model id for scheduled runs (set together with provider; empty clears both).",
+                    },
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_automation_task_logs",
+            "description": (
+                "Read the tail of a scheduled/automated task's execution log file "
+                "(~/.agenticx/logs/automation/<task_id>.log). "
+                "Each run writes [run.begin], [run.session_created|session_reused], [chat.request], "
+                "[chat.sse ...], [chat.done|stream_ended|http_error|sse.error|exception], and [run.end] lines. "
+                "Use this to diagnose why a task failed (e.g. terminated/timeout, http error, tool error) before proposing a fix."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task id (obtain via list_scheduled_tasks)."},
+                    "tail": {
+                        "type": "integer",
+                        "description": "Last N lines to return (default 200, max 2000).",
+                    },
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        # Plan-Id: machi-kb-stage1-local-mvp (plan §2.3).
+        "type": "function",
+        "function": {
+            "name": "knowledge_search",
+            "description": (
+                "Search mounted document brains (知识库 / docs brain) for the current session. "
+                "Returns {hits, by_brain, used_top_k, brains} — hits are merged top-k; "
+                "by_brain groups results per brain. Respects avatar brain mount settings. "
+                "Optional brain_id searches a single brain. If nothing is mounted, returns a hint."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural-language search query."},
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of chunks to return (1-20). Omit to use KB setting default Top-K.",
+                    },
+                    "brain_id": {
+                        "type": "string",
+                        "description": "Optional: search only this docs brain id (must be visible to the session avatar).",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "knowledge_synthesize",
+            "description": (
+                "Synthesize an answer from mounted document brains with [N] citations and gap analysis. "
+                "Use when the user wants a composed answer from the knowledge base rather than raw chunks. "
+                "Requires synthesis to be enabled in brain settings. For raw retrieval only, use knowledge_search."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Question to answer from the knowledge base."},
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum source chunks to retrieve before synthesis (1-20).",
+                    },
+                    "brain_id": {
+                        "type": "string",
+                        "description": "Optional: synthesize from a single docs brain id.",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the public web for up-to-date information (news, live data, documentation "
+                "beyond knowledge cutoff). Prefer this for time-sensitive or externally verifiable "
+                "facts before answering. "
+                "Do NOT use this tool to determine the current date, weekday or clock time; "
+                "use get_current_datetime instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keywords or question."},
+                    "max_results": {
+                        "type": "integer",
+                        "description": (
+                            "Number of results (>=1). Omit to use workspace default; "
+                            "values are capped by the configured maximum."
+                        ),
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_datetime",
+            "description": (
+                "Return the authoritative current date and time from the local system clock "
+                "(local ISO datetime, date, weekday, timezone and UTC offset). Use this instead "
+                "of web_search whenever the current date, weekday or clock time matters."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "document_read_pages",
+            "description": (
+                "Render more pages of a PDF that was attached to this conversation, so you can "
+                "read them visually in the next turn. Use this when an attachment note says only "
+                "part of the document was rendered — do NOT guess what the unread pages contain. "
+                "Pages are 1-based and inclusive of start_page. Returns an error if the file is "
+                "not a PDF attached to this session."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path of the PDF, exactly as given in the attachment note.",
+                    },
+                    "start_page": {
+                        "type": "integer",
+                        "description": "First page to render (1-based). Clamped to the document length.",
+                    },
+                    "max_pages": {
+                        "type": "integer",
+                        "description": "How many pages to render this time. Defaults to the deployment cap.",
+                    },
+                },
+                "required": ["path", "start_page"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetch a single web URL and return its readable text content plus a list of "
+                "in-page image URLs. Use this when the user provides a URL whose content you "
+                "need to understand. Returns markdown-ish text (HTML stripped) and a structured "
+                "tail block '[discovered_images]' listing absolute image URLs in source order. "
+                "Combine with view_image when visual content matters. Max page size 2 MB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute http(s) URL to fetch.",
+                    },
+                    "max_images": {
+                        "type": "integer",
+                        "description": "Cap on how many image URLs to return (default 20, hard max 50).",
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": (
+                "Load an image so the model can visually inspect it in the next turn. Accepts a "
+                "local absolute/relative file path, a http(s) URL (e.g. one returned by "
+                "web_fetch's [discovered_images]), or a data:image/* URL. Use when visual content "
+                "is necessary to answer (e.g. user asked 'describe the first image'). Returns an "
+                "error if the current model is not vision-capable. Each turn caps total attached "
+                "images at 4."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "File path, http(s) URL, or data:image/* URL.",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional short label used in the placeholder text (e.g. 'cover image').",
+                    },
+                },
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an image from a text prompt and save it to the session workspace. "
+                "Use when the user asks to draw / generate / 画一张图. "
+                "Returns a local file path. Do not invent a URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Image prompt."},
+                    "size": {
+                        "type": "string",
+                        "enum": ["1024x1024", "1024x1792", "1792x1024"],
+                        "description": "Optional size. Default 1024x1024.",
+                    },
+                },
+                "required": ["prompt"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_images",
+            "description": (
+                "Display 1-6 remote images inline in the chat bubble. "
+                "Use when the user wants to SEE photos / 搜照片看看 / 看看图. "
+                "Pass direct image http(s) URLs from web_fetch [discovered_images] "
+                "or obvious image CDN links. Do not pass HTML gallery pages. "
+                "This is display-only: the current model does not need vision. "
+                "Never tell the user the bubble cannot render images. "
+                "不要图集 HTML；不要选 URL 含 /ops/、/avatar/、/banner/ 或边长 ≤160 的运营位。"
+                "不要用 generate_image 画公众人物照片。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string", "description": "Direct http(s) image URL."},
+                                "alt": {"type": "string", "description": "Short caption."},
+                                "source_url": {
+                                    "type": "string",
+                                    "description": "Page URL for attribution.",
+                                },
+                            },
+                            "required": ["url"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_image",
+            "description": (
+                "Analyze an image with the configured vision-capable fallback model and return "
+                "a textual understanding. Use ONLY when the current session model is text-only "
+                "(view_image reports the model does not support vision, or a system notice says "
+                "attached images were omitted). Accepts a local file path, http(s) URL, or "
+                "data:image/* URL; when target is omitted, the most recently attached image in "
+                "this session is used. The returned text description is your only window into "
+                "the image — quote specifics from it when continuing the task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Optional. File path, http(s) URL, or data:image/* URL. Omit to use the latest session image.",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional focus for the vision pass, e.g. '识别图中的组织名称与 Logo 文字'.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ── task_experience tools (group team session cross-task memory) ──────────
+    {
+        "type": "function",
+        "function": {
+            "name": "task_experience_retrieve",
+            "description": (
+                "Retrieve relevant task experience from previous group team sessions. "
+                "Call at the start of every complex task to check for reusable lessons. "
+                "Uses hybrid search (BM25 + vector) against ~/.agenticx/groups/<group_id>/experience.json."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Describe the current task or challenge to match past experience.",
+                    },
+                    "group_id": {
+                        "type": "string",
+                        "description": "Group ID to scope the experience store. Defaults to current session group.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of experience entries to return (1-10, default 5).",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_experience_learn",
+            "description": (
+                "Record a key finding, rule, or lesson from the current task into the group experience store. "
+                "Call before the final reply to preserve reusable knowledge for future sessions. "
+                "Recording failed tool calls is especially valuable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The experience or lesson content to record.",
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Category label (e.g. 'debugging', 'code_pattern', 'api_usage'). Default 'general'.",
+                    },
+                    "when_to_use": {
+                        "type": "string",
+                        "description": "Describe when this experience should be applied in the future.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the experience entry.",
+                    },
+                    "group_id": {
+                        "type": "string",
+                        "description": "Group ID to scope the experience store. Defaults to current session group.",
+                    },
+                },
+                "required": ["content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_experience_clear",
+            "description": (
+                "Clear all stored task experience for a group. "
+                "Only call when explicitly requested by the user. Always confirm before clearing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "string",
+                        "description": "Group ID whose experience store should be cleared.",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to actually clear. Prevents accidental deletion.",
+                    },
+                },
+                "required": ["confirm"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+# Desktop Computer Use tools (injected at runtime when ``computer_use.enabled`` in config).
+COMPUTER_USE_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "desktop_screenshot",
+            "description": (
+                "Capture the entire primary display to a PNG under ~/.agenticx/desktop-use/ "
+                "(not the session project folder). On macOS uses ``screencapture``; elsewhere tries ``pyautogui`` if installed. "
+                "Prefer this over claiming you cannot screenshot when the user enabled 桌面操控."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional basename only (e.g. cap.png); must end with .png.",
+                    },
+                    "include_base64": {
+                        "type": "boolean",
+                        "description": "If true (default), include image_base64 when file is under ~900KB.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "desktop_mouse_click",
+            "description": (
+                "Click at screen coordinates using pyautogui (requires ``pip install pyautogui``). "
+                "Coordinates are in **screen** pixels (origin top-left). High-risk: user confirmation required."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Screen X coordinate."},
+                    "y": {"type": "integer", "description": "Screen Y coordinate."},
+                    "clicks": {
+                        "type": "integer",
+                        "description": "Number of clicks (default 1).",
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "description": "Mouse button (default left).",
+                    },
+                },
+                "required": ["x", "y"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "desktop_keyboard_type",
+            "description": (
+                "Type Unicode text as keyboard input using pyautogui (requires ``pip install pyautogui``). "
+                "High-risk: user confirmation required; never use for secrets unless the user explicitly asks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to type."},
+                    "interval_sec": {
+                        "type": "number",
+                        "description": "Optional delay between keystrokes (default 0.02).",
+                    },
+                },
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+COMPUTER_USE_TOOL_NAMES = frozenset(
+    name
+    for t in COMPUTER_USE_TOOLS
+    if isinstance(t, dict)
+    for name in (str(t.get("function", {}).get("name", "") or "").strip(),)
+    if name
+)
+
+
+def computer_use_config_enabled() -> bool:
+    """True when ``~/.agenticx/config.yaml`` has ``computer_use.enabled: true``."""
+    try:
+        return bool(ConfigManager.load().computer_use.enabled)
+    except Exception:
+        return False
+
+
+def merge_computer_use_tools_into(tool_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append Computer Use tool specs when enabled; dedupe by function name."""
+    if not computer_use_config_enabled():
+        return tool_list
+    seen: set[str] = set()
+    for t in tool_list:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        if isinstance(fn, dict):
+            n = str(fn.get("name", "") or "").strip()
+            if n:
+                seen.add(n)
+    out = list(tool_list)
+    for spec in COMPUTER_USE_TOOLS:
+        if not isinstance(spec, dict):
+            continue
+        fn = spec.get("function", {})
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get("name", "") or "").strip()
+        if not name or name in seen:
+            continue
+        out.append(spec)
+        seen.add(name)
+    return out
+
+
+NEAR_BROWSER_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_open",
+            "description": (
+                "Open a URL in the Near WorkPanel in-app browser (right-side visible webview). "
+                "Use when the user says 打开页面 / 看看这个链接 / 打开这个网页. "
+                "Reveals the workspace browser even if that panel is closed. "
+                "Prefer this over browser-use MCP and never fall back to the system browser. "
+                "User sees every navigation. After open, call near_browser_snapshot before click/type."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "http(s) URL or a host that will be prefixed with https://.",
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_snapshot",
+            "description": (
+                "Snapshot interactive elements in the WorkPanel browser and return index/tag/text/"
+                "is_password. Must be called before every near_browser_click or near_browser_type."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_click",
+            "description": (
+                "Click an indexed element in the WorkPanel browser. "
+                "Call near_browser_snapshot first and use the returned index."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "Element index from the latest near_browser_snapshot.",
+                    },
+                },
+                "required": ["index"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_type",
+            "description": (
+                "Type into an indexed input in the WorkPanel browser. "
+                "Call near_browser_snapshot first. Password fields require one user confirmation. "
+                "Set submit=true to press Enter / requestSubmit after typing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "Element index from the latest near_browser_snapshot.",
+                    },
+                    "text": {"type": "string", "description": "Text to insert."},
+                    "submit": {
+                        "type": "boolean",
+                        "description": "If true, press Enter and try form.requestSubmit after typing.",
+                    },
+                },
+                "required": ["index", "text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_press_key",
+            "description": (
+                "Dispatch a key (e.g. Enter, Escape, Tab) in the WorkPanel browser."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Keyboard key name, e.g. Enter."},
+                },
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_extract_text",
+            "description": (
+                "Read visible text from the current WorkPanel browser page. "
+                "Optional query keeps matching lines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional substring filter for visible text lines.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "near_browser_screenshot",
+            "description": (
+                "Capture the current WorkPanel browser viewport to a PNG under "
+                "~/.agenticx/desktop-use/ and return the absolute path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+NEAR_BROWSER_TOOL_NAMES = frozenset(
+    name
+    for t in NEAR_BROWSER_TOOLS
+    if isinstance(t, dict)
+    for name in (str(t.get("function", {}).get("name", "") or "").strip(),)
+    if name
+)
+
+_NEAR_BROWSER_HUMAN_TAKEOVER = "用户已接管浏览器，请停止自动操作并询问用户下一步。"
+
+
+def browser_control_config_enabled() -> bool:
+    """True when ``browser_control.enabled`` is unset or true (default on)."""
+    try:
+        return bool(ConfigManager.load().browser_control.enabled)
+    except Exception:
+        return True
+
+
+def merge_near_browser_tools_into(tool_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append WorkPanel browser tool specs when enabled; dedupe by function name."""
+    if not browser_control_config_enabled():
+        return tool_list
+    seen: set[str] = set()
+    for t in tool_list:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        if isinstance(fn, dict):
+            n = str(fn.get("name", "") or "").strip()
+            if n:
+                seen.add(n)
+    out = list(tool_list)
+    for spec in NEAR_BROWSER_TOOLS:
+        if not isinstance(spec, dict):
+            continue
+        fn = spec.get("function", {})
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get("name", "") or "").strip()
+        if not name or name in seen:
+            continue
+        out.append(spec)
+        seen.add(name)
+    return out
+
+
+_CODE_SEARCH_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "code_search",
+        "description": (
+            "Semantic/hybrid search over mounted code brains (设置 → 知识库 → 代码脑) "
+            "or a legacy global code_index codebase. Returns {hits, by_brain, brains}. "
+            "Prefer in Explore phase before reading whole files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "codebase_path": {
+                    "type": "string",
+                    "description": "Legacy: root path indexed via global code_index (omit when using code brains).",
+                },
+                "query": {"type": "string", "description": "Natural language or keyword query."},
+                "top_k": {"type": "integer", "description": "Number of hits (default 10)."},
+                "brain_id": {
+                    "type": "string",
+                    "description": "Optional: search only this code brain id.",
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": ["hybrid", "semantic", "bm25"],
+                    "description": "Search strategy (default hybrid).",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def code_index_config_enabled() -> bool:
+    try:
+        return bool(ConfigManager.get_value("code_index.enabled"))
+    except Exception:
+        return False
+
+
+def _has_enabled_code_brains() -> bool:
+    try:
+        from agenticx.brain.registry import BrainRegistry
+        from agenticx.brain.types import BrainType
+
+        BrainRegistry.instance().bootstrap()
+        return any(
+            b.enabled and b.type == BrainType.CODE for b in BrainRegistry.instance().list_brains()
+        )
+    except Exception:
+        return False
+
+
+def _code_search_tool_defs() -> List[Dict[str, Any]]:
+    return _code_index_tool_defs()
+
+
+def studio_tools_for_session(session: Optional[StudioSession] = None) -> List[Dict[str, Any]]:
+    """Studio/Meta tool list with optional code_search when mounted code brains exist."""
+    tools = merge_computer_use_tools_into(list(STUDIO_TOOLS))
+    tools = merge_near_browser_tools_into(tools)
+    from agenticx.ops.tools import merge_ops_tools_into
+
+    tools = merge_ops_tools_into(tools)
+    try:
+        from agenticx.brain.mount import session_has_mounted_code_brains
+
+        if session is not None and session_has_mounted_code_brains(session):
+            extra = _code_search_tool_defs()
+            if extra:
+                names = {
+                    str(t.get("function", {}).get("name", ""))
+                    for t in tools
+                    if isinstance(t, dict)
+                }
+                for spec in extra:
+                    n = str(spec.get("function", {}).get("name", ""))
+                    if n and n not in names:
+                        tools.append(spec)
+                        names.add(n)
+    except Exception:
+        pass
+    return tools
+
+
+_MAX_DESKTOP_SCREENSHOT_BYTES_FOR_B64 = 950_000
+
+
+def _agenticx_desktop_use_dir() -> Path:
+    """Fixed directory for desktop screenshots (under ~/.agenticx, not session cwd)."""
+    d = (Path.home() / ".agenticx" / "desktop-use").resolve(strict=False)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _desktop_use_blocked_message() -> str:
+    return (
+        "ERROR: 桌面操控工具未启用。请在 Near 设置中开启「桌面操控」（写入 ~/.agenticx/config.yaml 的 "
+        "computer_use.enabled）后完全重启 Near。"
+    )
+
+
+def _desktop_screenshot_target_path(session: StudioSession, filename: str | None) -> Path:
+    base = _agenticx_desktop_use_dir()
+    name = str(filename or "").strip()
+    if name:
+        safe = os.path.basename(name).replace("..", "_")
+        if not safe.lower().endswith(".png"):
+            safe = f"{safe}.png" if safe else f"screen_{uuid.uuid4().hex[:10]}.png"
+    else:
+        safe = f"screen_{uuid.uuid4().hex[:10]}.png"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.png", safe):
+        safe = f"screen_{uuid.uuid4().hex[:10]}.png"
+    return (base / safe).resolve(strict=False)
+
+
+async def _capture_display_to_png(out_path: Path) -> None:
+    """Write a full-screen PNG to ``out_path`` (blocking work in a thread)."""
+
+    def _darwin_screencapture() -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            ["screencapture", "-x", "-t", "png", str(out_path)],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip() or "screencapture failed"
+            raise RuntimeError(err)
+
+    def _pyautogui_capture() -> None:
+        import pyautogui  # type: ignore import-not-found
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img = pyautogui.screenshot()
+        img.save(str(out_path))
+
+    if sys.platform == "darwin":
+        await asyncio.to_thread(_darwin_screencapture)
+        return
+    try:
+        await asyncio.to_thread(_pyautogui_capture)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Screenshot failed ({exc!r}). Install pyautogui (`pip install pyautogui`) "
+            "or use macOS where screencapture is available."
+        ) from exc
+
+
+async def _tool_desktop_screenshot(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession],
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    if not computer_use_config_enabled():
+        return _desktop_use_blocked_message()
+    if session is None:
+        return "ERROR: desktop_screenshot requires an active Studio session"
+    if not await _confirm(
+        "将在本机截取**全屏**并保存到 ~/.agenticx/desktop-use/ ，是否继续？",
+        confirm_gate=confirm_gate,
+        context={"tool": "desktop_screenshot", "risk": "computer_use"},
+        emit_event=emit_event,
+    ):
+        return _cancelled("桌面截屏未执行", confirm_gate)
+    include_b64 = arguments.get("include_base64")
+    if include_b64 is None:
+        include_b64 = True
+    include_b64 = bool(include_b64)
+    try:
+        out_path = _desktop_screenshot_target_path(session, str(arguments.get("filename") or ""))
+        await _capture_display_to_png(out_path)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    try:
+        size = out_path.stat().st_size
+    except OSError as exc:
+        return json.dumps({"ok": False, "error": f"stat failed: {exc}"}, ensure_ascii=False)
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "path": str(out_path),
+        "bytes": size,
+        "hint": "若模型支持多模态，可将该 PNG 路径作为图像输入；否则向用户说明文件路径。",
+    }
+    if include_b64 and size <= _MAX_DESKTOP_SCREENSHOT_BYTES_FOR_B64:
+        try:
+            raw = out_path.read_bytes()
+            payload["image_base64"] = base64.standard_b64encode(raw).decode("ascii")
+        except OSError as exc:
+            payload["base64_error"] = str(exc)
+    elif include_b64:
+        payload["note"] = "PNG 过大，未内联 base64；请使用 path 或压缩后再读。"
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _tool_desktop_mouse_click(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession],
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    if not computer_use_config_enabled():
+        return _desktop_use_blocked_message()
+    if session is None:
+        return "ERROR: desktop_mouse_click requires an active Studio session"
+    try:
+        x = int(arguments.get("x"))
+        y = int(arguments.get("y"))
+    except (TypeError, ValueError):
+        return "ERROR: desktop_mouse_click requires integer x and y"
+    clicks_raw = arguments.get("clicks", 1)
+    try:
+        clicks = int(clicks_raw)
+    except (TypeError, ValueError):
+        clicks = 1
+    clicks = max(1, min(5, clicks))
+    button = str(arguments.get("button") or "left").strip().lower()
+    if button not in {"left", "right", "middle"}:
+        button = "left"
+    if not await _confirm(
+        f"将在屏幕坐标 ({x}, {y}) 用 pyautogui 执行 {clicks} 次 {button} 点击，是否继续？",
+        confirm_gate=confirm_gate,
+        context={"tool": "desktop_mouse_click", "risk": "computer_use", "x": x, "y": y},
+        emit_event=emit_event,
+    ):
+        return _cancelled("桌面点击未执行", confirm_gate)
+
+    def _run() -> str:
+        import pyautogui  # type: ignore import-not-found
+
+        pyautogui.click(x=x, y=y, clicks=clicks, button=button)
+        return "ok"
+
+    try:
+        await asyncio.to_thread(_run)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": str(exc),
+                "hint": "需要安装 pyautogui：pip install pyautogui（并在 macOS 上授予辅助功能权限）。",
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps({"ok": True, "x": x, "y": y, "clicks": clicks, "button": button}, ensure_ascii=False)
+
+
+async def _tool_desktop_keyboard_type(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession],
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    if not computer_use_config_enabled():
+        return _desktop_use_blocked_message()
+    if session is None:
+        return "ERROR: desktop_keyboard_type requires an active Studio session"
+    text = str(arguments.get("text", ""))
+    if not text:
+        return "ERROR: desktop_keyboard_type requires non-empty text"
+    if len(text) > 8000:
+        return "ERROR: text too long (max 8000 chars)"
+    interval_raw = arguments.get("interval_sec", 0.02)
+    try:
+        interval = float(interval_raw)
+    except (TypeError, ValueError):
+        interval = 0.02
+    interval = max(0.0, min(1.0, interval))
+    preview = text if len(text) <= 120 else text[:117] + "..."
+    if not await _confirm(
+        f"将通过 pyautogui 输入键盘文本（预览）：{preview!r} — 是否继续？",
+        confirm_gate=confirm_gate,
+        context={"tool": "desktop_keyboard_type", "risk": "computer_use"},
+        emit_event=emit_event,
+    ):
+        return _cancelled("桌面键入未执行", confirm_gate)
+
+    def _run() -> None:
+        import pyautogui  # type: ignore import-not-found
+
+        pyautogui.write(text, interval=interval)
+
+    try:
+        await asyncio.to_thread(_run)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": str(exc),
+                "hint": "需要安装 pyautogui：pip install pyautogui（部分字符仅支持 ASCII；复杂输入考虑剪贴板方案）。",
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps({"ok": True, "chars": len(text)}, ensure_ascii=False)
+
+
+def _studio_session_id(session: Optional[StudioSession]) -> str:
+    if session is None:
+        return ""
+    for attr in ("_session_id", "session_id", "id"):
+        raw = getattr(session, attr, None)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+    return ""
+
+
+def _near_browser_index(arguments: Dict[str, Any]) -> Optional[int]:
+    raw = arguments.get("index")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_near_browser_result(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    error = str(payload.get("error") or "").strip()
+    if error == "human_takeover":
+        return _NEAR_BROWSER_HUMAN_TAKEOVER
+    return raw
+
+
+async def _tool_near_browser_http(
+    session: StudioSession,
+    action: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_sec: float,
+) -> str:
+    from agenticx.cli.browser_bridge_settings import (
+        MISSING_BRIDGE_ERROR,
+        browser_bridge_base_url,
+        browser_bridge_token,
+    )
+
+    try:
+        import httpx
+    except ImportError:
+        return "ERROR: httpx is required for near_browser tools"
+
+    base = browser_bridge_base_url()
+    token = browser_bridge_token()
+    if not base or not token:
+        return f"ERROR: {MISSING_BRIDGE_ERROR}"
+    session_id = _studio_session_id(session)
+    if not session_id:
+        return "ERROR: near_browser tools require an active Studio session"
+    body: Dict[str, Any] = {"session_id": session_id, "action": action}
+    if payload:
+        body.update(payload)
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{base}/v1/browser/act"
+    client_kwargs = _cc_bridge_http_client_kwargs(base, timeout_sec)
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(url, headers=headers, json=body)
+    except httpx.ConnectError as exc:
+        return (
+            f"ERROR: {MISSING_BRIDGE_ERROR}；连接失败 {base}。可改用 browser-use MCP。Details: {exc}"
+        )
+    except httpx.TimeoutException as exc:
+        return f"ERROR: Near 浏览器桥超时（browser_bridge.port / {base}）：{exc}"
+    except httpx.HTTPError as exc:
+        return f"ERROR: Near 浏览器桥请求失败（browser_bridge.port / {base}）：{exc}"
+    text = response.text
+    if response.status_code in (401, 403):
+        return (
+            f"ERROR: Near 浏览器桥鉴权失败（HTTP {response.status_code}，browser_bridge.port）。"
+            f" Body: {text[:800]}"
+        )
+    if response.status_code >= 400:
+        return f"ERROR: Near 浏览器桥 {response.status_code}（browser_bridge.port）：{text[:2000]}"
+    return _format_near_browser_result(text)
+
+
+async def _tool_near_browser_open(arguments: Dict[str, Any], session: StudioSession) -> str:
+    url = str(arguments.get("url") or "").strip()
+    if not url:
+        return "ERROR: near_browser_open requires parameter url"
+    return await _tool_near_browser_http(session, "open", {"url": url}, timeout_sec=30.0)
+
+
+async def _tool_near_browser_snapshot(arguments: Dict[str, Any], session: StudioSession) -> str:
+    _ = arguments
+    return await _tool_near_browser_http(session, "snapshot", {}, timeout_sec=20.0)
+
+
+async def _tool_near_browser_click(arguments: Dict[str, Any], session: StudioSession) -> str:
+    index = _near_browser_index(arguments)
+    if index is None:
+        return "ERROR: near_browser_click requires integer parameter index"
+    return await _tool_near_browser_http(session, "click", {"index": index}, timeout_sec=20.0)
+
+
+async def _tool_near_browser_type(
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    index = _near_browser_index(arguments)
+    if index is None:
+        return "ERROR: near_browser_type requires integer parameter index"
+    text = str(arguments.get("text") or "")
+    submit = arguments.get("submit") is True
+    snap_raw = await _tool_near_browser_http(session, "snapshot", {}, timeout_sec=20.0)
+    if snap_raw == _NEAR_BROWSER_HUMAN_TAKEOVER:
+        return snap_raw
+    if snap_raw.startswith("ERROR:"):
+        return snap_raw
+    try:
+        snap = json.loads(snap_raw)
+    except Exception:
+        snap = {}
+    elements = snap.get("elements") if isinstance(snap, dict) else None
+    if isinstance(elements, list):
+        target = next(
+            (
+                row
+                for row in elements
+                if isinstance(row, dict) and row.get("index") == index
+            ),
+            None,
+        )
+        if target is None:
+            return (
+                "ERROR: index not found in latest snapshot; call near_browser_snapshot first"
+            )
+        if target.get("is_password") is True:
+            preview = text if len(text) <= 8 else text[:3] + "…"
+            if not await _confirm(
+                f"将在应用内浏览器密码框输入（预览 {preview!r}）— 是否继续？",
+                confirm_gate=confirm_gate,
+                context={"tool": "near_browser_type", "risk": "computer_use"},
+                emit_event=emit_event,
+            ):
+                return _cancelled("应用内浏览器密码输入未执行", confirm_gate)
+    return await _tool_near_browser_http(
+        session,
+        "type",
+        {"index": index, "text": text, "submit": submit},
+        timeout_sec=20.0,
+    )
+
+
+async def _tool_near_browser_press_key(arguments: Dict[str, Any], session: StudioSession) -> str:
+    key = str(arguments.get("key") or "").strip()
+    if not key:
+        return "ERROR: near_browser_press_key requires parameter key"
+    return await _tool_near_browser_http(session, "press_key", {"key": key}, timeout_sec=20.0)
+
+
+async def _tool_near_browser_extract_text(arguments: Dict[str, Any], session: StudioSession) -> str:
+    query = str(arguments.get("query") or "").strip()
+    payload: Dict[str, Any] = {}
+    if query:
+        payload["query"] = query
+    return await _tool_near_browser_http(session, "extract_text", payload, timeout_sec=20.0)
+
+
+async def _tool_near_browser_screenshot(arguments: Dict[str, Any], session: StudioSession) -> str:
+    _ = arguments
+    return await _tool_near_browser_http(session, "screenshot", {}, timeout_sec=30.0)
+
+
+META_TOOL_NAMES = {
+    "spawn_subagent",
+    "fresh_round_loop",
+    "cancel_subagent",
+    "retry_subagent",
+    "query_subagent_status",
+    "send_message_to_agent",
+    "check_resources",
+    "recommend_subagent_model",
+    "list_skills",
+    "list_mcps",
+    "send_bug_report_email",
+    "update_email_config",
+    "schedule_task",
+    "list_scheduled_tasks",
+    "cancel_scheduled_task",
+    "update_scheduled_task",
+    "get_automation_task_logs",
+}
+
+
+def _cancelled(what: str, confirm_gate: ConfirmGate) -> str:
+    """CANCELLED 文案，带上「为什么没通过」。
+
+    以前一律写 user denied。无人值守跑批时根本没人在场，用户回头看日志会去找一个
+    不存在的点击；等待超时同理。原因由 _confirm 在拒绝时挂到 gate 上。
+    """
+
+    note = getattr(confirm_gate, "last_denial_note", "")
+    if not isinstance(note, str) or not note.strip():
+        note = "用户拒绝"
+    return f"CANCELLED: {what}（{note.strip()}）"
+
+
+def _peel_to_inner_command(parts: List[str]) -> List[str]:
+    """Strip env assignments and delegating wrappers (timeout/env/xargs/…)."""
+    from agenticx.runtime.command_safety import DELEGATING_COMMANDS, _strip_env_assignments
+
+    current = list(_strip_env_assignments(parts))
+    for _ in range(8):
+        if not current:
+            return current
+        name = Path(current[0]).name
+        if name not in DELEGATING_COMMANDS:
+            return current
+        index = 1
+        if name == "timeout":
+            while index < len(current) and current[index].startswith("-"):
+                index += 1
+            index += 1
+        elif name == "env":
+            while index < len(current) and (
+                current[index].startswith("-") or "=" in current[index]
+            ):
+                index += 1
+        elif name == "xargs":
+            while index < len(current) and current[index].startswith("-"):
+                if current[index] in {"-I", "-n", "-P", "-L", "-d", "-s", "-E", "-a"}:
+                    index += 1
+                index += 1
+        else:
+            while index < len(current) and current[index].startswith("-"):
+                index += 1
+        current = list(current[index:])
+    return current
+
+
+def _extract_node_script_arg(parts: List[str]) -> Optional[str]:
+    if any(token in {"-e", "-p", "-c"} for token in parts[1:]):
+        return None
+    idx = 1
+    while idx < len(parts):
+        token = parts[idx]
+        if token == "--":
+            return parts[idx + 1] if idx + 1 < len(parts) else None
+        if token in {"-r", "--require"}:
+            idx += 2
+            continue
+        if token.startswith("-"):
+            idx += 1
+            continue
+        return token
+    return None
+
+
+def _workspace_script_paths(parts: List[str]) -> Optional[List[str]]:
+    """Executable + script args that must already exist in writable roots.
+
+    Returns None when the segment is not a workspace-script shape
+    (``python -c``, ``node -e``, empty inner command).
+    """
+    if not parts:
+        return None
+    name = Path(parts[0]).name
+    if name in {"python", "python3"}:
+        script = _extract_python_script_arg(parts)
+        if not script:
+            return None
+        return [parts[0], script]
+    if name in {"node", "npx"}:
+        script = _extract_node_script_arg(parts)
+        if not script:
+            return None
+        return [parts[0], script]
+    return [parts[0]]
+
+
+def _existing_writable_workspace_path(
+    path_arg: str,
+    session: Optional[StudioSession],
+) -> bool:
+    if session is None:
+        return False
+    try:
+        resolved = _resolve_workspace_path(path_arg, session)
+    except ValueError:
+        return False
+    try:
+        if not resolved.exists():
+            return False
+    except OSError:
+        return False
+    _read_roots, write_roots = _session_workspace_root_sets(session)
+    return any(_is_path_under_root(resolved, root) for root in write_roots)
+
+
+def _existing_writable_workspace_path_lexical(
+    path_arg: str,
+    session: Optional[StudioSession],
+) -> bool:
+    """Containment check that does not follow symlinks.
+
+    A venv interpreter is always ``.venv/bin/python -> <system python>``, so
+    resolving symlinks would report every venv as escaping the workspace. The
+    risk boundary is the script being run, not where the interpreter binary
+    physically lives; writes are still bounded by the OS sandbox. ``..`` cannot
+    be used to escape because ``normpath`` collapses it before the check.
+    """
+    if session is None:
+        return False
+    raw = str(path_arg or "").strip()
+    if not raw:
+        return False
+    _read_roots, write_roots = _session_workspace_root_sets(session)
+    if not write_roots:
+        return False
+    expanded = Path(raw).expanduser()
+    candidates: List[Path] = []
+    if expanded.is_absolute():
+        candidates.append(Path(os.path.normpath(str(expanded))))
+    else:
+        for root in write_roots:
+            candidates.append(Path(os.path.normpath(str(root / expanded))))
+    for candidate in candidates:
+        if _is_protected_path(candidate) or _path_denied_by_rules(candidate, session):
+            continue
+        try:
+            if not candidate.exists():
+                continue
+        except OSError:
+            continue
+        if any(
+            str(candidate) == str(root) or str(candidate).startswith(f"{root}{os.sep}")
+            for root in write_roots
+        ):
+            return True
+    return False
+
+
+def _unattended_workspace_script_allowed(
+    context: Dict[str, Any],
+    risk_codes: Iterable[str],
+    session: Optional[StudioSession],
+) -> bool:
+    """Narrow unattended allow: existing workspace scripts only, never-categories excluded."""
+    if session is None:
+        return False
+    try:
+        flag = ConfigManager.get_value("permissions.unattended_allow_workspace_scripts")
+    except Exception:
+        flag = False
+    if flag is not True:
+        return False
+    from agenticx.runtime.command_safety import (
+        NEVER_AUTO_APPROVED_CATEGORIES,
+        absolute_redirect_targets,
+        split_simple_commands,
+    )
+
+    if set(str(code) for code in risk_codes) & NEVER_AUTO_APPROVED_CATEGORIES:
+        return False
+    tool = str(context.get("tool") or "")
+    if tool not in {"bash_exec", "bash_bg_start"}:
+        return False
+    command = str(context.get("command") or "")
+    if not command.strip():
+        return False
+    if absolute_redirect_targets(command):
+        return False
+    segments = split_simple_commands(command)
+    if not segments:
+        return False
+    for parts in segments:
+        required = _workspace_script_paths(_peel_to_inner_command(list(parts)))
+        if not required:
+            return False
+        executable, script_args = required[0], required[1:]
+        # 解释器按字面路径判定（venv 里它必然是指向系统 Python 的符号链接）；
+        # 被执行的脚本仍按解析后的真实路径判定。
+        if not _existing_writable_workspace_path_lexical(executable, session):
+            return False
+        for arg in script_args:
+            if not _existing_writable_workspace_path(arg, session):
+                return False
+    return True
+
+
+async def _confirm(
+    question: str,
+    *,
+    confirm_gate: ConfirmGate,
+    context: Optional[Dict[str, Any]] = None,
+    emit_event: Optional[Any] = None,
+    session: Optional[StudioSession] = None,
+) -> bool:
+    payload_context = dict(context or {})
+    request_id = str(payload_context.get("request_id") or uuid.uuid4())
+    payload_context["request_id"] = request_id
+    from agenticx.runtime.command_safety import NEVER_AUTO_APPROVED_CATEGORIES
+
+    risk_codes = [
+        str(item.get("code") or "")
+        for item in (payload_context.get("risk_categories") or [])
+        if isinstance(item, dict)
+    ]
+    path_raw = payload_context.get("path")
+    path_allow = bool(path_raw) and _path_allowed_without_confirm(Path(str(path_raw)))
+    if set(risk_codes) & NEVER_AUTO_APPROVED_CATEGORIES:
+        path_allow = False
+    if tool_allowed_without_confirm(str(payload_context.get("tool") or ""), risk_codes) or path_allow:
+        _log.info(
+            "[confirm] auto-approved id=%s tool=%s by permissions allow rule",
+            request_id,
+            payload_context.get("tool"),
+        )
+        return True
+    if _unattended_workspace_script_allowed(payload_context, risk_codes, session):
+        _log.info(
+            "[confirm] auto-approved id=%s tool=%s by unattended workspace-script rule",
+            request_id,
+            payload_context.get("tool"),
+        )
+        return True
+    # 受保护的请求带上「为什么问你」。界面自己也能按 risk 推，但理由由后端给出才有
+    # 唯一出处——risk 取值将来加一个，不用记得同步改两处文案。
+    if is_protected_confirm(payload_context):
+        payload_context["protected_reason"] = protected_confirm_reason(payload_context)
+    _log.info(
+        "[confirm] requested id=%s question=%s risk=%s tool=%s",
+        request_id,
+        question,
+        payload_context.get("risk"),
+        payload_context.get("tool"),
+    )
+    # Gate capability, rather than concrete type, decides whether an event is
+    # needed. A risk-aware auto gate emits only for protected interactive work;
+    # low-risk and unattended requests must not create phantom UI prompts.
+    emit_prompt = emit_event is not None and confirm_gate.should_emit_prompt(payload_context)
+    if emit_prompt:
+        # Register the pending request before publishing its ID. Otherwise a
+        # fast UI callback can arrive before AsyncConfirmGate.resolve() has a
+        # future to resolve and the turn hangs until timeout.
+        confirm_task = asyncio.create_task(
+            confirm_gate.request_confirm(question, payload_context)
+        )
+        await asyncio.sleep(0)
+        try:
+            await emit_event(
+                {
+                    "type": "confirm_required",
+                    "data": {
+                        "id": request_id,
+                        "question": question,
+                        "context": payload_context,
+                    },
+                }
+            )
+            approved = await confirm_task
+        except BaseException:
+            confirm_task.cancel()
+            await asyncio.gather(confirm_task, return_exceptions=True)
+            raise
+    else:
+        approved = await confirm_gate.request_confirm(question, payload_context)
+    _log.info("[confirm] resolved id=%s approved=%s", request_id, approved)
+    if not approved:
+        # 调用方拼 CANCELLED 文案时读这一条：是人按的拒绝，还是无人值守直接拦下的。
+        setattr(confirm_gate, "last_denial_note", confirm_denial_note(confirm_gate, request_id))
+    if emit_prompt:
+        await emit_event(
+            {
+                "type": "confirm_response",
+                "data": {
+                    "id": request_id,
+                    "approved": approved,
+                },
+            }
+        )
+    return approved
+
+
+def build_clarification_tool_result(answer: Dict[str, Any]) -> str:
+    """Render a structured clarification answer as natural-language tool result.
+
+    The agent reads this text as the tool result of ``request_clarification``
+    and continues the same turn. Sentinels ``__timeout__`` / ``__suspended__``
+    are translated into explicit guidance so the model wraps up gracefully
+    instead of asking again.
+    """
+    if isinstance(answer, dict):
+        if answer.get("__timeout__"):
+            return (
+                "[CLARIFICATION_TIMEOUT] 用户未在时限内回复该提问。"
+                "请把待确认项写入待办并优雅结束本轮，不要重复发起同一提问。"
+            )
+        if answer.get("__suspended__"):
+            return (
+                "[CLARIFICATION_PENDING] 当前为无人值守/自动化会话，已向用户发起提问但暂无人回复。"
+                "请把待确认项写入待办并结束本轮，等待用户下次回来时再继续。"
+            )
+    answer_text = str((answer or {}).get("answer_text", "") or "").strip()
+    selected = list((answer or {}).get("selected_options", []) or [])
+    parts: List[str] = []
+    if selected:
+        parts.append("用户选择：" + "；".join(selected))
+    if answer_text:
+        parts.append(f"自定义补充：{answer_text}")
+    if not parts:
+        return "用户未提供具体内容（视为按你的默认方案推进）。"
+    return "；".join(parts) + "。"
+
+
+def _normalize_clarification_decisions(raw: Any) -> List[Dict[str, Any]]:
+    """Parse structured decision groups for multi-part sign-off cards.
+
+    Each decision gets ``selection_mode`` (``single`` | ``multiple``, default
+    ``single``) and ``exclusive_options`` (only meaningful for ``multiple``;
+    filtered to labels that exist in ``options``).
+    """
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for idx, item in enumerate(raw[:6]):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "") or "").strip()
+        raw_opts = item.get("options") or []
+        if not question or not isinstance(raw_opts, list):
+            continue
+        options = [str(opt).strip() for opt in raw_opts if str(opt).strip()][:8]
+        if not options:
+            continue
+        decision_id = str(item.get("id", "") or "").strip() or f"decision-{idx + 1}"
+        selection_mode = (
+            "multiple" if str(item.get("selection_mode", "") or "").strip() == "multiple" else "single"
+        )
+        exclusive_options: List[str] = []
+        if selection_mode == "multiple":
+            raw_exclusive = item.get("exclusive_options") or []
+            if isinstance(raw_exclusive, list):
+                seen: set[str] = set()
+                option_set = set(options)
+                for label in raw_exclusive:
+                    text = str(label).strip()
+                    if not text or text not in option_set or text in seen:
+                        continue
+                    seen.add(text)
+                    exclusive_options.append(text)
+        out.append(
+            {
+                "id": decision_id,
+                "question": question,
+                "options": options,
+                "selection_mode": selection_mode,
+                "exclusive_options": exclusive_options,
+            }
+        )
+    return out
+
+
+_ACTION_CONFIRM_MIN_TTL = 30
+_ACTION_CONFIRM_MAX_TTL = 1800
+_ACTION_CONFIRM_DEFAULT_TTL = 300
+
+
+def _clamp_action_confirmation_ttl(raw: Any) -> float:
+    """Clamp expires_in_seconds into the supported action-confirmation window."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = float(_ACTION_CONFIRM_DEFAULT_TTL)
+    if val <= 0:
+        val = float(_ACTION_CONFIRM_DEFAULT_TTL)
+    return max(float(_ACTION_CONFIRM_MIN_TTL), min(float(_ACTION_CONFIRM_MAX_TTL), val))
+
+
+def _normalize_action_confirmation_summary(raw: Any) -> List[Dict[str, str]]:
+    """Normalize summary rows for the action-confirmation card."""
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in raw:
+        if len(out) >= 12:
+            break
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label", "") or "").strip()[:40]
+        value = str(item.get("value", "") or "").strip()[:1000]
+        if not label or not value:
+            continue
+        out.append({"label": label, "value": value})
+    return out
+
+
+def build_action_confirmation_tool_result(
+    answer: Dict[str, Any],
+    *,
+    approve_label: str = "确认执行",
+    reject_label: str = "取消",
+) -> str:
+    """Render action-confirmation answers as explicit tool-result guidance."""
+    if isinstance(answer, dict):
+        if answer.get("__timeout__"):
+            return (
+                "[ACTION_CONFIRMATION_EXPIRED] 确认已失效。不得继续该动作，"
+                "若仍需执行必须重新生成预览。"
+            )
+        if answer.get("__suspended__"):
+            return "[ACTION_CONFIRMATION_SUSPENDED] 无人值守会话不能确认外部写操作。"
+
+    answer_text = str((answer or {}).get("answer_text", "") or "").strip()
+    selected = [str(x).strip() for x in list((answer or {}).get("selected_options", []) or []) if str(x).strip()]
+    approve = str(approve_label or "确认执行").strip() or "确认执行"
+    reject = str(reject_label or "取消").strip() or "取消"
+
+    lowered = answer_text.lower()
+    approve_hits = {approve, "确认", "确认发送", "同意", "继续", "yes", "y", "ok"}
+    reject_hits = {reject, "取消", "拒绝", "不用了", "no", "n"}
+
+    if any(opt in approve_hits or opt.lower() in approve_hits for opt in selected):
+        return "[ACTION_CONFIRMED] 用户已确认执行。"
+    if any(opt in reject_hits or opt.lower() in reject_hits for opt in selected):
+        return "[ACTION_REJECTED] 用户已取消执行。不得继续该动作。"
+    if answer_text in approve_hits or lowered in {x.lower() for x in approve_hits if x.isascii()}:
+        return "[ACTION_CONFIRMED] 用户已确认执行。"
+    if answer_text in reject_hits or lowered in {x.lower() for x in reject_hits if x.isascii()}:
+        return "[ACTION_REJECTED] 用户已取消执行。不得继续该动作。"
+
+    # Ambiguous / empty answers must never silently approve an external write.
+    return "[ACTION_REJECTED] 用户未明确确认。不得继续该动作。"
+
+
+async def _request_action_confirmation(
+    title: str,
+    *,
+    summary: Optional[List[Dict[str, Any]]] = None,
+    approve_label: str = "确认执行",
+    reject_label: str = "取消",
+    expires_in_seconds: Any = None,
+    source: str = "",
+    clarify_gate: Optional[ClarifyGate] = None,
+    emit_event: Optional[Any] = None,
+    is_unattended: bool = False,
+    caller_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Block for a binary action confirmation via the clarification transport.
+
+    Emits ``clarification_required`` with ``context.kind = action_confirmation``
+    so Desktop can render the dedicated confirm card while still resolving
+    through ``POST /api/clarify``.
+    """
+    title_text = str(title or "").strip()[:200]
+    if not title_text:
+        return (
+            "ERROR: request_action_confirmation requires a non-empty `title`. "
+            "请立即重新调用并填写 title。"
+        )
+
+    approve = str(approve_label or "确认执行").strip()[:20] or "确认执行"
+    reject = str(reject_label or "取消").strip()[:20] or "取消"
+    summary_rows = _normalize_action_confirmation_summary(summary)
+    ttl = _clamp_action_confirmation_ttl(expires_in_seconds)
+    source_text = str(source or "").strip()[:80]
+    request_id = str(uuid.uuid4())
+    expires_at_ms = int((time.time() + ttl) * 1000)
+
+    # Controlled context only — never trust caller-provided kind/secrets.
+    payload_context: Dict[str, Any] = {
+        "kind": "action_confirmation",
+        "request_id": request_id,
+        "title": title_text,
+        "summary": summary_rows,
+        "approve_label": approve,
+        "reject_label": reject,
+        "expires_at_ms": expires_at_ms,
+    }
+    if source_text:
+        payload_context["source"] = source_text
+    # caller_context is intentionally ignored for security (kind/token scrubbing).
+    _ = caller_context
+
+    if is_unattended or isinstance(clarify_gate, AutoSuspendClarifyGate):
+        _log.info(
+            "[action_confirm] suspended id=%s title=%s (unattended)",
+            request_id,
+            title_text[:80],
+        )
+        if emit_event is not None:
+            await emit_event(
+                {
+                    "type": "clarification_suspended",
+                    "data": {
+                        "id": request_id,
+                        "prompt": title_text,
+                        "options": [approve, reject],
+                        "decisions": [],
+                        "allow_free_text": True,
+                        "context": payload_context,
+                    },
+                }
+            )
+        return build_action_confirmation_tool_result({"__suspended__": True})
+
+    gate = clarify_gate or AsyncClarifyGate()
+    emit_prompt = emit_event is not None and isinstance(gate, AsyncClarifyGate)
+    _log.info("[action_confirm] requested id=%s title=%s ttl=%.1fs", request_id, title_text[:80], ttl)
+    wait_task = asyncio.create_task(
+        gate.request_clarification(
+            title_text,
+            options=[approve, reject],
+            allow_free_text=True,
+            context=payload_context,
+        )
+    )
+    # Register _pending[id] before publishing the prompt. A fast UI callback
+    # otherwise resolves nothing and the turn sits until ttl.
+    await asyncio.sleep(0)
+    try:
+        if emit_prompt:
+            await emit_event(
+                {
+                    "type": "clarification_required",
+                    "data": {
+                        "id": request_id,
+                        "prompt": title_text,
+                        "options": [approve, reject],
+                        "decisions": [],
+                        "allow_free_text": True,
+                        "context": payload_context,
+                    },
+                }
+            )
+        try:
+            answer = await asyncio.wait_for(wait_task, timeout=ttl)
+        except asyncio.TimeoutError:
+            _log.warning("[action_confirm] timed out id=%s after %.1fs", request_id, ttl)
+            # Best-effort: resolve pending future so the gate does not linger.
+            if isinstance(gate, AsyncClarifyGate):
+                gate.resolve(request_id, {"__timeout__": True})
+            answer = {"__timeout__": True}
+    except BaseException:
+        wait_task.cancel()
+        await asyncio.gather(wait_task, return_exceptions=True)
+        raise
+
+    _log.info("[action_confirm] resolved id=%s answer=%s", request_id, answer)
+    if emit_prompt:
+        await emit_event(
+            {
+                "type": "clarification_response",
+                "data": {
+                    "id": request_id,
+                    "answer": answer,
+                },
+            }
+        )
+    return build_action_confirmation_tool_result(
+        answer if isinstance(answer, dict) else {},
+        approve_label=approve,
+        reject_label=reject,
+    )
+
+
+async def _request_clarification(
+    prompt: str,
+    *,
+    options: Optional[List[str]] = None,
+    decisions: Optional[List[Dict[str, Any]]] = None,
+    allow_free_text: bool = True,
+    context: Optional[Dict[str, Any]] = None,
+    clarify_gate: Optional[ClarifyGate] = None,
+    emit_event: Optional[Any] = None,
+    is_unattended: bool = False,
+) -> str:
+    """Block inside a tool call to ask the user an open-ended question.
+
+    Emits ``clarification_required`` (or ``clarification_suspended`` for
+    unattended sessions), waits on the clarify gate, and returns a tool-result
+    string built by :func:`build_clarification_tool_result`.
+    """
+    options = list(options or [])
+    decisions = list(decisions or [])
+    # A clarification without any selectable choice is necessarily open-ended.
+    # Never emit an impossible prompt that offers neither choices nor a text
+    # answer surface; desktop also mirrors this invariant for persisted rows.
+    if not options and not decisions:
+        allow_free_text = True
+    payload_context = dict(context or {})
+    request_id = str(payload_context.get("request_id") or uuid.uuid4())
+    payload_context["request_id"] = request_id
+
+    # Unattended/automation sessions must never block -- there is no UI to
+    # answer. AutoSuspendClarifyGate also hits this branch via isinstance.
+    if is_unattended or isinstance(clarify_gate, AutoSuspendClarifyGate):
+        _log.info(
+            "[clarify] suspended id=%s prompt=%s (unattended)",
+            request_id,
+            prompt[:80],
+        )
+        if emit_event is not None:
+            await emit_event(
+                {
+                    "type": "clarification_suspended",
+                    "data": {
+                        "id": request_id,
+                        "prompt": prompt,
+                        "options": options,
+                        "decisions": decisions,
+                        "allow_free_text": allow_free_text,
+                        "context": payload_context,
+                    },
+                }
+            )
+        return build_clarification_tool_result({"__suspended__": True})
+
+    gate = clarify_gate or AsyncClarifyGate()
+    emit_prompt = emit_event is not None and isinstance(gate, AsyncClarifyGate)
+    _log.info("[clarify] requested id=%s prompt=%s", request_id, prompt[:80])
+    if emit_prompt:
+        # Register the pending future before publishing its ID. Otherwise a
+        # fast UI submit arrives before AsyncClarifyGate.resolve() has a
+        # future and the turn hangs until timeout (issue #32).
+        wait_task = asyncio.create_task(
+            gate.request_clarification(
+                prompt,
+                options=options,
+                allow_free_text=allow_free_text,
+                context=payload_context,
+            )
+        )
+        await asyncio.sleep(0)
+        try:
+            await emit_event(
+                {
+                    "type": "clarification_required",
+                    "data": {
+                        "id": request_id,
+                        "prompt": prompt,
+                        "options": options,
+                        "decisions": decisions,
+                        "allow_free_text": allow_free_text,
+                        "context": payload_context,
+                    },
+                }
+            )
+            answer = await wait_task
+        except BaseException:
+            wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
+            raise
+    else:
+        answer = await gate.request_clarification(
+            prompt,
+            options=options,
+            allow_free_text=allow_free_text,
+            context=payload_context,
+        )
+    _log.info("[clarify] resolved id=%s answer=%s", request_id, answer)
+    if emit_prompt:
+        await emit_event(
+            {
+                "type": "clarification_response",
+                "data": {
+                    "id": request_id,
+                    "answer": answer,
+                },
+            }
+        )
+    return build_clarification_tool_result(answer)
+
+
+def _path_from_arg(path_arg: str) -> Path:
+    return Path(path_arg).expanduser()
+
+
+def _is_protected_config_path(path: Path) -> bool:
+    """Backward-compatible alias for config.yaml protection."""
+    return _is_protected_path(path)
+
+
+def _is_protected_path(path: Path) -> bool:
+    """Sensitive paths blocked for both read and write (above any root allowlist)."""
+    resolved = _safe_resolve_path(path)
+    home = Path.home()
+    protected: List[Path] = [
+        home / ".agenticx" / "config.yaml",
+        home / ".agenticx" / "serve.token",
+        home / ".agenticx" / "wechat_credentials.json",
+        home / ".agenticx" / "feishu_binding.json",
+        home / ".ssh",
+        home / ".aws",
+        home / ".gnupg",
+    ]
+    for item in protected:
+        try:
+            base = item.resolve(strict=False)
+        except Exception:
+            continue
+        if resolved == base:
+            return True
+        try:
+            resolved.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    if resolved.name == "config.yaml" and ".agenticx" in resolved.parts:
+        return True
+    return False
+
+
+def denied_path_patterns_for_sandbox(session: Optional[StudioSession] = None) -> List[str]:
+    """Deny globs from ``permissions.path_rules`` for the OS sandbox.
+
+    First-party file tools go through :func:`_path_denied_by_rules`.
+    Shell writes such as ``rm -f secrets/key`` do not. Pushing deny
+    patterns into the sandbox is the process-level boundary that does
+    not depend on parsing the command.
+
+    Allow rules are not pushed down: they skip confirmation, they do
+    not open the sandbox. Session ``path_rules`` (delegated inherit)
+    win over the global config.
+    """
+    from agenticx.runtime.path_policy import normalize_path_rules
+
+    raw = _path_rules_source(session)
+    return [pattern for pattern, allow in normalize_path_rules(raw) if not allow]
+
+
+def _path_rules_source(session: Optional[StudioSession] = None) -> Any:
+    """Session ``path_rules`` (delegated inherit) win over the global config."""
+    raw = getattr(session, "path_rules", None) if session is not None else None
+    if raw is not None:
+        return raw
+    try:
+        return ConfigManager.get_value("permissions.path_rules")
+    except Exception:
+        return None
+
+
+def _path_denied_by_rules(
+    path: Path, session: Optional[StudioSession] = None
+) -> Optional[str]:
+    """Denial text when ``permissions.path_rules`` rejects ``path``.
+
+    Deny is absolute and short-circuits before the confirm gate. Allow
+    rules have no effect here -- they only skip confirmation via
+    :func:`_path_allowed_without_confirm`. Reads and writes are both
+    refused.
+    """
+    from agenticx.runtime.path_policy import path_rule_decision
+
+    decision, pattern = path_rule_decision(path, _path_rules_source(session))
+    if decision is False:
+        return (
+            f"path blocked by permissions.path_rules "
+            f"(pattern {pattern!r} matched {path})"
+        )
+    return None
+
+
+def _path_allowed_without_confirm(
+    path: Path, session: Optional[StudioSession] = None
+) -> bool:
+    """True when a user allow rule says this path needs no per-write prompt.
+
+    Does not open the sandbox. Workspace bounds stay with
+    :func:`_resolve_workspace_path` and the OS sandbox.
+    """
+    from agenticx.runtime.path_policy import path_rule_decision
+
+    decision, _pattern = path_rule_decision(path, _path_rules_source(session))
+    return decision is True
+
+
+def _raise_if_path_denied(
+    path: Path, session: Optional[StudioSession] = None
+) -> None:
+    rule_deny = _path_denied_by_rules(path, session)
+    if rule_deny:
+        raise ValueError(rule_deny)
+
+
+_TOOL_METADATA_LINE_RE = re.compile(r"^\s*(call_[A-Za-z0-9]+|sa-[a-z0-9]+)\s*$")
+
+
+def _strip_tool_metadata_noise_lines(text: str) -> str:
+    if not text:
+        return text
+    had_trailing_newline = text.endswith("\n")
+    lines = text.splitlines()
+    filtered = [line for line in lines if not _TOOL_METADATA_LINE_RE.fullmatch(line)]
+    out = "\n".join(filtered)
+    if had_trailing_newline and out:
+        out += "\n"
+    return out
+
+
+def _command_touches_protected_config(command: str, parts: List[str]) -> bool:
+    home_cfg = str((Path.home() / ".agenticx" / "config.yaml").resolve(strict=False))
+    markers = {
+        "~/.agenticx/config.yaml",
+        ".agenticx/config.yaml",
+        home_cfg,
+    }
+    lowered_command = command.lower()
+    if any(marker.lower() in lowered_command for marker in markers):
+        return True
+    for token in parts:
+        expanded = token.strip().strip("\"'").replace("\\ ", " ")
+        if not expanded:
+            continue
+        if expanded in markers:
+            return True
+        if expanded.endswith("/.agenticx/config.yaml"):
+            return True
+    return False
+
+
+def _resolve_workspace_path(
+    path_arg: str,
+    session: Optional[StudioSession] = None,
+    *,
+    pick_existing: bool = False,
+    for_write: bool = False,
+) -> Path:
+    raw_path = _path_from_arg(path_arg)
+    if _desktop_unrestricted_fs_enabled():
+        if raw_path.is_absolute():
+            resolved = _safe_resolve_path(raw_path)
+            mapped = _map_virtual_reference_path(resolved, session)
+            if mapped is not None:
+                resolved = mapped[0]
+        else:
+            prefixed = _resolve_prefixed_workspace_relpath(raw_path, session)
+            if prefixed is not None:
+                resolved = prefixed[0]
+            else:
+                resolved = _safe_resolve_path(_workspace_root() / raw_path)
+        from agenticx.runtime.isolate_run import remap_path_into_isolate
+
+        resolved = remap_path_into_isolate(resolved, session)
+        if _is_protected_path(resolved):
+            raise ValueError(f"path is protected: {resolved}")
+        _raise_if_path_denied(resolved, session)
+        return resolved
+
+    read_roots, write_roots = _session_workspace_root_sets(session)
+    roots = write_roots if for_write else read_roots
+    if not roots:
+        raise ValueError("path escapes workspace: no roots configured")
+
+    def _format_escape(resolved: Path) -> str:
+        allowed = ", ".join(str(r) for r in roots[:8])
+        more = "" if len(roots) <= 8 else f" (+{len(roots) - 8} more)"
+        return f"path escapes workspace: {resolved} (allowed roots: {allowed}{more})"
+
+    def _format_readonly_reference(resolved: Path) -> str:
+        # Distinct from "escapes workspace" so the model stops retrying the same write
+        # (including via bash_exec redirects / tee).
+        return (
+            f"path is read-only (mounted as reference): {resolved}. "
+            "Do not retry file_edit/file_write/bash_exec on this path. "
+            "Ask the user to remount the parent folder as link (直连), "
+            "or write a copy under the session workspace."
+        )
+
+    def _under_any_root(resolved: Path, candidates: list[Path]) -> bool:
+        return any(_is_path_under_root(resolved, root) for root in candidates)
+
+    if raw_path.is_absolute():
+        resolved = _safe_resolve_path(raw_path)
+        from agenticx.runtime.isolate_run import remap_path_into_isolate
+
+        resolved = remap_path_into_isolate(resolved, session)
+        if _is_protected_path(resolved):
+            raise ValueError(f"path is protected: {resolved}")
+        mapped = _map_virtual_reference_path(resolved, session)
+        if mapped is not None:
+            mapped_path, mount_mode = mapped
+            if _is_protected_path(mapped_path):
+                raise ValueError(f"path is protected: {mapped_path}")
+            if for_write and mount_mode == "reference":
+                raise ValueError(_format_readonly_reference(mapped_path))
+            if for_write and not _under_any_root(mapped_path, write_roots):
+                if _under_any_root(mapped_path, read_roots):
+                    raise ValueError(_format_readonly_reference(mapped_path))
+                raise ValueError(_format_escape(mapped_path))
+            _raise_if_path_denied(mapped_path, session)
+            return mapped_path
+        _raise_if_path_denied(resolved, session)
+        for root in roots:
+            if _is_path_under_root(resolved, root):
+                return resolved
+        if (not for_write) and _is_context_file_read_allowed(resolved, session):
+            return resolved
+        if for_write and _under_any_root(resolved, read_roots):
+            raise ValueError(_format_readonly_reference(resolved))
+        if for_write and _is_context_file_read_allowed(resolved, session):
+            raise ValueError(
+                f"path is read-only (context_files attachment): {resolved}. "
+                "Do not retry file_edit/file_write/bash_exec on this path."
+            )
+        raise ValueError(_format_escape(resolved))
+
+    prefixed = _resolve_prefixed_workspace_relpath(raw_path, session)
+    if prefixed is not None:
+        resolved, mount_mode = prefixed
+        from agenticx.runtime.isolate_run import remap_path_into_isolate
+
+        resolved = remap_path_into_isolate(resolved, session)
+        if _is_protected_path(resolved):
+            raise ValueError(f"path is protected: {resolved}")
+        if for_write and mount_mode == "reference":
+            raise ValueError(_format_readonly_reference(resolved))
+        if for_write and not _under_any_root(resolved, write_roots):
+            if _under_any_root(resolved, read_roots):
+                raise ValueError(_format_readonly_reference(resolved))
+            raise ValueError(_format_escape(resolved))
+        _raise_if_path_denied(resolved, session)
+        return resolved
+
+    if pick_existing:
+        for root in roots:
+            candidate = _safe_resolve_path(root / raw_path)
+            if not _is_path_under_root(candidate, root):
+                continue
+            if _is_protected_path(candidate) or _path_denied_by_rules(candidate, session):
+                continue
+            if candidate.exists():
+                return candidate
+
+    primary = roots[0]
+    resolved = _safe_resolve_path(primary / raw_path)
+    if _is_protected_path(resolved):
+        raise ValueError(f"path is protected: {resolved}")
+    _raise_if_path_denied(resolved, session)
+    if not _is_path_under_root(resolved, primary):
+        if for_write and _under_any_root(resolved, read_roots):
+            raise ValueError(_format_readonly_reference(resolved))
+        raise ValueError(_format_escape(resolved))
+    return resolved
+
+
+def _format_diff(path: Path, old_text: str, new_text: str) -> str:
+    diff_lines = difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        fromfile=f"{path} (old)",
+        tofile=f"{path} (new)",
+        lineterm="",
+    )
+    return "\n".join(diff_lines)
+
+
+def _extract_guarded_paths(command_name: str, parts: List[str]) -> List[str]:
+    """Extract path-like arguments for guarded read commands."""
+    args = parts[1:]
+    if not args:
+        return []
+
+    if command_name in {"cat", "ls", "tree", "wc"}:
+        return [arg for arg in args if arg != "--" and not arg.startswith("-")]
+
+    if command_name in {"head", "tail"}:
+        paths: List[str] = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--":
+                continue
+            if arg in {"-n", "-c"}:
+                skip_next = True
+                continue
+            if arg.startswith("-"):
+                continue
+            paths.append(arg)
+        return paths
+
+    if command_name == "grep":
+        pattern_consumed = False
+        explicit_pattern_provided = False
+        paths = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--":
+                continue
+            if arg in {"-e", "-f", "-m", "-A", "-B", "-C"}:
+                if arg == "-e":
+                    explicit_pattern_provided = True
+                skip_next = True
+                continue
+            if arg.startswith("-e") and len(arg) > 2:
+                explicit_pattern_provided = True
+                continue
+            if arg.startswith("-"):
+                continue
+            if not pattern_consumed and not explicit_pattern_provided:
+                pattern_consumed = True
+                continue
+            paths.append(arg)
+        return paths
+
+    if command_name == "find":
+        paths = []
+        for arg in args:
+            if arg in {"--", ".", ".."}:
+                paths.append(arg)
+                continue
+            if arg.startswith("-") or arg in {"(", ")", "!", ","}:
+                break
+            paths.append(arg)
+        return paths if paths else ["."]
+
+    return []
+
+
+def _ensure_paths_within_workspace(
+    paths: List[str],
+    session: Optional[StudioSession] = None,
+) -> Optional[str]:
+    """Validate all path arguments stay within session workspace roots."""
+    for path_arg in paths:
+        if path_arg == "-":
+            continue
+        try:
+            _resolve_workspace_path(path_arg, session, pick_existing=True)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+    return None
+
+
+# Redirect / tee write targets (aligned with desktop session-artifacts BASH_REDIRECT_RE).
+_BASH_WRITE_REDIRECT_RE = re.compile(
+    r"(?:>>?|\btee\b(?:\s+-a)?)\s+(['\"]?)([^\s'\"|;&<>]+)\1",
+    re.IGNORECASE,
+)
+_BASH_CD_SEGMENT_RE = re.compile(
+    r"(?:^|[;&|]|\|\||&&)\s*cd\s+(['\"]?)([^\s'\"|;&]+)\1",
+    re.IGNORECASE,
+)
+_BASH_ABS_PATH_TOKEN_RE = re.compile(
+    r"(?:/(?:Users|home|tmp|var|opt|private|Volumes)[^\s'\"|;&<>]+|~/[^\s'\"|;&<>]+)"
+)
+
+
+def _extract_bash_write_target_paths(command: str) -> List[str]:
+    """Best-effort extract of shell redirect / tee write destinations."""
+    paths: List[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        text = (raw or "").strip().strip("'\"")
+        if not text or text == "-":
+            return
+        if text in seen:
+            return
+        seen.add(text)
+        paths.append(text)
+
+    for match in _BASH_WRITE_REDIRECT_RE.finditer(command or ""):
+        _add(match.group(2))
+
+    try:
+        parts = shlex.split(command or "")
+    except ValueError:
+        parts = []
+    i = 0
+    while i < len(parts):
+        tok = parts[i]
+        if tok in {">", ">>"} and i + 1 < len(parts):
+            _add(parts[i + 1])
+            i += 2
+            continue
+        if Path(tok).name == "tee":
+            j = i + 1
+            while j < len(parts) and parts[j].startswith("-") and parts[j] not in {">", ">>"}:
+                j += 1
+            while j < len(parts) and parts[j] not in {">", ">>", "|", "||", "&&", ";"}:
+                if not parts[j].startswith("-"):
+                    _add(parts[j])
+                j += 1
+            i = j
+            continue
+        i += 1
+    return paths
+
+
+def _bash_cd_bases_in_command(command: str) -> List[str]:
+    return [m.group(2) for m in _BASH_CD_SEGMENT_RE.finditer(command or "")]
+
+
+def _ensure_bash_write_targets_allowed(
+    command: str,
+    session: Optional[StudioSession],
+    cwd: Optional[Path],
+) -> Optional[str]:
+    """Block bash_exec writes into reference (read-only) mounts — including ``>>`` / tee.
+
+    ``file_edit`` already enforces write roots; without this, models bypass via shell.
+    """
+    targets = _extract_bash_write_target_paths(command)
+    if not targets and _bash_exec_is_read_only({"command": command}):
+        return None
+    cd_bases = _bash_cd_bases_in_command(command)
+
+    def _candidates_for(raw: str) -> List[str]:
+        out: List[str] = []
+        expanded = Path(raw).expanduser()
+        if expanded.is_absolute():
+            out.append(str(expanded))
+            return out
+        if cwd is not None:
+            out.append(str((cwd / raw).expanduser()))
+        for base in cd_bases:
+            try:
+                base_path = Path(base).expanduser()
+                if not base_path.is_absolute() and cwd is not None:
+                    base_path = cwd / base_path
+                out.append(str(base_path / raw))
+            except Exception:
+                continue
+        out.append(raw)
+        return out
+
+    def _deny_if_readonly(path_arg: str) -> Optional[str]:
+        try:
+            _resolve_workspace_path(path_arg, session, for_write=True)
+            return None
+        except ValueError as exc:
+            msg = str(exc)
+            if "read-only" in msg or "escapes workspace" in msg or "protected" in msg:
+                return f"ERROR: {msg}"
+            return f"ERROR: {msg}"
+
+    for raw in targets:
+        any_ok = False
+        last_err: Optional[str] = None
+        for cand in _candidates_for(raw):
+            err = _deny_if_readonly(cand)
+            if err is None:
+                any_ok = True
+                break
+            if "read-only" in err:
+                return err
+            last_err = err
+        if not any_ok and last_err:
+            return last_err
+
+    # No redirect/tee target parsed (e.g. python -c open(...)): still block
+    # absolute paths that land on reference mounts. Skip when redirects were
+    # already checked so `cat <ref> && echo >> <writable>` stays allowed.
+    if not targets:
+        for match in _BASH_ABS_PATH_TOKEN_RE.finditer(command or ""):
+            err = _deny_if_readonly(match.group(0))
+            if err is not None and "read-only" in err:
+                return err
+
+    return None
+
+
+def _first_non_option_token(
+    parts: List[str],
+    *,
+    start: int = 1,
+    options_with_value: Optional[set[str]] = None,
+) -> Optional[str]:
+    """Return first non-option token while skipping known option values."""
+    options_with_value = options_with_value or set()
+    idx = start
+    while idx < len(parts):
+        token = parts[idx]
+        if token == "--":
+            idx += 1
+            break
+        if token in options_with_value:
+            idx += 2
+            continue
+        if token.startswith("-"):
+            idx += 1
+            continue
+        return token
+    if idx < len(parts):
+        return parts[idx]
+    return None
+
+
+def _collect_subcommand_risk_reasons(command_name: str, parts: List[str]) -> List[str]:
+    """Return confirmation reasons; knowledge lives in ``command_safety``."""
+    del command_name
+    from agenticx.runtime.command_safety import classify_simple_command
+
+    verdict = classify_simple_command(parts)
+    return [item.evidence for item in verdict.findings]
+
+
+def _extract_python_script_arg(parts: List[str]) -> Optional[str]:
+    """Extract python script path for `python <script>.py` style execution."""
+    if any(token in {"-c", "-m"} for token in parts[1:]):
+        return None
+
+    idx = 1
+    while idx < len(parts):
+        token = parts[idx]
+        if token == "--":
+            idx += 1
+            break
+        if token in {"-W", "-X"}:
+            idx += 2
+            continue
+        if token.startswith("-"):
+            idx += 1
+            continue
+        return token
+
+    if idx < len(parts):
+        return parts[idx]
+    return None
+
+
+def _bash_exec_shell_argv(command: str) -> List[str]:
+    """Argv for ``subprocess.run(..., shell=False)`` to run ``command`` in a system shell.
+
+    On Windows, ``/bin/bash`` is not available; use ``cmd.exe`` (COMSPEC) with ``/d /s /c``.
+    """
+    if sys.platform == "win32":
+        comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+        return [comspec, "/d", "/s", "/c", command]
+    return ["/bin/bash", "-c", command]
+
+
+def _bash_exec_default_timeout_sec() -> int:
+    """Studio global default for bash_exec when the model omits timeout_sec."""
+    try:
+        raw = ConfigManager.get_value("tools_options.bash_exec.default_timeout_sec")
+    except Exception:
+        raw = None
+    if raw is None:
+        return 30
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 30
+    return max(30, min(3600, v))
+
+
+_CD_PEEL_BLOCK_METACHAR_RE = re.compile(r"\|\||\||>|<|\$\(|`")
+
+
+def _command_blocks_cd_prefix_peel(command: str) -> bool:
+    """If True, do not peel ``cd … &&`` into cwd + argv — preserves pipes/redirs/subshells."""
+    return bool(_CD_PEEL_BLOCK_METACHAR_RE.search(command))
+
+
+_STDERR_REDIRECT_PEEL_HINT_RES = (
+    re.compile(r"unrecognized arguments:.*2>", re.I),
+    re.compile(r"syntax error.*unexpected token", re.I),
+    re.compile(r"unexpected token.*'\|'", re.I),
+    re.compile(r"command not found.*&&", re.I),
+)
+
+
+def _stderr_suggests_redirect_peel_damage(text: str) -> bool:
+    return any(rx.search(text) for rx in _STDERR_REDIRECT_PEEL_HINT_RES)
+
+
+def _bash_stdout_output_hint(stdout: str) -> str:
+    """Append-only hint so models notice answers already in stdout (FR-10)."""
+    if not stdout or not stdout.strip():
+        return ""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    paths: List[str] = []
+    for m in re.finditer(r"(?:/[\w./+\-]{3,}|~/[\w./+\-]{2,})", stdout[:50_000]):
+        g = m.group(0)
+        if g not in paths:
+            paths.append(g)
+        if len(paths) >= 2:
+            break
+    path_part = ", ".join(paths[:2]) if paths else "(无路径匹配)"
+    return (
+        f"\nOUTPUT_HINT: stdout 已包含 {len(lines)} 个非空行，主要文件路径线索 = {path_part}\n"
+    )
+
+
+def _try_peel_cd_prefix_parts(
+    parts: List[str],
+    session: Optional[StudioSession],
+) -> Optional[Tuple[Path, List[str]]]:
+    """If argv is ``cd <path> && ...`` or ``cd <path>; ...``, return cwd + remaining argv."""
+    if len(parts) < 4:
+        return None
+    if parts[0].lower() != "cd":
+        return None
+    if parts[2] not in ("&&", ";"):
+        return None
+    rest = parts[3:]
+    if not rest:
+        return None
+    try:
+        resolved = _resolve_workspace_path(parts[1], session)
+    except ValueError:
+        return None
+    try:
+        if not resolved.is_dir():
+            return None
+    except OSError:
+        return None
+    return (resolved, rest)
+
+
+@dataclass
+class _BashPrepared:
+    """Prepared shell execution payload shared by sync/background bash tools."""
+
+    argv: List[str]
+    cwd: Optional[Path]
+    use_shell: bool
+    command: str
+    command_name: str
+    env: Optional[Dict[str, str]] = None
+    sandbox_backend: str = "none"
+
+
+@dataclass
+class _BashBgJob:
+    """In-memory background bash job state."""
+
+    job_id: str
+    session_id: str
+    command: str
+    cwd: Optional[str]
+    proc: asyncio.subprocess.Process
+    lines: List[str]
+    read_cursor: int
+    started_at: float
+    log_path: Path
+    drain_task: Optional[asyncio.Task[Any]]
+    exit_code: Optional[int]
+
+
+def _bash_bg_log_dir() -> Path:
+    """``~/.agenticx/logs/bash_bg``，按调用时的 HOME 解析（见 utils/agx_home.py）。"""
+    from agenticx.utils.agx_home import lazy_home_path
+
+    return lazy_home_path(__name__, "_BASH_BG_LOG_DIR", "logs", "bash_bg")
+_BASH_BG_MAX_JOBS_DEFAULT = 8
+_AUTH_URL_RE = re.compile(r"https?://[^\s'\"<>）)]+")
+_BASH_BG_JOBS: Dict[str, _BashBgJob] = {}
+
+
+def _bash_bg_default_first_wait_sec() -> float:
+    """Default bounded wait to capture first-screen output."""
+    try:
+        raw = ConfigManager.get_value("tools_options.bash_bg.first_wait_sec")
+    except Exception:
+        raw = None
+    if raw is None:
+        return 4.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 4.0
+    return max(1.0, min(15.0, value))
+
+
+def _bash_bg_first_wait_sec(arguments: Dict[str, Any]) -> float:
+    """Resolve first wait seconds from args or config."""
+    raw = arguments.get("first_wait_sec")
+    if raw is None:
+        return _bash_bg_default_first_wait_sec()
+    if isinstance(raw, str) and not raw.strip():
+        return _bash_bg_default_first_wait_sec()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _bash_bg_default_first_wait_sec()
+    return max(1.0, min(15.0, value))
+
+
+def _bash_bg_max_jobs() -> int:
+    """Maximum concurrent running background jobs per session."""
+    try:
+        raw = ConfigManager.get_value("tools_options.bash_bg.max_jobs")
+    except Exception:
+        raw = None
+    if raw is None:
+        return _BASH_BG_MAX_JOBS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _BASH_BG_MAX_JOBS_DEFAULT
+    return max(1, min(32, value))
+
+
+def _extract_auth_urls(text: str) -> List[str]:
+    """Extract auth/login URLs from tool output text."""
+    urls: List[str] = []
+    for match in _AUTH_URL_RE.findall(text or ""):
+        if match not in urls:
+            urls.append(match)
+        if len(urls) >= 5:
+            break
+    return urls
+
+
+def _bash_bg_session_id(session: Optional[StudioSession]) -> str:
+    """Stable session id key for ownership checks.
+
+    Real ``StudioSession`` instances carry the session id as ``_session_id``
+    (set via ``setattr(session, "_session_id", ...)`` in ``studio/server.py``);
+    the class has no ``session_id`` field. Reading the wrong attribute would
+    make every session collapse into the same "default" bucket and defeat
+    background-job ownership isolation across sessions.
+    """
+    if session is None:
+        return "default"
+    sid = str(getattr(session, "_session_id", "") or getattr(session, "session_id", "") or "").strip()
+    return sid or "default"
+
+
+def _bash_bg_owned_job(job_id: str, session: Optional[StudioSession]) -> Union[_BashBgJob, str]:
+    """Resolve a job id and validate it belongs to the current session."""
+    key = str(job_id or "").strip()
+    if not key:
+        return "ERROR: job_id is required"
+    job = _BASH_BG_JOBS.get(key)
+    if job is None:
+        return f"ERROR: unknown or not-owned job_id: {key}"
+    if job.session_id != _bash_bg_session_id(session):
+        return f"ERROR: unknown or not-owned job_id: {key}"
+    return job
+
+
+def _bash_bg_running_jobs_for_session(session_id: str) -> int:
+    """Count running jobs for a session."""
+    return sum(1 for job in _BASH_BG_JOBS.values() if job.session_id == session_id and job.exit_code is None)
+
+
+async def _bash_bg_drain(job: _BashBgJob) -> None:
+    """Drain stdout/stderr of a background process into memory and log file."""
+
+    async def _pump(stream: Optional[asyncio.StreamReader]) -> None:
+        if stream is None:
+            return
+        async for raw in stream:
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            job.lines.append(line)
+            try:
+                with job.log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception:
+                pass
+
+    try:
+        await asyncio.gather(_pump(job.proc.stdout), _pump(job.proc.stderr))
+        await job.proc.wait()
+    finally:
+        try:
+            job.exit_code = job.proc.returncode
+        except Exception:
+            if job.exit_code is None:
+                job.exit_code = -1
+
+
+async def _apply_command_sandbox(
+    argv: List[str],
+    session: Optional[StudioSession],
+    cwd: Optional[Path],
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any],
+    tool_name: str,
+    command: str,
+) -> Union[Tuple[List[str], Optional[Dict[str, str]], str], str]:
+    """Wrap argv with the OS sandbox. Unavailable backends require confirm."""
+    from agenticx.runtime.command_sandbox import (
+        CommandSandboxError,
+        CommandSandboxUnavailable,
+        DANGER_FULL_ACCESS,
+        build_command_sandbox_plan,
+    )
+
+    permissions = _configured_command_permissions(session)
+    if permissions == DANGER_FULL_ACCESS:
+        if not await _confirm(
+            "这条命令将在没有操作系统文件隔离的情况下运行，仍要继续吗？",
+            confirm_gate=confirm_gate,
+            context={
+                "tool": tool_name,
+                "command": command,
+                "risk": "high",
+                "risk_categories": [
+                    {
+                        "code": "host_full_access",
+                        "evidence": "command_permissions=danger-full-access",
+                    }
+                ],
+            },
+            emit_event=emit_event,
+            session=session,
+        ):
+            return _cancelled("未授权脱离工作区隔离", confirm_gate)
+
+    read_roots, write_roots = _session_workspace_root_sets(session)
+    scope_id = f"{_bash_bg_session_id(session)}|{'|'.join(str(root) for root in write_roots)}"
+    try:
+        plan = build_command_sandbox_plan(
+            argv,
+            denied_path_patterns=denied_path_patterns_for_sandbox(session),
+            permissions=permissions,
+            writable_roots=write_roots,
+            readable_roots=read_roots,
+            scope_id=scope_id,
+            cwd=cwd,
+            platform_name=sys.platform,
+        )
+    except CommandSandboxUnavailable as exc:
+        if not await _confirm(
+            f"命令沙箱不可用（{exc}）。要在没有操作系统隔离的情况下运行吗？",
+            confirm_gate=confirm_gate,
+            context={
+                "tool": tool_name,
+                "command": command,
+                "risk": "high",
+                "risk_categories": [
+                    {"code": "host_full_access", "evidence": str(exc)}
+                ],
+            },
+            emit_event=emit_event,
+            session=session,
+        ):
+            return _cancelled("沙箱不可用，命令未执行", confirm_gate)
+        return argv, None, "none"
+    except CommandSandboxError as exc:
+        return f"ERROR: command sandbox: {exc}"
+    return list(plan.argv), dict(plan.env), plan.backend
+
+
+async def _bash_exec_prepare(
+    command: str,
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession],
+    *,
+    tool_name: str,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any],
+) -> Union[_BashPrepared, str]:
+    """Shared validation and argv construction for sync/background bash tools."""
+    command = str(command or "").strip()
+    if not command:
+        return "ERROR: missing command"
+    if len(command) > MAX_BASH_EXEC_COMMAND_CHARS:
+        return f"ERROR: command exceeds maximum length ({MAX_BASH_EXEC_COMMAND_CHARS} characters)"
+
+    perm_deny = tool_denied_by_session_permissions(tool_name)
+    if perm_deny:
+        return f"ERROR: {perm_deny}"
+
+    cwd_arg = arguments.get("cwd")
+    if cwd_arg:
+        try:
+            cwd = _resolve_workspace_path(str(cwd_arg), session, for_write=True)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+    else:
+        cwd = None
+
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        return f"ERROR: command parse failed: {exc}"
+    if not parts:
+        return "ERROR: empty command"
+
+    if cwd is None:
+        peeled = (
+            None
+            if _command_blocks_cd_prefix_peel(command)
+            else _try_peel_cd_prefix_parts(parts, session)
+        )
+        if peeled:
+            cwd, parts = peeled
+            command = shlex.join(parts)
+
+    if cwd is None:
+        cwd = _default_bash_cwd(session)
+
+    command_name = Path(parts[0]).name
+    if command_name.startswith("firecrawl_"):
+        return (
+            f"ERROR: '{command_name}' is an MCP tool name, not a shell command. "
+            "Use mcp_call with JSON arguments, e.g. "
+            "{\"tool_name\":\"firecrawl_scrape\",\"arguments\":{\"url\":\"https://example.com\"}}. "
+            "For multiple URLs, iterate single-url calls or use firecrawl_crawl/firecrawl_map."
+        )
+    if session is not None and getattr(session, "mcp_hub", None) is not None:
+        try:
+            routed = getattr(session.mcp_hub, "_tool_routing", {}) or {}
+            if command_name in routed:
+                return (
+                    f"ERROR: '{command_name}' is an MCP tool name, not a shell command. "
+                    "Use mcp_call with JSON arguments. "
+                    "Tip: call list_mcps and copy tool_name from mcp_tool_names."
+                )
+        except Exception:
+            pass
+    if command_name == "cd" and len(parts) <= 2:
+        target = str(parts[1]) if len(parts) > 1 else "~"
+        try:
+            resolved = _resolve_workspace_path(target, session)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if not resolved.exists() or not resolved.is_dir():
+            return f"ERROR: target directory not found: {resolved}"
+        return (
+            f"OK: cd {resolved}\n"
+            "说明：`cd` 是 shell 内建命令，不会在无 shell 的单次执行中持久化。\n"
+            "请在后续 bash_exec 调用里通过 `cwd` 参数指定工作目录。"
+        )
+
+    # Before confirm gates: reject shell writes into reference mounts (no bash bypass).
+    write_guard_error = _ensure_bash_write_targets_allowed(command, session, cwd)
+    if write_guard_error:
+        return write_guard_error
+
+    if _command_touches_protected_config(command, parts):
+        return (
+            "ERROR: direct access to ~/.agenticx/config.yaml is blocked for safety. "
+            "Use update_email_config for notifications.email.* changes."
+        )
+
+    if command_name in PATH_GUARDED_READ_COMMANDS:
+        guarded_paths = _extract_guarded_paths(command_name, parts)
+        validation_error = _ensure_paths_within_workspace(guarded_paths, session)
+        if validation_error:
+            return validation_error
+
+    if command_name == "python":
+        python_script = _extract_python_script_arg(parts)
+        if python_script and python_script != "-":
+            try:
+                _resolve_workspace_path(python_script, session, pick_existing=True)
+            except ValueError as exc:
+                return f"ERROR: {exc}"
+
+    safety_confirm = _bash_exec_safety_confirm(command)
+    if safety_confirm:
+        risk, cancel_what, risk_reasons, risk_codes = safety_confirm
+        confirm_question = _bash_exec_confirm_question(
+            command_name, risk, risk_reasons
+        )
+        if not await _confirm(
+            confirm_question,
+            confirm_gate=confirm_gate,
+            context={
+                "tool": tool_name,
+                "command": command,
+                "risk": risk,
+                "reasons": risk_reasons,
+                "risk_categories": [
+                    {"code": code, "evidence": evidence}
+                    for code, evidence in zip(risk_codes, risk_reasons)
+                ],
+            },
+            emit_event=emit_event,
+            session=session,
+        ):
+            return _cancelled(cancel_what, confirm_gate)
+
+    use_shell = bool(re.search(r"(;|&&|\|\||\||`|\$\(|>|<|\n)", command))
+    if not use_shell:
+        use_shell = bool(
+            re.match(
+                r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)+[^\s].*$",
+                command,
+            )
+        ) or command.lstrip().startswith("export ")
+    if sys.platform == "win32" and not use_shell and parts:
+        resolved0 = shutil.which(parts[0])
+        if resolved0:
+            parts = [resolved0] + list(parts[1:])
+    argv = _bash_exec_shell_argv(command) if use_shell else parts
+    wrapped = await _apply_command_sandbox(
+        argv,
+        session,
+        cwd,
+        confirm_gate=confirm_gate,
+        emit_event=emit_event,
+        tool_name=tool_name,
+        command=command,
+    )
+    if isinstance(wrapped, str):
+        return wrapped
+    argv, env, backend = wrapped
+    return _BashPrepared(
+        argv=argv,
+        cwd=cwd,
+        use_shell=use_shell,
+        command=command,
+        command_name=command_name,
+        env=env,
+        sandbox_backend=backend,
+    )
+
+
+def _bash_bg_status_line(job: _BashBgJob) -> str:
+    """Return running/exited status text."""
+    return "exited" if job.exit_code is not None else "running"
+
+
+def _bash_bg_render_urls(urls: List[str]) -> str:
+    """Render URL list for tool response text."""
+    if not urls:
+        return "(none)"
+    return "\n".join(f"- {url}" for url in urls)
+
+
+async def _tool_bash_bg_start(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    command = str(arguments.get("command", "")).strip()
+    prepared = await _bash_exec_prepare(
+        command,
+        arguments,
+        session,
+        tool_name="bash_bg_start",
+        confirm_gate=confirm_gate,
+        emit_event=emit_event,
+    )
+    if isinstance(prepared, str):
+        return prepared
+
+    session_id = _bash_bg_session_id(session)
+    max_jobs = _bash_bg_max_jobs()
+    if _bash_bg_running_jobs_for_session(session_id) >= max_jobs:
+        return (
+            f"ERROR: too many running background jobs (max {max_jobs}). "
+            "Stop one with bash_bg_stop first."
+        )
+
+    try:
+        _bash_bg_log_dir().mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    job_id = uuid.uuid4().hex[:12]
+    log_path = _bash_bg_log_dir() / f"{job_id}.log"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *prepared.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(prepared.cwd) if prepared.cwd else None,
+            env=prepared.env,
+        )
+    except Exception as exc:
+        return f"ERROR: command failed to start: {exc}"
+
+    job = _BashBgJob(
+        job_id=job_id,
+        session_id=session_id,
+        command=prepared.command,
+        cwd=str(prepared.cwd) if prepared.cwd else None,
+        proc=proc,
+        lines=[],
+        read_cursor=0,
+        started_at=time.time(),
+        log_path=log_path,
+        drain_task=None,
+        exit_code=None,
+    )
+    _BASH_BG_JOBS[job_id] = job
+    job.drain_task = asyncio.create_task(_bash_bg_drain(job))
+
+    first_wait_sec = _bash_bg_first_wait_sec(arguments)
+    deadline = asyncio.get_event_loop().time() + first_wait_sec
+    while asyncio.get_event_loop().time() < deadline:
+        if job.exit_code is not None or job.lines:
+            break
+        await asyncio.sleep(0.2)
+
+    captured_output = "\n".join(job.lines).strip()
+    auth_urls = _extract_auth_urls(captured_output)
+    job.read_cursor = len(job.lines)
+    status = _bash_bg_status_line(job)
+    exit_code = str(job.exit_code) if job.exit_code is not None else "null"
+    cwd_text = job.cwd or "(session workspace)"
+    return (
+        f"job_id={job.job_id}\n"
+        f"status={status}\n"
+        f"exit_code={exit_code}\n"
+        f"cwd={cwd_text}\n"
+        f"command={job.command}\n"
+        f"captured_output:\n{captured_output or '(empty)'}\n"
+        f"auth_urls:\n{_bash_bg_render_urls(auth_urls)}\n"
+        "NOTE: Process is running in background and is not timeout-killed.\n"
+        "- If auth_urls is not empty, relay them verbatim to the user and ask for scan/authorize.\n"
+        "- If command requires input, use bash_bg_input(job_id, text).\n"
+        "- After user confirms completion, call bash_bg_poll for final exit_code and output."
+    )
+
+
+async def _tool_bash_bg_poll(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+) -> str:
+    owned = _bash_bg_owned_job(str(arguments.get("job_id", "") or ""), session)
+    if isinstance(owned, str):
+        return owned
+    job = owned
+    new_lines = job.lines[job.read_cursor:]
+    job.read_cursor = len(job.lines)
+    new_output = "\n".join(new_lines).strip()
+    auth_urls = _extract_auth_urls(new_output)
+    status = _bash_bg_status_line(job)
+    exit_code = str(job.exit_code) if job.exit_code is not None else "null"
+    body = (
+        f"job_id={job.job_id}\n"
+        f"status={status}\n"
+        f"exit_code={exit_code}\n"
+        f"new_output:\n{new_output or '(none)'}\n"
+        f"auth_urls:\n{_bash_bg_render_urls(auth_urls)}"
+    )
+    if status == "running" and not new_output:
+        body += (
+            "\nHINT: job still running with no new output. "
+            "It may be waiting for user scan/authorization or stdin input."
+        )
+    return body
+
+
+async def _tool_bash_bg_input(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+) -> str:
+    owned = _bash_bg_owned_job(str(arguments.get("job_id", "") or ""), session)
+    if isinstance(owned, str):
+        return owned
+    job = owned
+    if job.exit_code is not None:
+        return "ERROR: job already exited"
+    text = str(arguments.get("text", ""))
+    stream = job.proc.stdin
+    if stream is None:
+        return "ERROR: job stdin is not available"
+    payload = f"{text}\n".encode("utf-8")
+    try:
+        stream.write(payload)
+        await stream.drain()
+    except Exception as exc:
+        return f"ERROR: failed to write stdin: {exc}"
+    return f"OK: wrote {len(payload)} bytes to stdin of {job.job_id}"
+
+
+async def _tool_bash_bg_stop(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+) -> str:
+    owned = _bash_bg_owned_job(str(arguments.get("job_id", "") or ""), session)
+    if isinstance(owned, str):
+        return owned
+    job = owned
+    if job.exit_code is not None:
+        return f"OK: job already exited (exit_code={job.exit_code})"
+
+    force = bool(arguments.get("force", False))
+    try:
+        if force:
+            job.proc.kill()
+        else:
+            job.proc.terminate()
+        try:
+            await asyncio.wait_for(job.proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            job.proc.kill()
+            await job.proc.wait()
+    except Exception as exc:
+        return f"ERROR: failed to stop job: {exc}"
+
+    job.exit_code = job.proc.returncode
+    return f"OK: stopped {job.job_id} (exit_code={job.exit_code})"
+
+
+async def _tool_bash_exec(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    command = str(arguments.get("command", "")).strip()
+    raw_timeout = arguments.get("timeout_sec")
+    if raw_timeout is None:
+        timeout_sec = _bash_exec_default_timeout_sec()
+    elif isinstance(raw_timeout, str) and not str(raw_timeout).strip():
+        timeout_sec = _bash_exec_default_timeout_sec()
+    else:
+        try:
+            timeout_sec = int(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_sec = _bash_exec_default_timeout_sec()
+    timeout_sec = max(1, min(3600, timeout_sec))
+
+    prepared = await _bash_exec_prepare(
+        command,
+        arguments,
+        session,
+        tool_name="bash_exec",
+        confirm_gate=confirm_gate,
+        emit_event=emit_event,
+    )
+    if isinstance(prepared, str):
+        return prepared
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *prepared.argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(prepared.cwd) if prepared.cwd else None,
+            env=prepared.env,
+        )
+    except Exception as exc:
+        return f"ERROR: command failed to start: {exc}"
+
+    stdout_lines: List[str] = []
+    stderr_lines: List[str] = []
+    _STREAM_THROTTLE_SEC = 0.2
+    _last_emit_time = 0.0
+
+    async def _read_pipe(
+        stream: asyncio.StreamReader,
+        target: List[str],
+        label: str,
+    ) -> None:
+        nonlocal _last_emit_time
+        async for raw in stream:
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            target.append(line)
+            if emit_event is not None:
+                now = asyncio.get_event_loop().time()
+                if now - _last_emit_time >= _STREAM_THROTTLE_SEC:
+                    _last_emit_time = now
+                    try:
+                        await emit_event({
+                            "type": "tool_output",
+                            "data": {
+                                "stream": label,
+                                "line": line,
+                            },
+                        })
+                    except Exception:
+                        pass
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                _read_pipe(proc.stdout, stdout_lines, "stdout"),
+                _read_pipe(proc.stderr, stderr_lines, "stderr"),
+            ),
+            timeout=max(1, timeout_sec),
+        )
+        await proc.wait()
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return f"ERROR: command timeout after {timeout_sec}s"
+
+    stdout = "\n".join(stdout_lines).strip()
+    stderr = "\n".join(stderr_lines).strip()
+    out = (
+        f"exit_code={proc.returncode}\n"
+        f"stdout:\n{stdout or '(empty)'}\n"
+        f"stderr:\n{stderr or '(empty)'}"
+    )
+    if proc.returncode != 0:
+        blob = f"{stdout}\n{stderr}"
+        if _stderr_suggests_redirect_peel_damage(blob):
+            out += (
+                "\n\n[HINT] 检测到 shell 元字符（如 2>&1 / | / > 等）可能因 `cd` 前缀剥离或参数拆分被破坏。"
+                "建议：(a) 移除命令内的 cd 前缀并在 bash_exec 的 cwd 参数指定工作目录；"
+                "或 (b) 使用 bash -c '...' 显式包裹整条命令。\n"
+            )
+    elif stdout and len(stdout) >= 200:
+        hint_line = _bash_stdout_output_hint(stdout)
+        if hint_line:
+            out += hint_line
+    return out
+
+
+def _max_read_chars_for_session(session: Optional[StudioSession]) -> int:
+    if session is None:
+        return MAX_READ_CHARS
+    try:
+        from agenticx.runtime.session_mode import is_code_dev
+
+        return MAX_READ_CHARS_CODE_DEV if is_code_dev(session) else MAX_READ_CHARS
+    except Exception:
+        return MAX_READ_CHARS
+
+
+def _tool_code_search(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    try:
+        from agenticx.code_index.tools import dispatch_code_search  # type: ignore
+    except ImportError:
+        return (
+            "ERROR: code_index 依赖未安装。请执行: pip install 'agenticx[code_index]'"
+        )
+    return dispatch_code_search(arguments, session)
+
+
+def _tool_code_index_create(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_create
+
+    return dispatch_code_index_create(arguments, session)
+
+
+def _tool_code_index_status(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_status
+
+    return dispatch_code_index_status(arguments, session)
+
+
+def _tool_code_index_clear(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_clear
+
+    return dispatch_code_index_clear(arguments, session)
+
+
+def _tool_code_index_cancel(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_cancel
+
+    return dispatch_code_index_cancel(arguments, session)
+
+
+_CODE_INDEX_LIFECYCLE_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_create",
+            "description": "Start background indexing for a codebase (code_index.enabled).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Root path to index."},
+                },
+                "required": ["codebase_path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_status",
+            "description": "Query code index build status for a codebase (or all tasks if path omitted).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Optional root path."},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_clear",
+            "description": "Drop in-memory code index for a codebase and free memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Root path to clear."},
+                },
+                "required": ["codebase_path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_cancel",
+            "description": "Cooperatively cancel an in-progress code index build by task_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task id from code_index_create/status."},
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def _code_index_tool_defs() -> List[Dict[str, Any]]:
+    if not code_index_config_enabled() and not _has_enabled_code_brains():
+        return []
+    try:
+        import importlib
+
+        importlib.import_module("agenticx.code_index")
+    except ImportError:
+        return []
+    tools: List[Dict[str, Any]] = [_CODE_SEARCH_TOOL]
+    if code_index_config_enabled():
+        tools.extend(_CODE_INDEX_LIFECYCLE_TOOLS)
+    return tools
+
+
+def _tool_code_outline(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.runtime.code_outline import build_outline, format_outline_result
+
+    raw_path = str(arguments.get("path", "")).strip()
+    if not raw_path:
+        return "ERROR: path is required"
+    try:
+        resolved = _resolve_workspace_path(raw_path, session, pick_existing=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    query = str(arguments.get("query", "") or "").strip() or None
+    max_files = int(arguments.get("max_files") or 50)
+    max_files = min(max(max_files, 1), 50)
+    payload = build_outline(resolved, query=query, max_files=max_files)
+    if payload.get("error"):
+        return f"ERROR: {payload['error']}"
+    return format_outline_result(payload)
+
+
+def _tool_result_recall(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+) -> str:
+    """Read a previously archived tool observation for the current session."""
+    raw_id = str(arguments.get("id") or "").strip()
+    query = arguments.get("query")
+    offset = arguments.get("offset_bytes")
+    context_lines = arguments.get("context_lines", 2)
+    query_text = None if query is None else str(query)
+    offset_value: Optional[int]
+    if offset is None:
+        offset_value = None
+    else:
+        try:
+            offset_value = int(offset)
+        except (TypeError, ValueError):
+            return "ERROR: offset_bytes must be an integer"
+    try:
+        ctx = 2 if context_lines is None else int(context_lines)
+    except (TypeError, ValueError):
+        return "ERROR: context_lines must be an integer"
+    try:
+        return recall_tool_observation(
+            session,
+            raw_id,
+            offset_bytes=offset_value,
+            query=query_text,
+            context_lines=ctx,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        return f"ERROR: {exc}"
+
+
+def _tool_file_read(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    try:
+        path = _resolve_workspace_path(str(arguments.get("path", "")), session, pick_existing=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not path.exists():
+        return f"ERROR: file not found: {path}"
+    if not path.is_file():
+        return f"ERROR: not a file: {path}"
+
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"ERROR: read failed: {exc}"
+
+    start_line = arguments.get("start_line")
+    end_line = arguments.get("end_line")
+    max_chars = _max_read_chars_for_session(session)
+    whole_file = start_line is None and end_line is None
+    if start_line is not None or end_line is not None:
+        lines = content.splitlines()
+        start = max(1, int(start_line or 1))
+        end = min(len(lines), int(end_line or len(lines)))
+        if start > end:
+            return "ERROR: invalid line range"
+        selected = lines[start - 1 : end]
+        numbered = [f"{idx+start}|{line}" for idx, line in enumerate(selected)]
+        out = "\n".join(numbered)
+        if session is not None:
+            from agenticx.runtime.code_read_cache import record_file_read
+
+            record_file_read(session, path, start_line=start, end_line=end, total_lines=len(lines))
+            tracker = getattr(session, "file_state_tracker", None)
+            if tracker is not None:
+                tracker.refresh_from_disk(str(path))
+        return out
+
+    if session is not None:
+        try:
+            from agenticx.runtime.code_read_cache import record_file_read
+            from agenticx.runtime.session_mode import (
+                EXPLORE_WHOLE_FILE_READ_WARN_KEY,
+                PHASE_EXPLORE,
+                get_session_phase,
+                is_code_dev,
+            )
+
+            record_file_read(
+                session,
+                path,
+                start_line=None,
+                end_line=None,
+                total_lines=len(content.splitlines()),
+            )
+            if is_code_dev(session) and get_session_phase(session) == PHASE_EXPLORE:
+                scratch = getattr(session, "scratchpad", None) or {}
+                if isinstance(scratch, dict):
+                    count = int(scratch.get(EXPLORE_WHOLE_FILE_READ_WARN_KEY, 0) or 0) + 1
+                    scratch[EXPLORE_WHOLE_FILE_READ_WARN_KEY] = str(count)
+        except Exception:
+            pass
+
+    if len(content) > max_chars:
+        suffix = (
+            f"\n... (truncated, total {len(content)} chars)"
+            + (
+                " 建议：code_dev 模式下请使用 start_line/end_line 缩小范围，或先用 code_outline。"
+                if max_chars <= MAX_READ_CHARS_CODE_DEV
+                else ""
+            )
+        )
+        out = content[:max_chars] + suffix
+    else:
+        out = content
+    if session is not None:
+        tracker = getattr(session, "file_state_tracker", None)
+        if tracker is not None and whole_file:
+            tracker.record_read(str(path), content)
+    return out
+
+
+def _autoheal_skill_md_after_write(path: Path, base_msg: str) -> str:
+    """Ensure a SKILL.md written via file tools is discoverable by the Skills system.
+
+    When ``path`` points at ``<...>/skills/<name>/SKILL.md`` we normalize the YAML
+    frontmatter (injecting ``name=<dir>`` / placeholder description when missing) and
+    verify the SkillBundleLoader can parse it.  This guarantees that any "saved"
+    reply for a skill equals "searchable in Settings → Skills".  Non-skill writes are
+    returned unchanged.
+    """
+    try:
+        if path.name != "SKILL.md":
+            return base_msg
+        parts = [p for p in path.parts]
+        if "skills" not in parts:
+            return base_msg
+        skill_dir = path.parent
+        # SKILL.md must live in skills/<name>/SKILL.md, not directly under skills/.
+        if not skill_dir.name or skill_dir.name == "skills":
+            return base_msg
+
+        from agenticx.skills.frontmatter import (
+            SkillFrontmatterError,
+            normalize_skill_md,
+            verify_skill_discoverable,
+        )
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return base_msg
+
+        try:
+            normalized, fixed = normalize_skill_md(content, skill_dir.name)
+        except SkillFrontmatterError as exc:
+            return (
+                f"ERROR: skill 不会被收录 — {exc}。"
+                "SKILL.md 必须以 YAML frontmatter（`---\\nname: <名称>\\ndescription: <描述>\\n---`）开头。"
+                f"文件已写入 {path}，但**不会**出现在设置 → Skills，请修正 frontmatter 后重写。"
+            )
+
+        if fixed:
+            try:
+                path.write_text(normalized, encoding="utf-8")
+            except OSError as exc:
+                return f"{base_msg}\n[warn] 自动补全 frontmatter 失败：{exc}（skill 可能无法被检索）"
+
+        discoverable, skill_name, errors = verify_skill_discoverable(skill_dir)
+        if not discoverable:
+            detail = "; ".join(errors) if errors else "unknown parse failure"
+            return (
+                f"ERROR: skill 写入后仍不可被检索（{detail}）。"
+                f"文件已写入 {path}，但**不会**出现在设置 → Skills。"
+            )
+
+        note = f"（已自动补全 frontmatter：{', '.join(fixed)}）" if fixed else ""
+        return f"{base_msg}\nOK: skill '{skill_name}' 已可在设置 → Skills 检索{note}"
+    except Exception:
+        # Never let auto-heal failures break the underlying write result.
+        return base_msg
+
+
+def _tool_stage_context_file(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+) -> str:
+    if session is None:
+        return "ERROR: session is required"
+    try:
+        source = _resolve_workspace_path(
+            str(arguments.get("path", "")),
+            session,
+            pick_existing=True,
+        )
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not source.is_file():
+        return f"ERROR: not a file: {source}"
+
+    _read_roots, write_roots = _session_workspace_root_sets(session)
+    if not write_roots:
+        return "ERROR: no writable workspace configured"
+    preferred = _safe_resolve_path(Path(str(session.workspace_dir or "")))
+    workspace = (
+        preferred
+        if any(_is_path_under_root(preferred, root) for root in write_roots)
+        else write_roots[0]
+    )
+    target_dir = workspace / ".agenticx" / "context-files"
+    digest = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:12]
+    target = target_dir / f"{digest}-{source.name}"
+    staged_tmp: Optional[Path] = None
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".stage-", dir=str(target_dir))
+        os.close(fd)
+        staged_tmp = Path(tmp_name)
+        shutil.copy2(source, staged_tmp)
+        os.replace(staged_tmp, target)
+    except OSError as exc:
+        return f"ERROR: failed to stage context file: {exc}"
+    finally:
+        if staged_tmp is not None and staged_tmp.exists():
+            staged_tmp.unlink(missing_ok=True)
+    return json.dumps(
+        {
+            "ok": True,
+            "path": str(target),
+            "source_path": str(source),
+            "source_unchanged": True,
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _tool_file_write(
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    raw_path = str(arguments.get("path", "")).strip()
+    if not raw_path:
+        return (
+            "ERROR: missing required parameter 'path'. "
+            "You must provide a full file path, e.g. file_write(path='/Users/.../file.py', content='...')"
+        )
+    from_path_arg = str(arguments.get("from_path", "") or "").strip()
+    raw_content = arguments.get("content")
+    if from_path_arg:
+        try:
+            src = _resolve_workspace_path(from_path_arg, session, pick_existing=True)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if not src.is_file():
+            return f"ERROR: from_path not found: {src}"
+        try:
+            new_text = _strip_tool_metadata_noise_lines(src.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            return f"ERROR: read from_path failed: {exc}"
+    elif raw_content is None:
+        return (
+            "ERROR: missing required parameter 'content' or 'from_path'. "
+            "You must provide file content, e.g. file_write(path='/Users/.../file.py', content='...')"
+        )
+    else:
+        new_text = _strip_tool_metadata_noise_lines(str(raw_content))
+    try:
+        path = _resolve_workspace_path(raw_path, session, for_write=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if _is_protected_path(path):
+        return (
+            "ERROR: writes to protected paths are blocked for safety "
+            "(e.g. ~/.agenticx/config.yaml, ~/.ssh). "
+            "Use update_email_config meta tool for notifications.email.* updates."
+        )
+    old_text = ""
+    if path.exists():
+        if not path.is_file():
+            return f"ERROR: not a file: {path}"
+        try:
+            old_text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"ERROR: read old file failed: {exc}"
+
+    diff = _format_diff(path, old_text, new_text)
+    if not await _confirm(
+        f"要将更改写入 {path} 吗？",
+        confirm_gate=confirm_gate,
+        context={"tool": "file_write", "path": str(path), "diff": diff, "risk": "low"},
+        emit_event=emit_event,
+    ):
+        return _cancelled("文件未写入", confirm_gate)
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        return f"ERROR: write failed: {exc}"
+    scratchpad = getattr(session, "scratchpad", None)
+    if isinstance(scratchpad, dict):
+        scratchpad["__taskspace_hint__"] = str(path)
+    result = _autoheal_skill_md_after_write(path, f"OK: wrote {path}")
+    tracker = getattr(session, "file_state_tracker", None)
+    if tracker is not None:
+        tracker.refresh_from_disk(str(path))
+    return result
+
+
+async def _tool_file_edit(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession] = None,
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    try:
+        # for_write=True: reference mounts are read-only and must not be editable.
+        path = _resolve_workspace_path(
+            str(arguments.get("path", "")),
+            session,
+            pick_existing=True,
+            for_write=True,
+        )
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if _is_protected_path(path):
+        return (
+            "ERROR: edits to protected paths are blocked for safety "
+            "(e.g. ~/.agenticx/config.yaml, ~/.ssh). "
+            "Use update_email_config meta tool for notifications.email.* updates."
+        )
+    old_text_snippet = str(arguments.get("old_text", ""))
+    new_text_snippet = _strip_tool_metadata_noise_lines(str(arguments.get("new_text", "")))
+    occurrence = int(arguments.get("occurrence", 1) or 1)
+    if old_text_snippet == "":
+        return "ERROR: old_text cannot be empty"
+    if occurrence < 1:
+        return "ERROR: occurrence must be >= 1"
+    if not path.exists() or not path.is_file():
+        return f"ERROR: file not found: {path}"
+
+    tracker = getattr(session, "file_state_tracker", None) if session is not None else None
+    if tracker is not None:
+        stale = tracker.check_staleness(str(path))
+        if stale:
+            return stale
+
+    try:
+        old_text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"ERROR: read failed: {exc}"
+    if old_text_snippet not in old_text:
+        return "ERROR: old_text not found in file"
+
+    start_idx = -1
+    cursor = 0
+    for _ in range(occurrence):
+        start_idx = old_text.find(old_text_snippet, cursor)
+        if start_idx < 0:
+            return f"ERROR: old_text occurrence {occurrence} not found"
+        cursor = start_idx + len(old_text_snippet)
+
+    end_idx = start_idx + len(old_text_snippet)
+    updated_text = old_text[:start_idx] + new_text_snippet + old_text[end_idx:]
+
+    diff = _format_diff(path, old_text, updated_text)
+    if not await _confirm(
+        f"要修改 {path} 吗？",
+        confirm_gate=confirm_gate,
+        context={"tool": "file_edit", "path": str(path), "diff": diff, "risk": "low"},
+        emit_event=emit_event,
+    ):
+        return _cancelled("文件未修改", confirm_gate)
+
+    try:
+        path.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        return f"ERROR: write failed: {exc}"
+    result = _autoheal_skill_md_after_write(path, f"OK: edited {path}")
+    if tracker is not None:
+        tracker.refresh_from_disk(str(path))
+    return result
+
+
+async def _tool_codegen(
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+) -> str:
+    description = str(arguments.get("description", "")).strip()
+    if not description:
+        return "ERROR: description is required"
+    target = str(arguments.get("target") or _detect_target(description)).strip().lower()
+
+    try:
+        llm = ProviderResolver.resolve(
+            provider_name=session.provider_name,
+            model=session.model_name,
+        )
+    except Exception as exc:
+        return f"ERROR: cannot resolve provider: {exc}"
+
+    try:
+        engine = CodeGenEngine(llm)
+        generated = engine.generate(target=target, description=description, context={"reference_files": dict(session.context_files)})
+    except Exception as exc:
+        return f"ERROR: code generation failed: {exc}"
+
+    output_path_raw = str(arguments.get("output_path", "")).strip()
+    if output_path_raw:
+        try:
+            output_path = _resolve_workspace_path(output_path_raw, session)
+        except ValueError as exc:
+            return f"ERROR: invalid output_path: {exc}"
+    else:
+        # If user did not explicitly provide output directory/path, require confirmation
+        # on the inferred destination to prevent writing to unexpected locations.
+        inferred = infer_output_path(target=target, description=description)
+        try:
+            output_path = _resolve_workspace_path(str(inferred), session)
+        except ValueError as exc:
+            return f"ERROR: inferred output path invalid: {exc}"
+        should_confirm = confirm_gate.is_service_mode() or sys.stdin.isatty()
+        if should_confirm and not await _confirm(
+            (
+                "未检测到你显式指定落盘目录。"
+                f"建议写入：{output_path}。是否确认按该路径生成？"
+            ),
+            confirm_gate=confirm_gate,
+            context={"tool": "codegen", "path": str(output_path), "target": target, "risk": "low"},
+            emit_event=emit_event,
+        ):
+            return (
+                _cancelled("推断的落盘路径未获批准", confirm_gate)
+                + " Please provide output_path explicitly, e.g. "
+                '{"target":"agent","description":"...","output_path":"./docs/xxx.md"}'
+            )
+    try:
+        write_generated_file(output_path, generated.code)
+    except Exception as exc:
+        return f"ERROR: failed to write generated file: {exc}"
+    if not output_path.exists() or not output_path.is_file():
+        return f"ERROR: write returned but output missing on disk: {output_path}"
+
+    session.artifacts[output_path] = generated.code
+    try:
+        from agenticx.cli.studio import HistoryRecord
+
+        session.history.append(HistoryRecord(description=description, file_path=output_path, target=target))
+    except Exception:
+        pass
+    return f"OK: generated {output_path.resolve()}"
+
+
+def _tool_mcp_connect(arguments: Dict[str, Any], session: StudioSession) -> str:
+    name = str(arguments.get("name", "")).strip()
+    if not name:
+        return "ERROR: missing server name"
+
+    ok, detail = mcp_connect(session.mcp_hub, session.mcp_configs, session.connected_servers, name)
+    if ok:
+        return "OK"
+    d = (detail or "").strip()
+    return f"ERROR: connect failed: {d}" if d else "ERROR: connect failed"
+
+
+def _find_git_root_for_cc_bridge(start: Path, *, max_up: int = 48) -> Optional[Path]:
+    """Walk upward from start looking for a `.git` directory."""
+    cur = start
+    for _ in range(max_up):
+        try:
+            if (cur / ".git").exists():
+                return cur
+        except OSError:
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _session_default_cwd_for_cc_bridge(session: StudioSession) -> str:
+    w = str(getattr(session, "workspace_dir", "") or "").strip()
+    if w:
+        base = Path(w).expanduser().resolve(strict=False)
+        git_root = _find_git_root_for_cc_bridge(base)
+        if git_root is not None:
+            return str(git_root)
+        return str(base)
+    return str(Path.cwd().resolve(strict=False))
+
+
+def _cc_bridge_is_loopback_base(base_url: str) -> tuple[bool, str, int]:
+    """Parse bridge URL and return (is_loopback, host, port)."""
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return (False, "127.0.0.1", 9742)
+    host = (parsed.hostname or "").strip().lower()
+    port = int(parsed.port or 9742)
+    is_loopback = host in {"127.0.0.1", "localhost", "::1", "[::1]"}
+    return (is_loopback, host or "127.0.0.1", port)
+
+
+def _cc_bridge_http_client_kwargs(base_url: str, timeout_sec: float) -> Dict[str, Any]:
+    """Build httpx client kwargs; bypass env proxies for localhost bridge calls."""
+    kwargs: Dict[str, Any] = {"timeout": timeout_sec}
+    is_loopback, _host, _port = _cc_bridge_is_loopback_base(base_url)
+    if is_loopback:
+        # Avoid SOCKS/HTTP proxy hijacking localhost requests (common source of bridge 502).
+        kwargs["transport"] = __import__("httpx").AsyncHTTPTransport()
+        kwargs["trust_env"] = False
+    return kwargs
+
+
+def _cc_bridge_proc_running() -> bool:
+    global _CC_BRIDGE_AUTO_PROC
+    return _CC_BRIDGE_AUTO_PROC is not None and _CC_BRIDGE_AUTO_PROC.poll() is None
+
+
+def _cc_bridge_idle_stop_seconds() -> int:
+    """Idle timeout for auto-started local bridge (0 disables auto-stop)."""
+    raw = os.getenv("AGX_CC_BRIDGE_IDLE_STOP_SECONDS", "").strip()
+    if not raw:
+        try:
+            cfg = ConfigManager.get_value("cc_bridge.idle_stop_seconds")
+        except Exception:
+            cfg = None
+        if cfg is not None:
+            raw = str(cfg).strip()
+    if not raw:
+        return 600
+    try:
+        v = int(raw)
+    except ValueError:
+        return 600
+    return max(0, min(86400, v))
+
+
+async def _cc_bridge_has_active_sessions(base_url: str, token: str) -> bool:
+    try:
+        import httpx
+    except ImportError:
+        return True
+    try:
+        async with httpx.AsyncClient(**_cc_bridge_http_client_kwargs(base_url, 5.0)) as client:
+            r = await client.get(
+                f"{base_url}/v1/sessions",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception:
+        return True
+    if r.status_code != 200:
+        return True
+    try:
+        body = r.json()
+    except Exception:
+        return True
+    sessions = body.get("sessions")
+    return isinstance(sessions, list) and len(sessions) > 0
+
+
+async def _cc_bridge_idle_reaper(base_url: str, token: str, idle_sec: int) -> None:
+    global _CC_BRIDGE_AUTO_PROC
+    global _CC_BRIDGE_LAST_ACTIVE_MONO
+    if idle_sec <= 0:
+        return
+    await asyncio.sleep(float(idle_sec))
+    if not _cc_bridge_proc_running():
+        return
+    if (time.monotonic() - _CC_BRIDGE_LAST_ACTIVE_MONO) < float(idle_sec):
+        return
+    if await _cc_bridge_has_active_sessions(base_url, token):
+        return
+    proc = _CC_BRIDGE_AUTO_PROC
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        try:
+            await asyncio.to_thread(proc.wait, 3)
+        except Exception:
+            proc.kill()
+    except Exception:
+        pass
+    _CC_BRIDGE_AUTO_PROC = None
+
+
+def _touch_cc_bridge_activity(base_url: str, token: str) -> None:
+    global _CC_BRIDGE_IDLE_TASK
+    global _CC_BRIDGE_LAST_ACTIVE_MONO
+    if not _cc_bridge_proc_running():
+        return
+    idle_sec = _cc_bridge_idle_stop_seconds()
+    if idle_sec <= 0:
+        return
+    _CC_BRIDGE_LAST_ACTIVE_MONO = time.monotonic()
+    if _CC_BRIDGE_IDLE_TASK is not None and not _CC_BRIDGE_IDLE_TASK.done():
+        _CC_BRIDGE_IDLE_TASK.cancel()
+    _CC_BRIDGE_IDLE_TASK = asyncio.create_task(
+        _cc_bridge_idle_reaper(base_url, token, idle_sec)
+    )
+
+
+def _ensure_cc_bridge_local_process(base_url: str, token: str) -> tuple[bool, str]:
+    """Best-effort lazy autostart for local cc-bridge process."""
+    global _CC_BRIDGE_AUTO_PROC
+    if _cc_bridge_proc_running():
+        return (True, "already running")
+    is_loopback, host, port = _cc_bridge_is_loopback_base(base_url)
+    if not is_loopback:
+        return (False, "non-loopback URL; skip autostart")
+
+    visible = os.getenv("AGX_CC_BRIDGE_AUTOSTART_VISIBLE_TERMINAL", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if visible and sys.platform == "darwin":
+        try:
+            agx_path = shutil.which("agx") or "agx"
+            cmd = (
+                f"export CC_BRIDGE_TOKEN={shlex.quote(token)} AGX_CC_BRIDGE_TOKEN={shlex.quote(token)}; "
+                f"if command -v {shlex.quote(agx_path)} >/dev/null 2>&1; then "
+                f"{shlex.quote(agx_path)} cc-bridge serve --host {shlex.quote(host)} --port {port}; "
+                f"else {shlex.quote(sys.executable)} -m agenticx.cli.main cc-bridge serve "
+                f"--host {shlex.quote(host)} --port {port}; fi"
+            )
+            cmd_escaped = cmd.replace("\\", "\\\\").replace('"', '\\"')
+            script = (
+                'tell application "Terminal"\n'
+                "activate\n"
+                f'do script "{cmd_escaped}"\n'
+                "end tell\n"
+            )
+            subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                text=True,
+            )
+            return (True, "started in visible Terminal.app")
+        except Exception as exc:
+            _log.warning("visible cc-bridge terminal launch failed: %s", exc)
+
+    env = os.environ.copy()
+    if token:
+        env.setdefault("CC_BRIDGE_TOKEN", token)
+        env.setdefault("AGX_CC_BRIDGE_TOKEN", token)
+
+    candidates: list[list[str]] = []
+    agx_bin = shutil.which("agx")
+    if agx_bin:
+        candidates.append([agx_bin, "cc-bridge", "serve", "--host", host, "--port", str(port)])
+    candidates.append([sys.executable, "-m", "agenticx.cli.main", "cc-bridge", "serve", "--host", host, "--port", str(port)])
+
+    last_err = "unknown"
+    for cmd in candidates:
+        try:
+            _CC_BRIDGE_AUTO_PROC = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+                text=True,
+            )
+            return (True, f"started pid={_CC_BRIDGE_AUTO_PROC.pid}")
+        except Exception as exc:  # pragma: no cover - platform/env specific
+            last_err = str(exc)
+            continue
+    _CC_BRIDGE_AUTO_PROC = None
+    return (False, f"failed to spawn bridge process: {last_err}")
+
+
+async def _tool_cc_bridge_http(
+    session: StudioSession,
+    method: str,
+    path: str,
+    json_body: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_sec: float = 300.0,
+) -> str:
+    _ = session
+    from agenticx.cc_bridge.settings import (
+        cc_bridge_base_url,
+        cc_bridge_token,
+        validate_bridge_url_for_studio,
+    )
+
+    try:
+        import httpx
+    except ImportError:
+        return "ERROR: httpx is required for cc_bridge tools"
+
+    base = cc_bridge_base_url()
+    err = validate_bridge_url_for_studio(base)
+    if err:
+        return f"ERROR: {err}"
+    token = cc_bridge_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{base}{path}"
+    client_kwargs = _cc_bridge_http_client_kwargs(base, timeout_sec)
+
+    async def _do_request() -> Any:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            m = method.upper()
+            if m == "GET":
+                return await client.get(url, headers=headers)
+            elif m == "POST":
+                return await client.post(url, headers=headers, json=json_body)
+            elif m == "DELETE":
+                return await client.delete(url, headers=headers)
+            else:
+                return f"ERROR: unsupported HTTP method {method}"
+    tried_autostart = False
+    try:
+        r = await _do_request()
+        if isinstance(r, str):
+            return r
+    except httpx.ConnectError as exc:
+        started, detail = _ensure_cc_bridge_local_process(base, token)
+        if started:
+            tried_autostart = True
+            await asyncio.sleep(0.9)
+            try:
+                r = await _do_request()
+                if isinstance(r, str):
+                    return r
+            except httpx.ConnectError as exc2:
+                return (
+                    "ERROR: CC bridge not reachable and autostart did not become healthy. "
+                    f"Autostart: {detail}. URL: {base}. Details: {exc2}"
+                )
+            except httpx.TimeoutException as exc2:
+                return f"ERROR: CC bridge autostart succeeded but HTTP timed out: {exc2}"
+            except httpx.HTTPError as exc2:
+                return f"ERROR: bridge HTTP failed after autostart: {exc2}"
+        else:
+            return (
+                "ERROR: CC bridge not reachable (connection refused). "
+                f"Autostart skipped/failed: {detail}. "
+                "You can still start manually: agx cc-bridge serve "
+                f"(expects {base}). Details: {exc}"
+            )
+    except httpx.TimeoutException as exc:
+        return f"ERROR: CC bridge HTTP timed out: {exc}"
+    except httpx.HTTPError as exc:
+        return f"ERROR: bridge HTTP failed: {exc}"
+    # Bridge may be reachable but unhealthy (e.g., stale process / boot race / reverse proxy 5xx).
+    if r.status_code >= 500:
+        started, detail = _ensure_cc_bridge_local_process(base, token)
+        if started:
+            tried_autostart = True
+            await asyncio.sleep(0.9)
+            try:
+                r2 = await _do_request()
+                if isinstance(r2, str):
+                    return r2
+                r = r2
+            except httpx.HTTPError as exc:
+                return f"ERROR: bridge HTTP failed after 5xx recovery: {exc}"
+            except Exception as exc:
+                return f"ERROR: bridge 5xx recovery failed: {exc}"
+        if r.status_code >= 500:
+            # one-shot lightweight diagnostics for clearer operator message
+            health_hint = ""
+            try:
+                async with httpx.AsyncClient(**_cc_bridge_http_client_kwargs(base, 5.0)) as client:
+                    hr = await client.get(f"{base}/health")
+                    health_hint = f"health={hr.status_code}"
+            except Exception:
+                health_hint = "health=unreachable"
+            body = (r.text or "").strip()
+            if not body:
+                body = "<empty>"
+            return (
+                f"ERROR: bridge {r.status_code}: {body[:400]} "
+                f"(diag: {health_hint}, autostart={detail})"
+            )
+    text = r.text
+    if r.status_code in (401, 403):
+        return (
+            f"ERROR: CC bridge auth rejected (HTTP {r.status_code}). "
+            "Use the same token on the bridge as in ~/.agenticx/config.yaml (cc_bridge.token) "
+            f"or set matching CC_BRIDGE_TOKEN / AGX_CC_BRIDGE_TOKEN. Body: {text[:800]}"
+        )
+    if r.status_code >= 400:
+        return f"ERROR: bridge {r.status_code}: {text[:2000]}"
+    _touch_cc_bridge_activity(base, token)
+    if tried_autostart:
+        return f"{text}\n\n[cc-bridge] autostarted in background."
+    return text
+
+
+async def _tool_cc_bridge_start(arguments: Dict[str, Any], session: StudioSession) -> str:
+    from agenticx.cc_bridge.settings import cc_bridge_mode, cc_bridge_mode_configured
+
+    explicit_mode = str(arguments.get("mode", "") or "").strip().lower()
+    if explicit_mode not in {"", "headless", "visible_tui"}:
+        return "ERROR: mode must be one of: headless, visible_tui"
+
+    def _latest_user_intent() -> str:
+        hist = getattr(session, "chat_history", None) or []
+        for msg in reversed(hist):
+            if str(msg.get("role", "")) == "user":
+                return str(msg.get("content", "") or "")
+        return ""
+
+    def _choose_mode(config_mode: str, configured_mode: str | None) -> str:
+        if explicit_mode in {"headless", "visible_tui"}:
+            return explicit_mode
+        sid = str(getattr(session, "session_id", "") or "").strip().lower()
+        if sid.startswith("im-"):
+            return "headless"
+        # Respect explicit user config from Settings first; only auto-infer when
+        # no persisted mode is set.
+        if configured_mode in {"headless", "visible_tui"}:
+            return configured_mode
+        intent = _latest_user_intent().lower()
+        interactive_hints = (
+            "visible_tui",
+            "visible tui",
+            "可见",
+            "交互",
+            "终端",
+            "手动",
+            "按键",
+            "点击确认",
+            "在cc里",
+        )
+        autonomous_hints = (
+            "自动",
+            "直接给我结果",
+            "报告",
+            "摘要",
+            "总结",
+            "分析",
+            "不要改代码",
+            "无需交互",
+            "无需确认",
+            "session_id +",
+        )
+        if any(k in intent for k in interactive_hints):
+            return "visible_tui"
+        if any(k in intent for k in autonomous_hints):
+            return "headless"
+        return config_mode
+
+    cwd = str(arguments.get("cwd", "") or "").strip()
+    if not cwd:
+        cwd = _session_default_cwd_for_cc_bridge(session)
+    auto = bool(arguments.get("auto_allow_permissions", False))
+    resolved_mode = _choose_mode(cc_bridge_mode(), cc_bridge_mode_configured())
+    return await _tool_cc_bridge_http(
+        session,
+        "POST",
+        "/v1/sessions",
+        {"cwd": cwd, "auto_allow_permissions": auto, "mode": resolved_mode},
+        timeout_sec=60.0,
+    )
+
+
+async def _cc_bridge_resolve_session_mode(session: StudioSession, sid: str) -> Tuple[Optional[str], str]:
+    """Resolve headless|visible_tui for sid via GET /v1/sessions/{id}, then list fallback.
+
+    Returns (mode, ""). If session is missing, (None, error_text).
+    """
+    from agenticx.cc_bridge.settings import (
+        cc_bridge_base_url,
+        cc_bridge_mode,
+        cc_bridge_token,
+        validate_bridge_url_for_studio,
+    )
+
+    try:
+        import httpx
+    except ImportError:
+        return (None, "ERROR: httpx is required for cc_bridge tools")
+
+    detail = await _tool_cc_bridge_http(
+        session, "GET", f"/v1/sessions/{sid}", None, timeout_sec=15.0
+    )
+    if not detail.startswith("ERROR:"):
+        try:
+            obj = json.loads(detail)
+            if isinstance(obj, dict):
+                mv = str(obj.get("mode", "")).strip().lower()
+                if mv in {"headless", "visible_tui"}:
+                    return (mv, "")
+        except Exception:
+            pass
+    else:
+        err = detail
+        if "session not found" in err.lower():
+            return (None, err)
+
+    resolved_mode = str(cc_bridge_mode() or "headless").strip().lower()
+    if resolved_mode not in {"headless", "visible_tui"}:
+        resolved_mode = "headless"
+
+    base = cc_bridge_base_url()
+    err = validate_bridge_url_for_studio(base)
+    if not err:
+        token = cc_bridge_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        list_url = f"{base}/v1/sessions"
+        try:
+            async with httpx.AsyncClient(**_cc_bridge_http_client_kwargs(base, 15.0)) as client:
+                r = await client.get(list_url, headers=headers)
+            if r.status_code < 400:
+                payload = r.json() if r.content else {}
+                if isinstance(payload, dict):
+                    sessions = payload.get("sessions")
+                    if isinstance(sessions, list):
+                        for item in sessions:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("session_id", "")).strip() != sid:
+                                continue
+                            mode_value = str(item.get("mode", "")).strip().lower()
+                            if mode_value in {"headless", "visible_tui"}:
+                                return (mode_value, "")
+                            break
+        except Exception:
+            pass
+
+    return (resolved_mode, "")
+
+
+async def _tool_cc_bridge_send(arguments: Dict[str, Any], session: StudioSession) -> str:
+    sid = str(arguments.get("session_id", "")).strip()
+    prompt = str(arguments.get("prompt", "") or "")
+    if not sid or not prompt:
+        return "ERROR: session_id and prompt are required"
+    wait = arguments.get("wait_seconds", 120.0)
+    try:
+        wait_f = float(wait)
+    except (TypeError, ValueError):
+        wait_f = 120.0
+    wait_f = max(1.0, min(3600.0, wait_f))
+
+    resolved_mode, resolve_err = await _cc_bridge_resolve_session_mode(session, sid)
+    if resolved_mode is None:
+        return resolve_err
+
+    async def _post_message() -> str:
+        return await _tool_cc_bridge_http(
+            session,
+            "POST",
+            f"/v1/sessions/{sid}/message",
+            {"text": prompt, "wait_seconds": wait_f},
+            timeout_sec=wait_f + 45.0,
+        )
+
+    def _decorate_message_response(resp_text: str, *, mode_corrected: bool) -> str:
+        if not mode_corrected:
+            return resp_text
+        if resp_text.startswith("ERROR:"):
+            return resp_text
+        try:
+            obj = json.loads(resp_text)
+            if isinstance(obj, dict):
+                obj["mode_corrected"] = True
+                return json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            pass
+        return f"{resp_text}\n[cc-bridge] mode_corrected=true"
+
+    if resolved_mode == "visible_tui":
+        write_res = await _tool_cc_bridge_http(
+            session,
+            "POST",
+            f"/v1/sessions/{sid}/write",
+            {"data": f"{prompt}\r"},
+            timeout_sec=30.0,
+        )
+        if write_res.startswith("ERROR:") and "write is only for visible_tui" in write_res.lower():
+            msg_res = await _post_message()
+            return _decorate_message_response(msg_res, mode_corrected=True)
+        if write_res.startswith("ERROR:"):
+            return write_res
+        return json.dumps(
+            {
+                "ok": True,
+                "mode": "visible_tui",
+                "interactive": True,
+                "parsed_response": "",
+                "parse_confidence": 0.0,
+                "tail": "",
+                "status": "sent",
+                "final_available": False,
+                "evidence_level": "none",
+                "must_not_summarize_as_complete": True,
+                "message": "Prompt sent to visible TUI terminal",
+                "next_action": "wait_for_user_terminal_interaction",
+            },
+            ensure_ascii=False,
+        )
+
+    resp_text = await _post_message()
+    if resp_text.startswith("ERROR:"):
+        return resp_text
+    try:
+        obj = json.loads(resp_text)
+        if isinstance(obj, dict):
+            ok = bool(obj.get("ok", False))
+            if not ok:
+                obj.setdefault("final_available", False)
+                obj.setdefault("evidence_level", "low")
+                obj.setdefault("must_not_summarize_as_complete", True)
+                obj.setdefault(
+                    "message",
+                    "No verified final output from cc_bridge_send; report status and next action only.",
+                )
+                return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        pass
+    return resp_text
+
+
+async def _tool_cc_bridge_list(arguments: Dict[str, Any], session: StudioSession) -> str:
+    _ = arguments
+    return await _tool_cc_bridge_http(session, "GET", "/v1/sessions", None, timeout_sec=30.0)
+
+
+async def _tool_cc_bridge_stop(arguments: Dict[str, Any], session: StudioSession) -> str:
+    from agenticx.cc_bridge.settings import (
+        cc_bridge_base_url,
+        cc_bridge_token,
+        validate_bridge_url_for_studio,
+    )
+
+    try:
+        import httpx
+    except ImportError:
+        return "ERROR: httpx is required for cc_bridge tools"
+
+    sid = str(arguments.get("session_id", "") or "").strip()
+    force = bool(arguments.get("force", False))
+    if not sid:
+        return "ERROR: session_id required"
+    if not force:
+        base = cc_bridge_base_url()
+        err = validate_bridge_url_for_studio(base)
+        if not err:
+            token = cc_bridge_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            try:
+                async with httpx.AsyncClient(**_cc_bridge_http_client_kwargs(base, 10.0)) as client:
+                    resp = await client.get(f"{base}/v1/sessions", headers=headers)
+                if resp.status_code < 400:
+                    payload = resp.json() if resp.content else {}
+                    rows = payload.get("sessions") if isinstance(payload, dict) else None
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            if str(row.get("session_id", "")).strip() != sid:
+                                continue
+                            mode = str(row.get("mode", "")).strip().lower()
+                            poll = row.get("poll")
+                            if mode == "visible_tui" and poll is None:
+                                return (
+                                    "ERROR: visible_tui session is still active; stopping now may lose interactive state. "
+                                    "Only stop after user confirms terminal flow is done, or call cc_bridge_stop with force=true."
+                                )
+                            break
+            except Exception:
+                pass
+    return await _tool_cc_bridge_http(session, "DELETE", f"/v1/sessions/{sid}", None, timeout_sec=30.0)
+
+
+async def _tool_cc_bridge_permission(arguments: Dict[str, Any], session: StudioSession) -> str:
+    sid = str(arguments.get("session_id", "") or "").strip()
+    rid = str(arguments.get("request_id", "") or "").strip()
+    if not sid or not rid:
+        return "ERROR: session_id and request_id are required"
+    if "allow" not in arguments:
+        return "ERROR: allow is required"
+    allow = bool(arguments.get("allow"))
+    deny_message = str(arguments.get("deny_message", "") or "Denied by operator")
+    body: Dict[str, Any] = {
+        "request_id": rid,
+        "allow": allow,
+        "deny_message": deny_message,
+    }
+    tuid = arguments.get("tool_use_id")
+    if tuid is not None and str(tuid).strip():
+        body["tool_use_id"] = str(tuid).strip()
+    tin = arguments.get("tool_input")
+    if isinstance(tin, dict):
+        body["tool_input"] = tin
+    return await _tool_cc_bridge_http(
+        session,
+        "POST",
+        f"/v1/sessions/{sid}/permission",
+        body,
+        timeout_sec=30.0,
+    )
+
+
+async def _tool_wb_bridge_http(
+    session: StudioSession,
+    method: str,
+    path: str,
+    json_body: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_sec: float = 300.0,
+) -> str:
+    _ = session
+    from agenticx.wb_bridge.settings import (
+        validate_bridge_url_for_studio,
+        wb_bridge_base_url,
+        wb_bridge_token,
+    )
+
+    try:
+        import httpx
+    except ImportError:
+        return "ERROR: httpx is required for wb_bridge tools"
+
+    base = wb_bridge_base_url()
+    err = validate_bridge_url_for_studio(base)
+    if err:
+        return f"ERROR: {err}"
+    token = wb_bridge_token()
+    from agenticx.wb_bridge.process import ensure_wb_bridge_protocol
+    from agenticx.wb_bridge.settings import probe_wb_bridge as _probe_wb
+
+    _ok, ensure_detail = ensure_wb_bridge_protocol(base, token)
+    if ensure_detail.startswith("recycled") or ensure_detail.startswith("started"):
+        for _ in range(40):
+            await asyncio.sleep(0.4)
+            if _probe_wb(url=base, token=token).get("reachable"):
+                break
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{base}{path}"
+    client_kwargs = _cc_bridge_http_client_kwargs(base, timeout_sec)
+
+    async def _do_request() -> Any:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            m = method.upper()
+            if m == "GET":
+                return await client.get(url, headers=headers)
+            if m == "POST":
+                return await client.post(url, headers=headers, json=json_body)
+            if m == "DELETE":
+                return await client.delete(url, headers=headers)
+            return f"ERROR: unsupported HTTP method {method}"
+
+    try:
+        r = await _do_request()
+        if isinstance(r, str):
+            return r
+    except httpx.ConnectError as exc:
+        from agenticx.wb_bridge.process import ensure_wb_bridge_local_process
+
+        started, detail = ensure_wb_bridge_local_process(base, token)
+        if not started:
+            return (
+                "ERROR: WB bridge not reachable (connection refused). "
+                "Do not start it with bash/bash_bg (sandbox PermissionError). "
+                f"Open Settings → Tools → CodeBuddy 本机 Bridge and click「启动并检测」. "
+                f"Autostart skipped: {detail}. expects {base}. Details: {exc}"
+            )
+        last_exc: Exception = exc
+        r = None
+        for _ in range(40):
+            await asyncio.sleep(0.4)
+            try:
+                r = await _do_request()
+                if isinstance(r, str):
+                    return r
+                break
+            except httpx.ConnectError as exc2:
+                last_exc = exc2
+        if r is None:
+            return (
+                "ERROR: WB bridge not reachable after autostart. "
+                f"Autostart: {detail}. expects {base}. Details: {last_exc}. "
+                "Check Settings → Tools → CodeBuddy 本机 Bridge status (red = not listening)."
+            )
+    except httpx.TimeoutException as exc:
+        return f"ERROR: WB bridge HTTP timed out: {exc}"
+    except httpx.HTTPError as exc:
+        return f"ERROR: WB bridge HTTP failed: {exc}"
+    text = r.text
+    if r.status_code in (401, 403):
+        return (
+            f"ERROR: WB bridge auth rejected (HTTP {r.status_code}). "
+            "Use the same token on the bridge as in ~/.agenticx/config.yaml (wb_bridge.token) "
+            f"or set matching WB_BRIDGE_TOKEN / AGX_WB_BRIDGE_TOKEN. Body: {text[:800]}"
+        )
+    if r.status_code >= 400:
+        return f"ERROR: bridge {r.status_code}: {text[:2000]}"
+    return text
+
+
+async def _tool_wb_bridge_start(arguments: Dict[str, Any], session: StudioSession) -> str:
+    cwd = str(arguments.get("cwd", "") or "").strip()
+    if not cwd:
+        cwd = _session_default_cwd_for_cc_bridge(session)
+    mode = str(arguments.get("permission_mode", "") or "default").strip()
+    return await _tool_wb_bridge_http(
+        session,
+        "POST",
+        "/v1/sessions",
+        {"cwd": cwd, "permission_mode": mode},
+        timeout_sec=60.0,
+    )
+
+
+async def _tool_wb_bridge_send(arguments: Dict[str, Any], session: StudioSession) -> str:
+    sid = str(arguments.get("session_id", "")).strip()
+    text = str(arguments.get("text", "") or "")
+    if not sid or not text:
+        return "ERROR: session_id and text are required"
+    wait = arguments.get("wait_seconds", 180.0)
+    try:
+        wait_f = float(wait)
+    except (TypeError, ValueError):
+        wait_f = 180.0
+    wait_f = max(0.0, min(3600.0, wait_f))
+    body: Dict[str, Any] = {"text": text, "wait_seconds": wait_f}
+    idem = str(arguments.get("idempotency_key", "") or "").strip()
+    if not idem:
+        idem = f"{sid}:{hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]}"
+    body["idempotency_key"] = idem[:200]
+    return await _tool_wb_bridge_http(
+        session,
+        "POST",
+        f"/v1/sessions/{sid}/message",
+        body,
+        timeout_sec=wait_f + 45.0,
+    )
+
+
+async def _tool_wb_bridge_list(arguments: Dict[str, Any], session: StudioSession) -> str:
+    _ = arguments
+    return await _tool_wb_bridge_http(session, "GET", "/v1/sessions", None, timeout_sec=30.0)
+
+
+async def _tool_wb_bridge_describe(arguments: Dict[str, Any], session: StudioSession) -> str:
+    sid = str(arguments.get("session_id", "") or "").strip()
+    if not sid:
+        return "ERROR: session_id required"
+    return await _tool_wb_bridge_http(session, "GET", f"/v1/sessions/{sid}", None, timeout_sec=15.0)
+
+
+async def _tool_wb_bridge_stop(arguments: Dict[str, Any], session: StudioSession) -> str:
+    sid = str(arguments.get("session_id", "") or "").strip()
+    if not sid:
+        return "ERROR: session_id required"
+    force = bool(arguments.get("force", False))
+    if not force:
+        desc = await _tool_wb_bridge_http(
+            session, "GET", f"/v1/sessions/{sid}", None, timeout_sec=15.0
+        )
+        if not desc.startswith("ERROR:"):
+            try:
+                row = json.loads(desc)
+            except (TypeError, ValueError):
+                row = {}
+            if isinstance(row, dict) and row.get("turn_state") == "running":
+                return (
+                    "ERROR: turn is still running; in-flight file writes may be incomplete. "
+                    "Pass force=true to stop anyway, or wait and poll wb_bridge_describe."
+                )
+    return await _tool_wb_bridge_http(session, "DELETE", f"/v1/sessions/{sid}", None, timeout_sec=30.0)
+
+
+_SCREENSHOT_TOOL_NAMES = frozenset({
+    "browser_screenshot", "screenshot", "take_screenshot",
+    "browser_take_screenshot", "computer_screenshot",
+})
+
+
+def _is_non_vision_model(session: StudioSession) -> bool:
+    provider = str(getattr(session, "provider_name", "") or "").strip().lower()
+    model = str(getattr(session, "model_name", "") or "").strip().lower()
+    if not model:
+        return False
+    from agenticx.llms.vision import is_vision_capable
+
+    return not is_vision_capable(provider, model)
+
+
+_SCREENSHOT_NON_VISION_HINT = (
+    "\n\n⚠️ 当前模型不支持图片识别，无法查看截图内容。"
+    "请改用以下文本工具获取页面信息：\n"
+    "- browser_get_state：获取页面 URL、标题和可交互元素列表\n"
+    "- browser_extract_content(query='...')：按查询提取页面文本内容\n"
+    "- browser_get_html：获取页面 HTML 源码\n"
+    "请勿再次调用 browser_screenshot。"
+)
+
+
+_MCP_REPEAT_GUARD_KEY = "__mcp_repeat_guard__"
+_MCP_REPEAT_GUARDED_TOOLS = frozenset({"browser_type", "browser_navigate"})
+
+
+def _mcp_action_signature(tool_name: str, args_obj: Dict[str, Any]) -> str | None:
+    if tool_name == "browser_type":
+        index = args_obj.get("index")
+        text = str(args_obj.get("text", "")).strip()
+        if index is None or not text:
+            return None
+        return f"browser_type::{index}::{text}"
+    if tool_name == "browser_navigate":
+        url = str(args_obj.get("url", "")).strip()
+        if not url:
+            return None
+        return f"browser_navigate::{url}"
+    return None
+
+
+def _check_mcp_repeat_guard(session: StudioSession, tool_name: str, args_obj: Dict[str, Any]) -> str | None:
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        session.scratchpad = {}
+        scratchpad = session.scratchpad
+
+    if tool_name not in _MCP_REPEAT_GUARDED_TOOLS:
+        scratchpad.pop(_MCP_REPEAT_GUARD_KEY, None)
+        return None
+
+    sig = _mcp_action_signature(tool_name, args_obj)
+    if not sig:
+        scratchpad.pop(_MCP_REPEAT_GUARD_KEY, None)
+        return None
+
+    raw_state = scratchpad.get(_MCP_REPEAT_GUARD_KEY)
+    state = raw_state if isinstance(raw_state, dict) else {}
+    prev_sig = str(state.get("sig", "")).strip()
+    prev_count = int(state.get("count", 0) or 0)
+    count = prev_count + 1 if prev_sig == sig else 1
+    scratchpad[_MCP_REPEAT_GUARD_KEY] = {"sig": sig, "count": count}
+
+    if count < 3:
+        return None
+
+    if tool_name == "browser_type":
+        return (
+            "ERROR: repeated browser_type detected (same index/text called >=3 times). "
+            "Do not type again. Next action must be one of: "
+            "1) browser_click on the search/submit button, or "
+            "2) browser_get_state to refresh interactive elements."
+        )
+    return (
+        "ERROR: repeated browser_navigate detected (same url called >=3 times). "
+        "Do not navigate again. Next action must be browser_get_state or browser_click."
+    )
+
+
+def _tool_tool_search(
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    runtime_tool_context: Optional[Any] = None,
+) -> str:
+    """Run local ToolSearch ranking; schemas load on the next model round."""
+    if runtime_tool_context is None:
+        return json.dumps(
+            {"error": "tool_search unavailable in this context"},
+            ensure_ascii=False,
+        )
+    from agenticx.runtime.tool_search import (
+        apply_search,
+        dump_state_to_scratchpad,
+    )
+
+    query = str((arguments or {}).get("query") or "").strip()
+    if not query:
+        return json.dumps({"error": "query is required"}, ensure_ascii=False)
+    max_results_raw = (arguments or {}).get("max_results", 5)
+    try:
+        max_results = int(max_results_raw)
+    except (TypeError, ValueError):
+        max_results = 5
+    new_ctx, result = apply_search(
+        runtime_tool_context,
+        query,
+        max_results=max_results,
+    )
+    # Mutate turn-local context so the next round projection sees loaded ids.
+    try:
+        runtime_tool_context.state = new_ctx.state
+    except Exception:
+        pass
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        scratchpad = {}
+        try:
+            setattr(session, "scratchpad", scratchpad)
+        except Exception:
+            pass
+    dump_state_to_scratchpad(scratchpad, new_ctx.state)
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def _tool_mcp_call_async(arguments: Dict[str, Any], session: StudioSession) -> str:
+    if session.mcp_hub is None:
+        return "ERROR: no MCP hub connected"
+    tool_name = str(arguments.get("tool_name", "")).strip()
+    if not tool_name:
+        return "ERROR: missing tool_name"
+
+    raw_args = arguments.get("arguments", None)
+    if raw_args is None and "args" in arguments:
+        raw_args = arguments.get("args")
+    args_obj = raw_args if raw_args is not None else {}
+    if not isinstance(args_obj, dict):
+        return "ERROR: arguments/args must be an object"
+
+    # Firecrawl scrape is a single-url API. Guard common misuse early.
+    if (
+        tool_name == "firecrawl_scrape"
+        and "url" not in args_obj
+        and isinstance(args_obj.get("urls"), list)
+    ):
+        return (
+            "ERROR: firecrawl_scrape expects a single 'url' string, not 'urls' array. "
+            "Use: {\"url\":\"https://example.com\"}. "
+            "For multiple pages, iterate firecrawl_scrape per URL or use firecrawl_crawl/firecrawl_map."
+        )
+    repeat_guard_error = _check_mcp_repeat_guard(session, tool_name, args_obj)
+    if repeat_guard_error:
+        return repeat_guard_error
+    if tool_name in _SCREENSHOT_TOOL_NAMES and _is_non_vision_model(session):
+        return (
+            f'{{"size_bytes": 0, "viewport": {{}}, "skipped": true}}'
+            + _SCREENSHOT_NON_VISION_HINT
+        )
+    result = await mcp_call_tool_async(
+        session.mcp_hub,
+        tool_name,
+        json.dumps(args_obj, ensure_ascii=False),
+        echo=False,
+    )
+    return result
+
+
+def _tool_mcp_import(arguments: Dict[str, Any], session: StudioSession) -> str:
+    source_path = str(arguments.get("source_path", "")).strip()
+    if not source_path:
+        return "ERROR: missing source_path"
+    result = import_mcp_config(source_path)
+    if not result.get("ok"):
+        return f"ERROR: {result.get('error', 'mcp_import failed')}"
+    try:
+        session.mcp_configs = load_available_servers()
+    except Exception:
+        pass
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _tool_skill_use(arguments: Dict[str, Any], session: StudioSession) -> str:
+    name = str(arguments.get("name", "")).strip()
+    if not name:
+        return "ERROR: missing skill name"
+    bound = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+    allowed, err = skill_is_allowed_for_session(name, bound_avatar_id=bound)
+    if not allowed:
+        return f"ERROR: {err}"
+    ok = studio_skill_use(
+        session.context_files, name, bound_avatar_id=bound, quiet=True
+    )
+    if not ok:
+        from pathlib import Path
+
+        hint = (
+            f"Skill '{name}' was not found in the skill index. "
+            "Common causes: SKILL.md missing YAML `name:` (only `title:` is not enough), "
+            "skill not under a scanned path, or name mismatch vs frontmatter. "
+            "Run skill_list for discoverable names, or fix frontmatter then retry skill_use."
+        )
+        guessed = Path.home() / ".agenticx" / "skills" / name / "SKILL.md"
+        if guessed.is_file():
+            hint += (
+                f" File exists at {guessed} but is not indexed — add "
+                f"`name: {name}` to frontmatter (or use skill_manage create/patch)."
+            )
+        return f"ERROR: skill activation failed. {hint}"
+
+    meta = SkillBundleLoader().get_skill(name)
+    try:
+        from agenticx.learning.skill_usage_tracker import record_use
+        skill_dir = meta.base_dir if meta else None
+        if skill_dir:
+            sid = str(getattr(session, "session_id", "") or getattr(session, "id", "") or "")
+            record_use(skill_dir, session_id=sid)
+    except Exception:
+        pass
+    if meta is None:
+        return (
+            f"OK: activated skill '{name}'. 正文已注入本轮上下文（context_files 键 skill:{name}），"
+            "请直接使用，不要再用 file_read/bash_exec 读取该技能目录——工作区之外不可读。"
+        )
+    return (
+        f"OK: activated skill '{name}'. 正文已注入本轮上下文（context_files 键 skill:{name}），"
+        "请直接使用，不要再用 file_read/bash_exec 读取该技能目录——工作区之外不可读。"
+        f" source={meta.source}, location={meta.location}, "
+        f"base_dir={meta.base_dir}（该目录在工作区之外，不可读）。"
+    )
+
+
+def _tool_skill_list(session: StudioSession) -> str:
+    try:
+        bound = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+        summaries = get_all_skill_summaries(bound_avatar_id=bound)
+    except Exception as exc:
+        return f"ERROR: list skill failed: {exc}"
+    if not summaries:
+        return "No skills found."
+    lines = []
+    for item in summaries:
+        source = str(item.get("source", "unknown"))
+        location = str(item.get("location", "unknown"))
+        base_dir = str(item.get("base_dir", ""))
+        lines.append(
+            f"- {item['name']}: {item['description']} "
+            f"[source={source}, location={location}, base_dir={base_dir}]"
+        )
+    return "\n".join(lines)
+
+
+def _tool_todo_write(arguments: Dict[str, Any], session: StudioSession) -> str:
+    items = arguments.get("items", [])
+    todo_manager = getattr(session, "todo_manager", None)
+    if todo_manager is None:
+        return "ERROR: todo manager unavailable in session"
+    try:
+        return todo_manager.update(items)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+
+
+def _tool_scratchpad_write(arguments: Dict[str, Any], session: StudioSession) -> str:
+    key = str(arguments.get("key", "")).strip()
+    value = str(arguments.get("value", ""))
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        session.scratchpad = {}
+        scratchpad = session.scratchpad
+    if not key:
+        return "ERROR: key is required"
+    if key not in scratchpad and len(scratchpad) >= 50:
+        return "ERROR: scratchpad key limit exceeded (50)"
+    if len(value) > 10_000:
+        value = value[:10_000] + "\n... (truncated to 10000 chars)"
+    old_value = scratchpad.get(key, "")
+    scratchpad[key] = value
+    try:
+        from agenticx.runtime.session_mode import (
+            PHASE_AUTHOR,
+            PHASE_READ,
+            PHASE_SCRATCH_KEY,
+            is_code_dev,
+        )
+
+        if is_code_dev(session) and key == PHASE_SCRATCH_KEY:
+            prev = str(old_value or "").strip().lower()
+            new = value.strip().lower()
+            if prev == PHASE_READ and new == PHASE_AUTHOR:
+                setattr(session, "_code_dev_phase_compact_pending", True)
+    except Exception:
+        pass
+    return f"OK: scratchpad[{key}] updated"
+
+
+def _tool_scratchpad_read(arguments: Dict[str, Any], session: StudioSession) -> str:
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        return "No scratchpad entries."
+    if bool(arguments.get("list_only", False)):
+        keys = sorted(scratchpad.keys())
+        return "\n".join(keys) if keys else "No scratchpad entries."
+    key = str(arguments.get("key", "")).strip()
+    if not key:
+        keys = sorted(scratchpad.keys())
+        return "\n".join(keys) if keys else "No scratchpad entries."
+    if key not in scratchpad:
+        return f"ERROR: key not found: {key}"
+    return str(scratchpad[key])
+
+
+async def _tool_memory_append(
+    arguments: Dict[str, Any],
+    *,
+    confirm_gate: ConfirmGate,
+    emit_event: Optional[Any] = None,
+    session: Optional["StudioSession"] = None,
+) -> str:
+    target = str(arguments.get("target", "")).strip().lower()
+    content = str(arguments.get("content", "")).strip()
+    scope = str(arguments.get("scope", "subject") or "subject").strip().lower()
+    if target not in {"daily", "long_term"}:
+        return "ERROR: target must be daily or long_term"
+    if scope not in {"subject", "user_global"}:
+        return "ERROR: scope must be subject or user_global"
+    if not content:
+        return "ERROR: content is required"
+
+    from datetime import date
+
+    from agenticx.workspace.loader import (
+        DAILY_MEMORY_TEMPLATE,
+        append_daily_memory,
+        append_long_term_memory,
+        append_user_global_preference,
+        resolve_subject_workspace_dir,
+        resolve_workspace_dir,
+    )
+
+    if scope == "user_global":
+        if target != "long_term":
+            return "ERROR: user_global scope only supports target=long_term"
+        if not await _confirm(
+            "要将偏好写入全局 USER.md（所有主体）吗？",
+            confirm_gate=confirm_gate,
+            context={"tool": "memory_append", "scope": scope, "preview": content[:200], "risk": "policy"},
+            emit_event=emit_event,
+        ):
+            return _cancelled("记忆未写入", confirm_gate)
+        append_user_global_preference(content)
+        workspace_dir = resolve_workspace_dir()
+    else:
+        workspace_dir = resolve_subject_workspace_dir(session=session)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        if target == "long_term":
+            if not await _confirm(
+                "要将笔记写入当前主体的长期 MEMORY.md 吗？",
+                confirm_gate=confirm_gate,
+                context={"tool": "memory_append", "target": target, "preview": content[:200], "risk": "policy"},
+                emit_event=emit_event,
+            ):
+                return _cancelled("记忆未写入", confirm_gate)
+            append_long_term_memory(workspace_dir, content)
+        else:
+            memory_dir = workspace_dir / "memory"
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            today_file = memory_dir / f"{date.today().isoformat()}.md"
+            if not today_file.exists():
+                today_file.write_text(
+                    DAILY_MEMORY_TEMPLATE.format(today=date.today().isoformat()),
+                    encoding="utf-8",
+                )
+            append_daily_memory(workspace_dir, content)
+
+    try:
+        store = WorkspaceMemoryStore()
+        store.index_workspace_sync(workspace_dir)
+        global_ws = resolve_workspace_dir()
+        if workspace_dir.resolve(strict=False) != global_ws.resolve(strict=False):
+            store.index_workspace_sync(global_ws)
+    except Exception:
+        pass
+    return f"OK: appended to {target} (scope={scope})"
+
+
+def _tool_knowledge_search(
+    arguments: Dict[str, Any], session: Optional["StudioSession"] = None
+) -> str:
+    """Search mounted docs brains (multi-brain architecture)."""
+
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return json.dumps(
+            {"ok": False, "error": "query is required", "hits": []},
+            ensure_ascii=False,
+        )
+    try:
+        from agenticx.brain.search import search_docs_brains
+        from agenticx.studio.kb import KBManager
+    except Exception as exc:
+        return json.dumps(
+            {"ok": False, "error": f"KB subsystem unavailable: {exc}", "hits": []},
+            ensure_ascii=False,
+        )
+
+    cfg = KBManager.instance().read_config()
+    default_top_k = int(getattr(getattr(cfg, "retrieval", None), "top_k", 5) or 5)
+    raw_top_k = arguments.get("top_k")
+    try:
+        top_k = int(raw_top_k) if raw_top_k is not None else default_top_k
+    except (TypeError, ValueError):
+        top_k = default_top_k
+    top_k = max(1, min(20, top_k))
+
+    avatar_id = None
+    if session is not None:
+        avatar_id = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+    brain_id = str(arguments.get("brain_id") or "").strip() or None
+
+    try:
+        payload = search_docs_brains(
+            query=query,
+            top_k=top_k,
+            avatar_id=avatar_id,
+            brain_id=brain_id,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"ok": False, "error": f"search failed: {exc}", "hits": []},
+            ensure_ascii=False,
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _tool_knowledge_synthesize(
+    arguments: Dict[str, Any], session: Optional["StudioSession"] = None
+) -> str:
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return json.dumps(
+            {"ok": False, "error": "query is required", "answer": ""},
+            ensure_ascii=False,
+        )
+    try:
+        from agenticx.brain.synthesis import synthesize_docs_brains
+        from agenticx.studio.kb import KBManager
+    except Exception as exc:
+        return json.dumps(
+            {"ok": False, "error": f"KB subsystem unavailable: {exc}", "answer": ""},
+            ensure_ascii=False,
+        )
+
+    cfg = KBManager.instance().read_config()
+    default_top_k = int(getattr(getattr(cfg, "retrieval", None), "top_k", 5) or 5)
+    raw_top_k = arguments.get("top_k")
+    try:
+        top_k = int(raw_top_k) if raw_top_k is not None else default_top_k
+    except (TypeError, ValueError):
+        top_k = default_top_k
+    top_k = max(1, min(20, top_k))
+
+    avatar_id = None
+    if session is not None:
+        avatar_id = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+    brain_id = str(arguments.get("brain_id") or "").strip() or None
+
+    try:
+        payload = synthesize_docs_brains(
+            query=query,
+            top_k=top_k,
+            avatar_id=avatar_id,
+            brain_id=brain_id,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"ok": False, "error": f"synthesis failed: {exc}", "answer": ""},
+            ensure_ascii=False,
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _tool_web_search(arguments: Dict[str, Any], session: Optional["StudioSession"] = None) -> str:
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "ERROR: web_search requires a non-empty query"
+    raw_mr = arguments.get("max_results")
+    try:
+        from agenticx.studio.web_search.service import WebSearchService
+        from agenticx.studio.references import queue_web_search_batch
+
+        svc = WebSearchService.from_config()
+        mr: int | None = None
+        if raw_mr is not None and str(raw_mr).strip() != "":
+            mr = int(raw_mr)
+        hits = svc.search(query, max_results=mr)
+        if session is not None:
+            queue_web_search_batch(
+                session,
+                query=query,
+                hits=hits,
+                provider=str(svc._cfg.default_provider or "duckduckgo"),
+            )
+        return WebSearchService.format_results(hits)
+    except Exception as exc:
+        return f"ERROR: web_search failed: {exc}"
+
+
+def _tool_get_current_datetime(arguments: Dict[str, Any]) -> str:
+    """Return local clock facts as JSON for the model to quote verbatim."""
+    from agenticx.runtime.prompts.current_time import get_current_time_facts
+
+    payload = dict(get_current_time_facts())
+    payload["source"] = "local_system_clock"
+    return json.dumps(payload, ensure_ascii=False)
+
+
+PENDING_VISUAL_ATTACHMENTS_KEY = "__pending_visual_attachments__"
+VIEW_IMAGE_INJECT_LLM_TEXT = (
+    "<system-injected> attached images requested via view_image tool:"
+)
+VIEW_IMAGE_INJECT_METADATA_SOURCE = "view_image_inject"
+_WEB_FETCH_MAX_BYTES = 2 * 1024 * 1024
+_WEB_FETCH_BODY_CHAR_LIMIT = 12_000
+_VIEW_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_VIEW_IMAGE_MAX_PENDING = 4
+_VIDEO_UNDERSTAND_DEFAULT_MAX_FRAMES = 12
+_VIDEO_UNDERSTAND_HARD_MAX_FRAMES = 24
+_VIDEO_UNDERSTAND_DEFAULT_INTERVAL_SECONDS = 8.0
+_VIDEO_UNDERSTAND_MIN_FRAMES = 4
+_VIDEO_UNDERSTAND_MAX_VIDEO_BYTES = 512 * 1024 * 1024
+_ALLOWED_WEB_FETCH_CONTENT_TYPES = (
+    "text/html",
+    "application/xhtml",
+    "text/plain",
+    "text/markdown",
+)
+
+
+def _httpx_transport_for_url(url: str):
+    import httpx
+
+    host = (urlparse(url).hostname or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return httpx.AsyncHTTPTransport()
+    return None
+
+
+def _detect_image_mime(data: bytes) -> str | None:
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 6 and data[:6] in {b"GIF87a", b"GIF89a"}:
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 2 and data[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _filename_from_url(url: str, mime: str) -> str:
+    path = urlparse(url).path.rsplit("/", 1)[-1].strip()
+    if path and "." in path:
+        return path
+    ext = "png"
+    if "jpeg" in mime or "jpg" in mime:
+        ext = "jpg"
+    elif "webp" in mime:
+        ext = "webp"
+    elif "gif" in mime:
+        ext = "gif"
+    elif "bmp" in mime:
+        ext = "bmp"
+    return f"image.{ext}"
+
+
+def _data_url_from_bytes(data: bytes, mime: str) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _parse_data_image_url(target: str) -> tuple[bytes, str] | None:
+    raw = str(target or "").strip()
+    if not raw.startswith("data:image/"):
+        return None
+    header, _, payload = raw.partition(",")
+    if not payload:
+        return None
+    mime = header[5:].split(";", 1)[0].strip() or "image/png"
+    try:
+        if ";base64" in header.lower():
+            data = base64.b64decode(payload, validate=False)
+        else:
+            from urllib.parse import unquote_to_bytes
+
+            data = unquote_to_bytes(payload)
+    except Exception:
+        return None
+    return data, mime
+
+
+async def _fetch_http_bytes(url: str, *, timeout: float, max_bytes: int) -> tuple[bytes, str, str]:
+    import httpx
+
+    transport = _httpx_transport_for_url(url)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        transport=transport,
+    ) as client:
+        response = await client.get(url)
+        final_url = str(response.url)
+        if response.status_code != 200:
+            raise ValueError(f"http {response.status_code}")
+        content_type = str(response.headers.get("content-type", "") or "").split(";", 1)[0].strip().lower()
+        data = response.content
+        if len(data) > max_bytes:
+            raise ValueError("too-large")
+        return data, content_type, final_url
+
+
+async def _tool_document_read_pages(
+    arguments: Dict[str, Any], session: Optional["StudioSession"] = None
+) -> str:
+    """接着读 PDF 的后续页。只允许读本会话已附加的文件。"""
+    from agenticx.studio.document_pages import (
+        DEFAULT_MAX_PAGES,
+        pdf_rendering_available,
+        render_pdf_pages,
+    )
+
+    raw_path = str(arguments.get("path", "") or "").strip()
+    if not raw_path:
+        return "ERROR: document_read_pages requires 'path'"
+    if session is None:
+        return "ERROR: no active session"
+    context_files = getattr(session, "context_files", None)
+    if not isinstance(context_files, dict) or raw_path not in context_files:
+        return (
+            f"ERROR: '{raw_path}' is not an attachment of this conversation. "
+            "Use the exact path from the attachment note."
+        )
+    if not pdf_rendering_available():
+        return "ERROR: PDF rendering is unavailable in this deployment (PyMuPDF missing)."
+    try:
+        start_page = int(arguments.get("start_page") or 1)
+    except (TypeError, ValueError):
+        return "ERROR: start_page must be an integer"
+    try:
+        max_pages = int(arguments.get("max_pages") or DEFAULT_MAX_PAGES)
+    except (TypeError, ValueError):
+        max_pages = DEFAULT_MAX_PAGES
+
+    result = render_pdf_pages(raw_path, first_page=start_page, max_pages=max_pages)
+    if not result.available:
+        return f"ERROR: {result.error}"
+
+    display = os.path.basename(raw_path)
+    pending = _pending_visual_attachments(session)
+    for page in result.pages:
+        pending.append(
+            {
+                "data_url": page.data_url,
+                "name": f"{display} · 第 {page.page_number} 页",
+                "source": "document_pages",
+            }
+        )
+    first = result.pages[0].page_number
+    last = result.pages[-1].page_number
+    tail = ""
+    if result.next_page is not None:
+        tail = (
+            f" 还有第 {result.next_page}–{result.total_pages} 页未读，"
+            f'需要时再调用 document_read_pages(path="{raw_path}", start_page={result.next_page})。'
+        )
+    return (
+        f"已渲染 {display} 第 {first}–{last} 页（共 {result.total_pages} 页），"
+        f"将在下一轮作为图片出现在你的输入中。{tail}"
+    )
+
+
+def _pending_visual_attachments(session: Optional[StudioSession]) -> list[dict[str, Any]]:
+    if session is None:
+        return []
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        session.scratchpad = {}
+        scratchpad = session.scratchpad
+    pending = scratchpad.get(PENDING_VISUAL_ATTACHMENTS_KEY)
+    if not isinstance(pending, list):
+        pending = []
+        scratchpad[PENDING_VISUAL_ATTACHMENTS_KEY] = pending
+    return pending
+
+
+def _session_vision_capable(session: Optional[StudioSession]) -> bool:
+    from agenticx.llms.vision import is_vision_capable
+
+    provider = str(getattr(session, "provider_name", "") or "")
+    model = str(getattr(session, "model_name", "") or "")
+    return is_vision_capable(provider, model)
+
+
+async def _tool_web_fetch(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    url = str(arguments.get("url", "") or "").strip()
+    if not url:
+        return "ERROR: missing required parameter 'url'"
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return "ERROR: only http(s) URLs are supported"
+    raw_max_images = arguments.get("max_images")
+    try:
+        max_images = int(raw_max_images) if raw_max_images is not None else 20
+    except (TypeError, ValueError):
+        max_images = 20
+    max_images = max(1, min(max_images, 50))
+    try:
+        body, content_type, final_url = await _fetch_http_bytes(
+            url,
+            timeout=15.0,
+            max_bytes=_WEB_FETCH_MAX_BYTES,
+        )
+    except ValueError as exc:
+        reason = str(exc)
+        if reason == "too-large":
+            return "ERROR: page exceeds 2MB limit"
+        if reason.startswith("http "):
+            return f"ERROR: {reason}"
+        return f"ERROR: network"
+    except Exception:
+        return "ERROR: network"
+    if not any(content_type.startswith(prefix) for prefix in _ALLOWED_WEB_FETCH_CONTENT_TYPES):
+        return f"ERROR: unsupported content-type {content_type or '(missing)'}"
+    from agenticx.tools.html_extractor import extract_readable_text
+
+    html = body.decode("utf-8", errors="replace")
+    extracted = extract_readable_text(html, final_url)
+    title = str(extracted.get("title", "") or "").strip() or "(untitled)"
+    text = str(extracted.get("text", "") or "").strip()
+    total_chars = len(text)
+    truncated = False
+    if total_chars > _WEB_FETCH_BODY_CHAR_LIMIT:
+        text = text[:_WEB_FETCH_BODY_CHAR_LIMIT]
+        truncated = True
+    lines = [f"Title: {title}", f"URL: {final_url}", "", text]
+    if truncated:
+        lines.append(f"...[truncated, total ~{total_chars} chars]")
+    from agenticx.tools.show_images import is_junk_remote_image_url
+
+    images = [
+        image_url
+        for image_url in list(extracted.get("images") or [])
+        if not is_junk_remote_image_url(str(image_url or ""))
+    ][:max_images]
+    if images:
+        lines.append("")
+        lines.append("[discovered_images]")
+        for idx, image_url in enumerate(images, start=1):
+            lines.append(f"{idx}. {image_url}")
+    return "\n".join(lines).strip()
+
+
+async def _load_image_target(
+    target: str,
+    session: Optional[StudioSession],
+) -> Tuple[bytes, str, str, str]:
+    """Resolve an image target to (data, mime, name, source).
+
+    Shared by view_image and analyze_image. Raises ValueError with a
+    user-facing message (without the "ERROR: " prefix) on failure.
+    """
+    parsed = urlparse(target)
+    if target.startswith("data:image/"):
+        parsed_data = _parse_data_image_url(target)
+        if parsed_data is None:
+            raise ValueError("unsupported image type")
+        data, mime = parsed_data
+        return data, mime, "clipboard-image", target
+    if parsed.scheme in {"http", "https"}:
+        try:
+            data, content_type, final_url = await _fetch_http_bytes(
+                target,
+                timeout=10.0,
+                max_bytes=_VIEW_IMAGE_MAX_BYTES,
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "too-large":
+                raise ValueError("image exceeds 8MB limit") from exc
+            if reason.startswith("http "):
+                raise ValueError(reason) from exc
+            raise ValueError("network") from exc
+        except Exception as exc:
+            raise ValueError("network") from exc
+        mime = _detect_image_mime(data) or (
+            content_type if content_type.startswith("image/") else None
+        )
+        if not mime:
+            raise ValueError("unsupported image type")
+        return data, mime, _filename_from_url(final_url, mime), final_url
+    if parsed.scheme in {"file", ""} or target.startswith("/") or (len(target) > 2 and target[1] == ":"):
+        if session is not None:
+            try:
+                from agenticx.studio.chat_attachments import resolve_session_chat_image
+
+                session_hit = resolve_session_chat_image(session, target)
+            except Exception:
+                session_hit = None
+            if session_hit is not None:
+                return session_hit
+        try:
+            path = _resolve_workspace_path(target, session, pick_existing=True)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"file not found: {path}")
+        data = path.read_bytes()
+        if len(data) > _VIEW_IMAGE_MAX_BYTES:
+            raise ValueError("image exceeds 8MB limit")
+        mime = _detect_image_mime(data)
+        if not mime:
+            raise ValueError("unsupported image type")
+        return data, mime, path.name, str(path)
+    raise ValueError("only http(s) URLs, data:image/* URLs, and local file paths are supported")
+
+
+async def _tool_view_image(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    target = str(arguments.get("target", "") or "").strip()
+    note = str(arguments.get("note", "") or "").strip()
+    if not target:
+        return "ERROR: missing required parameter 'target'"
+    if not _session_vision_capable(session):
+        model = str(getattr(session, "model_name", "") or "unknown")
+        return (
+            f"ERROR: current model '{model}' does not support vision; "
+            "use analyze_image(target=...) to read it via the vision fallback model, "
+            "or switch to a vision-capable model."
+        )
+    pending = _pending_visual_attachments(session)
+    if len(pending) >= _VIEW_IMAGE_MAX_PENDING:
+        return "ERROR: too many pending visual attachments (max 4 per turn)"
+    try:
+        data, mime, name, source = await _load_image_target(target, session)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if len(data) > _VIEW_IMAGE_MAX_BYTES:
+        return "ERROR: image exceeds 8MB limit"
+    data_url = _data_url_from_bytes(data, mime)
+    pending.append(
+        {
+            "name": name,
+            "data_url": data_url,
+            "mime_type": mime,
+            "size": len(data),
+            "source": source,
+            "note": note,
+        }
+    )
+    size_kb = max(1, len(data) // 1024)
+    note_clause = f" ({note})" if note else ""
+    return (
+        f"[image loaded: {name} ({size_kb} KB, {mime}); "
+        f"will be visually attached in next turn{note_clause}]"
+    )
+
+
+async def _tool_analyze_image(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    target = str(arguments.get("target", "") or "").strip()
+    question = str(arguments.get("question", "") or "").strip()
+    if _session_vision_capable(session):
+        return (
+            "ERROR: current model already supports vision; use view_image(target=...) instead "
+            "so the image is attached to your own next turn."
+        )
+    from agenticx.llms.vision_fallback import resolve_vision_fallback
+
+    info = resolve_vision_fallback(session=session)
+    if not info.get("available"):
+        return (
+            "ERROR: no vision-capable fallback model is configured. Tell the user to add a "
+            "vision model (a SKU whose name carries a v/vision/vl marker, e.g. glm-4.6v) in "
+            "Settings → 模型服务, or set vision_fallback.provider/model in ~/.agenticx/config.yaml."
+        )
+    if target:
+        try:
+            data, mime, name, source = await _load_image_target(target, session)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if len(data) > _VIEW_IMAGE_MAX_BYTES:
+            return "ERROR: image exceeds 8MB limit"
+        data_url = _data_url_from_bytes(data, mime)
+    else:
+        from agenticx.studio.chat_attachments import (
+            image_data_url_from_attachment,
+            iter_session_image_attachments,
+        )
+
+        atts = iter_session_image_attachments(session) if session is not None else []
+        if not atts:
+            return (
+                "ERROR: no image found in this session; "
+                "pass target explicitly (path, http(s) URL, or data:image/* URL)"
+            )
+        att = atts[-1]
+        data_url = image_data_url_from_attachment(att)
+        if not data_url:
+            return "ERROR: latest image attachment has no readable bytes"
+        name = str(att.get("name", "") or "image")
+        source = str(att.get("storage_path", "") or "session-upload")
+
+    prompt_text = question or (
+        "请详细描述这张图片的关键内容（其中的文字、标识/Logo、界面元素、图表数据等），"
+        "以便后续据此检索与推理。"
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    try:
+        from agenticx.llms.provider_resolver import ProviderResolver
+
+        llm = ProviderResolver.resolve(
+            provider_name=str(info["provider"]),
+            model=str(info["model"]),
+        )
+        resp = await llm.ainvoke(messages)
+    except Exception as exc:
+        return (
+            f"ERROR: vision fallback call failed "
+            f"({info.get('label') or info.get('model')}): {exc}"
+        )
+    desc = str(getattr(resp, "content", "") or "").strip()
+    if not desc:
+        return "ERROR: vision fallback returned empty content"
+    label = str(info.get("label") or f"{info.get('provider')}/{info.get('model')}")
+    return (
+        f"[analyze_image: 视觉解读由 {label} 提供；图片 {name}，来源 {source}]\n"
+        f"{desc}\n"
+        "[/analyze_image] 请基于以上文字解读继续完成用户请求（如需检索请调用 web_search）。"
+    )
+
+
+async def _tool_memory_search(arguments: Dict[str, Any], session: StudioSession) -> str:
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "ERROR: query is required"
+    mode = str(arguments.get("mode", "hybrid") or "hybrid").strip().lower()
+    limit = int(arguments.get("limit", 5) or 5)
+    avatar_id = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+    session_id = str(getattr(session, "session_id", "") or "").strip() or None
+    try:
+        from agenticx.memory.recall import search_memory_for_chat
+
+        recall = await search_memory_for_chat(
+            query,
+            limit=max(1, limit),
+            mode=mode,
+            avatar_id=avatar_id,
+            session_id=session_id,
+        )
+        rows = recall.matches
+    except Exception as exc:
+        return f"ERROR: memory search failed: {exc}"
+    if not rows:
+        return "No memory matches."
+    lines: List[str] = []
+    for idx, row in enumerate(rows, start=1):
+        text = str(row.get("text", "")).replace("\n", " ")
+        if len(text) > 240:
+            text = text[:240] + "..."
+        source = str(row.get("source") or "workspace")
+        path = str(row.get("path") or "")
+        loc = f"path={path}:{row.get('start_line')}-{row.get('end_line')}" if path else f"source={source}"
+        lines.append(
+            f"{idx}. score={row.get('score', 0.0)} {loc} text={text}"
+        )
+    if recall.graph_skipped_reason:
+        lines.append(f"(graph skipped: {recall.graph_skipped_reason})")
+    return "\n".join(lines)
+
+
+async def _tool_memory_forget(arguments: Dict[str, Any], session: StudioSession) -> str:
+    query = str(arguments.get("query", "")).strip()
+    scope = str(arguments.get("scope", "both") or "both").strip().lower()
+    avatar_id = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+    session_id = str(getattr(session, "session_id", "") or "").strip() or None
+    try:
+        from agenticx.memory.graph.forget import forget_memory_for_session
+
+        result = await forget_memory_for_session(
+            query,
+            scope=scope,
+            avatar_id=avatar_id,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        return f"ERROR: memory forget failed: {exc}"
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _skill_manage_enabled() -> bool:
+    v = os.environ.get("AGX_SKILL_MANAGE", "0").strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if os.environ.get("AGX_CONFIRM_STRATEGY", "").strip().lower() == "auto":
+        return True
+    return False
+
+
+def _safe_skill_dir_name(name: str) -> Optional[str]:
+    """Validate a skill name, allowing sub-paths like ``ima/notes``.
+
+    Each path segment must start with an alphanumeric character and contain
+    only alphanumerics, dots, underscores, or hyphens.  Back-references
+    (``..``) and hidden segments (starting with ``.``) are rejected.
+    """
+    n = str(name or "").strip().replace("\\", "/")
+    if not n:
+        return None
+    _SEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+    segments = n.split("/")
+    for seg in segments:
+        if not seg or seg.startswith(".") or seg == "..":
+            return None
+        if not _SEG.fullmatch(seg):
+            return None
+    return n
+
+
+def _agent_created_skill_root() -> Path:
+    return Path.home() / ".agenticx" / "skills"
+
+
+def _skill_url_allowlist() -> List[str]:
+    defaults = [
+        "raw.githubusercontent.com",
+        "gist.githubusercontent.com",
+        "registry.clawhub.ai",
+    ]
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+
+        raw = ConfigManager.get_value("skill_manage.url_allowlist")
+        if isinstance(raw, list) and raw:
+            return [str(x).strip().lower() for x in raw if str(x).strip()]
+    except Exception:
+        pass
+    return defaults
+
+
+def _skill_max_url_bytes() -> int:
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+
+        raw = ConfigManager.get_value("skill_manage.max_url_payload_bytes")
+        if raw is not None:
+            return max(1024, int(raw))
+    except Exception:
+        pass
+    return 1_048_576
+
+
+def _resolve_skill_content_path(path_arg: str, session: Optional[StudioSession]) -> Path:
+    """Resolve a local path for skill content (workspace or ~/.agenticx/)."""
+    agx_root = (Path.home() / ".agenticx").resolve()
+    try:
+        resolved = _resolve_workspace_path(path_arg, session, pick_existing=True)
+    except ValueError:
+        raw = _path_from_arg(path_arg)
+        if not raw.is_absolute():
+            raw = (Path.home() / raw).resolve(strict=False)
+        else:
+            raw = raw.resolve(strict=False)
+        if not _is_path_under_root(raw, agx_root) and not _desktop_unrestricted_fs_enabled():
+            raise ValueError(f"path must be under workspace or ~/.agenticx/: {raw}") from None
+        resolved = raw
+    if not resolved.is_file():
+        raise ValueError(f"file not found: {resolved}")
+    return resolved
+
+
+def _fetch_skill_content_from_url(url: str) -> str:
+    from urllib.parse import urlparse
+    import urllib.request
+
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme != "https":
+        raise ValueError("only https URLs are allowed for from_url")
+    host = (parsed.hostname or "").lower()
+    allow = _skill_url_allowlist()
+    if host not in allow:
+        raise ValueError(f"host not in skill_manage.url_allowlist: {host}")
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    max_bytes = _skill_max_url_bytes()
+    if len(data) > max_bytes:
+        raise ValueError(f"URL payload exceeds max_url_payload_bytes ({max_bytes})")
+    return data.decode("utf-8")
+
+
+def _resolve_skill_create_content(arguments: Dict[str, Any], session: Optional[StudioSession]) -> Tuple[Optional[str], Optional[str]]:
+    from_path = str(arguments.get("from_path", "") or "").strip()
+    from_url = str(arguments.get("from_url", "") or "").strip()
+    content = str(arguments.get("content", "") or "")
+    if from_path and from_url:
+        return None, "ERROR: from_path and from_url are mutually exclusive"
+    if from_path:
+        try:
+            path = _resolve_skill_content_path(from_path, session)
+            return path.read_text(encoding="utf-8"), None
+        except ValueError as exc:
+            return None, f"ERROR: {exc}"
+        except OSError as exc:
+            return None, f"ERROR: read failed: {exc}"
+    if from_url:
+        try:
+            return _fetch_skill_content_from_url(from_url), None
+        except Exception as exc:
+            return None, f"ERROR: from_url fetch failed: {exc}"
+    if not content.strip():
+        return None, "ERROR: content is required for create (or provide from_path/from_url)"
+    return content, None
+
+
+def _skill_manage_error(code: str, message: str) -> str:
+    return f"ERROR[{code.upper()}]: {message}"
+
+
+def _skill_patch_token_payload(
+    *,
+    name: str,
+    strategy: str,
+    old_hash: str,
+    old_string: str,
+    new_string: str,
+    before_context: str,
+    after_context: str,
+    ranges: list[dict[str, int]],
+) -> dict[str, Any]:
+    return {
+        "v": 1,
+        "name": name,
+        "strategy": strategy,
+        "old_hash": old_hash,
+        "old_string_sha256": hashlib.sha256(old_string.encode("utf-8")).hexdigest(),
+        "new_string_sha256": hashlib.sha256(new_string.encode("utf-8")).hexdigest(),
+        "before_context_sha256": hashlib.sha256(before_context.encode("utf-8")).hexdigest() if before_context else "",
+        "after_context_sha256": hashlib.sha256(after_context.encode("utf-8")).hexdigest() if after_context else "",
+        "ranges": ranges,
+        "issued_at": int(time.time()),
+    }
+
+
+def _encode_patch_token(payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    checksum = hashlib.sha256(body).hexdigest()
+    envelope = {"p": payload, "c": checksum}
+    raw = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_patch_token(token: str) -> Tuple[Optional[dict[str, Any]], Optional[str]]:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii"))
+        obj = json.loads(raw.decode("utf-8"))
+        payload = obj.get("p")
+        checksum = str(obj.get("c", ""))
+        if not isinstance(payload, dict):
+            return None, "invalid patch token payload"
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        expected = hashlib.sha256(body).hexdigest()
+        if checksum != expected:
+            return None, "patch token checksum mismatch"
+        return payload, None
+    except Exception as exc:
+        return None, f"invalid patch token: {exc}"
+
+
+def _looks_like_stock_chart_payload(parsed: Dict[str, Any]) -> bool:
+    """Detect a stock_chart JSON even if the model forgot the `type` field.
+
+    Models sometimes emit `{"chart_type": ..., "watchlist": [...]}` without the
+    literal `"type": "stock_chart"` marker. Recognizing the shape (watchlist /
+    points-with-OHLC-keys) avoids silently degrading to a raw-JSON HTML widget.
+    """
+    if parsed.get("type") == "stock_chart":
+        return True
+    if parsed.get("type") not in (None, "", "stock_chart"):
+        return False
+    watchlist = parsed.get("watchlist") or parsed.get("instruments") or parsed.get("series")
+    if isinstance(watchlist, list) and watchlist:
+        first = watchlist[0]
+        if isinstance(first, dict) and isinstance(first.get("points") or first.get("data"), list):
+            return True
+    rows = parsed.get("points") or parsed.get("data")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        keys = {str(k).lower() for k in rows[0].keys()}
+        ohlc_keys = {"open", "high", "low", "close", "开盘", "最高", "最低", "收盘"}
+        if keys & ohlc_keys:
+            return True
+    return False
+
+
+def _tool_show_widget(arguments: Dict[str, Any]) -> str:
+    """Return a widget payload JSON consumed by the Desktop ToolCallCard.
+
+    The backend does no rendering; it validates and passes the widget code
+    through to the frontend as a structured JSON string.
+    """
+    title = str(arguments.get("title") or "").strip()
+    widget_code = str(arguments.get("widget_code") or "")
+    raw_msgs = arguments.get("loading_messages")
+    loading_messages = (
+        [str(m).strip() for m in raw_msgs if str(m).strip()]
+        if isinstance(raw_msgs, list)
+        else []
+    )
+    if not widget_code.strip():
+        return "ERROR: show_widget requires non-empty widget_code."
+    widget_format_raw = arguments.get("widget_format")
+    widget_format = (
+        str(widget_format_raw).strip().lower()
+        if widget_format_raw is not None
+        else ""
+    )
+    if widget_format and widget_format not in {"svg", "html", "mermaid"}:
+        return (
+            "ERROR: show_widget widget_format must be one of: svg, html, mermaid."
+        )
+    stripped = widget_code.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and _looks_like_stock_chart_payload(parsed):
+                parsed.setdefault("type", "stock_chart")
+                return json.dumps(parsed, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+    payload = {
+        "type": "widget",
+        "title": title,
+        "widget_code": widget_code,
+        "loading_messages": loading_messages,
+    }
+    if widget_format:
+        payload["widget_format"] = widget_format
+    return json.dumps(payload, ensure_ascii=False)
+
+
+_DATA_SOURCE_REGISTRY: Optional[Any] = None
+
+
+def _get_data_source_registry() -> Any:
+    global _DATA_SOURCE_REGISTRY
+    if _DATA_SOURCE_REGISTRY is None:
+        from agenticx.data_sources.registry import build_registry_from_config
+
+        _DATA_SOURCE_REGISTRY = build_registry_from_config()
+    return _DATA_SOURCE_REGISTRY
+
+
+def reset_data_source_registry_cache() -> None:
+    """Clear cached registry (e.g. after config changes from Desktop settings)."""
+    global _DATA_SOURCE_REGISTRY
+    _DATA_SOURCE_REGISTRY = None
+
+
+async def _tool_list_data_sources(arguments: Dict[str, Any]) -> str:
+    registry = _get_data_source_registry()
+    domain_filter = str(arguments.get("domain") or "").strip().lower()
+    verbose = bool(arguments.get("verbose", False))
+    items: List[Dict[str, Any]] = []
+    for plugin in registry.list_plugins():
+        if domain_filter and plugin.domain.lower() != domain_filter:
+            continue
+        apis = plugin.list_apis()
+        items.append(
+            {
+                "name": plugin.name,
+                "display_name": plugin.display_name,
+                "domain": plugin.domain,
+                "requires_credential": plugin.requires_credential,
+                "apis": [
+                    {"name": a.name, "description": a.description}
+                    if not verbose
+                    else {
+                        "name": a.name,
+                        "description": a.description,
+                        "params_schema": a.params_schema,
+                    }
+                    for a in apis
+                ],
+            }
+        )
+    return json.dumps({"data_sources": items}, ensure_ascii=False)
+
+
+async def _tool_query_data_source(arguments: Dict[str, Any]) -> str:
+    from agenticx.data_sources.errors import DataSourceError, MissingCredentialError
+
+    registry = _get_data_source_registry()
+    data_source_name = str(arguments.get("data_source_name") or "").strip()
+    api_name = str(arguments.get("api_name") or "").strip()
+    params = arguments.get("params") or {}
+    if not isinstance(params, dict):
+        return "ERROR: query_data_source params must be an object."
+    if not data_source_name or not api_name:
+        return "ERROR: query_data_source requires data_source_name and api_name."
+    try:
+        result = await registry.call(data_source_name, api_name, params)
+    except MissingCredentialError:
+        return (
+            f"ERROR: data source '{data_source_name}' requires credentials. "
+            "Configure via Desktop 设置 → 数据源."
+        )
+    except DataSourceError as exc:
+        return f"ERROR: {exc}"
+    except Exception as exc:
+        logging.getLogger("agenticx.cli.agent_tools").warning(
+            "query_data_source unexpected failure: %s", exc
+        )
+        return f"ERROR: query_data_source failed unexpectedly: {exc}"
+    return json.dumps(result.to_dict(), ensure_ascii=False, default=str)
+
+
+def _tool_session_search(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:
+    _ = session
+    from agenticx.memory.session_store import session_fts_enabled
+
+    store = SessionStore()
+    raw_q = str(arguments.get("query", "") or "").strip()
+    role_raw = str(arguments.get("role_filter", "") or "").strip()
+    role_parts = [x.strip().lower() for x in role_raw.split(",") if x.strip()] if role_raw else None
+    lim = int(arguments.get("limit", 3) or 3)
+    lim = max(1, min(lim, 5))
+
+    if not raw_q:
+        rows = store._list_latest_sessions_sync(lim)
+        sessions = [
+            {
+                "session_id": r["session_id"],
+                "created_at": r["created_at"],
+                "metadata": r["metadata"],
+            }
+            for r in rows
+        ]
+        return json.dumps({"mode": "recent", "sessions": sessions}, ensure_ascii=False)
+
+    if not session_fts_enabled():
+        return json.dumps({"mode": "search", "sessions": []}, ensure_ascii=False)
+
+    hits = store._search_session_messages_sync(raw_q, role_parts, limit=500)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for h in hits:
+        sid = h["session_id"]
+        if sid not in groups:
+            if len(groups) >= lim:
+                continue
+            groups[sid] = []
+        groups[sid].append(h)
+
+    def _truncate_hits(items: List[Dict[str, Any]], max_chars: int = 10_000) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        total = 0
+        for it in items:
+            frag = json.dumps(it, ensure_ascii=False)
+            if total + len(frag) > max_chars and out:
+                break
+            out.append(it)
+            total += len(frag) + 1
+        return out
+
+    sessions_out = [{"session_id": sid, "hits": _truncate_hits(items)} for sid, items in groups.items()]
+    return json.dumps({"mode": "search", "sessions": sessions_out}, ensure_ascii=False)
+
+
+def _tool_plugin_usage(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:
+    from agenticx.runtime.plugin_usage import query_plugin_usage
+
+    live_id = _studio_session_id(session)
+    live_messages = None
+    if session is not None:
+        history = getattr(session, "chat_history", None)
+        if isinstance(history, list):
+            live_messages = history
+    try:
+        limit = int(arguments.get("limit") or 8)
+    except (TypeError, ValueError):
+        limit = 8
+    payload = query_plugin_usage(
+        plugin=str(arguments.get("plugin") or "all"),
+        scope=str(arguments.get("scope") or "all"),
+        purpose=str(arguments.get("purpose") or "all"),
+        session_id=str(arguments.get("session_id") or ""),
+        model=str(arguments.get("model") or ""),
+        provider=str(arguments.get("provider") or ""),
+        from_date=str(arguments.get("from_date") or ""),
+        to_date=str(arguments.get("to_date") or ""),
+        range_key=str(arguments.get("range") or ""),
+        limit=limit,
+        live_messages=live_messages,
+        live_session_id=live_id,
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _should_queue_skill_write() -> bool:
+    from agenticx.learning.config import get_learning_config
+
+    cfg = get_learning_config()
+    if bool(cfg.get("agent_writes_require_approval", True)):
+        return True
+    if bool(cfg.get("freeze_during_session", True)):
+        try:
+            from agenticx.runtime.session_freeze import is_frozen
+
+            return is_frozen()
+        except Exception:
+            return False
+    return False
+
+
+def _queue_skill_proposal(
+    *,
+    action: str,
+    name: str,
+    skill_md_text: str,
+    session: Optional[StudioSession],
+    diff_summary: str = "",
+    candidate_index: int = 1,
+    total_candidates: int = 1,
+    review_model: str = "",
+    scores: Optional[Dict[str, float]] = None,
+) -> str:
+    from agenticx.learning.gepa_proposer import write_proposal
+
+    session_id = ""
+    if session is not None:
+        session_id = str(
+            getattr(session, "_session_id", "")
+            or getattr(session, "_usage_owner_session_id", "")
+            or getattr(session, "session_id", "")
+            or ""
+        ).strip()
+        if not review_model:
+            review_model = str(getattr(session, "model_name", "") or "").strip()
+    pdir = write_proposal(
+        base_skill=name,
+        action=action,
+        skill_md_text=skill_md_text,
+        session_id=session_id,
+        review_model=review_model,
+        diff_summary=diff_summary,
+        candidate_index=candidate_index,
+        total_candidates=total_candidates,
+        scores=scores,
+    )
+    pid = pdir.name
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "action": f"{action}_pending",
+        "name": name,
+        "path": str(pdir / "SKILL.md"),
+        "proposal_id": pid,
+        "message": f"Proposal queued for approval: {pid}",
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _skill_manage_success_payload(
+    *,
+    action: str,
+    skill_md: Path,
+    discoverable: bool,
+    skill_name: Optional[str],
+    frontmatter_fixed: List[str],
+    validation_warnings: List[str],
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "path": str(skill_md),
+        "discoverable": discoverable,
+        "skill_name": skill_name,
+        "frontmatter_fixed": frontmatter_fixed,
+        "validation_warnings": validation_warnings,
+    }
+    if extra:
+        payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _write_skill_md_with_checks(
+    *,
+    action: str,
+    skill_dir: Path,
+    content: str,
+    canonical_name: str,
+    on_rollback: Optional[Any] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    skip_queue: bool = False,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize, write, guard-scan, and verify discoverability.
+
+    Returns:
+        (success_json, error_message) — exactly one is non-None.
+    """
+    from agenticx.skills.frontmatter import (
+        SkillFrontmatterError,
+        normalize_skill_md,
+        verify_skill_discoverable,
+    )
+
+    try:
+        normalized, frontmatter_fixed = normalize_skill_md(content, canonical_name)
+    except SkillFrontmatterError as exc:
+        return None, f"ERROR: {exc}"
+
+    if action == "create":
+        from agenticx.skills.frontmatter import ensure_skill_source, write_skill_provenance
+
+        normalized = ensure_skill_source(normalized, "agent_created")
+
+    from agenticx.learning.config import get_learning_config
+    from agenticx.learning.skill_quality_gate import check_size_limits
+    from agenticx.skills.frontmatter import get_description_from_frontmatter
+
+    _cfg = get_learning_config()
+    _desc = get_description_from_frontmatter(normalized) or ""
+    _size = check_size_limits(
+        normalized,
+        _desc,
+        max_bytes=int(_cfg.get("max_skill_bytes", 15360)),
+        max_desc_chars=int(_cfg.get("max_description_chars", 500)),
+    )
+    if not _size["ok"]:
+        return None, _skill_manage_error("size_limit", f"{_size['error']}. {_size['hint']}")
+
+    session_obj = extra.get("_session") if isinstance(extra, dict) else None
+    if not skip_queue and _should_queue_skill_write():
+        queued = _queue_skill_proposal(
+            action=action,
+            name=canonical_name,
+            skill_md_text=normalized,
+            session=session_obj,
+        )
+        if on_rollback:
+            on_rollback()
+        return queued, None
+
+    # Defense-in-depth: block classic remote pipe-to-shell patterns even if
+    # guard pattern sets or confidence filters drift over time.
+    if re.search(r"(curl|wget)[^\n]*\|\s*(?:ba)?sh\b", normalized, re.IGNORECASE):
+        return None, _skill_manage_error("policy", "危险命令模式：检测到远程下载并管道执行 shell")
+
+    validation_warnings: List[str] = []
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        skill_md.write_text(normalized, encoding="utf-8")
+        if action == "create":
+            from agenticx.skills.frontmatter import write_skill_provenance
+
+            write_skill_provenance(skill_dir, "agent_created", extra={"name": canonical_name})
+        result = scan_skill(skill_dir, source="agent-created")
+        ok, reason = should_allow(result, "agent-created")
+        if not ok:
+            if on_rollback:
+                on_rollback()
+            else:
+                skill_md.unlink(missing_ok=True)
+            from agenticx.skills.guard import format_guard_rejection_message
+
+            return None, format_guard_rejection_message(result, action=action)
+
+        discoverable, skill_name, errors = verify_skill_discoverable(skill_dir)
+        if not discoverable:
+            if on_rollback:
+                on_rollback()
+            else:
+                skill_md.unlink(missing_ok=True)
+            detail = "; ".join(errors) if errors else "unknown parse failure"
+            return None, f"ERROR: skill not discoverable after write ({detail})"
+
+        return (
+            _skill_manage_success_payload(
+                action=action,
+                skill_md=skill_md,
+                discoverable=discoverable,
+                skill_name=skill_name,
+                frontmatter_fixed=frontmatter_fixed,
+                validation_warnings=validation_warnings,
+                extra=extra,
+            ),
+            None,
+        )
+    except OSError as exc:
+        if on_rollback:
+            on_rollback()
+        else:
+            skill_md.unlink(missing_ok=True)
+        return None, f"ERROR: {exc}"
+
+
+def _hook_manage_enabled() -> bool:
+    """Whether hook_manage is allowed. Default-on; set AGX_HOOK_MANAGE=0 to disable."""
+    v = os.environ.get("AGX_HOOK_MANAGE", "1").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+
+def _scan_hook_command(command: str) -> Optional[str]:
+    """Scan a command-type hook body for dangerous patterns via the skill guard.
+
+    Returns a human-readable reason string when the command must be blocked,
+    or ``None`` when it is allowed. Wraps the command in a fenced shell block so
+    both v1 and v2 guard scanners inspect it.
+    """
+    try:
+        from agenticx.skills.guard import scan_skill_markdown_text, should_allow
+    except ImportError:
+        return None
+    fenced = f"```bash\n{command}\n```\n"
+    try:
+        result = scan_skill_markdown_text(fenced, source="agent-created")
+        allowed, reason = should_allow(result, source="agent-created")
+    except Exception:
+        return None
+    if not allowed:
+        return reason
+    return None
+
+
+def _tool_hook_manage(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:  # noqa: ARG001
+    """Implement the hook_manage agent tool — create/delete/list/toggle declarative hooks."""
+    if not _hook_manage_enabled():
+        return (
+            "ERROR: hook_manage is disabled (AGX_HOOK_MANAGE=0). "
+            "Re-enable it in settings to create/modify hooks."
+        )
+    action = str(arguments.get("action", "")).strip().lower()
+    if action not in ("create", "delete", "list", "toggle"):
+        return "ERROR: hook_manage requires action='create'|'delete'|'list'|'toggle'."
+
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+        from agenticx.hooks.list_api import invalidate_hooks_list_cache
+    except ImportError as exc:
+        return f"ERROR: config subsystem unavailable: {exc}"
+
+    def _load_declarative() -> List[Dict[str, Any]]:
+        raw = ConfigManager.get_value("hooks.declarative") or []
+        return [d for d in raw if isinstance(d, dict)]
+
+    def _save_declarative(entries: List[Dict[str, Any]]) -> None:
+        ConfigManager.set_value("hooks.declarative", entries)
+        invalidate_hooks_list_cache()
+
+    if action == "list":
+        entries = _load_declarative()
+        if not entries:
+            return json.dumps({"ok": True, "hooks": [], "count": 0}, ensure_ascii=False)
+        return json.dumps({"ok": True, "hooks": entries, "count": len(entries)}, ensure_ascii=False)
+
+    name = str(arguments.get("name", "")).strip()
+    if not name:
+        return "ERROR: 'name' is required for action='create'|'delete'|'toggle'."
+
+    entries = _load_declarative()
+
+    if action == "delete":
+        new_entries = [e for e in entries if e.get("name") != name]
+        if len(new_entries) == len(entries):
+            return json.dumps({"ok": False, "error": f"hook '{name}' not found"}, ensure_ascii=False)
+        _save_declarative(new_entries)
+        return json.dumps({"ok": True, "action": "deleted", "name": name}, ensure_ascii=False)
+
+    if action == "toggle":
+        enabled_val = arguments.get("enabled")
+        if enabled_val is None:
+            return "ERROR: 'enabled' (true/false) is required for action='toggle'."
+        target = next((e for e in entries if e.get("name") == name), None)
+        if target is None:
+            return json.dumps({"ok": False, "error": f"hook '{name}' not found"}, ensure_ascii=False)
+        target["enabled"] = bool(enabled_val)
+        _save_declarative(entries)
+        state = "enabled" if bool(enabled_val) else "disabled"
+        return json.dumps({"ok": True, "action": state, "name": name}, ensure_ascii=False)
+
+    # action == "create"
+    event = str(arguments.get("event", "")).strip()
+    valid_events = {"before_tool_call", "after_tool_call", "session_start", "session_end"}
+    if event not in valid_events:
+        return f"ERROR: 'event' must be one of {sorted(valid_events)}."
+
+    hook_type = str(arguments.get("type", "command")).strip()
+    valid_types = {"command", "http", "prompt", "agent"}
+    if hook_type not in valid_types:
+        return f"ERROR: 'type' must be one of {sorted(valid_types)}."
+
+    if hook_type == "command":
+        cmd_body = str(arguments.get("command", "")).strip()
+        if not cmd_body:
+            return "ERROR: 'command' is required for type='command'."
+        block_reason = _scan_hook_command(cmd_body)
+        if block_reason:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": f"command hook blocked by safety scan: {block_reason}",
+                    "hint": "Revise the command to avoid dangerous patterns, or use type='http'/'prompt'/'agent'.",
+                },
+                ensure_ascii=False,
+            )
+    if hook_type == "http" and not str(arguments.get("url", "")).strip():
+        return "ERROR: 'url' is required for type='http'."
+    if hook_type in ("prompt", "agent") and not str(arguments.get("prompt", "")).strip():
+        return "ERROR: 'prompt' is required for type='prompt'/'agent'."
+
+    if any(e.get("name") == name for e in entries):
+        return json.dumps({"ok": False, "error": f"hook '{name}' already exists; use delete first to replace."}, ensure_ascii=False)
+
+    new_hook: Dict[str, Any] = {
+        "name": name,
+        "event": event,
+        "type": hook_type,
+        "enabled": True,
+    }
+    if hook_type == "command":
+        new_hook["command"] = str(arguments.get("command", "")).strip()
+    elif hook_type == "http":
+        new_hook["url"] = str(arguments.get("url", "")).strip()
+    elif hook_type in ("prompt", "agent"):
+        new_hook["prompt"] = str(arguments.get("prompt", "")).strip()
+
+    for opt_field in ("matcher", "block_on_failure", "timeout_seconds"):
+        val = arguments.get(opt_field)
+        if val is not None:
+            new_hook[opt_field] = val
+
+    entries.append(new_hook)
+    _save_declarative(entries)
+    return json.dumps({"ok": True, "action": "created", "hook": new_hook}, ensure_ascii=False)
+
+
+async def _tool_skill_manage(
+    arguments: Dict[str, Any],
+    session: Optional[StudioSession],
+    *,
+    confirm_gate: Optional[ConfirmGate] = None,
+    emit_event: Optional[Any] = None,
+) -> str:
+    _ = session
+    if not _skill_manage_enabled():
+        return (
+            "ERROR: skill_manage is disabled. Set AGX_SKILL_MANAGE=1 "
+            "or AGX_CONFIRM_STRATEGY=auto (Run Everything hook)."
+        )
+    # Interactive mode: user approves/rejects inline in the chat.
+    # Non-interactive (e.g. session_review_hook): falls back to pending queue.
+    _interactive = (
+        emit_event is not None
+        and confirm_gate is not None
+        and confirm_gate.is_service_mode()
+    )
+    action = str(arguments.get("action", "") or "").strip().lower()
+    if not action:
+        return (
+            "ERROR: 'action' is required. "
+            "Call skill_manage with action='create'|'patch'|'delete'|'history'|'rollback', name=<skill-name>, "
+            "and content=<full SKILL.md text> for create."
+        )
+    raw_name = str(arguments.get("name", "") or "").strip()
+    if not raw_name:
+        return (
+            "ERROR: 'name' is required. "
+            "Provide the skill directory name, e.g. name='my-skill' or name='ima/notes'."
+        )
+    name = _safe_skill_dir_name(raw_name)
+    if name is None:
+        return (
+            f"ERROR: invalid skill name {raw_name!r}. "
+            "Name must be alphanumeric with hyphens/underscores. "
+            "Sub-paths like 'ima/notes' are allowed; spaces and leading dots are not."
+        )
+    root = _agent_created_skill_root().expanduser().resolve(strict=False)
+    skill_dir = (root / name).resolve(strict=False)
+    try:
+        skill_dir.relative_to(root)
+    except ValueError:
+        return "ERROR: skill path outside skills root"
+
+    if action == "create":
+        content, content_err = _resolve_skill_create_content(arguments, session)
+        if content_err:
+            return content_err
+        assert content is not None
+        if skill_dir.exists():
+            return "ERROR: skill already exists"
+        from agenticx.skills.frontmatter import SkillFrontmatterError, normalize_skill_md
+
+        try:
+            normalize_skill_md(content, name)
+        except SkillFrontmatterError as exc:
+            return f"ERROR: {exc}"
+        if _interactive:
+            preview = content[:400] + ("\n\n…（已截断）" if len(content) > 400 else "")
+            approved = await _confirm(
+                f"skill_manage 请求**创建**新技能「{name}」\n\n内容预览：\n\n```\n{preview}\n```\n\n确认写入 `~/.agenticx/skills/{name}/SKILL.md`？",
+                confirm_gate=confirm_gate,  # type: ignore[arg-type]
+                context={"tool": "skill_manage", "action": "create", "skill": name, "risk": "policy"},
+                emit_event=emit_event,
+            )
+            if not approved:
+                return "CANCELLED: 用户拒绝了 skill_manage create 操作"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        success, err = _write_skill_md_with_checks(
+            action="create",
+            skill_dir=skill_dir,
+            content=content,
+            canonical_name=name,
+            on_rollback=lambda: shutil.rmtree(skill_dir, ignore_errors=True),
+            extra={"_session": session},
+            skip_queue=_interactive,
+        )
+        if err:
+            if skill_dir.exists() and not (skill_dir / "SKILL.md").is_file():
+                shutil.rmtree(skill_dir, ignore_errors=True)
+            return err
+        try:
+            from agenticx.skills.versioning import append_changelog
+
+            append_changelog(skill_dir, action="create", summary="agent-created skill")
+        except Exception:
+            pass
+        return success or "ERROR: unknown create failure"
+
+    if action == "patch":
+        old_s = str(arguments.get("old_string", ""))
+        new_s = str(arguments.get("new_string", ""))
+        mode = str(arguments.get("mode", "apply") or "apply").strip().lower()
+        if mode not in {"preview", "apply"}:
+            return _skill_manage_error("validation", "mode must be 'preview' or 'apply'")
+        replace_all = bool(arguments.get("replace_all", False))
+        before_context = str(arguments.get("before_context", "") or "")
+        after_context = str(arguments.get("after_context", "") or "")
+        target_index_raw = arguments.get("target_index")
+        target_index: Optional[int] = None
+        if target_index_raw is not None:
+            try:
+                target_index = int(target_index_raw)
+            except Exception:
+                return _skill_manage_error("validation", "target_index must be an integer")
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            return _skill_manage_error("validation", "SKILL.md not found")
+        try:
+            original = skill_md.read_text(encoding="utf-8")
+        except OSError as exc:
+            return _skill_manage_error("validation", f"read failed: {exc}")
+        from agenticx.skills.fuzzy_patch import fuzzy_find_and_replace, fuzzy_find_matches
+        from agenticx.skills.guard import scan_skill_markdown_text
+
+        matches_info = fuzzy_find_matches(
+            original,
+            old_s,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        if matches_info.get("error"):
+            return _skill_manage_error("validation", str(matches_info["error"]))
+        ranges = list(matches_info.get("matches", []))
+        strategy = str(matches_info.get("strategy", "") or "")
+        if not ranges:
+            return _skill_manage_error("validation", "Could not find a match for old_string in the file")
+        if len(ranges) > 1 and not replace_all:
+            if target_index is None:
+                payload = {
+                    "ok": False,
+                    "action": "patch",
+                    "mode": mode,
+                    "requires_target_selection": True,
+                    "strategy": strategy,
+                    "match_count": len(ranges),
+                    "target_ranges": ranges,
+                }
+                return json.dumps(payload, ensure_ascii=False)
+            if target_index < 0 or target_index >= len(ranges):
+                return _skill_manage_error("validation", "target_index out of range")
+            selected = ranges[target_index]
+            ranges = [selected]
+            s = int(selected.get("start", 0))
+            e = int(selected.get("end", s))
+            before_context = original[max(0, s - 80) : s]
+            after_context = original[e : min(len(original), e + 80)]
+            replace_all = False
+
+        updated, match_count, strategy2, match_err = fuzzy_find_and_replace(
+            original,
+            old_s,
+            new_s,
+            replace_all=replace_all,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        if match_err:
+            return _skill_manage_error("validation", match_err)
+        strategy = strategy2 or strategy
+
+        old_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        token_payload = _skill_patch_token_payload(
+            name=name,
+            strategy=strategy or "exact",
+            old_hash=old_hash,
+            old_string=old_s,
+            new_string=new_s,
+            before_context=before_context,
+            after_context=after_context,
+            ranges=ranges,
+        )
+        patch_token = _encode_patch_token(token_payload)
+        quick_result = scan_skill_markdown_text(updated, source="agent-created")
+        quick_allowed, quick_reason = should_allow(quick_result, "agent-created")
+        preview_payload = {
+            "ok": True,
+            "action": "patch",
+            "mode": "preview",
+            "strategy": strategy,
+            "match_count": match_count,
+            "target_ranges": ranges,
+            "old_sha256": old_hash,
+            "new_sha256": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+            "patch_token": patch_token,
+            "risk": {
+                "verdict": quick_result.verdict,
+                "allowed": quick_allowed,
+                "reason": quick_reason,
+                "findings": [f.pattern_name for f in quick_result.findings[:8]],
+            },
+            "diff": "\n".join(
+                difflib.unified_diff(
+                    original.splitlines(),
+                    updated.splitlines(),
+                    fromfile="SKILL.md (old)",
+                    tofile="SKILL.md (new)",
+                    lineterm="",
+                )
+            ),
+        }
+        if mode == "preview":
+            return json.dumps(preview_payload, ensure_ascii=False)
+
+        token_arg = str(arguments.get("patch_token", "") or "").strip()
+        if token_arg:
+            decoded, token_err = _decode_patch_token(token_arg)
+            if token_err:
+                return _skill_manage_error("validation", token_err)
+            assert decoded is not None
+            if str(decoded.get("name", "")) != name:
+                return _skill_manage_error("validation", "patch token skill mismatch")
+            if str(decoded.get("old_hash", "")) != old_hash:
+                return _skill_manage_error("validation", "patch token outdated: file changed since preview")
+            if str(decoded.get("old_string_sha256", "")) != hashlib.sha256(old_s.encode("utf-8")).hexdigest():
+                return _skill_manage_error("validation", "patch token old_string mismatch")
+            if str(decoded.get("new_string_sha256", "")) != hashlib.sha256(new_s.encode("utf-8")).hexdigest():
+                return _skill_manage_error("validation", "patch token new_string mismatch")
+            if str(decoded.get("before_context_sha256", "")) != (
+                hashlib.sha256(before_context.encode("utf-8")).hexdigest() if before_context else ""
+            ):
+                return _skill_manage_error("validation", "patch token before_context mismatch")
+            if str(decoded.get("after_context_sha256", "")) != (
+                hashlib.sha256(after_context.encode("utf-8")).hexdigest() if after_context else ""
+            ):
+                return _skill_manage_error("validation", "patch token after_context mismatch")
+
+        backup = original
+
+        def _rollback_patch() -> None:
+            skill_md.write_text(backup, encoding="utf-8")
+
+        if _interactive:
+            old_preview = old_s[:200] + ("…" if len(old_s) > 200 else "")
+            new_preview = new_s[:200] + ("…" if len(new_s) > 200 else "")
+            approved = await _confirm(
+                f"skill_manage 请求**修改**技能「{name}」（{match_count} 处替换）\n\n"
+                f"**旧内容：**\n```\n{old_preview}\n```\n\n"
+                f"**新内容：**\n```\n{new_preview}\n```\n\n"
+                f"确认应用补丁？",
+                confirm_gate=confirm_gate,  # type: ignore[arg-type]
+                context={"tool": "skill_manage", "action": "patch", "skill": name, "risk": "policy"},
+                emit_event=emit_event,
+            )
+            if not approved:
+                return "CANCELLED: 用户拒绝了 skill_manage patch 操作"
+
+        try:
+            from agenticx.skills.skill_versions import save_snapshot
+
+            save_snapshot(
+                skills_root=root,
+                skill_name=name,
+                content=original,
+                actor="agent",
+                session_id=str(getattr(session, "session_id", "") or ""),
+                summary=f"pre-patch fuzzy:{strategy}",
+            )
+        except Exception:
+            pass
+
+        success, err = _write_skill_md_with_checks(
+            action="patch",
+            skill_dir=skill_dir,
+            content=updated,
+            canonical_name=name,
+            on_rollback=_rollback_patch,
+            extra={"strategy": strategy, "matches": match_count, "mode": "apply", "_session": session},
+            skip_queue=_interactive,
+        )
+        if err:
+            if err.startswith("ERROR: 技能内容被安全策略拦截"):
+                return _skill_manage_error("policy", err)
+            return _skill_manage_error("validation", err)
+        try:
+            from agenticx.skills.versioning import append_changelog
+
+            append_changelog(
+                skill_dir,
+                action="patch",
+                summary=f"fuzzy:{strategy}, {match_count} replacement(s)",
+            )
+        except Exception:
+            pass
+        return success or _skill_manage_error("validation", "unknown patch failure")
+
+    if action == "delete":
+        if not skill_dir.exists():
+            return json.dumps({"ok": True, "action": "delete", "removed": False}, ensure_ascii=False)
+        if _interactive:
+            approved = await _confirm(
+                f"skill_manage 请求**删除**技能「{name}」\n\n路径：`~/.agenticx/skills/{name}/`\n\n此操作不可撤销（除非系统有版本快照），确认删除？",
+                confirm_gate=confirm_gate,  # type: ignore[arg-type]
+                context={"tool": "skill_manage", "action": "delete", "skill": name, "risk": "destructive"},
+                emit_event=emit_event,
+            )
+            if not approved:
+                return "CANCELLED: 用户拒绝了 skill_manage delete 操作"
+        try:
+            from agenticx.skills.versioning import append_changelog
+            append_changelog(skill_dir, action="delete", summary="skill deleted by agent")
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(skill_dir)
+        except OSError as exc:
+            return f"ERROR: delete failed: {exc}"
+        return json.dumps({"ok": True, "action": "delete", "removed": True}, ensure_ascii=False)
+
+    if action == "history":
+        limit = int(arguments.get("limit", 50) or 50)
+        limit = max(1, min(limit, 200))
+        try:
+            from agenticx.skills.skill_versions import list_versions
+
+            versions = list_versions(skills_root=root, skill_name=name, limit=limit)
+        except Exception as exc:
+            return _skill_manage_error("validation", f"history failed: {exc}")
+        payload = {
+            "ok": True,
+            "action": "history",
+            "name": name,
+            "versions": [
+                {
+                    "version": v.version,
+                    "created_at": v.created_at,
+                    "actor": v.actor,
+                    "session_id": v.session_id,
+                    "content_sha256": v.content_sha256,
+                    "summary": v.summary,
+                }
+                for v in versions
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    if action == "rollback":
+        to_version = str(arguments.get("to_version", "") or "").strip()
+        if not to_version:
+            return _skill_manage_error("validation", "to_version is required for rollback")
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            return _skill_manage_error("validation", "SKILL.md not found")
+        try:
+            from agenticx.skills.skill_versions import get_version_content, save_snapshot
+        except Exception as exc:
+            return _skill_manage_error("validation", f"versioning unavailable: {exc}")
+        try:
+            original = skill_md.read_text(encoding="utf-8")
+            target = get_version_content(skills_root=root, skill_name=name, version=to_version)
+        except FileNotFoundError as exc:
+            return _skill_manage_error("validation", str(exc))
+        except Exception as exc:
+            return _skill_manage_error("validation", f"rollback read failed: {exc}")
+
+        def _rollback_original() -> None:
+            skill_md.write_text(original, encoding="utf-8")
+
+        try:
+            save_snapshot(
+                skills_root=root,
+                skill_name=name,
+                content=original,
+                actor="agent",
+                session_id=str(getattr(session, "session_id", "") or ""),
+                summary=f"pre-rollback -> {to_version}",
+            )
+        except Exception:
+            pass
+
+        success, err = _write_skill_md_with_checks(
+            action="rollback",
+            skill_dir=skill_dir,
+            content=target,
+            canonical_name=name,
+            on_rollback=_rollback_original,
+            extra={"to_version": to_version, "_session": session},
+        )
+        if err:
+            if err.startswith("ERROR: 技能内容被安全策略拦截"):
+                return _skill_manage_error("policy", err)
+            return _skill_manage_error("validation", err)
+        try:
+            from agenticx.skills.versioning import append_changelog
+
+            append_changelog(skill_dir, action="edit", summary=f"rollback to {to_version}")
+        except Exception:
+            pass
+        return success or _skill_manage_error("validation", "unknown rollback failure")
+
+    return "ERROR: unknown action"
+
+
+def _tool_skill_import_repo(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:
+    _ = session
+    if not _skill_manage_enabled():
+        return (
+            "ERROR: skill_import_repo is disabled. Set AGX_SKILL_MANAGE=1 "
+            "or AGX_CONFIRM_STRATEGY=auto (Run Everything hook)."
+        )
+    repo = str(arguments.get("repo", "") or "").strip()
+    if not repo:
+        return "ERROR: repo is required (owner/name)"
+    branch = str(arguments.get("branch", "main") or "main").strip() or "main"
+    path_glob = str(arguments.get("path_glob", "skills/**/SKILL.md") or "skills/**/SKILL.md").strip()
+    exclude_raw = arguments.get("exclude")
+    exclude: Optional[List[str]] = None
+    if isinstance(exclude_raw, list):
+        exclude = [str(x) for x in exclude_raw if str(x).strip()]
+    dry_run = bool(arguments.get("dry_run", False))
+    overwrite = bool(arguments.get("overwrite", False))
+    from agenticx.skills.import_repo import import_skills_from_repo, result_to_json
+
+    result = import_skills_from_repo(
+        repo=repo,
+        branch=branch,
+        path_glob=path_glob,
+        exclude=exclude,
+        dry_run=dry_run,
+        overwrite=overwrite,
+    )
+    return result_to_json(result)
+
+
+def _tool_ask_user(arguments: Dict[str, Any], *, service_mode: bool = False) -> str:
+    if service_mode:
+        return (
+            "ERROR: ask_user is not supported in service mode; "
+            "use the request_clarification tool to ask the user an open-ended question."
+        )
+    question = str(arguments.get("question", "")).strip()
+    if not question:
+        return "ERROR: missing question"
+    answer = input(f"{question}\n> ").strip()
+    return answer or "(empty)"
+
+
+_WORKSPACE_MOUNT_META_NAMES = frozenset({".agx-mounts.json", ".agx-copy-manifest.json"})
+
+
+def _list_files_entries(root: Path, *, recursive: bool) -> List[Path]:
+    """List a workspace directory, injecting reference mounts like the workspace panel."""
+    if recursive:
+        entries = [p for p in root.rglob("*") if p.name not in _WORKSPACE_MOUNT_META_NAMES]
+        return sorted(entries, key=lambda p: str(p))
+    entries = [p for p in root.iterdir() if p.name not in _WORKSPACE_MOUNT_META_NAMES]
+    existing_names = {p.name for p in entries}
+    extras: List[Path] = []
+    for mount in _load_default_workspace_mounts(root):
+        name = str(mount.get("name") or "").strip()
+        mode = str(mount.get("mode") or "").strip().lower()
+        source = str(mount.get("source_path") or "").strip()
+        if not name or name in existing_names or mode != "reference" or not source:
+            continue
+        extras.append(Path(source).expanduser())
+        existing_names.add(name)
+    return sorted(entries + extras, key=lambda p: str(p))
+
+
+def _tool_list_files(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    path_arg = str(arguments.get("path", "."))
+    try:
+        root = _resolve_workspace_path(path_arg, session, pick_existing=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    recursive = bool(arguments.get("recursive", False))
+    limit = int(arguments.get("limit", 200) or 200)
+    if limit < 1:
+        limit = 1
+    if limit > 2000:
+        limit = 2000
+    if not root.exists():
+        return f"ERROR: path not found: {root}"
+    if not root.is_dir():
+        return f"ERROR: not a directory: {root}"
+
+    entries = _list_files_entries(root, recursive=recursive)
+    listed_root = _safe_resolve_path(root)
+    lines: List[str] = [f"root: {listed_root}"]
+    for item in entries[:limit]:
+        suffix = "/" if item.is_dir() else ""
+        try:
+            rel = _safe_resolve_path(item).relative_to(listed_root)
+            lines.append(f"{rel}{suffix}")
+        except ValueError:
+            lines.append(f"{item.name}{suffix} -> {item}{suffix}")
+    if len(entries) > limit:
+        lines.append(f"... (truncated, total {len(entries)} entries)")
+    if len(lines) == 1:
+        return f"{lines[0]}\n(empty directory)"
+    return "\n".join(lines)
+
+
+async def _tool_liteparse(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    """Parse one document strictly via LiteParse adapter."""
+    raw_path = str(arguments.get("path", "")).strip()
+    if not raw_path:
+        return "ERROR: missing required parameter 'path'."
+    try:
+        path = _resolve_workspace_path(raw_path, session, pick_existing=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not path.exists():
+        return f"ERROR: file not found: {path}"
+    if path.is_dir():
+        return f"ERROR: expected a file path, got directory: {path}"
+
+    from agenticx.tools.adapters.liteparse import LiteParseAdapter
+
+    if not LiteParseAdapter.is_available():
+        return (
+            "ERROR: liteparse CLI is not available. "
+            "Install with: npm i -g @llamaindex/liteparse"
+        )
+
+    try:
+        adapter = LiteParseAdapter(config={"debug": False})
+        content = await adapter.parse_to_text(path)
+    except Exception as exc:
+        return f"ERROR: liteparse parsing failed: {exc}"
+
+    if not content.strip():
+        return "ERROR: liteparse returned empty content."
+    return content
+
+
+def _video_understand_settings() -> Dict[str, Any]:
+    """Read video_understanding.* from config with safe fallbacks."""
+
+    def _int(key: str, default: int) -> int:
+        raw = ConfigManager.get_value(f"video_understanding.{key}")
+        try:
+            return int(raw) if raw is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def _float(key: str, default: float) -> float:
+        raw = ConfigManager.get_value(f"video_understanding.{key}")
+        try:
+            return float(raw) if raw is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def _bool(key: str, default: bool) -> bool:
+        raw = ConfigManager.get_value(f"video_understanding.{key}")
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return default
+
+    def _str(key: str, default: str) -> str:
+        raw = ConfigManager.get_value(f"video_understanding.{key}")
+        if raw is None:
+            return default
+        return str(raw)
+
+    max_frames = min(
+        _int("max_frames", _VIDEO_UNDERSTAND_DEFAULT_MAX_FRAMES),
+        _VIDEO_UNDERSTAND_HARD_MAX_FRAMES,
+    )
+    return {
+        "max_frames": max(1, max_frames),
+        "interval_seconds": max(
+            1.0,
+            _float("interval_seconds", _VIDEO_UNDERSTAND_DEFAULT_INTERVAL_SECONDS),
+        ),
+        "min_frames": max(1, _int("min_frames", _VIDEO_UNDERSTAND_MIN_FRAMES)),
+        "use_scene_detection": _bool("use_scene_detection", False),
+        "enable_audio_transcription": _bool("enable_audio_transcription", True),
+        "transcription_language": _str("transcription_language", "").strip(),
+    }
+
+
+async def _transcribe_video_audio(audio_path: Path, language: str) -> tuple[str, str]:
+    """Best-effort audio transcription that never breaks video visual flow."""
+    try:
+        # Inline import avoids circular dependency:
+        # voice_endpoints imports STUDIO_TOOLS/dispatch_tool_async from this module.
+        from agenticx.studio.voice_endpoints import (
+            _resolve_transcribe_provider,
+            _transcribe_doubao_flash,
+            _transcribe_openai_whisper,
+        )
+    except Exception as exc:
+        return "", f"transcription module unavailable: {exc}"
+
+    try:
+        provider = _resolve_transcribe_provider()
+    except Exception as exc:
+        return "", f"transcribe provider resolve failed: {exc}"
+    if not provider:
+        return "", "no transcription backend configured (see 设置 → 语音)"
+
+    try:
+        raw = audio_path.read_bytes()
+    except OSError as exc:
+        return "", f"cannot read extracted audio: {exc}"
+
+    try:
+        if provider == "openai_whisper":
+            text = await _transcribe_openai_whisper(
+                raw,
+                filename=audio_path.name,
+                content_type="audio/mpeg",
+                language=(language or "zh"),
+            )
+        elif provider == "doubao_flash":
+            text = await _transcribe_doubao_flash(raw)
+        else:
+            return "", f"unknown transcription provider: {provider}"
+    except Exception as exc:
+        return "", f"transcription failed ({provider}): {exc}"
+    return (text or "").strip(), ""
+
+
+async def _tool_video_understand(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    """Probe and extract representative video frames, then stage for vision input."""
+    raw_path = str(arguments.get("path", "")).strip()
+    if not raw_path:
+        return "ERROR: missing required parameter 'path'."
+
+    if not _session_vision_capable(session):
+        model = str(getattr(session, "model_name", "") or "unknown")
+        return (
+            f"ERROR: current model '{model}' does not support vision; "
+            "switch to a vision-capable model before understanding a video."
+        )
+
+    try:
+        path = _resolve_workspace_path(raw_path, session, pick_existing=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not path.exists() or not path.is_file():
+        return f"ERROR: video not found: {path}"
+
+    ext = path.suffix.lower()
+    if ext not in VideoFrameExtractor.SUPPORTED_FORMATS:
+        return (
+            f"ERROR: unsupported video format '{ext}'. "
+            f"Supported: {', '.join(VideoFrameExtractor.SUPPORTED_FORMATS)}"
+        )
+
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"ERROR: cannot stat video: {exc}"
+    if size > _VIDEO_UNDERSTAND_MAX_VIDEO_BYTES:
+        return f"ERROR: video too large ({size // (1024 * 1024)} MB); limit is 512 MB."
+
+    if not VideoFrameExtractor.is_available():
+        return (
+            "ERROR: ffmpeg/ffprobe not found. Install with: brew install ffmpeg "
+            "(macOS) or your platform package manager."
+        )
+
+    settings = _video_understand_settings()
+    req_max = arguments.get("max_frames")
+    if req_max is not None:
+        try:
+            settings["max_frames"] = max(
+                1,
+                min(int(req_max), _VIDEO_UNDERSTAND_HARD_MAX_FRAMES),
+            )
+        except (TypeError, ValueError):
+            pass
+
+    extractor = VideoFrameExtractor()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="agenticx_video_"))
+    probe = None
+    result = None
+    staged = 0
+    transcript = ""
+    degrade_reason = ""
+    try:
+        probe = await extractor.probe(path)
+        frame_count = extractor.plan_frame_count(
+            probe.duration_seconds,
+            interval=settings["interval_seconds"],
+            min_frames=settings["min_frames"],
+            max_frames=settings["max_frames"],
+        )
+        if settings["use_scene_detection"]:
+            result = await extractor.extract_scene(
+                path,
+                tmp_dir,
+                max_frames=settings["max_frames"],
+                probe=probe,
+            )
+        if result is None or len(result.frames) < 2:
+            result = await extractor.extract_interval(
+                path,
+                tmp_dir,
+                frame_count=frame_count,
+                probe=probe,
+            )
+        if not result.frames:
+            return "ERROR: failed to extract any frame from the video."
+
+        pending = _pending_visual_attachments(session)
+        for idx, frame_path in enumerate(result.frames):
+            try:
+                data = frame_path.read_bytes()
+            except OSError:
+                continue
+            ts = result.timestamps[idx] if idx < len(result.timestamps) else 0.0
+            data_url = _data_url_from_bytes(data, "image/png")
+            pending.append(
+                {
+                    "name": f"{path.stem}_frame_{idx + 1:02d}_t{ts:.1f}s.png",
+                    "data_url": data_url,
+                    "mime_type": "image/png",
+                    "size": len(data),
+                    "source": str(path),
+                    "note": f"video frame @ {ts:.1f}s",
+                }
+            )
+            staged += 1
+        if staged == 0:
+            return "ERROR: extracted frames could not be read for attachment."
+
+        if probe.has_audio and settings.get("enable_audio_transcription", True):
+            audio_path = await extractor.extract_audio(path, tmp_dir)
+            if audio_path is None:
+                degrade_reason = "audio extraction unavailable"
+            else:
+                transcript, degrade_reason = await _transcribe_video_audio(
+                    audio_path,
+                    str(settings.get("transcription_language", "") or ""),
+                )
+    except Exception as exc:
+        return (
+            f"ERROR: video_understand failed for {path.name}: {exc}\n"
+            f"{traceback.format_exc(limit=3)}"
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if probe is None or result is None:
+        return "ERROR: internal video_understand state error."
+    audio_note = (
+        "with audio (transcribed)"
+        if transcript
+        else ("with audio (not transcribed)" if probe.has_audio else "no audio track")
+    )
+    lines = [
+        f"[video_understand] {path.name}",
+        (
+            f"duration={probe.duration_seconds:.1f}s resolution={probe.width}x{probe.height} "
+            f"{audio_note} strategy={result.strategy} frames_attached={staged}"
+        ),
+        "Frames are attached as images in the NEXT turn; combine them with the transcript below.",
+    ]
+    if transcript:
+        clipped = transcript if len(transcript) <= 6000 else transcript[:6000] + " ...[truncated]"
+        lines.append("")
+        lines.append("[audio_transcript]")
+        lines.append(clipped)
+    elif probe.has_audio:
+        lines.append(
+            f"NOTE: audio present but not transcribed ({degrade_reason or 'unknown'})."
+        )
+    return "\n".join(lines)
+
+
+def _resolve_lsp_settings() -> tuple[bool, float]:
+    try:
+        global_data = ConfigManager._load_yaml(ConfigManager.GLOBAL_CONFIG_PATH)
+        project_data = ConfigManager._load_yaml(ConfigManager.PROJECT_CONFIG_PATH)
+        merged = ConfigManager._deep_merge(global_data, project_data)
+        enabled_raw = ConfigManager._get_nested(merged, "lsp.enabled")
+        timeout_raw = ConfigManager._get_nested(merged, "lsp.startup_timeout")
+    except Exception:
+        enabled_raw = None
+        timeout_raw = None
+
+    if enabled_raw is None:
+        enabled = True
+    elif isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    elif isinstance(enabled_raw, str):
+        lowered = enabled_raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            enabled = True
+        elif lowered in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            enabled = True
+    else:
+        enabled = bool(enabled_raw)
+    try:
+        timeout = float(timeout_raw if timeout_raw is not None else 30.0)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    timeout = max(1.0, min(120.0, timeout))
+    return enabled, timeout
+
+
+def _infer_lsp_workspace_root(session: StudioSession) -> str:
+    roots = _session_workspace_roots(session)
+    return str(roots[0]) if roots else str(_workspace_root())
+
+
+async def _dispatch_lsp_tool(name: str, arguments: Dict[str, Any], session: StudioSession) -> str:
+    from agenticx.tools.lsp_manager import LSPManager
+
+    mgr: Optional[LSPManager] = getattr(session, "_lsp_manager", None)
+    enabled, startup_timeout = _resolve_lsp_settings()
+    if mgr is None:
+        mgr = LSPManager(
+            _infer_lsp_workspace_root(session),
+            startup_timeout=startup_timeout,
+            enabled=enabled,
+        )
+        setattr(session, "_lsp_manager", mgr)
+
+    file_path = str(arguments.get("file", "")).strip()
+    line_raw = arguments.get("line", 1)
+    column_raw = arguments.get("column", 1)
+    try:
+        line = int(line_raw)
+    except (TypeError, ValueError):
+        line = 1
+    try:
+        column = int(column_raw)
+    except (TypeError, ValueError):
+        column = 1
+
+    try:
+        if name == "lsp_goto_definition":
+            return await mgr.tool_goto_definition(file_path, line, column)
+        if name == "lsp_find_references":
+            return await mgr.tool_find_references(file_path, line, column)
+        if name == "lsp_hover":
+            return await mgr.tool_hover(file_path, line, column)
+        if name == "lsp_diagnostics":
+            return await mgr.tool_diagnostics(file_path or None)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": f"LSP error: {exc}"}, ensure_ascii=False)
+    return json.dumps({"ok": False, "error": f"unknown LSP tool: {name}"}, ensure_ascii=False)
+
+
+# Project state harness tools (.agx/project state machine).
+try:
+    from agenticx.project_state.tools import project_state_tool_schemas as _project_state_schemas
+
+    STUDIO_TOOLS.extend(_project_state_schemas())
+except Exception as _exc:  # pragma: no cover - defensive import isolation
+    logging.getLogger(__name__).warning(
+        "project_state tool registration skipped: %s", _exc,
+    )
+
+
+_TOOL_REQUIRED_PARAMS: Dict[str, List[str]] = {}
+for _td in STUDIO_TOOLS:
+    _fn = _td.get("function", {})
+    _name = _fn.get("name", "")
+    _req = _fn.get("parameters", {}).get("required", [])
+    if _name and _req:
+        _TOOL_REQUIRED_PARAMS[_name] = _req
+for _td in COMPUTER_USE_TOOLS:
+    _fn = _td.get("function", {})
+    _name = _fn.get("name", "")
+    _req = _fn.get("parameters", {}).get("required", [])
+    if _name and _req:
+        _TOOL_REQUIRED_PARAMS[_name] = _req
+for _td in NEAR_BROWSER_TOOLS:
+    _fn = _td.get("function", {})
+    _name = _fn.get("name", "")
+    _req = _fn.get("parameters", {}).get("required", [])
+    if _name and _req:
+        _TOOL_REQUIRED_PARAMS[_name] = _req
+
+
+def _repair_malformed_file_tool_arguments(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort repair for malformed file tool arguments from weaker models."""
+    if name not in {"file_write", "file_edit"}:
+        return arguments
+    if not isinstance(arguments, dict):
+        return arguments
+
+    def _is_tool_metadata_noise(value: Any) -> bool:
+        text = _strip_tool_metadata_noise_lines(str(value or "")).strip()
+        if not text:
+            return False
+        return bool(re.fullmatch(r"(call_[A-Za-z0-9]+|sa-[a-z0-9]+)", text))
+
+    def _collect_safe_extra_payload(extra_keys: List[str]) -> str:
+        # Only merge text-like alias fields; drop unknown keys to avoid
+        # leaking streamed tool-call metadata fragments into file content.
+        alias_keys = {"text", "body", "code", "value", "new_content", "newText"}
+        payloads: List[str] = []
+        for key in extra_keys:
+            if key not in alias_keys:
+                continue
+            raw = repaired.get(key, "")
+            if _is_tool_metadata_noise(raw):
+                continue
+            text = _strip_tool_metadata_noise_lines(str(raw)).strip()
+            if text:
+                payloads.append(text)
+        return "\n".join(payloads)
+
+    repaired = dict(arguments)
+    if name == "file_edit":
+        for src, dst in (
+            ("old_str", "old_text"),
+            ("old_string", "old_text"),
+            ("new_str", "new_text"),
+            ("new_string", "new_text"),
+        ):
+            if src in repaired and dst not in repaired:
+                repaired[dst] = repaired.pop(src)
+            elif src in repaired:
+                repaired.pop(src, None)
+    elif name == "file_write":
+        for src, dst in (
+            ("text", "content"),
+            ("body", "content"),
+            ("new_content", "content"),
+        ):
+            if src in repaired and dst not in repaired:
+                repaired[dst] = repaired.pop(src)
+            elif src in repaired:
+                repaired.pop(src, None)
+
+    if name == "file_write":
+        allowed_keys = {"path", "content"}
+        extra_keys = [k for k in repaired.keys() if k not in allowed_keys]
+        if not extra_keys:
+            return repaired
+        extra_payload = _collect_safe_extra_payload(extra_keys)
+        existing_content = _strip_tool_metadata_noise_lines(str(repaired.get("content", "")))
+        if extra_payload:
+            repaired["content"] = f"{existing_content}\n{extra_payload}".strip() if existing_content else extra_payload
+        for key in extra_keys:
+            repaired.pop(key, None)
+        _log.warning(
+            "[tool-args-repair] repaired malformed file_write args, removed keys=%s",
+            extra_keys,
+        )
+        return repaired
+
+    allowed_keys = {"path", "old_text", "new_text", "occurrence"}
+    extra_keys = [k for k in repaired.keys() if k not in allowed_keys]
+    if not extra_keys:
+        return repaired
+    extra_payload = _collect_safe_extra_payload(extra_keys)
+    if extra_payload:
+        base_new_text = _strip_tool_metadata_noise_lines(str(repaired.get("new_text", "")))
+        repaired["new_text"] = f"{base_new_text}\n{extra_payload}".strip() if base_new_text else extra_payload
+    for key in extra_keys:
+        repaired.pop(key, None)
+    _log.warning(
+        "[tool-args-repair] repaired malformed file_edit args, removed keys=%s",
+        extra_keys,
+    )
+    return repaired
+
+
+# ── task_experience implementation ────────────────────────────────────────────
+
+def _experience_path(group_id: str) -> Path:
+    """Return the JSON file path for a group's experience store."""
+    import pathlib
+    base = pathlib.Path.home() / ".agenticx" / "groups" / group_id
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "experience.json"
+
+
+def _experience_load(group_id: str) -> List[Dict[str, Any]]:
+    p = _experience_path(group_id)
+    if not p.exists():
+        return []
+    try:
+        import json as _json
+        return _json.loads(p.read_text(encoding="utf-8")) or []
+    except Exception:
+        return []
+
+
+def _experience_save(group_id: str, entries: List[Dict[str, Any]]) -> None:
+    import json as _json
+    p = _experience_path(group_id)
+    p.write_text(_json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _experience_retrieve_impl(query: str, group_id: str, limit: int = 5) -> str:
+    """Simple keyword-based retrieval from the JSON experience store.
+
+    Falls back to pure keyword search when WorkspaceMemoryStore is unavailable.
+    Hybrid search integration can be added without changing the tool schema.
+    """
+    import json as _json
+    entries = _experience_load(group_id)
+    if not entries:
+        return _json.dumps({"status": "no_experience", "results": [], "group_id": group_id})
+
+    q_lower = query.casefold()
+    q_tokens = set(q_lower.split())
+
+    def _score(entry: Dict[str, Any]) -> float:
+        text = (
+            (entry.get("content") or "")
+            + " " + (entry.get("title") or "")
+            + " " + (entry.get("when_to_use") or "")
+        ).casefold()
+        return sum(1 for t in q_tokens if t in text) / max(len(q_tokens), 1)
+
+    scored = sorted(entries, key=_score, reverse=True)
+    top = [e for e in scored if _score(e) > 0][:limit] or scored[:limit]
+    return _json.dumps({
+        "status": "ok",
+        "group_id": group_id,
+        "count": len(top),
+        "results": top,
+    }, ensure_ascii=False)
+
+
+def _experience_learn_impl(
+    content: str,
+    group_id: str,
+    section: str = "general",
+    when_to_use: str = "",
+    title: str = "",
+) -> str:
+    import json as _json
+    import uuid
+    from datetime import datetime, timezone
+    entries = _experience_load(group_id)
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "section": section or "general",
+        "content": content,
+        "title": title or content[:60],
+        "when_to_use": when_to_use,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    entries.append(entry)
+    _experience_save(group_id, entries)
+    return _json.dumps({"status": "ok", "group_id": group_id, "entry_id": entry["id"]})
+
+
+def _experience_clear_impl(group_id: str, confirm: bool) -> str:
+    import json as _json
+    if not confirm:
+        return _json.dumps({"status": "aborted", "reason": "confirm must be true"})
+    p = _experience_path(group_id)
+    if p.exists():
+        p.write_text("[]", encoding="utf-8")
+    return _json.dumps({"status": "cleared", "group_id": group_id})
+
+
+def _resolve_group_id(session: "StudioSession", arg_group_id: str | None) -> str:
+    """Best-effort resolution of group_id from session or argument."""
+    if arg_group_id and str(arg_group_id).strip():
+        return str(arg_group_id).strip()
+    # Try to read from session scratchpad if set by run_group_turn.
+    scratchpad = getattr(session, "scratchpad", {}) or {}
+    gid = str(scratchpad.get("__group_id", "") or "").strip()
+    return gid or "default"
+
+
+_SHARED_WRITE_ISOLATE_OPTION = "创建隔离副本"
+_SHARED_WRITE_SHARED_OPTION = "继续共用当前工作区"
+_SHARED_WRITE_CANCEL_OPTION = "取消"
+
+
+async def _maybe_guard_shared_workspace_write(
+    name: str,
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    clarify_gate: Optional[ClarifyGate] = None,
+    emit_event: Optional[Any] = None,
+    is_unattended: bool = False,
+) -> Optional[str]:
+    """First-write guard for conversation branches on a shared workspace.
+
+    Returns an ERROR string to stop the tool, or None to let it run.
+    """
+    from agenticx.studio.conversation_continue import (
+        mark_shared_write_prompted,
+        should_prompt_shared_write,
+    )
+
+    try:
+        from agenticx.runtime.replay_ledger.effects import classify_tool_effect
+        effect = classify_tool_effect(str(name or ""), dict(arguments or {}))
+    except Exception:
+        effect = ""
+    if not should_prompt_shared_write(session, name, effect):
+        return None
+
+    scratchpad = getattr(session, "scratchpad", None)
+    lineage = (
+        scratchpad.get("conversation_lineage")
+        if isinstance(scratchpad, dict)
+        else None
+    )
+    if not isinstance(lineage, dict):
+        return None
+
+    if is_unattended or isinstance(clarify_gate, AutoSuspendClarifyGate):
+        mark_shared_write_prompted(session)
+        return None
+
+    # Non-git workspaces cannot offer an isolate copy — shared/cancel only.
+    from agenticx.runtime.isolate_run import find_git_root
+
+    workspace_dir = str(getattr(session, "workspace_dir", None) or "").strip()
+    git_root = None
+    if workspace_dir:
+        try:
+            git_root = find_git_root(Path(workspace_dir).expanduser())
+        except Exception:
+            git_root = None
+    can_isolate = git_root is not None
+    options = (
+        [_SHARED_WRITE_ISOLATE_OPTION, _SHARED_WRITE_SHARED_OPTION, _SHARED_WRITE_CANCEL_OPTION]
+        if can_isolate
+        else [_SHARED_WRITE_SHARED_OPTION, _SHARED_WRITE_CANCEL_OPTION]
+    )
+    prompt = (
+        "这是从历史消息继续出来的新分支，与源会话共用当前工作区。"
+        "本次工具要写入本地文件，请选择：创建隔离副本（后续写入只影响副本），"
+        "继续共用当前工作区（之后不再询问），或取消本次写入。"
+        if can_isolate
+        else "这是从历史消息继续出来的新分支，与源会话共用当前工作区。"
+        "当前不是 git 工作区，无法创建隔离副本；请选择继续共用当前工作区（之后不再询问），或取消本次写入。"
+    )
+    payload_context: Dict[str, Any] = {
+        "kind": "shared_workspace_write",
+        "request_id": str(uuid.uuid4()),
+        "tool": str(name or ""),
+    }
+    gate = clarify_gate or AsyncClarifyGate()
+    emit_prompt = emit_event is not None and isinstance(gate, AsyncClarifyGate)
+    if emit_prompt:
+        wait_task = asyncio.create_task(
+            gate.request_clarification(
+                prompt,
+                options=options,
+                allow_free_text=True,
+                context=payload_context,
+            )
+        )
+        await asyncio.sleep(0)
+        try:
+            await emit_event(
+                {
+                    "type": "clarification_required",
+                    "data": {
+                        "id": payload_context["request_id"],
+                        "prompt": prompt,
+                        "options": options,
+                        "decisions": [],
+                        "allow_free_text": True,
+                        "context": payload_context,
+                    },
+                }
+            )
+            answer = await wait_task
+        except BaseException:
+            wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
+            raise
+    else:
+        answer = await gate.request_clarification(
+            prompt,
+            options=options,
+            allow_free_text=True,
+            context=payload_context,
+        )
+    if emit_prompt:
+        await emit_event(
+            {
+                "type": "clarification_response",
+                "data": {
+                    "id": payload_context["request_id"],
+                    "answer": answer,
+                },
+            }
+        )
+    if not isinstance(answer, dict):
+        return "ERROR: 用户取消了本次写入（从历史消息继续的新分支与源会话共用工作区）。"
+    if answer.get("__suspended__"):
+        mark_shared_write_prompted(session)
+        return None
+    if answer.get("__timeout__"):
+        return "ERROR: 用户未在时限内回复，本次写入已取消（从历史消息继续的新分支与源会话共用工作区）。"
+    selected = list(answer.get("selected_options", []) or [])
+    choice = str(selected[0] or "").strip() if selected else ""
+    if choice == _SHARED_WRITE_ISOLATE_OPTION and can_isolate:
+        from agenticx.runtime.isolate_run import ensure_isolate
+
+        try:
+            state = ensure_isolate(session, isolate_run=True, is_automation=False)
+        except Exception as exc:
+            return f"ERROR: 创建隔离副本失败，本次写入已取消：{exc}"
+        if not isinstance(state, dict) or not state.get("active"):
+            reason = str((state or {}).get("error", "unknown") or "unknown")
+            return f"ERROR: 创建隔离副本失败（{reason}），本次写入已取消。请改用只读工具或让用户先把工作区建成 git 仓库。"
+        lineage["workspace_mode"] = "isolated"
+        lineage["shared_write_prompted"] = True
+        return None
+    if choice == _SHARED_WRITE_SHARED_OPTION:
+        mark_shared_write_prompted(session)
+        return None
+    return "ERROR: 用户取消了本次写入（从历史消息继续的新分支与源会话共用工作区）。"
+
+
+async def dispatch_tool_async(
+    name: str,
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    confirm_gate: Optional[ConfirmGate] = None,
+    event_callback: Optional[Any] = None,
+    team_manager: Optional[Any] = None,
+    clarify_gate: Optional[ClarifyGate] = None,
+    is_unattended: bool = False,
+    runtime_tool_context: Optional[Any] = None,
+) -> str:
+    """Dispatch one tool call asynchronously and return result text."""
+    policy_denial = tool_denied_by_session_permissions(name)
+    if policy_denial:
+        return f"ERROR: {policy_denial}"
+    intent_denial = turn_intent_denial_message(name, session)
+    if intent_denial:
+        return f"ERROR: {intent_denial}"
+    path_denial = _dispatch_path_rule_denial(arguments, session)
+    if path_denial:
+        return f"ERROR: {path_denial}"
+    shared_write_block = await _maybe_guard_shared_workspace_write(
+        name,
+        arguments,
+        session,
+        clarify_gate=clarify_gate,
+        emit_event=event_callback,
+        is_unattended=is_unattended,
+    )
+    if shared_write_block:
+        return shared_write_block
+    arguments = _repair_malformed_file_tool_arguments(name, arguments)
+    required = _TOOL_REQUIRED_PARAMS.get(name)
+    if required and not arguments:
+        # FR-B.1：空参数往往源于流式工具调用被截断或弱模型忘填字段；
+        # 错误文本必须强引导"立即重试本工具"，避免模型读到 ERROR 后转去
+        # 自言自语而放弃任务。对常见的文件类工具补充字段释义。
+        param_hints = {
+            "file_write": (
+                "path（绝对路径，不要省略）, content（要写入的完整文档正文，至少几百字的实际内容，不能是空字符串或省略号）"
+            ),
+            "file_edit": (
+                "path（绝对路径）, old_string（原文片段）, new_string（替换后的内容）"
+            ),
+            "skill_manage": (
+                "action（create / patch / delete）, name（skill 名称，可含子路径如 ima/notes）, "
+                "以及 content / from_path / from_url（create）或 old_string / new_string（patch）"
+            ),
+            "skill_import_repo": (
+                "repo（owner/name）, 可选 branch/path_glob/exclude/dry_run/overwrite"
+            ),
+            "schedule_task": (
+                "name（任务名）、frequency / time / date 至少一项、instruction（具体指令）、workspace（执行目录）"
+            ),
+        }
+        guidance = param_hints.get(name, "见工具 schema 中的 required 列表")
+        return (
+            f"ERROR: {name}() called with empty arguments. "
+            f"Required parameters: {', '.join(required)}.\n"
+            f"参数说明：{guidance}\n"
+            f"行动要求：请立即重新调用 {name} 一次，并把上述所有必填参数完整填入；"
+            f"不要换其他工具、不要把这次失败汇报给用户、不要在没有重新调用前给出最终回复。"
+            f"如果你忘记了目标路径或正文内容，请回头查看用户最近的原始任务描述（含 [user-pending-question] 与 [user-goal-anchor]）以及 system prompt 里的工作区根，再生成完整调用。"
+        )
+    gate = confirm_gate or SyncConfirmGate()
+    try:
+        if name in META_TOOL_NAMES:
+            tm = team_manager or getattr(session, "_team_manager", None)
+            import logging as _logging
+            _logging.getLogger("agenticx.cli.agent_tools").debug(
+                "[dispatch_tool] meta_tool=%s session=%s tm=%s (explicit=%s, attr=%s)",
+                name,
+                id(session),
+                id(tm) if tm else "None",
+                id(team_manager) if team_manager else "None",
+                id(getattr(session, "_team_manager", None)) if getattr(session, "_team_manager", None) else "None",
+            )
+            if tm is None:
+                return "ERROR: meta tool requires team manager in session"
+            from agenticx.runtime.meta_tools import dispatch_meta_tool_async
+
+            return await dispatch_meta_tool_async(
+                name,
+                arguments,
+                team_manager=tm,
+                session=session,
+            )
+        if name == "bash_exec":
+            return await _tool_bash_exec(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "bash_bg_start":
+            return await _tool_bash_bg_start(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "bash_bg_poll":
+            return await _tool_bash_bg_poll(arguments, session)
+        if name == "bash_bg_input":
+            return await _tool_bash_bg_input(arguments, session)
+        if name == "bash_bg_stop":
+            return await _tool_bash_bg_stop(arguments, session)
+        if name == "code_outline":
+            return _tool_code_outline(arguments, session)
+        if name == "file_read":
+            return _tool_file_read(arguments, session)
+        if name == "tool_result_recall":
+            return _tool_result_recall(arguments, session)
+        if name == "stage_context_file":
+            return _tool_stage_context_file(arguments, session)
+        if name == "file_write":
+            return await _tool_file_write(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "file_edit":
+            return await _tool_file_edit(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "codegen":
+            return await _tool_codegen(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "mcp_connect":
+            return _tool_mcp_connect(arguments, session)
+        if name == "cc_bridge_start":
+            return await _tool_cc_bridge_start(arguments, session)
+        if name == "cc_bridge_send":
+            return await _tool_cc_bridge_send(arguments, session)
+        if name == "cc_bridge_list":
+            return await _tool_cc_bridge_list(arguments, session)
+        if name == "cc_bridge_stop":
+            return await _tool_cc_bridge_stop(arguments, session)
+        if name == "cc_bridge_permission":
+            return await _tool_cc_bridge_permission(arguments, session)
+        if name == "wb_bridge_start":
+            return await _tool_wb_bridge_start(arguments, session)
+        if name == "wb_bridge_send":
+            return await _tool_wb_bridge_send(arguments, session)
+        if name == "wb_bridge_list":
+            return await _tool_wb_bridge_list(arguments, session)
+        if name == "wb_bridge_describe":
+            return await _tool_wb_bridge_describe(arguments, session)
+        if name == "wb_bridge_stop":
+            return await _tool_wb_bridge_stop(arguments, session)
+        if name == "desktop_screenshot":
+            return await _tool_desktop_screenshot(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "desktop_mouse_click":
+            return await _tool_desktop_mouse_click(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "desktop_keyboard_type":
+            return await _tool_desktop_keyboard_type(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "near_browser_open":
+            return await _tool_near_browser_open(arguments, session)
+        if name == "near_browser_snapshot":
+            return await _tool_near_browser_snapshot(arguments, session)
+        if name == "near_browser_click":
+            return await _tool_near_browser_click(arguments, session)
+        if name == "near_browser_type":
+            return await _tool_near_browser_type(
+                arguments, session, confirm_gate=gate, emit_event=event_callback
+            )
+        if name == "near_browser_press_key":
+            return await _tool_near_browser_press_key(arguments, session)
+        if name == "near_browser_extract_text":
+            return await _tool_near_browser_extract_text(arguments, session)
+        if name == "near_browser_screenshot":
+            return await _tool_near_browser_screenshot(arguments, session)
+        if name == "mcp_call":
+            return await _tool_mcp_call_async(arguments, session)
+        if name == "tool_search":
+            return _tool_tool_search(arguments, session, runtime_tool_context=runtime_tool_context)
+        if name == "mcp_import":
+            return _tool_mcp_import(arguments, session)
+        if name == "skill_use":
+            return _tool_skill_use(arguments, session)
+        if name == "skill_list":
+            return _tool_skill_list(session)
+        if name == "hook_manage":
+            return _tool_hook_manage(arguments, session)
+        if name == "skill_manage":
+            return await _tool_skill_manage(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "skill_import_repo":
+            return _tool_skill_import_repo(arguments, session)
+        if name == "plan_create":
+            return create_plan_artifact(session, arguments)
+        if name == "plan_update":
+            return update_plan_artifact(session, arguments)
+        if name == "todo_write":
+            return _tool_todo_write(arguments, session)
+        if name == "scratchpad_write":
+            return _tool_scratchpad_write(arguments, session)
+        if name == "scratchpad_read":
+            return _tool_scratchpad_read(arguments, session)
+        if name in {
+            "project_init",
+            "project_status",
+            "feature_select",
+            "feature_complete",
+            "progress_append",
+            "verify_run",
+        }:
+            from agenticx.project_state.tools import dispatch_project_state_tool
+
+            return await asyncio.to_thread(
+                dispatch_project_state_tool, name, arguments, session
+            )
+        if name == "memory_append":
+            return await _tool_memory_append(
+                arguments,
+                confirm_gate=gate,
+                emit_event=event_callback,
+                session=session,
+            )
+        if name == "memory_search":
+            return await _tool_memory_search(arguments, session)
+        if name == "memory_forget":
+            return await _tool_memory_forget(arguments, session)
+        if name in {"get_trace", "get_logs", "get_recent_changes", "get_session_review", "get_umodel", "sync_changeplane", "get_trace_parity", "get_channel_slo"}:
+            from agenticx.ops.tools import dispatch_ops_tool, ops_tools_enabled
+
+            if not ops_tools_enabled():
+                return (
+                    "ERROR: ops tools disabled. Enable them in Settings → 工具 → 调查取证, "
+                    "or set AGENTICX_OPS_TOOLS=1"
+                )
+            return await asyncio.to_thread(dispatch_ops_tool, name, arguments, session)
+        if name == "knowledge_search":
+            return await asyncio.to_thread(_tool_knowledge_search, arguments, session)
+        if name == "knowledge_synthesize":
+            return await asyncio.to_thread(_tool_knowledge_synthesize, arguments, session)
+        if name == "web_search":
+            return await asyncio.to_thread(_tool_web_search, arguments, session)
+        if name == "get_current_datetime":
+            return _tool_get_current_datetime(arguments)
+        if name == "web_fetch":
+            return await _tool_web_fetch(arguments, session)
+        if name == "view_image":
+            return await _tool_view_image(arguments, session)
+        if name == "document_read_pages":
+            return await _tool_document_read_pages(arguments, session)
+        if name == "generate_image":
+            from agenticx.tools.image_generation import generate_image
+
+            prompt = str(arguments.get("prompt") or "").strip()
+            size = str(arguments.get("size") or "1024x1024").strip() or "1024x1024"
+            return await asyncio.to_thread(
+                generate_image,
+                prompt,
+                size=size,
+                session=session,
+            )
+        if name == "show_images":
+            from agenticx.tools.show_images import show_images
+
+            items = arguments.get("items") or []
+            return await asyncio.to_thread(show_images, items)
+        if name == "analyze_image":
+            return await _tool_analyze_image(arguments, session)
+        if name == "session_search":
+            return _tool_session_search(arguments, session)
+        if name == "plugin_usage":
+            return _tool_plugin_usage(arguments, session)
+        if name == "code_search":
+            return await asyncio.to_thread(_tool_code_search, arguments, session)
+        if name == "code_index_create":
+            return await asyncio.to_thread(_tool_code_index_create, arguments, session)
+        if name == "code_index_status":
+            return await asyncio.to_thread(_tool_code_index_status, arguments, session)
+        if name == "code_index_clear":
+            return await asyncio.to_thread(_tool_code_index_clear, arguments, session)
+        if name == "code_index_cancel":
+            return await asyncio.to_thread(_tool_code_index_cancel, arguments, session)
+        if name == "ask_user":
+            return _tool_ask_user(arguments, service_mode=gate.is_service_mode())
+        if name == "request_clarification":
+            prompt = str(arguments.get("prompt", "") or "").strip()
+            if not prompt:
+                return (
+                    "ERROR: request_clarification requires a non-empty `prompt`. "
+                    "请立即重新调用 request_clarification 并填写 prompt。"
+                )
+            raw_options = arguments.get("options") or []
+            if not isinstance(raw_options, list):
+                raw_options = []
+            options = [str(opt).strip() for opt in raw_options if str(opt).strip()]
+            options = options[:8]
+            raw_decisions = arguments.get("decisions") or []
+            decisions = _normalize_clarification_decisions(raw_decisions)
+            allow_free_text = bool(arguments.get("allow_free_text", True))
+            ctx = arguments.get("context")
+            if not isinstance(ctx, dict):
+                ctx = None
+            return await _request_clarification(
+                prompt,
+                options=options,
+                decisions=decisions,
+                allow_free_text=allow_free_text,
+                context=ctx,
+                clarify_gate=clarify_gate,
+                emit_event=event_callback,
+                is_unattended=is_unattended,
+            )
+        if name == "request_action_confirmation":
+            title = str(arguments.get("title", "") or "").strip()
+            if not title:
+                return (
+                    "ERROR: request_action_confirmation requires a non-empty `title`. "
+                    "请立即重新调用并填写 title。"
+                )
+            raw_summary = arguments.get("summary") or []
+            if not isinstance(raw_summary, list):
+                raw_summary = []
+            return await _request_action_confirmation(
+                title,
+                summary=raw_summary,
+                approve_label=str(arguments.get("approve_label", "") or "确认执行"),
+                reject_label=str(arguments.get("reject_label", "") or "取消"),
+                expires_in_seconds=arguments.get("expires_in_seconds"),
+                source=str(arguments.get("source", "") or ""),
+                clarify_gate=clarify_gate,
+                emit_event=event_callback,
+                is_unattended=is_unattended,
+            )
+        if name == "list_files":
+            return _tool_list_files(arguments, session)
+        if name == "liteparse":
+            return await _tool_liteparse(arguments, session)
+        if name == "video_understand":
+            return await _tool_video_understand(arguments, session)
+        if name == "list_data_sources":
+            return await _tool_list_data_sources(arguments)
+        if name == "query_data_source":
+            return await _tool_query_data_source(arguments)
+        if name == "show_widget":
+            return _tool_show_widget(arguments)
+        if name == "task_experience_retrieve":
+            gid = _resolve_group_id(session, arguments.get("group_id"))
+            limit = min(max(int(arguments.get("limit") or 5), 1), 10)
+            return _experience_retrieve_impl(
+                query=str(arguments.get("query", "")),
+                group_id=gid,
+                limit=limit,
+            )
+        if name == "task_experience_learn":
+            gid = _resolve_group_id(session, arguments.get("group_id"))
+            return _experience_learn_impl(
+                content=str(arguments.get("content", "")),
+                group_id=gid,
+                section=str(arguments.get("section") or "general"),
+                when_to_use=str(arguments.get("when_to_use") or ""),
+                title=str(arguments.get("title") or ""),
+            )
+        if name == "task_experience_clear":
+            gid = _resolve_group_id(session, arguments.get("group_id"))
+            confirm = bool(arguments.get("confirm", False))
+            return _experience_clear_impl(group_id=gid, confirm=confirm)
+        if name.startswith("lsp_"):
+            return await _dispatch_lsp_tool(name, arguments, session)
+    except Exception as exc:
+        return f"ERROR: {name} crashed: {exc}"
+    if name.startswith("confirm_"):
+        return (
+            "ERROR: Desktop mode does not provide confirm_* tools. "
+            "To request approval, directly call the real tool (e.g. bash_exec); "
+            "runtime will emit confirm_required and wait for UI confirmation."
+        )
+    # --- Dynamic MCP function tools loaded via tool_search (public names) ---
+    if runtime_tool_context is not None:
+        try:
+            from agenticx.runtime.mcp_tool_catalog import resolve_mcp_execution_name
+            from agenticx.cli.studio_mcp import mcp_call_tool_async
+
+            routed = resolve_mcp_execution_name(
+                name,
+                getattr(runtime_tool_context, "catalog", None).descriptors
+                if getattr(runtime_tool_context, "catalog", None) is not None
+                else (),
+            )
+            if routed:
+                hub = getattr(session, "mcp_hub", None)
+                if hub is None:
+                    return "ERROR: no MCP hub connected"
+                # Parent gate: catalog only contains MCP tools when mcp_call was allowed.
+                args_obj = arguments if isinstance(arguments, dict) else {}
+                repeat_guard_error = _check_mcp_repeat_guard(session, routed, args_obj)
+                if repeat_guard_error:
+                    return repeat_guard_error
+                return await mcp_call_tool_async(
+                    hub,
+                    routed,
+                    json.dumps(args_obj, ensure_ascii=False),
+                    echo=False,
+                )
+        except Exception as mcp_dyn_exc:
+            return f"ERROR: dynamic MCP tool '{name}' failed: {mcp_dyn_exc}"
+
+    # --- Fallback chain: try resolving via registered ToolFallbackChain ---
+    _fallback_chain = getattr(session, "_fallback_chain", None)
+    if _fallback_chain is not None:
+        try:
+            from agenticx.tools.fallback_chain import ToolFallbackChain
+            if isinstance(_fallback_chain, ToolFallbackChain):
+                _fb_result = await _fallback_chain.execute(name, **arguments)
+                return _fb_result.output
+        except Exception as _fb_exc:
+            logging.getLogger(__name__).debug(
+                "Fallback chain could not resolve '%s': %s", name, _fb_exc,
+            )
+    return f"ERROR: unknown tool '{name}'"
+
+
+def dispatch_tool(
+    name: str,
+    arguments: Dict[str, Any],
+    session: StudioSession,
+    *,
+    confirm_gate: Optional[ConfirmGate] = None,
+) -> str:
+    """Backward-compatible sync dispatcher for tests/CLI."""
+    return asyncio.run(
+        dispatch_tool_async(
+            name,
+            arguments,
+            session,
+            confirm_gate=confirm_gate,
+        )
+    )

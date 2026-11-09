@@ -1,0 +1,759 @@
+import type { Message } from "../../store";
+import type { ReactNode } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  ChevronDown,
+  ChevronRight,
+  BarChart3,
+  FileText,
+  Film,
+  ListChecks,
+  Plug,
+  Search,
+  ShieldAlert,
+  Terminal,
+  Wrench,
+} from "lucide-react";
+
+import { Shimmer } from "../ds/Shimmer";
+import { ToolOutputStream } from "./ToolOutputStream";
+import { SkillPatchPreviewCard } from "./SkillPatchPreviewCard";
+import { ShowWidgetDrawingPlaceholder } from "./ShowWidgetDrawingPlaceholder";
+import { WidgetBlock } from "./WidgetBlock";
+import {
+  parseSkillManageError,
+  parseSkillPatchPreviewPayload,
+  type SkillPatchPreviewPayload,
+} from "./skill-manage-preview";
+import { parseWidgetPayload, isBrokenStockChartAttempt, stockChartDegradedMessage } from "./widget-preview";
+import { extractPartialShowWidgetArgs, finalizePartialSvg, type PartialShowWidget } from "./show-widget-partial";
+import { parseBashBgStart } from "./bash-bg-preview";
+import { resolveBashExecCardText } from "./bash-exec-result";
+import { openExternalUrl } from "../../utils/open-external";
+import { MarkdownContext } from "./markdown-components";
+import { isHookBlockedToolMessage } from "../../utils/hook-block-message";
+import {
+  formatToolElapsedSeconds,
+  useLiveToolElapsedSeconds,
+} from "./tool-elapsed-timer";
+
+type Props = {
+  message: Message;
+  action?: ReactNode;
+  /** Nested inside TurnToolGroupCard — lighter chrome */
+  variant?: "default" | "nested" | "flat";
+  /** When true, remove left w-8 spacer (ReAct block already has avatar column). */
+  omitLeadingSpacer?: boolean;
+  /** 有需要用户操作的内联确认时强制展开 */
+  forceExpand?: boolean;
+  /** 历史搜索关键词高亮（命中时自动展开） */
+  highlightTerms?: string[];
+  /** 多选模式 */
+  selectable?: boolean;
+  selected?: boolean;
+  onToggleSelectMessage?: (message: Message) => void;
+  onSkillManageApply?: (message: Message, payload: SkillPatchPreviewPayload, targetIndex: number | null) => void;
+};
+
+/** Legacy: extract tool name from old 🔧/✅ prefixed content */
+function extractToolSummary(content: string): string {
+  const toolMatch = content.match(/^🔧\s+([^:]+)/);
+  if (toolMatch) return toolMatch[1].trim();
+  const emojiMatch = content.match(/^([⚠️❌🗣✅])\s+(.{0,60})/u);
+  if (emojiMatch) return emojiMatch[2].trim();
+  return content.slice(0, 60).replace(/\n/g, " ").trim();
+}
+
+const DECISION_TITLE_MAX = 48;
+
+/** 把用户在澄清 / 确认卡里的回答压成一行标题；还没回答返回 null。
+ *
+ * 这些串由后端的 ``build_clarification_tool_result`` 和
+ * ``build_action_confirmation_tool_result`` 生成（agenticx/cli/agent_tools.py）。
+ * 两边靠字符串前缀耦合——改后端的措辞必须同步改这里，
+ * tests/test_confirmation_result_shapes.py 钉住了这些前缀，改了会红。
+ *
+ * 之前这里只认 "用户选择：" 一种形态，后端实际会产出九种，
+ * 于是「已取消」「自定义补充」「超时」全都掉进 fallback，卡片一直显示
+ * "等待你确认" —— 用户明明已经答过了。
+ */
+type ChatTranslate = (key: string, options?: Record<string, unknown>) => string;
+
+export function summarizeUserDecision(
+  toolName: string,
+  raw: string,
+  t?: ChatTranslate,
+): string | null {
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+
+  if (toolName === "request_action_confirmation") {
+    if (text.startsWith("[ACTION_CONFIRMED]")) return t ? t("tool.confirmed") : "已确认执行";
+    if (text.startsWith("[ACTION_REJECTED]")) {
+      return text.includes("已取消执行")
+        ? t
+          ? t("tool.cancelled")
+          : "已取消"
+        : t
+          ? t("tool.notConfirmed")
+          : "未明确确认，已取消";
+    }
+    if (text.startsWith("[ACTION_CONFIRMATION_EXPIRED]")) return t ? t("tool.expired") : "确认已失效";
+    if (text.startsWith("[ACTION_CONFIRMATION_SUSPENDED]")) {
+      return t ? t("tool.unattendedUnconfirmed") : "无人值守，未确认";
+    }
+    return null;
+  }
+
+  if (text.startsWith("[CLARIFICATION_TIMEOUT]")) return t ? t("tool.clarifyTimeout") : "未在时限内答复";
+  if (text.startsWith("[CLARIFICATION_PENDING]")) return t ? t("tool.clarifyPending") : "无人值守，未答复";
+  if (text.startsWith("用户未提供具体内容")) return t ? t("tool.noChoice") : "未作选择";
+
+  // 正文形态：`用户选择：A；B` / `自定义补充：xxx` / 两者以 `；` 相连。
+  const body = text.replace(/。+$/, "");
+  if (body.startsWith("用户选择：")) {
+    return clipDecision(t ? t("tool.selectedPrefix", { body: body.slice(5) }) : `已选：${body.slice(5)}`);
+  }
+  if (body.startsWith("自定义补充：")) {
+    return clipDecision(t ? t("tool.supplementedPrefix", { body: body.slice(6) }) : `已补充：${body.slice(6)}`);
+  }
+  return null;
+}
+
+function clipDecision(s: string): string {
+  return s.length > DECISION_TITLE_MAX ? `${s.slice(0, DECISION_TITLE_MAX)}…` : s;
+}
+
+export function buildToolCardTitle(message: Message, t?: ChatTranslate): string {
+  const name = (message.toolName ?? "").trim();
+  const args = message.toolArgs ?? {};
+  if (name === "group_progress") {
+    return String(message.toolResultPreview || message.content || (t ? t("tool.groupProgress") : "群聊成员处理中")).trim();
+  }
+  if (name === "file_read" || name === "file_write" || name === "file_edit") {
+    const p = String(args.path ?? "").trim();
+    const sl = args.start_line;
+    const el = args.end_line;
+    if (p && sl != null && el != null) return `Read ${p} L${sl}-${el}`;
+    if (p) return `${name} ${p}`;
+  }
+  if (name === "bash_exec") {
+    const cmd = String(args.command ?? "").replace(/\s+/g, " ").trim();
+    if (!cmd) return "bash_exec";
+    return cmd.length > 80 ? `${cmd.slice(0, 80)}…` : cmd;
+  }
+  if (name === "todo_write") return "todo_write";
+  // 澄清 / 确认行记的是用户自己的回答。标题直接给答案，而不是 "request_clarification"：
+  // 关掉工具详情时这张卡默认是收起的，标题就是用户唯一能看到的一行。
+  if (name === "request_clarification" || name === "request_action_confirmation") {
+    const decided = summarizeUserDecision(name, String(message.content ?? ""), t);
+    if (decided) return decided;
+    return name === "request_action_confirmation"
+      ? (t ? t("tool.waitingConfirm") : "等待你确认")
+      : (t ? t("tool.waitingClarify") : "等待你补充信息");
+  }
+  if (name === "mcp_call") {
+    const tn = String(args.tool_name ?? "").trim();
+    return tn ? `mcp_call ${tn}` : "mcp_call";
+  }
+  if (name === "knowledge_search") return "knowledge_search";
+  if (name === "video_understand") {
+    const p = String(args.path ?? "").trim();
+    const base = p ? p.split(/[\\/]/).pop() : "";
+    return base
+      ? (t ? t("tool.understandVideoNamed", { name: base }) : `理解视频 ${base}`)
+      : (t ? t("tool.understandVideo") : "理解视频");
+  }
+  if (name === "show_widget") {
+    const argTitle = String(args.title ?? "").trim();
+    if (argTitle) return argTitle;
+    const parsed = parseWidgetPayload(message.content);
+    if (parsed?.title) return parsed.title;
+    return t ? t("tool.chart") : "可视化图表";
+  }
+  if (name) return name;
+  return extractToolSummary(message.content);
+}
+
+function pickToolIcon(name: string) {
+  if (name === "bash_exec") return Terminal;
+  if (name === "file_read" || name === "file_write" || name === "file_edit") return FileText;
+  if (name === "todo_write") return ListChecks;
+  if (name === "mcp_call") return Plug;
+  if (name === "knowledge_search") return Search;
+  if (name === "video_understand") return Film;
+  if (name === "show_widget") return BarChart3;
+  return Wrench;
+}
+
+function iconTone(st: Message["toolStatus"]): string {
+  if (st === "done") return "text-emerald-400";
+  if (st === "error") return "text-text-muted";
+  if (st === "cancelled") return "text-text-faint";
+  if (st === "running" || st === "pending") return "text-cyan-400";
+  return "text-text-subtle";
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeHighlightTerms(terms?: string[]): string[] {
+  if (!terms || terms.length === 0) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of terms) {
+    const t = String(raw || "").trim();
+    if (t.length < 2) continue;
+    const key = t.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  out.sort((a, b) => b.length - a.length);
+  return out;
+}
+
+const TOOL_URL_RE = /(https?:\/\/[^\s<>"']+)/giu;
+const TOOL_URL_TRAILING_PUNCT = /[.,;:!?)\]>}"']+$/;
+
+function highlightTextSegment(text: string, terms: string[]): ReactNode {
+  if (!text) return null;
+  if (terms.length === 0) return text;
+  const regex = new RegExp(`(${terms.map((t) => escapeRegExp(t)).join("|")})`, "giu");
+  const parts = text.split(regex);
+  return parts.map((part, idx) => {
+    if (!part) return null;
+    regex.lastIndex = 0;
+    const matched = regex.test(part);
+    if (!matched) return <span key={`tool-part-${idx}`}>{part}</span>;
+    return (
+      <mark key={`tool-part-${idx}`} data-agx-highlight="1" className="agx-keyword-highlight rounded px-[1px]">
+        {part}
+      </mark>
+    );
+  });
+}
+
+function ToolResultLink({ url }: { url: string }) {
+  const { onHttpLinkClick } = useContext(MarkdownContext);
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="break-all text-[rgb(var(--theme-color-rgb,59,130,246))] underline underline-offset-2 hover:opacity-90"
+      onClick={(event) => {
+        event.preventDefault();
+        if (onHttpLinkClick) {
+          onHttpLinkClick(url);
+          return;
+        }
+        openExternalUrl(url);
+      }}
+    >
+      {url}
+    </a>
+  );
+}
+
+// URL 整体保持完整可点击，不被关键词高亮拆散。
+function renderHighlightedText(content: string, terms: string[]): ReactNode {
+  if (!content) return null;
+  const segments: Array<{ type: "text" | "url"; value: string }> = [];
+  let last = 0;
+  TOOL_URL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TOOL_URL_RE.exec(content)) !== null) {
+    const start = m.index;
+    const raw = m[1];
+    if (start > last) segments.push({ type: "text", value: content.slice(last, start) });
+    const url = raw.replace(TOOL_URL_TRAILING_PUNCT, "");
+    if (url) segments.push({ type: "url", value: url });
+    last = start + raw.length;
+    TOOL_URL_RE.lastIndex = last;
+    if (raw.length === 0) break;
+  }
+  if (last < content.length) segments.push({ type: "text", value: content.slice(last) });
+
+  if (segments.length === 0) return content;
+  if (!segments.some((s) => s.type === "url")) return highlightTextSegment(content, terms);
+
+  return segments.map((seg, i) => {
+    if (seg.type === "url") {
+      return <ToolResultLink key={`tool-link-${i}`} url={seg.value} />;
+    }
+    return <span key={`tool-text-${i}`}>{highlightTextSegment(seg.value, terms)}</span>;
+  });
+}
+
+export function ToolCallCard({
+  message,
+  action,
+  variant = "default",
+  forceExpand = false,
+  omitLeadingSpacer = false,
+  highlightTerms,
+  selectable,
+  selected,
+  onToggleSelectMessage,
+  onSkillManageApply,
+}: Props) {
+  const { t } = useTranslation("chat");
+  const normalizedTerms = useMemo(() => normalizeHighlightTerms(highlightTerms), [highlightTerms]);
+  const isHookBlocked = useMemo(() => isHookBlockedToolMessage(message), [message.content, message.toolStatus]);
+  const widgetPayload = useMemo(() => {
+    if ((message.toolName ?? "").trim() !== "show_widget") return null;
+    return parseWidgetPayload(message.content);
+  }, [message.toolName, message.content]);
+  const matchedByHighlight = useMemo(() => {
+    if (!message.content || normalizedTerms.length === 0) return false;
+    const hay = message.content.toLocaleLowerCase();
+    return normalizedTerms.some((t) => hay.includes(t.toLocaleLowerCase()));
+  }, [message.content, normalizedTerms]);
+  const toolName = (message.toolName ?? "").trim();
+  const bashBgAuth = useMemo(() => {
+    if (toolName !== "bash_bg_start") return null;
+    return parseBashBgStart(message.content);
+  }, [toolName, message.content]);
+  const hasBashBgAuthUrls = (bashBgAuth?.authUrls?.length ?? 0) > 0;
+  const shouldForceExpand = forceExpand || matchedByHighlight || hasBashBgAuthUrls;
+  const [expanded, setExpanded] = useState(shouldForceExpand);
+
+  const title = useMemo(() => buildToolCardTitle(message, t), [message, t]);
+  const longestShowWidgetPartialRef = useRef<PartialShowWidget | null>(null);
+  const showWidgetPartial = useMemo(() => {
+    if (toolName !== "show_widget") return null;
+    if (message.toolStatus !== "running" && message.toolStatus !== "pending") {
+      longestShowWidgetPartialRef.current = null;
+    }
+
+    let extracted: PartialShowWidget | null = null;
+    const partial = message.toolArgsPartial;
+    if (partial) {
+      if (partial.argumentsRaw && typeof partial.argumentsRaw === "string") {
+        extracted = extractPartialShowWidgetArgs(partial.argumentsRaw);
+      } else {
+        const widgetCode = String(partial.widgetCode ?? "");
+        const titleText = String(partial.title ?? "");
+        extracted = {
+          title: titleText,
+          widgetCode,
+          widgetFormat: "",
+          readyForPreview: /<svg\b/i.test(widgetCode),
+        };
+      }
+    }
+
+    const argsCode = String(message.toolArgs?.widget_code ?? "");
+    if (argsCode && (!extracted || argsCode.length > extracted.widgetCode.length)) {
+      const formatRaw = String(message.toolArgs?.widget_format ?? "").trim().toLowerCase();
+      const widgetFormat =
+        formatRaw === "svg" || formatRaw === "html" || formatRaw === "mermaid"
+          ? formatRaw
+          : extracted?.widgetFormat || "";
+      extracted = {
+        title: String(message.toolArgs?.title ?? extracted?.title ?? "").trim(),
+        widgetCode: argsCode,
+        widgetFormat,
+        readyForPreview: widgetFormat !== "mermaid" && /<svg\b/i.test(argsCode),
+      };
+    }
+
+    const sticky = longestShowWidgetPartialRef.current;
+    if (
+      extracted?.widgetCode
+      && extracted.widgetCode.length >= (sticky?.widgetCode.length ?? 0)
+    ) {
+      longestShowWidgetPartialRef.current = extracted;
+    } else if (sticky && extracted) {
+      const mergedCode =
+        sticky.widgetCode.length >= extracted.widgetCode.length
+          ? sticky.widgetCode
+          : extracted.widgetCode;
+      const widgetFormat = extracted.widgetFormat || sticky.widgetFormat;
+      longestShowWidgetPartialRef.current = {
+        title: extracted.title || sticky.title,
+        widgetCode: mergedCode,
+        widgetFormat,
+        readyForPreview: widgetFormat !== "mermaid" && /<svg\b/i.test(mergedCode),
+      };
+    }
+
+    const best = longestShowWidgetPartialRef.current ?? extracted;
+    if (!best) return null;
+    return best;
+  }, [message.toolArgs, message.toolArgsPartial, message.toolStatus, toolName]);
+  const hasStream = (message.toolStreamLines?.length ?? 0) > 0;
+  const bashCard = useMemo(() => {
+    if (toolName !== "bash_exec") {
+      return { matched: false as const, text: message.content };
+    }
+    return resolveBashExecCardText(message.content, (code) => t("tool.commandFailed", { code }));
+  }, [message.content, t, toolName]);
+  const skillPreviewPayload = useMemo(() => {
+    if ((message.toolName ?? "").trim() !== "skill_manage") return null;
+    return parseSkillPatchPreviewPayload(message.content);
+  }, [message.toolName, message.content]);
+  const skillManageError = useMemo(() => {
+    if ((message.toolName ?? "").trim() !== "skill_manage") return null;
+    return parseSkillManageError(message.content);
+  }, [message.toolName, message.content]);
+  const status = message.toolStatus;
+  const toolIsActive = status === "running" || status === "pending";
+  const liveElapsedSec = useLiveToolElapsedSeconds(
+    String(message.toolCallId || message.id),
+    toolIsActive,
+    message.toolElapsedSec,
+  );
+
+  // Keep this effect above any early return so the hook count/order stays
+  // stable across renders (show_widget streaming paths return before the
+  // component's later JSX, which previously left this effect unreachable
+  // on some renders → "Rendered more hooks than during the previous render").
+  useEffect(() => {
+    if (shouldForceExpand) setExpanded(true);
+  }, [shouldForceExpand]);
+
+  // show_widget with valid payload → render inline (no collapsible chrome)
+  if (toolName === "show_widget" && widgetPayload) {
+    return (
+      <div className="w-full min-w-0 px-4">
+        <WidgetBlock payload={widgetPayload} />
+      </div>
+    );
+  }
+  if (toolName === "show_widget" && showWidgetPartial?.readyForPreview) {
+    const widgetCode = finalizePartialSvg(showWidgetPartial.widgetCode) ?? showWidgetPartial.widgetCode;
+    return (
+      <div className="w-full min-w-0 px-4">
+        <WidgetBlock
+          payload={{
+            title: showWidgetPartial.title || t("tool.chart"),
+            widgetCode,
+            loadingMessages: [],
+            kind: "svg",
+          }}
+          streaming
+        />
+      </div>
+    );
+  }
+  if (toolName === "show_widget" && showWidgetPartial && !showWidgetPartial.readyForPreview
+    && (message.toolStatus === "running" || message.toolStatus === "pending")) {
+    const statusLabel =
+      showWidgetPartial.widgetFormat === "mermaid" ? t("tool.composingChart") : t("tool.drawing");
+    return (
+      <ShowWidgetDrawingPlaceholder
+        title={showWidgetPartial.title}
+        statusLabel={statusLabel}
+      />
+    );
+  }
+  if (
+    toolName === "show_widget"
+    && (message.toolStatus === "running" || message.toolStatus === "pending")
+    && !showWidgetPartial
+  ) {
+    return <ShowWidgetDrawingPlaceholder statusLabel={t("tool.drawing")} />;
+  }
+
+  // show_widget with truncated/broken content → amber warning inline
+  if (toolName === "show_widget" && /\[micro-compact tool=show_widget/i.test(message.content)) {
+    return (
+      <div className="w-full min-w-0 rounded border border-border bg-surface-card px-3 py-2 text-[12px] text-text-muted">
+        {t("tool.chartTruncated")}
+      </div>
+    );
+  }
+
+  if (toolName === "show_widget" && isBrokenStockChartAttempt(message.content) && !widgetPayload) {
+    return (
+      <div className="w-full min-w-0 rounded border border-border bg-surface-card px-3 py-2 text-[12px] text-text-muted">
+        {stockChartDegradedMessage()}
+      </div>
+    );
+  }
+  const Icon = isHookBlocked
+    ? ShieldAlert
+    : pickToolIcon(toolName || extractToolSummary(message.content).split(/\s/)[0] || "tool");
+  const hasDetail = !isHookBlocked && (bashCard.text.length > 0 || hasStream);
+
+  const iconColorClass = isHookBlocked ? "text-amber-400" : iconTone(status);
+
+  const titleEl = isHookBlocked ? (
+    <span className="inline-flex min-w-0 flex-1 items-baseline gap-1.5 truncate">
+      <span className="min-w-0 truncate text-[13px] font-medium text-text-subtle">{title}</span>
+      <span className="shrink-0 rounded-[4px] bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-400">
+        {t("tool.hookBlocked")}
+      </span>
+    </span>
+  ) : status === "running" || status === "pending" ? (
+    <Shimmer text={title} className="text-[13px] font-medium" />
+  ) : (
+    <span className="text-[13px] font-medium text-text-subtle">{title}</span>
+  );
+
+  const metaRight = toolIsActive ? (
+    <Shimmer
+      variant="status"
+      text={t("tool.running", { elapsed: formatToolElapsedSeconds(liveElapsedSec) })}
+      className="shrink-0 whitespace-nowrap text-[12px] font-normal tabular-nums"
+    />
+  ) : status === "cancelled" ? (
+    <span className="shrink-0 whitespace-nowrap text-[12px] font-normal text-text-faint">
+      {t("tool.cancelled")}
+    </span>
+  ) : null;
+
+  const expandedDetailClass =
+    variant === "flat"
+      ? "space-y-1 px-3 pb-2 pt-0.5 text-[13px] leading-[1.7]"
+      : variant === "nested"
+        ? "mt-1.5 space-y-1 pl-3 text-[13px] leading-[1.7]"
+        : "space-y-1 border-t border-border px-3 pb-2 pt-1.5 text-[13px] leading-[1.7]";
+  const forcedActionClass =
+    variant === "flat"
+      ? "px-3 pb-2 pt-0.5"
+      : variant === "nested"
+        ? "mt-1.5 pl-3"
+        : "border-t border-border px-3 pb-2 pt-1.5";
+
+  const detailBody = (
+    <>
+      {hasStream ? <ToolOutputStream lines={message.toolStreamLines ?? []} /> : null}
+      {skillPreviewPayload ? (
+        <SkillPatchPreviewCard
+          message={message}
+          payload={skillPreviewPayload}
+          onApply={onSkillManageApply}
+        />
+      ) : null}
+      {skillManageError ? (
+        <div
+          className={`rounded border px-2 py-1 text-[12px] ${
+            skillManageError.code === "POLICY"
+              ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+              : "border-rose-500/50 bg-rose-500/10 text-rose-300"
+          }`}
+        >
+          <div className="font-medium">
+            {skillManageError.code === "POLICY" ? t("tool.policyBlocked") : t("tool.validationFailed")}
+          </div>
+          {skillManageError.detail ? (
+            <div className="mt-0.5 whitespace-pre-wrap break-words text-[11px] text-current/90">
+              {skillManageError.detail}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {toolName === "bash_bg_start" && hasBashBgAuthUrls ? (
+        <div className="rounded border border-border bg-surface-card px-2 py-2 text-[12px]">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="font-medium text-text-strong">{t("tool.needAuth")}</span>
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] ${
+                bashBgAuth?.status === "running"
+                  ? "bg-amber-500/15 text-amber-300"
+                  : bashBgAuth?.status === "exited"
+                    ? "bg-emerald-500/15 text-emerald-300"
+                    : "bg-surface-card-strong text-text-faint"
+              }`}
+            >
+              {bashBgAuth?.status === "running"
+                ? t("tool.statusRunning")
+                : bashBgAuth?.status === "exited"
+                  ? t("tool.statusExited")
+                  : t("tool.statusUnknown")}
+            </span>
+          </div>
+          <div className="space-y-1.5">
+            {bashBgAuth?.authUrls.map((url) => (
+              <div key={url} className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="break-all text-left text-[rgb(var(--theme-color-rgb,59,130,246))] underline underline-offset-2 hover:opacity-90"
+                  onClick={() => openExternalUrl(url)}
+                >
+                  {url}
+                </button>
+                <button
+                  type="button"
+                  className="rounded border border-border px-1.5 py-0.5 text-[11px] text-text-subtle hover:bg-surface-card-strong"
+                  onClick={() => void navigator.clipboard.writeText(url)}
+                >
+                  {t("tool.copyLink")}
+                </button>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-text-subtle">
+            {t("tool.authHint")}
+          </p>
+          <button
+            type="button"
+            className="mt-2 inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-text-subtle hover:bg-surface-card-strong"
+            onClick={() => {
+              window.dispatchEvent(
+                new CustomEvent("agx:open-terminal", {
+                  detail: {
+                    cwd: bashBgAuth?.cwd ?? "",
+                    command: bashBgAuth?.command ?? "",
+                  },
+                })
+              );
+            }}
+          >
+            <Terminal className="h-3 w-3" />
+            {t("tool.openInTerminal")}
+          </button>
+        </div>
+      ) : null}
+      {bashCard.text && !isHookBlocked && !skillPreviewPayload && !skillManageError && !widgetPayload ? (
+        <span className="break-all whitespace-pre-wrap">
+          {renderHighlightedText(bashCard.text, normalizedTerms)}
+        </span>
+      ) : null}
+      {action}
+    </>
+  );
+
+  const shellOuterClass =
+    variant === "nested"
+      ? "relative w-full min-w-0 text-[13px] text-text-muted"
+      : variant === "flat"
+        ? "w-full min-w-0 overflow-hidden text-[13px] text-text-muted"
+        : `w-full min-w-0 overflow-hidden rounded-lg border bg-surface-card text-[13px] text-text-muted transition ${
+            selected
+              ? "border-[rgba(var(--theme-color-rgb,6,182,212),0.6)]"
+              : isHookBlocked
+                ? "border-amber-500/30"
+                : "border-border"
+          }`;
+
+  const shell =
+    variant === "nested" ? (
+      <div className={shellOuterClass}>
+        {/* 与 TurnToolGroupCard 左侧虚线对齐（父容器 px-3 12px + 10px = 22px） */}
+        <div
+          className="pointer-events-none absolute left-[10px] top-[15px] z-[2] h-2 w-2 -translate-x-1/2 rounded-full border-2 border-surface-card bg-border"
+          aria-hidden
+        />
+        <div className="ml-[28px] min-w-0">
+          <button
+            type="button"
+            className={`group inline-flex max-w-full items-center gap-2 rounded-full border border-border/70 bg-zinc-100/60 px-3 py-1.5 text-left shadow-sm transition hover:bg-zinc-200/60 disabled:cursor-default disabled:opacity-60 dark:border-white/10 dark:bg-white/[0.03] dark:hover:bg-white/[0.05] ${
+              selected ? "ring-1 ring-[rgba(var(--theme-color-rgb,6,182,212),0.55)]" : ""
+            }`}
+            onClick={() => hasDetail && setExpanded((v) => !v)}
+            disabled={!hasDetail}
+          >
+            <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-transparent">
+              <Icon className={`h-3 w-3 ${iconColorClass}`} aria-hidden />
+            </span>
+            <span className="min-w-0 shrink truncate text-left">{titleEl}</span>
+            {metaRight}
+            {hasDetail ? (
+              expanded ? (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              )
+            ) : null}
+          </button>
+
+          {expanded && (hasDetail || action) && <div className={expandedDetailClass}>{detailBody}</div>}
+          {!expanded && shouldForceExpand && action && <div className={forcedActionClass}>{action}</div>}
+        </div>
+      </div>
+    ) : variant === "flat" ? (
+      <div className={shellOuterClass}>
+        <button
+          type="button"
+          className="relative z-[1] inline-flex w-full max-w-full items-center gap-2 px-3 py-1 text-left disabled:cursor-default disabled:opacity-60"
+          onClick={() => hasDetail && setExpanded((v) => !v)}
+          disabled={!hasDetail}
+        >
+          <span className="flex h-[20px] w-[20px] shrink-0 items-center justify-center" aria-hidden>
+            <Icon className={`h-3.5 w-3.5 ${iconColorClass}`} aria-hidden />
+          </span>
+          <span className="min-w-0 truncate text-left">{titleEl}</span>
+          {metaRight}
+          {hasDetail ? (
+            expanded ? (
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+            )
+          ) : null}
+        </button>
+
+        {expanded && (hasDetail || action) && (
+          <div className={expandedDetailClass}>
+            <div className="pl-[28px]">{detailBody}</div>
+          </div>
+        )}
+
+        {!expanded && shouldForceExpand && action && <div className={forcedActionClass}>{action}</div>}
+      </div>
+    ) : (
+      <div className={shellOuterClass}>
+        <div className={`flex w-full items-center gap-1.5 px-3 py-3 text-left`}>
+          <button
+            type="button"
+            className="inline-flex min-w-0 flex-1 items-center gap-1.5 text-left disabled:cursor-default disabled:opacity-60"
+            onClick={() => hasDetail && setExpanded((v) => !v)}
+            disabled={!hasDetail}
+          >
+            {hasDetail &&
+              (expanded ? (
+                <ChevronDown className="h-3 w-3 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              ) : (
+                <ChevronRight className="h-3 w-3 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              ))}
+            <Icon className={`h-3.5 w-3.5 shrink-0 ${iconColorClass}`} />
+            <span className="min-w-0 truncate">{titleEl}</span>
+            {metaRight}
+          </button>
+        </div>
+
+        {expanded && (hasDetail || action) && <div className={expandedDetailClass}>{detailBody}</div>}
+
+        {!expanded && shouldForceExpand && action && <div className={forcedActionClass}>{action}</div>}
+      </div>
+    );
+
+  if (variant === "nested" || (variant === "flat" && omitLeadingSpacer)) {
+    return <div className="min-w-0 w-full">{shell}</div>;
+  }
+
+  return (
+    <div className="flex min-w-0 items-start gap-2">
+      {selectable && (
+        <button
+          type="button"
+          className={`mt-2 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition ${
+            selected
+              ? "border-[rgb(var(--theme-color-rgb,6,182,212))] bg-[rgb(var(--theme-color-rgb,6,182,212))] text-[var(--theme-color-text)]"
+              : "border-text-faint bg-transparent text-transparent"
+          }`}
+          onClick={() => onToggleSelectMessage?.(message)}
+          aria-label={selected ? t("tool.unselect") : t("tool.selectTool")}
+        >
+          <svg viewBox="0 0 16 16" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M3.5 8.5L6.5 11.5L12.5 4.5" />
+          </svg>
+        </button>
+      )}
+
+      <div className="flex min-w-0 flex-1 justify-start gap-2">
+        <div className="flex min-w-0 flex-1 flex-row gap-2">
+          <div className="flex min-w-0 flex-1 flex-col items-start">
+            {shell}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

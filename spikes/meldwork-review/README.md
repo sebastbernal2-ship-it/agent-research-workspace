@@ -2,7 +2,7 @@
 
 **Purpose:** Review the collaboration specialist candidate and run isolated, offline Node tests on Linux. This is not a Meldwork product integration or model-backed pilot.
 
-**Upstream:** `upstream/` is a Git submodule pinned to release commit `1ddf3fbdd76ef6e6b3baddfa6a460a72570aa7fd` (Meldwork V1.0.9; Apache-2.0).
+**Upstream:** `upstream/` is the complete vendored Meldwork V1.0.9 source snapshot from release commit `1ddf3fbdd76ef6e6b3baddfa6a460a72570aa7fd`.
 **Environment:** Linux, Node v24.22.1 / npm 11.19.1. No Agent CLI, model credentials, user data, or real model calls were used.
 
 ## What the source shows
@@ -59,13 +59,9 @@ No security changes were made upstream. The detailed audit summary is recorded i
 
 ## Component decision
 
-**Advance Meldwork as the collaboration-behavior benchmark, not yet as the product base.** Among the evaluated components:
+**Use Meldwork V4 directly as the collaboration engine inside the combined organization workflow.** Meldwork has the richest tested propose → challenge → agree → work → verify → synthesize/accept path and local recovery/gates. The product-owned harness invokes its vendored Node `LocalWorkspace` V4 implementation through `MeldworkAgenticXRuntimeBridge`; this is executable upstream code, not a reimplementation of its collaboration sequence. The harness keeps the canonical project/work/inbox ledger outside Meldwork so its state remains replaceable. This does not adopt Meldwork's Electron UI or claim production deployment readiness.
 
-- Meldwork has the richest tested propose → challenge → agree → work → verify → synthesize/accept path and local recovery/gates.
-- AG2 has a cleaner protocol/network substrate (typed channels, Hub/WAL, optional durable store, HumanClient, authenticated WebSocket links) but its discussion semantics are round-robin or declared workflows, and its agents need an adapter for AgenticX/Meldwork.
-- AgenticX offers a broad runtime and Studio Workforce delegation path, but that path currently establishes execution/delegation + synthesis, not the full negotiated peer review loop; secure server deployment needs further work.
-
-**Do not fuse source trees.** Keep a project-owned control plane and contract; use Meldwork as a collaboration-behavior reference. A later local harness prototype now runs the pinned Node `LocalWorkspace` V4 orchestration with deterministic AgenticX workers and maps its parsed/sanitized receipts into canonical SQLite. This is an adapter/protocol proof only—not Electron, the supported Apple-silicon app, or model-backed behavior. The product dependency audit and portability gates remain open; real-model comparison is future work and is not blocking offline development.
+The other sources serve complementary roles: AG2 provides typed network discussion/turn transport with a WAL-to-canonical mirror; AgenticX provides bounded specialist execution invoked by the Meldwork V4 worker connector and by the AG2 critic adapter. `harness.integration_tests.test_offline_organization_run` composes AG2 proposal/critique/revision, AgenticX workers, and Meldwork V4 verification within one human-gated project flow. Dependency remediation, native Electron/macOS behavior, real-model quality, and production security remain separate gates.
 
 ## Harness follow-up (2026-11-07)
 

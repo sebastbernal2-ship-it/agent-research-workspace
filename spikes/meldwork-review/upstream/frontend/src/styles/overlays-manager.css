@@ -1,0 +1,107 @@
+.manager-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+.manager-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.agent-manager .manager-toolbar .secondary-button {
+  border: 0;
+  background: transparent;
+}
+
+.agent-manager .manager-toolbar .secondary-button:hover {
+  background: var(--surface-hover);
+}
+
+.knowledge-base-toolbar .secondary-button {
+  border: 0;
+  background: transparent;
+}
+
+.knowledge-base-toolbar .secondary-button:hover {
+  background: var(--surface-hover);
+}
+
+.manager-list {
+  display: grid;
+  gap: 6px;
+}
+
+.manager-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.manager-row.focused {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.manager-row > img {
+  width: 44px;
+  height: 44px;
+  padding: 4px;
+  border-radius: 7px;
+  background: var(--surface);
+  object-fit: contain;
+}
+
+.manager-copy {
+  min-width: 0;
+}
+
+.manager-copy > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.manager-copy p,
+.manager-copy small {
+  display: block;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.manager-note {
+  max-width: 190px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-align: right;
+}
+
+.install-confirm,
+.install-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 7px;
+  color: var(--accent-text);
+  font-size: var(--text-xs);
+}
+
+.install-progress {
+  color: var(--muted);
+}
+
+.footer-spacer {
+  flex: 1;
+}

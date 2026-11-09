@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "module_id": "desktop",
+  "generation": "275a8be064a94f33964b0fd7a993c168",
+  "mapping_revision": 2,
+  "baseline_commit": "30e57496990b0e2acb18978091d9e623210eaba3",
+  "baseline_tree": "9e11bd92dc6c05fbdd0ce563ef6bb404616a70af",
+  "source_fingerprint": "sha256:132b6b5ea194c17f509117ed9b25210cda80307ec6294301865e993088f8a7e0",
+  "summary_path": "desktop/conclusions/desktop_conclusion.md",
+  "summary_sha256": "sha256:086f326ea8af3d886d80ba7234143ec6a4134e468aac0934d35b3bcfeedf0532",
+  "updated_at": "2026-09-17T23:53:53.004278+00:00"
+}

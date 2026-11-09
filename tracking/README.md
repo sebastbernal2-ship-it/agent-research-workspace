@@ -10,7 +10,7 @@ Canonical live tracking is in the [GitHub issues](https://github.com/sebastberna
 
 ## Harness completion epics
 
-The user requested six explicit completion issues. These are umbrella tracks; existing issues #2–#12 remain component-level work. Update this table and the matching GitHub issue checklists/comments after each verified implementation slice. Do not close an epic while an acceptance item is blocked or only prototyped.
+The user requested six explicit completion issues. These are umbrella tracks; existing issues #2–#12 remain component-level work. Complete source snapshots for Meldwork, AG2, and AgenticX are now vendored in `spikes/*/upstream/` (not just Git submodule pointers), and `harness.integration_tests.test_offline_organization_run` composes their live code paths within one canonical human-gated project DAG. Their pinned revisions and composition boundaries are recorded in the spike READMEs. This source import and deterministic composition are a foundation, not completion of all six tracks. Update this table and the matching GitHub issue checklists/comments after each verified implementation slice. Do not close an epic while an acceptance item is blocked or only prototyped.
 
 | Issue | Track | Status | Verified baseline / next gate |
 |---|---|---|---|
@@ -36,7 +36,7 @@ The user requested six explicit completion issues. These are umbrella tracks; ex
 | [#8](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/8) | Blind rubric and bounded real-model pilot | FUTURE; user has generally approved provider calls if useful, but no concrete provider/model, spend cap, credential setup, or data scope is selected; current reliability work needs no provider call | #2, #4, #5, #6, #7 |
 | [#9](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/9) | Laptop worker lifecycle / HiperGator policy gate | FUTURE; neither multi-laptop nor HPC work blocks the local harness | #2, #7 |
 | [#10](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/10) | Transparent VP alignment memory | OPEN; provenance/scope/confirmation/expiry/correction/conflict conformance tests use synthetic data only | #2 |
-| [#11](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/11) | Select project-first UI and service foundation | OPEN; source/license review and browser-verified loopback project/inbox slice persist synthetic answer/reject decisions across reload/restart; no real auth, models, or production framework; awaiting candidate links | #6 |
+| [#11](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/11) | Select project-first UI and service foundation | OPEN; source review and browser-verified loopback project/inbox slice persist synthetic answer/reject decisions across reload/restart; no real auth, models, or production framework; awaiting candidate links | #6 |
 | [#12](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/12) | Define model routing and provider adapter contract | OPEN; offline deterministic route/profile contract tests exist; no real provider SDK, credentials, or network calls; official Codex account/service terms remain unreviewed | #2, #7 |
 
 ## Current recommended sequence

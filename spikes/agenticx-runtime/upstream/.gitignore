@@ -1,0 +1,134 @@
+.idea/
+.cursor/*
+.vscode/
+!.cursor/plans/
+!.cursor/plans/**
+.cursor/commands/
+.qoder/
+.trae/
+.kiro/
+.pytest_cache/
+.mypy_cache/
+.lingma/
+.agenticx/
+
+# Per-skill usage stats (agenticx/learning/skill_usage_tracker.py)
+**/.usage_stats.json
+
+.mynotes/
+.myblog/
+
+__pycache__/ 
+**/__pycache__/
+**/.docs/
+
+# MkDocs build output
+site/
+
+*.egg-info/
+dist/
+
+deploy/data/
+deploy/logs/
+htmlcov/
+/rules/
+build/
+markmap/
+progress/
+examples/**/conclusions/
+discussions/
+exps/
+thirdparty/
+research/
+outputs/
+**/outputs/
+
+# prd.md
+
+*.log
+.env
+
+.coverage
+# pytest-cov 并行模式下每个 worker 自己写一份 .coverage.<host>.<pid>.<rand>，
+# 只有跑完 `coverage combine` 才会被吃掉。中途 Ctrl-C 或者用例把进程搞崩就会
+# 留在仓库根目录，git status 里一次刷出上百行。
+.coverage.*
+coverage.xml
+
+scan_structure.py
+.DS_Store
+**/.DS_Store
+.pypirc
+
+# Cookies files (contain sensitive login credentials)
+cookies.txt
+**/cookies.txt
+*.pkl
+**/*.pkl
+.claude/
+
+# PyInstaller packaging venv (local backend bundle builds)
+packaging/.venv-packaging/
+
+# WeChat iLink sidecar — build locally: cd packaging/wechat-sidecar && make build
+packaging/wechat-sidecar/agx-wechat-sidecar
+packaging/wechat-sidecar/agx-wechat-sidecar-*
+packaging/wechat-sidecar/agx-wechat-sidecar-*.exe
+
+docs/.private/
+
+# ============================================================
+# 客户交付物（每客户独立私有仓，嵌套于此目录但物理隔离）
+# ============================================================
+customers/
+
+# 密钥 / 凭据
+*.pem
+*.key
+*.p12
+*.pfx
+**/secrets/
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# 个人本地敏感目录请写入 .git/info/exclude（不入仓库）
+
+# Git hooks 的本地敏感关键词（每个人的客户/项目简称不同，不可入仓）
+.githooks/patterns.local.txt
+
+# Temporary planning files
+task_plan.md
+**/task_plan.md
+
+# Local release archives produced by /genreleasenote (notes + source zips + tags metadata)
+.releases/
+
+# Desktop app build artifacts
+**/node_modules/
+**/dist-electron/
+**/dist/
+**/release/
+**/test-results/
+**/.playwright-state/
+**/out/
+enterprise/apps/gateway/.runtime/
+enterprise/apps/web-portal/.runtime/
+enterprise/.runtime/
+.dataset/
+deploy/observability/pours/
+
+# harness comparison lab: 只忽略密钥与运行时产物，脚本/文档/图表入库
+harness-lab/.env
+harness-lab/.cache/
+harness-lab/.config/
+harness-lab/.hermes/
+harness-lab/.local-share/
+harness-lab/.state/
+harness-lab/__pycache__/
+harness-lab/harbor/
+harness-lab/jobs/
+harness-lab/logs/
+harness-lab/registry-local.json
+harness-lab/*.log

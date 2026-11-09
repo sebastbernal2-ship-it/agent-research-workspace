@@ -1,6 +1,6 @@
 # Local harness prototype
 
-A **piece-by-piece integration prototype**, not yet a production harness. It connects canonical project events to AG2 Network, invokes an AgenticX worker across a subprocess boundary, and imports validated Meldwork V4 phase receipts through a separate Node adapter. The upstream source trees remain pinned and unmodified.
+A **working offline composition prototype, not yet a production harness**. Complete upstream source snapshots for AG2, AgenticX, and Meldwork are vendored under `../spikes/*/upstream/`; their pinned source revisions and composition boundaries are documented in the spike READMEs. Product adapters invoke Meldwork V4's collaboration runtime, AgenticX's worker executor, and AG2's message/network protocol while project state remains canonical here.
 
 ## Data flow
 
@@ -59,7 +59,7 @@ spikes/ag2-collaboration/.venv/bin/python -m unittest \
   harness.integration_tests.test_offline_organization_run -v
 ```
 
-`harness/tests/test_agenticx_bridge.py` launches the ignored AgenticX spike venv automatically. The full Meldwork/AgenticX runtime integration launches the pinned Meldwork V4 Node runtime and AgenticX spike venv; it uses only deterministic mock responses, not Electron or a model API. Meldwork parser-only tests require Node.js and the pinned submodule checkout.
+`harness/tests/test_agenticx_bridge.py` launches the ignored AgenticX spike venv automatically. The full Meldwork/AgenticX runtime integration launches the pinned Meldwork V4 Node runtime and AgenticX spike venv; it uses only deterministic mock responses, not Electron or a model API. Meldwork parser-only tests require Node.js and the vendored source snapshot.
 
 ## Current limits / known failure surfaces
 

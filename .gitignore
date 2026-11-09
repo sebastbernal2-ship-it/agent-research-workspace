@@ -1,8 +1,13 @@
-# Python test/runtime artifacts
+# Python / Node test and install artifacts
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+node_modules/
+coverage/
+htmlcov/
+.coverage*
+coverage.xml
 
 # Local secrets and machine-specific files
 .env

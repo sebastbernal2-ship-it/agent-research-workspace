@@ -1,0 +1,340 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { LucideIcon } from "lucide-react";
+import { AlarmClock, BookOpen, Bot, MessageSquarePlus, Users, Waypoints } from "lucide-react";
+import { useAppStore, type MainView } from "../store";
+import { APP_DISPLAY_NAME, APP_VERSION, META_AGENT_DISPLAY_NAME } from "../constants/branding";
+import {
+  BUNDLED_META_AVATAR_IM_ZOOM_CLASS,
+  DEFAULT_META_AVATAR_URL,
+} from "../constants/meta-avatar";
+import { usePaneNavigation } from "../hooks/usePaneNavigation";
+import { isNewTaskNavActive } from "../utils/workspace-session-visibility";
+import { AvatarSettingsPanel } from "./AvatarSettingsPanel";
+import { SidebarAccountBar } from "./SidebarAccountBar";
+import { SidebarSessionHistory } from "./sidebar/SidebarSessionHistory";
+import { TopbarLeftControls } from "./TopbarLeftControls";
+import { SidebarCreateButton } from "./quick-compose/SidebarCreateButton";
+
+type Props = {
+  onToggleSidebar: () => void;
+};
+
+type MachiContextMenuState = { x: number; y: number } | null;
+
+const SIDEBAR_CONTEXT_MENU_CLASS =
+  "fixed z-[200] w-[120px] rounded-md border border-border bg-surface-base py-1 shadow-2xl";
+const SIDEBAR_CONTEXT_MENU_ITEM_CLASS =
+  "w-full whitespace-nowrap px-3 py-1.5 text-left text-[13px] transition";
+
+/** Compact nav row: theme-tint selected bg, no border. */
+const NAV_ITEM_BASE =
+  "flex w-full items-center gap-2 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none transition-colors";
+const NAV_ITEM_IDLE = "text-text-muted hover:bg-surface-hover hover:text-text-strong";
+const NAV_ITEM_ACTIVE = "bg-surface-card-strong font-medium text-text-strong";
+
+type SidebarView = Exclude<MainView, "chat">;
+
+type NavEntry =
+  | { kind: "action"; id: "new-task"; label: string; icon: LucideIcon }
+  | { kind: "view"; id: SidebarView; label: string; icon: LucideIcon };
+
+const NAV_ENTRY_DEFS = [
+  { kind: "action" as const, id: "new-task" as const, icon: MessageSquarePlus },
+  { kind: "view" as const, id: "avatars" as const, icon: Bot },
+  { kind: "view" as const, id: "groups" as const, icon: Waypoints },
+  { kind: "view" as const, id: "collab" as const, icon: Users },
+  { kind: "view" as const, id: "automation" as const, icon: AlarmClock },
+  { kind: "view" as const, id: "wiki" as const, icon: BookOpen },
+];
+
+const NAV_LABEL_KEY: Record<(typeof NAV_ENTRY_DEFS)[number]["id"], string> = {
+  "new-task": "nav.newTask",
+  avatars: "nav.avatars",
+  groups: "nav.groups",
+  collab: "nav.collab",
+  automation: "nav.automation",
+  wiki: "nav.wiki",
+};
+
+export function AvatarSidebar({ onToggleSidebar }: Props) {
+  const { t } = useTranslation("sidebar");
+  const { t: tCommon } = useTranslation("common");
+  const navEntries = useMemo<NavEntry[]>(
+    () =>
+      NAV_ENTRY_DEFS.map((entry): NavEntry => {
+        const label = t(NAV_LABEL_KEY[entry.id]);
+        if (entry.kind === "action") {
+          return { kind: "action", id: entry.id, icon: entry.icon, label };
+        }
+        return { kind: "view", id: entry.id, icon: entry.icon, label };
+      }),
+    [t],
+  );
+  const setAvatars = useAppStore((s) => s.setAvatars);
+  const setGroups = useAppStore((s) => s.setGroups);
+  const mainView = useAppStore((s) => s.mainView);
+  const setMainView = useAppStore((s) => s.setMainView);
+  const activePaneId = useAppStore((s) => s.activePaneId);
+  const panes = useAppStore((s) => s.panes);
+
+  const { openMetaOrAvatarPane, newMetaTask } = usePaneNavigation();
+
+  const [machiContextMenu, setMachiContextMenu] = useState<MachiContextMenuState>(null);
+  const [machiSettingsOpen, setMachiSettingsOpen] = useState(false);
+  const machiMenuRef = useRef<HTMLDivElement>(null);
+
+  const activePane = panes.find((p) => p.id === activePaneId);
+  const newTaskNavActive = isNewTaskNavActive(mainView, activePane);
+
+  const metaPaneActive =
+    mainView === "chat" &&
+    panes.some((p) => p.id === activePaneId && p.avatarId === null);
+
+  const refreshAvatars = useCallback(async (): Promise<boolean> => {
+    try {
+      const result = await window.agenticxDesktop.listAvatars();
+      if (result.ok && Array.isArray(result.avatars)) {
+        setAvatars(
+          result.avatars.map((a) => ({
+            id: a.id,
+            name: a.name,
+            role: a.role ?? "",
+            avatarUrl: a.avatar_url ?? "",
+            pinned: Boolean(a.pinned),
+            createdBy: a.created_by ?? "manual",
+            systemPrompt: a.system_prompt ?? "",
+            toolsEnabled: a.tools_enabled ?? {},
+            skillsEnabled:
+              a.skills_enabled && typeof a.skills_enabled === "object"
+                ? { ...a.skills_enabled }
+                : undefined,
+            brainsEnabled:
+              a.brains_enabled === "*"
+                ? "*"
+                : Array.isArray(a.brains_enabled)
+                  ? a.brains_enabled.map(String)
+                  : undefined,
+            defaultProvider: a.default_provider ?? "",
+            defaultModel: a.default_model ?? "",
+            color: typeof a.color === "string" ? a.color : "",
+            workspaceDir: a.workspace_dir ?? "",
+            description: a.description ?? "",
+            tags: Array.isArray(a.tags) ? a.tags.map(String) : [],
+            portraitStyle: typeof a.portrait_style === "string" ? a.portrait_style : "",
+          }))
+        );
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error("[AvatarSidebar] refreshAvatars error:", err);
+      return false;
+    }
+  }, [setAvatars]);
+
+  const refreshGroups = useCallback(async (): Promise<boolean> => {
+    try {
+      const result = await window.agenticxDesktop.listGroups();
+      if (result.ok && Array.isArray(result.groups)) {
+        setGroups(
+          result.groups.map((g) => ({
+            id: g.id,
+            name: g.name,
+            avatarIds: g.avatar_ids ?? [],
+            routing: g.routing ?? "intelligent",
+          }))
+        );
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error("[AvatarSidebar] refreshGroups error:", err);
+      return false;
+    }
+  }, [setGroups]);
+
+  // Keep the store's avatar / group lists fresh so the gallery & projects
+  // views always render current data. App.tsx already provides a startup
+  // fallback; this refresh (with a short retry loop during cold start) is the
+  // primary post-splash path.
+  useEffect(() => {
+    let cancelled = false;
+    const preloaded = useAppStore.getState().corePreloadAttempted;
+    const delays = [2000, 4000, 8000, 16000, 30000];
+    const runWithRetries = async (
+      label: "avatars" | "groups",
+      fn: () => Promise<boolean>
+    ) => {
+      for (let i = 0; i <= delays.length; i++) {
+        if (cancelled) return;
+        const ok = await fn();
+        if (ok || cancelled) return;
+        const delay = delays[i] ?? delays[delays.length - 1];
+        await new Promise((r) => setTimeout(r, delay));
+        if (cancelled) return;
+        console.warn(`[AvatarSidebar] ${label} refresh failed, retrying...`);
+      }
+    };
+
+    if (preloaded) {
+      void refreshAvatars();
+      void refreshGroups();
+    } else {
+      void runWithRetries("avatars", refreshAvatars);
+      void runWithRetries("groups", refreshGroups);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshAvatars, refreshGroups]);
+
+  // When an avatar is created / changed elsewhere, refresh the list and
+  // optionally open its pane (detail.openPane !== false).
+  useEffect(() => {
+    const onAvatarsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ avatarId?: string; name?: string; openPane?: boolean }>)
+        .detail;
+      const avatarId = String(detail?.avatarId ?? "").trim();
+      const avatarName = String(detail?.name ?? "").trim();
+      const shouldOpen = detail?.openPane !== false;
+      void (async () => {
+        await refreshAvatars();
+        if (shouldOpen && avatarId) {
+          openMetaOrAvatarPane(avatarId, avatarName || avatarId);
+        }
+      })();
+    };
+    window.addEventListener("agenticx:avatars:changed", onAvatarsChanged);
+    return () => window.removeEventListener("agenticx:avatars:changed", onAvatarsChanged);
+  }, [refreshAvatars, openMetaOrAvatarPane]);
+
+  // When groups change elsewhere, refresh the store list.
+  useEffect(() => {
+    const onGroupsChanged = () => {
+      void refreshGroups();
+    };
+    window.addEventListener("agenticx:groups:changed", onGroupsChanged);
+    return () => window.removeEventListener("agenticx:groups:changed", onGroupsChanged);
+  }, [refreshGroups]);
+
+  useEffect(() => {
+    if (!machiContextMenu) return;
+    const dismiss = (e: MouseEvent) => {
+      if (machiMenuRef.current && !machiMenuRef.current.contains(e.target as Node)) {
+        setMachiContextMenu(null);
+      }
+    };
+    const dismissByEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMachiContextMenu(null);
+    };
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", dismissByEsc);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", dismissByEsc);
+    };
+  }, [machiContextMenu]);
+
+  return (
+    <>
+      <aside className="flex h-full w-full flex-col bg-transparent">
+        {/* macOS traffic-light row: toggle + search aligned to the right edge. */}
+        <div className="drag-region agx-sidebar-topbar">
+          <div className="no-drag min-w-0 flex-1 self-stretch" data-window-zoom="" aria-hidden />
+          <div className="no-drag flex items-center gap-[var(--agx-topbar-icon-gap,8px)]">
+            <SidebarCreateButton />
+            <TopbarLeftControls
+              onToggleSidebar={onToggleSidebar}
+              toggleTitle={t("collapseSidebar")}
+              className="agx-topbar-left-controls"
+            />
+          </div>
+        </div>
+
+        <button
+          className={`group flex w-full items-center px-4 py-2.5 text-left transition-colors ${
+            metaPaneActive ? "" : "hover:bg-surface-hover"
+          }`}
+          aria-current={metaPaneActive ? "page" : undefined}
+          aria-label={`${APP_DISPLAY_NAME} ${APP_VERSION}`}
+          onClick={() => openMetaOrAvatarPane(null, META_AGENT_DISPLAY_NAME)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMachiContextMenu({ x: e.clientX, y: e.clientY });
+          }}
+        >
+          <span className="mr-2 inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center overflow-hidden">
+            <img
+              src={DEFAULT_META_AVATAR_URL}
+              alt=""
+              className={`h-full w-full origin-center object-cover ${BUNDLED_META_AVATAR_IM_ZOOM_CLASS}`}
+            />
+          </span>
+          <span className="flex min-w-0 items-baseline gap-1.5">
+            <span className="truncate text-[16px] font-semibold leading-none tracking-[-0.015em] text-text-strong">
+              {APP_DISPLAY_NAME}
+            </span>
+            <span className="shrink-0 text-[11px] font-normal leading-none tabular-nums text-text-faint">
+              {APP_VERSION}
+            </span>
+          </span>
+        </button>
+
+        {/* Compact button navigation */}
+        <nav className="flex flex-col gap-px px-2 py-1.5" aria-label={t("nav.aria")}>
+          {navEntries.map((entry) => {
+            const Icon = entry.icon;
+            const active =
+              entry.kind === "action" ? newTaskNavActive : mainView === entry.id;
+            return (
+              <button
+                key={entry.id}
+                type="button"
+                className={`${NAV_ITEM_BASE} ${active ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE}`}
+                aria-current={active ? "page" : undefined}
+                onClick={() => {
+                  if (entry.kind === "action") newMetaTask();
+                  else setMainView(entry.id);
+                }}
+              >
+                <Icon className="h-4 w-4 shrink-0" strokeWidth={1.75} aria-hidden />
+                <span>{entry.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <SidebarSessionHistory />
+        <SidebarAccountBar />
+      </aside>
+
+      {machiContextMenu && (
+        <div
+          ref={machiMenuRef}
+          className={SIDEBAR_CONTEXT_MENU_CLASS}
+          style={{ left: machiContextMenu.x, top: machiContextMenu.y }}
+        >
+          <button
+            type="button"
+            className={`${SIDEBAR_CONTEXT_MENU_ITEM_CLASS} text-text-muted hover:bg-surface-hover`}
+            onClick={() => {
+              setMachiContextMenu(null);
+              setMachiSettingsOpen(true);
+            }}
+          >
+            {tCommon("settings")}
+          </button>
+        </div>
+      )}
+
+      {machiSettingsOpen && (
+        <AvatarSettingsPanel
+          mode="machi"
+          onClose={() => setMachiSettingsOpen(false)}
+          onSaved={() => void refreshAvatars()}
+        />
+      )}
+    </>
+  );
+}
