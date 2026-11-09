@@ -55,6 +55,9 @@ class ProjectApplicationTests(unittest.TestCase):
 
     def test_project_reads_and_commands_require_membership(self):
         self.assertEqual(self.app.get_project(PROJECT_ID)["projectId"], PROJECT_ID)
+        state, events = self.app.get_project_snapshot(PROJECT_ID)
+        self.assertEqual(state["project"]["projectId"], PROJECT_ID)
+        self.assertEqual(state["_eventSequence"], len(events))
         self.assertEqual(self.app.list_work(PROJECT_ID)[0]["workId"], WORK_ID)
         with self.assertRaisesRegex(InboxForbidden, "membership"):
             self.app.get_project("project.other")

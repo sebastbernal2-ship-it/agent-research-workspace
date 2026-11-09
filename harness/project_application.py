@@ -40,12 +40,17 @@ class ProjectApplication:
         self.access_policy.require_project_access(actor, project_id, action)
         return actor
 
-    def get_project(self, project_id: str) -> dict[str, Any]:
+    def get_project_snapshot(self, project_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Return one verified, internally consistent project snapshot after authorization."""
         self._authorize(project_id, "project.read")
-        project = self.projector.replay(project_id)["project"]
-        if project is None:
+        state, events = self.projector.replay_snapshot(project_id)
+        if state["project"] is None:
             raise KeyError(f"unknown project {project_id!r}")
-        return project
+        return state, events
+
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        state, _events = self.get_project_snapshot(project_id)
+        return state["project"]
 
     def list_work(self, project_id: str) -> list[dict[str, Any]]:
         self._authorize(project_id, "work.read")

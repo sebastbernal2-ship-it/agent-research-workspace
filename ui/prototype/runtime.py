@@ -203,10 +203,11 @@ class PrototypeRuntime:
         }
 
     def project_summary(self, project_id: str) -> dict[str, Any]:
-        project = self.project_application.get_project(project_id)
-        state, events = self.projector.replay_snapshot(project_id)
-        if project is None:
-            raise InboxNotFound("project was not found")
+        try:
+            state, events = self.project_application.get_project_snapshot(project_id)
+        except KeyError as exc:
+            raise InboxNotFound("project was not found") from exc
+        project = state["project"]
         questions = list(state["questions"].values())
         open_count = sum(question["status"] == "open" for question in questions)
         resolved_count = sum(question["status"] in {"answered", "rejected", "cancelled", "expired", "superseded"} for question in questions)
