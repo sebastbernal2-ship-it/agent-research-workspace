@@ -107,9 +107,15 @@ class InboxReadModelTests(unittest.TestCase):
         with self.assertRaises(InboxForbidden):
             self.application.list_questions("project.other")
 
-        self.principal.actor = {"actorType": "agent", "actorId": "agent.vp", "role": "vp"}
-        with self.assertRaisesRegex(InboxForbidden, "authenticated human user"):
-            self.application.list_questions("project.inbox")
+        for malformed in (
+            {"actorType": "agent", "actorId": "agent.vp", "role": "vp"},
+            None,
+            {"actorType": "human", "role": "user"},
+            {"actorType": "human", "actorId": " ", "role": "user"},
+        ):
+            self.principal.actor = malformed
+            with self.assertRaisesRegex(InboxForbidden, "authenticated human user"):
+                self.application.list_questions("project.inbox")
 
     def test_application_requires_current_etag_for_answer_and_closure(self):
         item = self.application.get_question("project.inbox", "question.high")

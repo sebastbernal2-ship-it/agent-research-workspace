@@ -35,7 +35,7 @@ Record decisions in `decisions/` and link them from the relevant GitHub issue. D
 
 ## Phase 2 — identity, authorization, approvals, and API boundary (issues #6, #7, #14, #16)
 
-Current `InboxApplication` and `ProjectApplication` are reusable injected-principal boundaries. They do not authenticate. The demo still uses a fixed fake user, and direct lower-level APIs can bypass the facades.
+Current `InboxApplication` and `ProjectApplication` are reusable injected-principal boundaries; they reject malformed principal values and require an exact nonempty human-user identity shape. They do not authenticate. The demo still uses a fixed fake user, and direct lower-level APIs can bypass the facades.
 
 - [ ] Implement the selected identity/session adapter; derive principals only from verified server-side sessions/tokens. Reject client-supplied actor identity for every command.
 - [ ] Implement a durable project membership/role policy with explicit actions; cover project creation/invitation, membership change/removal, service accounts, and permission revocation.

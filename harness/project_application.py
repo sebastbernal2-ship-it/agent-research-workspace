@@ -11,7 +11,9 @@ from typing import Any
 from .capabilities import CapabilityAuthority
 from .control_plane import ProjectControlPlane
 from .event_store import ConcurrentWriteConflict
-from .inbox import InboxForbidden, PrincipalProvider, ProjectAccessPolicy
+from .inbox import (
+    InboxForbidden, PrincipalProvider, ProjectAccessPolicy, is_authenticated_human_actor,
+)
 from .projection import Projector
 
 
@@ -33,7 +35,7 @@ class ProjectApplication:
 
     def _authorize(self, project_id: str, action: str) -> dict[str, str]:
         actor = self.principal_provider.current_actor()
-        if not isinstance(actor, dict) or actor.get("actorType") != "human" or actor.get("role") != "user":
+        if not is_authenticated_human_actor(actor):
             raise InboxForbidden("an authenticated human user is required")
         self.access_policy.require_project_access(actor, project_id, action)
         return actor

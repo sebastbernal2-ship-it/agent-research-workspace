@@ -142,9 +142,14 @@ class ProjectApplicationTests(unittest.TestCase):
         self.assertEqual(self.membership.calls[-1][2], "capability.revoke")
 
     def test_agent_principal_and_unapproved_transitions_fail_closed(self):
-        self.app.principal_provider = Principal(AGENT)
-        with self.assertRaisesRegex(InboxForbidden, "authenticated human"):
-            self.app.revise_work(PROJECT_ID, WORK_ID, {"title": "Spoof"}, occurred_at=NOW)
+        for malformed in (
+            AGENT, None,
+            {"actorType": "human", "role": "user"},
+            {"actorType": "human", "actorId": "", "role": "user"},
+        ):
+            self.app.principal_provider = Principal(malformed)
+            with self.assertRaisesRegex(InboxForbidden, "authenticated human"):
+                self.app.revise_work(PROJECT_ID, WORK_ID, {"title": "Spoof"}, occurred_at=NOW)
         self.app.principal_provider = Principal(USER)
         with self.assertRaisesRegex(ValueError, "only approve ready work or cancel"):
             self.app.transition_work(

@@ -39,6 +39,18 @@ class ProjectAccessPolicy(Protocol):
     def require_project_access(self, actor: dict[str, str], project_id: str, action: str) -> None: ...
 
 
+def is_authenticated_human_actor(actor: Any) -> bool:
+    """Validate the minimal principal shape expected from a trusted identity adapter."""
+    return (
+        isinstance(actor, dict)
+        and set(actor) == {"actorType", "actorId", "role"}
+        and actor.get("actorType") == "human"
+        and actor.get("role") == "user"
+        and isinstance(actor.get("actorId"), str)
+        and bool(actor["actorId"].strip())
+    )
+
+
 class InboxReadModel:
     """Build minimal question summaries from canonical project replay."""
 
@@ -162,7 +174,7 @@ class InboxApplication:
 
     def _user(self, project_id: str, action: str) -> dict[str, str]:
         actor = self.principal_provider.current_actor()
-        if actor.get("actorType") != "human" or actor.get("role") != "user":
+        if not is_authenticated_human_actor(actor):
             raise InboxForbidden("an authenticated human user is required")
         self.access_policy.require_project_access(actor, project_id, action)
         return actor
