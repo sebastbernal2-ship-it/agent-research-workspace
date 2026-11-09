@@ -869,15 +869,37 @@ class SQLiteEventStore:
             item["invocationId"] for item in self.list_adapter_invocations(project_id)
             if item["state"] == "receipt_staged"
         ]
+        reconciled: list[str] = []
         for invocation_id in staged:
             if recovery_job_ids:
+                invocation = self.get_adapter_invocation(invocation_id)
+                receipt_events = invocation["receipt"]["events"]
+                run_ids = {
+                    event["payload"].get("runId") for event in receipt_events
+                    if isinstance(event.get("payload"), dict)
+                    and isinstance(event["payload"].get("runId"), str)
+                }
+                conn = self._connect()
+                try:
+                    jobs = {
+                        row["job_id"] for run_id in run_ids
+                        if (row := conn.execute(
+                            "SELECT job_id FROM queued_run_fences WHERE project_id=? AND run_id=?",
+                            (project_id, run_id),
+                        ).fetchone()) is not None
+                    }
+                finally:
+                    conn.close()
+                if not jobs or not jobs.issubset(recovery_job_ids):
+                    continue
                 self.commit_adapter_receipt(
                     invocation_id, recovery_job_ids=recovery_job_ids,
                     attest_no_live_worker=attest_no_live_worker,
                 )
             else:
                 self.commit_adapter_receipt(invocation_id)
-        return staged
+            reconciled.append(invocation_id)
+        return reconciled
 
     def mark_ambiguous_adapter_invocations(self, project_id: str) -> list[str]:
         """Mark dispatched calls with no durable receipt as ambiguous during recovery."""

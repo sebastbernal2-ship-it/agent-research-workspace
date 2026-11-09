@@ -190,11 +190,13 @@ class RunLedger:
         actor: dict[str, str],
         output_artifact_ids: Iterable[str] | None = None,
         occurred_at: str | None = None,
+        reconcile_receipts: bool = True,
     ) -> dict[str, Any]:
         if terminal_status not in _TERMINAL_STATUSES:
             raise ValueError("terminal_status must be succeeded, failed, cancelled, or interrupted")
         supplied_output_ids = None if output_artifact_ids is None else list(output_artifact_ids)
-        self.store.reconcile_staged_adapter_receipts(project_id)
+        if reconcile_receipts:
+            self.store.reconcile_staged_adapter_receipts(project_id)
         state = self.control.projector.replay(project_id)
         old = state["agentRuns"].get(run_id)
         if old is None:
@@ -304,15 +306,18 @@ class RunLedger:
         attest_no_live_worker: bool = False,
     ) -> list[str]:
         """Import durable receipts and close active runs under explicit queue recovery authorization."""
+        authorized_jobs = set(recovery_job_ids)
         self.store.reconcile_staged_adapter_receipts(
-            project_id, recovery_job_ids=set(recovery_job_ids),
+            project_id, recovery_job_ids=authorized_jobs,
             attest_no_live_worker=attest_no_live_worker,
         )
-        self.store.mark_ambiguous_adapter_invocations(project_id)
+        if not authorized_jobs:
+            self.store.mark_ambiguous_adapter_invocations(project_id)
         state = self.control.projector.replay(project_id)
         active_ids = [
             run_id for run_id, run in reversed(list(state["agentRuns"].items()))
             if run["status"] == "running"
+            and (not authorized_jobs or run.get("queueJobId") in authorized_jobs)
         ]
         recovered: list[str] = []
         for run_id in active_ids:
@@ -322,6 +327,7 @@ class RunLedger:
                 terminal_status="interrupted",
                 actor=state["agentRuns"][run_id]["agent"],
                 occurred_at=occurred_at,
+                reconcile_receipts=False,
             )
             recovered.append(run_id)
         return recovered

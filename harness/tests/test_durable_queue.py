@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from copy import deepcopy
 import multiprocessing
 import tempfile
 import unittest
@@ -480,7 +481,17 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.store.events(PROJECT_ID)), 7)
 
     async def test_staged_receipt_import_requires_explicit_expired_lease_recovery(self):
+        second_work = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
+        second_work.update(
+            workId="work.queue.second", title="Second isolated work item",
+            revision=1, status="ready", createdAt=NOW, updatedAt=NOW,
+        )
+        self.control.create_work(second_work)
+        self.queue.enqueue(
+            "job.runtime.second", PROJECT_ID, "work.queue.second", execution_descriptor(), now=649,
+        )
         claim = self.queue.claim_next("worker.receipt", now=650, lease_seconds=10)
+        second_claim = self.queue.claim_next("worker.receipt.second", now=650, lease_seconds=10)
         output_lease = {
             "jobId": "job.runtime", "workerId": "worker.receipt",
             "leaseToken": claim["leaseToken"], "leaseGeneration": 1,
@@ -503,6 +514,14 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "runId": "run.receipt.g1", "visibleTo": ["agent.vp"],
             },
         }
+        RunLedger(self.store).start(
+            PROJECT_ID, "work.queue.second", run_id="run.receipt.second.g1", agent=SPECIALIST,
+            adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
+            occurred_at=NOW, queue_lease={
+                "jobId": "job.runtime.second", "workerId": "worker.receipt.second",
+                "leaseToken": second_claim["leaseToken"], "leaseGeneration": 1, "now": 651,
+            },
+        )
         self.store.prepare_adapter_invocation("invocation.queued-receipt", PROJECT_ID, "a" * 64)
         self.store.start_adapter_invocation("invocation.queued-receipt")
         with self.store.queued_write_context(output_lease, lambda: 652):
@@ -529,6 +548,7 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invocation["state"], "imported")
         state = Projector(self.store).replay(PROJECT_ID)
         self.assertEqual(state["agentRuns"]["run.receipt.g1"]["status"], "interrupted")
+        self.assertEqual(state["agentRuns"]["run.receipt.second.g1"]["status"], "running")
         self.assertEqual(len(state["messages"]), 1)
 
     async def test_queued_execution_rejects_canonical_write_after_expiry_before_recovery_poll(self):
