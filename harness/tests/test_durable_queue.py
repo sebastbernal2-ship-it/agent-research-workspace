@@ -172,6 +172,21 @@ class SQLiteWorkQueueTests(unittest.TestCase):
                 now=214, lease_seconds=10,
             )
 
+    def test_expiry_recovery_state_survives_store_restart(self):
+        self.enqueue()
+        first = self.queue.claim_next("worker.before-restart", now=1_000, lease_seconds=5)
+        self.assertIsNone(self.queue.claim_next("worker.observe-expiry", now=1_006, lease_seconds=5))
+        self.assertEqual(self.queue.get("job.first")["state"], "recovery_required")
+
+        self.store = SQLiteEventStore(self.path)
+        self.queue = SQLiteWorkQueue(self.store)
+        self.assertEqual(self.queue.get("job.first")["state"], "recovery_required")
+        with self.assertRaisesRegex(QueueError, "explicit no-live-worker"):
+            self.queue.recover_expired("job.first", now=1_007)
+        self.queue.recover_expired("job.first", now=1_007, attest_no_live_worker=True)
+        second = self.queue.claim_next("worker.after-restart", now=1_008, lease_seconds=5)
+        self.assertEqual(second["leaseGeneration"], first["leaseGeneration"] + 1)
+
     def test_claim_skips_canonically_running_work(self):
         self.enqueue()
         RunLedger(self.store, clock=lambda: NOW).start(
