@@ -377,6 +377,8 @@ class SQLiteEventStore:
                 continue
             if event_work_id is not None and event_work_id != fence["work_id"]:
                 raise EventStoreError("run output references work outside its queued lease assignment")
+            if queue_lease is None:
+                raise ConcurrentWriteConflict("queued run output requires its active execution lease context")
             lease = conn.execute(
                 "SELECT state, lease_generation FROM scheduled_work WHERE job_id=? AND project_id=?",
                 (fence["job_id"], project_id),

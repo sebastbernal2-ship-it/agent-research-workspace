@@ -385,7 +385,12 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-        self.store.append(message("event.queue.output.before-expiry"))
+        output_lease = {
+            "jobId": "job.runtime", "workerId": "worker.output",
+            "leaseToken": claim["leaseToken"], "leaseGeneration": 1,
+        }
+        with self.store.queued_write_context(output_lease, lambda: 559):
+            self.store.append(message("event.queue.output.before-expiry"))
         # Reopening reconstructs this operational fence from canonical run.started history.
         conn = self.store._connect()
         try:
@@ -398,14 +403,15 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(SQLiteEventStore(backup).verified_events(PROJECT_ID)[-1]["eventId"], "event.queue.output.before-expiry")
         self.assertIsNone(self.queue.claim_next("worker.new", now=561, lease_seconds=10))
         self.queue.recover_expired("job.runtime", now=562, attest_no_live_worker=True)
-        with self.assertRaisesRegex(ConcurrentWriteConflict, "lease was fenced"):
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "requires its active execution lease context"):
             self.store.append(message("event.queue.output.after-fence"))
         ledger = RunLedger(self.store)
-        with self.assertRaisesRegex(ConcurrentWriteConflict, "lease was fenced"):
-            ledger.finish(
-                PROJECT_ID, "run.output.g1", terminal_status="succeeded",
-                actor=SPECIALIST, occurred_at=NOW,
-            )
+        with self.store.queued_write_context(output_lease, lambda: 562):
+            with self.assertRaisesRegex(ConcurrentWriteConflict, "queue lease expired or changed"):
+                ledger.finish(
+                    PROJECT_ID, "run.output.g1", terminal_status="succeeded",
+                    actor=SPECIALIST, occurred_at=NOW,
+                )
         self.assertEqual(ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW), ["run.output.g1"])
         self.assertEqual(
             Projector(self.store).replay(PROJECT_ID)["agentRuns"]["run.output.g1"]["status"], "interrupted",
