@@ -299,6 +299,15 @@ class SQLiteEventStore:
             or row["lease_expires_at"] <= now
         ):
             raise ConcurrentWriteConflict("queue lease expired or changed before canonical write")
+        for event in events:
+            payload = event.get("payload", {})
+            actor = event.get("actor", {})
+            if (
+                isinstance(payload, dict) and payload.get("workId") is not None
+                and isinstance(actor, dict) and actor.get("actorType") == "agent"
+                and payload.get("workId") != row["work_id"]
+            ):
+                raise EventStoreError("agent canonical write is outside its queued work assignment")
 
     @staticmethod
     def _assert_active_run_fences(
@@ -345,6 +354,26 @@ class SQLiteEventStore:
                             event.get("projectId"), record["runId"],
                             record_work if isinstance(record_work, str) else None,
                         ))
+
+        for event in events:
+            if not isinstance(event, dict) or not isinstance(event.get("payload"), dict):
+                continue
+            actor = event.get("actor")
+            work_id = event["payload"].get("workId")
+            if not isinstance(actor, dict) or actor.get("actorType") != "agent" or not isinstance(work_id, str):
+                continue
+            queued = conn.execute(
+                "SELECT job_id, lease_generation FROM scheduled_work "
+                "WHERE project_id=? AND work_id=? AND state IN ('leased', 'recovery_required')",
+                (event.get("projectId"), work_id),
+            ).fetchone()
+            if queued is not None and queue_lease is None:
+                raise ConcurrentWriteConflict("agent write on queued work requires its active execution lease context")
+            if queued is not None and (
+                queued["job_id"] != queue_lease.get("jobId")
+                or queued["lease_generation"] != queue_lease.get("leaseGeneration")
+            ):
+                raise ConcurrentWriteConflict("agent write is not authorized by the active queued work lease")
 
         for project_id, run_id, event_work_id in run_work_refs:
             start_event = starts.get(run_id)

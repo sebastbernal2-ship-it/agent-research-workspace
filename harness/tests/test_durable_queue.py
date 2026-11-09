@@ -183,17 +183,23 @@ class SQLiteWorkQueueTests(unittest.TestCase):
             )
 
         ledger = RunLedger(self.store, clock=lambda: NOW)
-        run = ledger.start(
-            PROJECT_ID, WORK_ID, run_id="run.completion", agent=SPECIALIST,
-            adapter={"name": "test", "version": "1"},
-            context_hash=hashlib.sha256(b"context").hexdigest(),
-            correlation_id="queue.test", occurred_at=NOW,
-        )
-        with self.assertRaises(ControlPlaneError):
+        queued_lease = {
+            "jobId": "job.first", "workerId": "worker",
+            "leaseToken": lease["leaseToken"], "leaseGeneration": 1,
+        }
+        with self.store.queued_write_context(queued_lease, lambda: 401):
+            run = ledger.start(
+                PROJECT_ID, WORK_ID, run_id="run.completion", agent=SPECIALIST,
+                adapter={"name": "test", "version": "1"},
+                context_hash=hashlib.sha256(b"context").hexdigest(),
+                correlation_id="queue.test", occurred_at=NOW,
+                queue_lease={**queued_lease, "now": 401},
+            )
+            with self.assertRaises(ControlPlaneError):
+                self.control.transition_work(PROJECT_ID, WORK_ID, "completed", actor=VP, occurred_at=NOW)
+            ledger.finish(PROJECT_ID, run["runId"], terminal_status="succeeded", actor=SPECIALIST, occurred_at=NOW)
+            self.control.transition_work(PROJECT_ID, WORK_ID, "verifying", actor=VP, occurred_at=NOW)
             self.control.transition_work(PROJECT_ID, WORK_ID, "completed", actor=VP, occurred_at=NOW)
-        ledger.finish(PROJECT_ID, run["runId"], terminal_status="succeeded", actor=SPECIALIST, occurred_at=NOW)
-        self.control.transition_work(PROJECT_ID, WORK_ID, "verifying", actor=VP, occurred_at=NOW)
-        self.control.transition_work(PROJECT_ID, WORK_ID, "completed", actor=VP, occurred_at=NOW)
         completed = self.queue.complete(
             "job.first", "worker", lease["leaseToken"], 1, now=402,
         )
@@ -423,7 +429,12 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "jobId": "job.runtime", "workerId": "worker.output",
             "leaseToken": claim["leaseToken"], "leaseGeneration": 1,
         }
+        unbound = message("event.queue.output.unbound")
+        unbound["payload"].pop("runId")
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "agent write on queued work requires"):
+            self.store.append(unbound)
         with self.store.queued_write_context(output_lease, lambda: 559):
+            self.store.append(unbound)
             self.store.append(message("event.queue.output.before-expiry"))
             with ThreadPoolExecutor(max_workers=1) as pool:
                 detached = pool.submit(self.store.append, message("event.queue.output.detached"))
@@ -466,7 +477,7 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             Projector(self.store).replay(PROJECT_ID)["agentRuns"]["run.output.g1"]["status"], "interrupted",
         )
-        self.assertEqual(len(self.store.events(PROJECT_ID)), 6)
+        self.assertEqual(len(self.store.events(PROJECT_ID)), 7)
 
     async def test_staged_receipt_import_requires_explicit_expired_lease_recovery(self):
         claim = self.queue.claim_next("worker.receipt", now=650, lease_seconds=10)
@@ -566,6 +577,10 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             PROJECT_ID, WORK_ID, run_id="run.crashed.g1", agent=SPECIALIST,
             adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
             occurred_at=NOW,
+            queue_lease={
+                "jobId": "job.runtime", "workerId": "worker.crashed",
+                "leaseToken": old["leaseToken"], "leaseGeneration": 1, "now": 601,
+            },
         )
         self.assertIsNone(self.queue.claim_next("worker.replacement", now=611, lease_seconds=10))
         self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
