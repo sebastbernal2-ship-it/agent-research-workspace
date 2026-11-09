@@ -1,0 +1,388 @@
+import { useNativeRuntime } from "@/app/runtime/RuntimeContext";
+import { InsightsNavigationProvider } from "@/app/features/insights/InsightsNavigationProvider";
+import { useUiPolicy } from "@/app/features/ui-policy/UiPolicyContext";
+import { sessionAvailable } from "@/app/features/ui-policy/policy";
+import { useProjectActions } from "@/app/providers/ProjectActionsProvider";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Navigate, useNavigate, useParams } from "react-router-dom";
+
+import { Button, Modal } from "@/app/atoms";
+import { ChatInputBox } from "@/app/components/inspector/ChatInputBox";
+import { MobileBottomBar } from "@/app/components/inspector/MobileBottomBar";
+import { RightSidebarRail } from "@/app/components/inspector/RightSidebarRail";
+import { SessionSideBox } from "@/app/components/inspector/SessionSideBox";
+import { Transcript } from "@/app/components/inspector/Transcript";
+import { TranscriptModelProvider } from "@/app/components/inspector/transcript/TranscriptModelProvider";
+import { TopSingleSessionHeader } from "@/app/components/inspector/TopSingleSessionHeader";
+import { useIsMobile } from "@/app/hooks/useMediaQuery";
+import { useRunStateSync, useSessionStream } from "@/app/hooks/useSessionStream";
+import { cn } from "@/app/lib/cn";
+import { perfRender } from "@/app/lib/perfDebug";
+import { sessionPanelPolicy } from "@/app/lib/sessionBehavior";
+import type { SessionBehavior } from "@/app/types/api";
+import { useErrorNotice } from "@/app/hooks/useErrorNotice";
+import {
+  DEFAULT_SESSION_PANEL,
+  isSessionPanel,
+  routes,
+  SESSION_PANEL_LABEL,
+  type SessionPanel,
+} from "@/app/lib/routes";
+import { PanelPhoneChromeProvider } from "@/app/providers/PanelPhoneChrome";
+import { useSessionSnapshot, useSessionSummary, useSshConnect } from "@/app/services/queries";
+
+// 80% as wide as the chat beside it, so 4/9 of the row, between 480px and
+// 800px, but never so wide that the chat gets less than 200px, or less than
+// half of a row under 400px. The bounds sit inside the width rather than in
+// `min-w` / `max-w`, which would stop the collapse tween dead at a bound.
+const SIDE_PANEL_WIDTH = "w-[min(clamp(480px,calc(100%*4/9),800px),max(50%,100%_-_200px))]";
+
+/**
+ * Opens an SSH browse handshake once when landing on a remote session that is
+ * not already marked connected. A failed attempt stays disconnected so the
+ * chat badge can offer a manual reconnect.
+ */
+function useAutoSshConnect(
+  sessionId: string | null,
+  summary:
+    | {
+        ssh_host: string | null;
+        ssh_port?: number | null;
+        ssh_identity_file?: string | null;
+      }
+    | null
+    | undefined,
+) {
+  const {
+    useSshConnectionStatus,
+    sshTargetKey,
+    sshTargetFromSummary,
+    markSshDisconnected,
+    markSshConnected,
+  } = useNativeRuntime().stores.sshConnectionStore;
+
+  const target = useMemo(() => sshTargetFromSummary(summary), [sshTargetFromSummary, summary]);
+  const status = useSshConnectionStatus(target);
+  const connect = useSshConnect();
+  const attemptedKey = useRef<string | null>(null);
+
+  useEffect(() => {
+    attemptedKey.current = null;
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!target) return;
+    const key = sshTargetKey(target);
+    if (status === "connected") {
+      attemptedKey.current = key;
+      return;
+    }
+    if (attemptedKey.current === key || connect.isPending) return;
+    attemptedKey.current = key;
+    void connect
+      .mutateAsync(target)
+      .then(() => markSshConnected(target))
+      .catch(() => markSshDisconnected(target));
+  }, [target, status, connect, sshTargetKey, markSshConnected, markSshDisconnected]);
+}
+
+/** Session screen: the Insights/Files/Worksets box beside a permanent chat. */
+export default function SessionPage() {
+  const {
+    useSidePanelExpanded,
+    useSidePanelCollapsed,
+    useSidePanelAnimate,
+    useSelectedThread,
+    selectInsight,
+    toggleSidePanelExpanded,
+    toggleSidePanelCollapsed,
+    showSidePanelList,
+    revealSidePanel,
+    setSidePanelAnimate,
+    activateSessionSelection,
+    unbindSidePanelProject,
+    bindSidePanelProject,
+  } = useNativeRuntime().stores.sessionLayoutStore;
+
+  const { clearAttention } = useNativeRuntime().stores.attentionStore;
+
+  const { sessionId, panel } = useParams<{
+    sessionId: string;
+    panel?: string;
+  }>();
+  const navigate = useNavigate();
+  const id = sessionId ?? null;
+  const policy = useUiPolicy();
+  const projectActions = useProjectActions();
+
+  perfRender("SessionPage");
+
+  const { data: snapshot = null, error, refetch: refetchSnapshot } = useSessionSnapshot(id);
+  const { data: entry = null } = useSessionSummary(id);
+  const toNotice = useErrorNotice(id, entry?.summary.backend);
+  const collapsed = useSidePanelCollapsed();
+  const animateSidePanel = useSidePanelAnimate();
+  const expanded = useSidePanelExpanded();
+  const selectedThread = useSelectedThread();
+  const isMobile = useIsMobile();
+
+  // An omitted behavior on a loaded session is the legacy orchestrator. An
+  // unloaded session is not that default: painting Insights/Files/Worksets and
+  // then replacing them is a flash.
+  const behaviorKnown = entry != null || snapshot != null;
+  const behavior: SessionBehavior | null = behaviorKnown
+    ? (entry?.summary.behavior ?? snapshot?.metadata.behavior ?? "orchestrator")
+    : null;
+  const available =
+    !behaviorKnown || sessionAvailable(policy, behavior, entry?.lineage ?? snapshot?.lineage);
+  useSessionStream(available ? id : null);
+  useRunStateSync(available ? snapshot?.active_run : null);
+  useAutoSshConnect(available ? id : null, available ? entry?.summary : null);
+  const panelPolicy =
+    behavior == null ? null : sessionPanelPolicy(behavior, snapshot?.lineage?.kind);
+  const sessionPanels = panelPolicy?.mobilePanels ?? [];
+  const requestedPanel = isSessionPanel(panel) ? panel : DEFAULT_SESSION_PANEL;
+  // Insights took over the Threads panel; an old link keeps the selected thread.
+  const routedPanel = requestedPanel === "threads" ? "insights" : requestedPanel;
+  const effectivePanel =
+    panelPolicy == null
+      ? routedPanel
+      : panelPolicy.mobilePanels.includes(routedPanel)
+        ? routedPanel
+        : panelPolicy.defaultPanel;
+
+  useEffect(() => {
+    if (!id || !isSessionPanel(panel)) return;
+    // Other corrections wait for the snapshot's panels. An old Threads link moves
+    // at once: moving it later would close a dialog opened over the page meanwhile.
+    const target = snapshot ? effectivePanel : panel === "threads" ? routedPanel : panel;
+    if (target === panel) return;
+    if (panel === "threads" && selectedThread) selectInsight({ kind: "thread" });
+    navigate(routes.session(id, target), { replace: true });
+  }, [effectivePanel, id, navigate, panel, routedPanel, selectInsight, selectedThread, snapshot]);
+
+  const heartbeatResultsThrough =
+    entry?.summary.session_id === id
+      ? (entry.heartbeat_results ?? []).reduce(
+          (maximum, result) => Math.max(maximum, result.sequence),
+          0,
+        )
+      : 0;
+  useEffect(() => {
+    if (id) clearAttention(id, heartbeatResultsThrough);
+  }, [clearAttention, id, heartbeatResultsThrough]);
+
+  useEffect(() => {
+    activateSessionSelection(id);
+  }, [id, activateSessionSelection]);
+
+  const projectKey = entry ? (entry.summary.project_id ?? "") : null;
+  useLayoutEffect(() => {
+    unbindSidePanelProject();
+    if (projectKey == null) return;
+    bindSidePanelProject(projectKey);
+  }, [bindSidePanelProject, id, projectKey, unbindSidePanelProject]);
+
+  // Restored after paint, so the launch open has already landed at full width
+  // and putting the tween back does not replay it.
+  useEffect(() => {
+    if (animateSidePanel) return undefined;
+    const frame = requestAnimationFrame(() => setSidePanelAnimate(true));
+    return () => cancelAnimationFrame(frame);
+  }, [animateSidePanel, setSidePanelAnimate]);
+
+  // The composer floats over the transcript, whose run-out under the last
+  // message has to clear it however tall it grows.
+  const [chatColumn, setChatColumn] = useState<HTMLDivElement | null>(null);
+  const [composerLayer, setComposerLayer] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!chatColumn || !composerLayer || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(() => {
+      chatColumn.style.setProperty("--composer-height", `${composerLayer.offsetHeight}px`);
+    });
+    observer.observe(composerLayer);
+    return () => observer.disconnect();
+  }, [chatColumn, composerLayer]);
+
+  if (behaviorKnown && !available)
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8">
+        <h1 className="heading-small">This chat is unavailable in direct-only mode</h1>
+        <p>
+          Its saved behavior and history are preserved. An operator can enable orchestration to open
+          it.
+        </p>
+        <Button
+          onClick={() => {
+            const projectId = entry?.summary.project_id ?? snapshot?.metadata.project_id;
+            if (projectId) void projectActions.newChat(projectId);
+            else projectActions.create();
+          }}
+        >
+          New direct chat
+        </Button>
+      </div>
+    );
+  if (!id) return <Navigate to={routes.list()} replace />;
+  if (!isSessionPanel(panel)) {
+    return <Navigate to={routes.session(id, DEFAULT_SESSION_PANEL)} replace />;
+  }
+
+  const configError = entry?.summary.model_config_error;
+  // The repair notice already explains a broken config, and that is exactly why
+  // the snapshot request fails, so only report an unexplained fetch failure.
+  const failure = configError ?? (!snapshot && error ? error : null);
+  const errorNotice = failure ? toNotice(failure, () => void refetchSnapshot()) : null;
+
+  const goToPanel = (next: SessionPanel) => navigate(routes.session(id, next));
+
+  const focusPanel = (next: SessionPanel) => {
+    revealSidePanel(isMobile);
+    goToPanel(next);
+  };
+
+  // The chat marks the rows the side box shows, so none while it is hidden:
+  // slid off to its rail, or on a phone, with the dialog closed.
+  const sideBoxShown = expanded || (!isMobile && !collapsed);
+
+  const sideBox = (
+    <SessionSideBox
+      sessionId={id}
+      snapshot={snapshot}
+      behavior={behavior}
+      panel={effectivePanel}
+      onPanelChange={goToPanel}
+    />
+  );
+
+  const page = (
+    <section className="relative flex min-h-0 min-w-0 flex-1 h-full overflow-clip bg-elevation-ground">
+      <div className="relative flex flex-1 min-w-0 h-full min-h-0">
+        <div className="flex flex-col items-center flex-1 min-w-0 h-full">
+          <div ref={setChatColumn} className="flex flex-col flex-1 min-h-0 w-full relative">
+            {isMobile ? null : (
+              <TopSingleSessionHeader sessionId={id} snapshot={snapshot} entry={entry} />
+            )}
+            <Transcript
+              sessionId={id}
+              snapshot={snapshot}
+              panel={sideBoxShown ? effectivePanel : null}
+              onFocusPanel={focusPanel}
+              errorNotice={errorNotice}
+            />
+
+            <div ref={setComposerLayer} className="pointer-events-none absolute inset-x-0 bottom-0">
+              <ChatInputBox sessionId={id} snapshot={snapshot} entry={entry} />
+            </div>
+          </div>
+        </div>
+
+        {isMobile ? null : (
+          <>
+            {/*
+              Same motion as the left sidebar: the column width is what the chat
+              lays out against, and the panel slides over the rail that stays.
+            */}
+            <div
+              className={cn(
+                "relative h-full shrink-0",
+                animateSidePanel && "transition-[width] duration-300 ease-out",
+                collapsed ? "w-[52px]" : SIDE_PANEL_WIDTH,
+              )}
+              style={animateSidePanel ? undefined : { transition: "none" }}
+            >
+              {collapsed ? (
+                <div className="absolute inset-y-0 right-0 w-[52px]">
+                  <RightSidebarRail
+                    sessionId={id}
+                    snapshot={snapshot}
+                    behavior={behavior}
+                    panels={panelPolicy?.widePanels ?? []}
+                    onOpen={toggleSidePanelCollapsed}
+                    onSelect={focusPanel}
+                  />
+                </div>
+              ) : null}
+            </div>
+            {/*
+            Pinned to the right edge rather than laid out in the row: a box
+            that kept its width while the row shrank would reflow its whole tree
+            over the animation, so it slides out at full size instead. It fills
+            that column edge to edge.
+          */}
+            <div
+              className={cn(
+                "absolute inset-y-0 right-0 z-[1] flex flex-col min-w-0",
+                SIDE_PANEL_WIDTH,
+                animateSidePanel && "transition-transform duration-300 ease-out",
+                collapsed && "translate-x-full",
+              )}
+              style={animateSidePanel ? undefined : { transition: "none" }}
+              aria-hidden={collapsed}
+              inert={collapsed}
+            >
+              <div className="flex flex-col flex-1 min-h-0">
+                {/* While the dialog is up it owns the panels, so this column stays
+                  empty behind the scrim instead of running them twice. */}
+                <div className="flex-1 min-h-0">{expanded ? null : sideBox}</div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {isMobile ? (
+        <Modal
+          open={expanded}
+          onClose={toggleSidePanelExpanded}
+          // Its own tabs move the route, so a route change must not close it.
+          keepOnNavigate
+          // Every screen inside heads itself: a list leaves the dialog, an
+          // opened row goes back to its list.
+          chromeless
+          hideClose
+          title={SESSION_PANEL_LABEL[effectivePanel]}
+          bodyClassName="relative overflow-hidden"
+        >
+          <PanelPhoneChromeProvider
+            value={{
+              close: toggleSidePanelExpanded,
+              bar:
+                sessionPanels.length > 0 ? (
+                  <MobileBottomBar
+                    panel={effectivePanel}
+                    panels={sessionPanels}
+                    onPanelChange={(next) => {
+                      // A tab opens on its list, the screen the bar belongs to.
+                      showSidePanelList(true);
+                      goToPanel(next);
+                    }}
+                  />
+                ) : null,
+            }}
+          >
+            {sideBox}
+          </PanelPhoneChromeProvider>
+        </Modal>
+      ) : (
+        <Modal
+          open={expanded}
+          onClose={toggleSidePanelExpanded}
+          fullScreen
+          chromeless
+          keepOnNavigate
+        >
+          <div className="flex flex-col flex-1 min-h-0">{sideBox}</div>
+        </Modal>
+      )}
+    </section>
+  );
+
+  return (
+    <TranscriptModelProvider sessionId={id} snapshot={snapshot}>
+      <InsightsNavigationProvider sessionId={id} panels={sessionPanels} focusPanel={focusPanel}>
+        {page}
+      </InsightsNavigationProvider>
+    </TranscriptModelProvider>
+  );
+}

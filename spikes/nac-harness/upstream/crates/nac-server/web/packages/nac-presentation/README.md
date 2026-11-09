@@ -1,0 +1,78 @@
+# Revision-pinned native presentation
+
+Import the actual native runtime and root from the private experimental artifact:
+
+```tsx
+import {
+  createNativeRuntime,
+  NativePresentationRoot,
+} from "@arcee-ai/nac-client-all-121/presentation";
+import "@arcee-ai/nac-client-all-121/presentation/styles.css";
+```
+
+Build NAC with `npm --prefix crates/nac-server/web run build`, then `npm pack
+--ignore-scripts` at the repository root. Pin the exact source revision and npm
+integrity. The package is private; this does not authorize publication.
+
+For a reproducible handoff, run
+`node crates/nac-server/web/scripts/presentation-artifact.mjs --output /absolute/evidence/directory`
+from the source repository after committing the normal build outputs. It
+preserves the root tarball and `artifact.json` with revision, SHA256, npm
+integrity, exports, assets/fonts, per-file hashes and toolchain/startup graphs.
+The receiving packed E2E fixture accepts `NAC_PRESENTATION_TARBALL` to test those
+exact bytes instead of repacking a different checkout. This artifact receipt
+does not itself qualify visual journeys or signed hosted consumption.
+
+The caller owns authentication, stream construction, the DOM mount, router and
+asset hosting. Copy the paths in `presentation/assets.json` from the packed
+artifact to static storage preserving their paths; set `assets.mathjaxFontUrl`
+on `createNativeRuntime` to the public MathJax font directory. Formula fonts
+are fetched there. The stylesheet is opt-in, scoped to `[data-nac-runtime]`, and
+uses namespaced fonts, animations and Tailwind registrations. The emitted
+stylesheet uses prefixed selectors; the consumer must support or compile its
+nested CSS. Formula sheets use the existing CSSOM parser with a temporary,
+inert style node inside the native portal, then emit prefixed selectors and
+instance-specific font names. They do not require `@scope` or constructable
+stylesheets and are removed with the view.
+
+A product with BrowserRouter must mount the native MemoryRouter in a separate
+caller-owned React root. Close the old runtime before replacement, logout,
+revoked eligibility or host deletion, then unmount its React root. Bindings are
+opaque state partitions and never authorization. Accepted mutations with lost
+responses require authoritative readback without replay.
+
+Primary prompt text survives route changes within the runtime. For same-tab
+reload recovery, callers may supply a separate `draftStorage` adapter with
+`getItem`, `setItem` and `removeItem`, backed by tab-scoped storage. The standalone
+entry enables `sessionStorage` only after validating its credential-free embedded
+HTML bootstrap. That bootstrap captures the actual binary build identity and a
+serving-router instance, so same-server reloads recover drafts while same-origin
+server replacement/upgrades cannot restore the previous serving lifetime. An
+absent/invalid bootstrap (including Vite dev) keeps drafts in memory. The browser
+origin binds the standalone client endpoint. Preference `storage` does not persist drafts. Records
+are versioned and partitioned by all seven immutable runtime binding fields and
+session ID. Supply the complete owner/profile/organization/host/incarnation/
+endpoint/release binding and replace the runtime when any field changes.
+
+Before logout, revoked access or host removal, call
+`runtime.stores.promptDraftStore.purgeAll()` before `runtime.close()` to remove
+that binding's persisted text. Use `purgeSessions(ids)` for confirmed session
+access loss/deletion; built-in deletion clears only confirmed deleted IDs.
+Closing a tab or a runtime alone retains reload recovery. No pending request,
+attachment payload or terminal input is saved. The store retains up to 100 drafts
+and one million characters by evicting oldest inactive records, always keeping
+the currently edited prompt verbatim. Storage errors fall back to memory and
+attempt to remove stale persisted data. Writes are synchronous, so route changes
+and pagehide require no delayed flush. Restoration never submits text.
+
+Hosted query reads default to no retries. The standalone entry explicitly sets
+`queryRetry: 1` to retain its existing transient-read recovery; callers may select
+that same bounded policy. Mutation retries remain disabled in either profile.
+
+Qualified locked peers: React/ReactDOM 19.2.8, React Router 7.18.2, TanStack Query
+5.101.4; and React/ReactDOM 19.2.6, React Router 7.15.0, TanStack Query 5.100.10.
+Peers are optional for SDK-only imports. The declared major ranges do not
+qualify every intermediate release. Local desktop/mobile tarball qualification
+covers router, styles, assets, keyboard/overlay ownership and lifecycle; an
+actual authenticated product gateway, identity/custody, machine-to-machine
+admission and Dev2 readiness remain separate acceptance work.

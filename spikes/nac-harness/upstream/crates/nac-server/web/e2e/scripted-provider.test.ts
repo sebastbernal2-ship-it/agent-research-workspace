@@ -1,0 +1,193 @@
+import { afterEach, expect, test } from "vitest";
+
+import { ScriptGate, ScriptedProvider } from "./scripted-provider";
+
+const providers: ScriptedProvider[] = [];
+afterEach(async () => {
+  await Promise.all(providers.splice(0).map((provider) => provider.stop()));
+});
+async function providerFor(stream: boolean | "request" | undefined, gate?: ScriptGate) {
+  const provider = new ScriptedProvider();
+  await provider.start();
+  providers.push(provider);
+  provider.enqueue(
+    "wire",
+    { token: "WIRE_PROBE" },
+    { kind: "text", text: "wire answer", stream },
+    gate,
+  );
+  return provider;
+}
+function send(provider: ScriptedProvider, stream: boolean | undefined) {
+  return fetch(`${provider.baseUrl}/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ input: "WIRE_PROBE", ...(stream == null ? {} : { stream }) }),
+    signal: AbortSignal.timeout(2_000),
+  });
+}
+function assertWire(body: string, streaming: boolean) {
+  if (streaming) {
+    expect(body).toMatch(/^data: /);
+    expect(body).toContain('"type":"response.completed"');
+    expect(body).toContain('"text":"wire answer"');
+  } else {
+    expect(JSON.parse(body).output[0].content[0].text).toBe("wire answer");
+  }
+}
+
+test.each([
+  ["opt-in true request", "request", true, true],
+  ["opt-in false request", "request", false, false],
+  ["opt-in omitted request", "request", undefined, false],
+  ["explicit true fixture stays SSE", true, false, true],
+  ["explicit false fixture stays JSON", false, true, false],
+  ["omitted fixture stays JSON", undefined, true, false],
+] as const)("scripted provider HTTP wire: %s", async (_name, mode, requested, streaming) => {
+  const provider = await providerFor(mode);
+  const response = await send(provider, requested);
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toBe(
+    streaming ? "text/event-stream" : "application/json",
+  );
+  assertWire(await response.text(), streaming);
+  provider.assertConsumed();
+});
+
+test.each([true, false, undefined])(
+  "request-shaped gated HTTP headers and body agree for request stream=%s",
+  async (requested) => {
+    const gate = new ScriptGate();
+    const provider = await providerFor("request", gate);
+    const pending = send(provider, requested);
+    await gate.accepted;
+    try {
+      if (requested === true) {
+        // The real HTTP response must expose SSE headers before releasing a slow
+        // scripted body, so deliberate latency cannot cause a protocol retry.
+        const response = await pending;
+        expect(response.headers.get("content-type")).toBe("text/event-stream");
+        gate.release();
+        assertWire(await response.text(), true);
+      } else {
+        gate.release();
+        const response = await pending;
+        expect(response.headers.get("content-type")).toBe("application/json");
+        assertWire(await response.text(), false);
+      }
+    } finally {
+      gate.release();
+    }
+    provider.assertConsumed();
+  },
+);
+
+test("fresh-task matching excludes the caller's quoted handoff receipt", async () => {
+  const provider = new ScriptedProvider();
+  await provider.start();
+  providers.push(provider);
+  provider.enqueue(
+    "caller",
+    { token: "CHILD_BRIEF", functionOutputCallId: "parent-launch" },
+    { kind: "text", text: "caller acknowledged" },
+  );
+  provider.enqueue(
+    "fresh-child",
+    { token: "CHILD_BRIEF", forbiddenToken: "parent-launch" },
+    { kind: "text", text: "child started" },
+  );
+  const post = (input: unknown) =>
+    fetch(`${provider.baseUrl}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ input }),
+      signal: AbortSignal.timeout(2_000),
+    });
+  const caller = await post([
+    { type: "function_call_output", call_id: "parent-launch", output: "CHILD_BRIEF" },
+  ]);
+  expect(caller.status).toBe(200);
+  expect(await caller.json()).toMatchObject({
+    output: [{ content: [{ text: "caller acknowledged" }] }],
+  });
+  const child = await post("CHILD_BRIEF");
+  expect(child.status).toBe(200);
+  expect(await child.json()).toMatchObject({
+    output: [{ content: [{ text: "child started" }] }],
+  });
+  expect(provider.requests.map((request) => request.matchedStep)).toEqual([
+    "caller",
+    "fresh-child",
+  ]);
+  provider.assertConsumed();
+});
+
+test.each([
+  ["request-shaped SSE", "request", true, true],
+  ["request-shaped JSON", "request", false, false],
+  ["request-omitted JSON", "request", undefined, false],
+  ["explicit SSE remains SSE", true, false, true],
+  ["explicit JSON remains JSON", false, true, false],
+  ["default remains JSON", undefined, true, false],
+] as const)("function-call wire: %s", async (_name, mode, requested, streaming) => {
+  const provider = new ScriptedProvider();
+  await provider.start();
+  providers.push(provider);
+  provider.enqueue(
+    "status",
+    { token: "WIRE_PROBE" },
+    {
+      kind: "function_call",
+      name: "subagent_status",
+      callId: "status-call",
+      arguments: { child_session_id: "controlled-child", _nac: null },
+      stream: mode,
+    },
+  );
+  provider.enqueue(
+    "after-status",
+    { functionOutputCallId: "status-call" },
+    {
+      kind: "text",
+      text: "status retained",
+      stream: "request",
+    },
+  );
+  const response = await send(provider, requested);
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toBe(
+    streaming ? "text/event-stream" : "application/json",
+  );
+  const body = await response.text();
+  const events = streaming
+    ? body
+        .trim()
+        .split("\n\n")
+        .map((event) => JSON.parse(event.slice(6)))
+    : [];
+  const envelope = streaming
+    ? events.find((event) => event.type === "response.completed").response
+    : JSON.parse(body);
+  const item = envelope.output[0];
+  expect(item).toMatchObject({
+    type: "function_call",
+    call_id: "status-call",
+    name: "subagent_status",
+  });
+  expect(JSON.parse(item.arguments)).toEqual({ child_session_id: "controlled-child", _nac: null });
+  if (streaming)
+    expect(events.find((event) => event.type === "response.output_item.done").item).toEqual(item);
+  const completed = await fetch(`${provider.baseUrl}/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      stream: true,
+      input: [{ type: "function_call_output", call_id: item.call_id, output: "controlled status" }],
+    }),
+    signal: AbortSignal.timeout(2_000),
+  });
+  expect(completed.status).toBe(200);
+  expect(completed.headers.get("content-type")).toBe("text/event-stream");
+  expect(await completed.text()).toContain('"text":"status retained"');
+  provider.assertConsumed();
+});

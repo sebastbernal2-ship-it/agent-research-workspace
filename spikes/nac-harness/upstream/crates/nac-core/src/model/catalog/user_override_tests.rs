@@ -1,0 +1,497 @@
+//! S2 tests: `$NAC_HOME/models.json` user overrides — schema, merge
+//! mechanics, per-entry resilience, and the full precedence chain. All
+//! tests drive `ModelCatalog::load_from_home` against temp homes, so they
+//! never touch the environment or the process-global catalog.
+
+use super::test_support::{write_overlay, TempHome};
+use super::*;
+use crate::model::{CompletionsTokenLimit, ReasoningEffort};
+
+fn write_models_json(home: &TempHome, doc: serde_json::Value) {
+    std::fs::write(
+        home.path().join("models.json"),
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn user_override_patches_an_exact_model() {
+    let home = TempHome::new("exact-patch");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            // Unknown top-level keys are tolerated (forward compatibility).
+            "version": 1,
+            "overrides": [
+                {
+                    "provider": "deepseek-chat",
+                    "model": "deepseek-v4-flash",
+                    "set": { "max_tokens": 65_536, "display_name": "DeepSeek V4 Flash (patched)" }
+                }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let metadata = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(metadata.source, ModelSource::UserOverride);
+    assert_eq!(metadata.max_tokens, 65_536);
+    assert_eq!(
+        metadata.display_name.as_deref(),
+        Some("DeepSeek V4 Flash (patched)")
+    );
+    // Untouched fields keep the baseline values.
+    assert_eq!(metadata.context_window, 1_000_000);
+    assert_eq!(metadata.cost.input, 0.14);
+    assert_eq!(
+        metadata.thinking_level_map.wire_value(ReasoningEffort::Max),
+        Some("max")
+    );
+}
+
+#[test]
+fn chat_completion_request_caps_are_explicit_and_mutually_exclusive() {
+    for (field, expected) in [
+        (
+            "max_completion_tokens",
+            CompletionsTokenLimit::Modern(4_096),
+        ),
+        ("legacy_max_tokens", CompletionsTokenLimit::Legacy(4_096)),
+    ] {
+        let home = TempHome::new(field);
+        let set = match field {
+            "max_completion_tokens" => serde_json::json!({"max_completion_tokens": 4_096}),
+            "legacy_max_tokens" => serde_json::json!({"legacy_max_tokens": 4_096}),
+            _ => unreachable!(),
+        };
+        write_models_json(
+            &home,
+            serde_json::json!({
+                "overrides": [{
+                    "provider": "openai-chat-completions",
+                    "model": "custom-model",
+                    "set": set
+                }]
+            }),
+        );
+        let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            catalog
+                .resolve(BackendKind::OpenAiChatCompletions, "custom-model")
+                .compat
+                .completions_token_limit,
+            Some(expected)
+        );
+    }
+
+    let home = TempHome::new("both-token-fields");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [{
+                "provider": "openai-chat-completions",
+                "model": "custom-model",
+                "set": { "max_completion_tokens": 4096, "legacy_max_tokens": 2048 }
+            }]
+        }),
+    );
+    let (_, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.to_string().contains("mutually exclusive")));
+
+    let home = TempHome::new("token-field-wrong-provider");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [{
+                "provider": "deepseek-chat",
+                "model": "deepseek-chat",
+                "set": { "max_completion_tokens": 4096 }
+            }]
+        }),
+    );
+    let (_, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+    assert!(warnings.iter().any(|warning| warning
+        .to_string()
+        .contains("only valid for openai-chat-completions")));
+}
+
+#[test]
+fn precedence_user_beats_overlay_beats_baseline_beats_provider_default() {
+    let home = TempHome::new("precedence");
+    write_overlay(
+        home.path(),
+        "2099-01-01T00:00:00Z",
+        serde_json::json!({
+            "deepseek-chat": {
+                "models": {
+                    "deepseek-chat": { "context_window": 111_111, "max_tokens": 11_111 },
+                    "deepseek-v4-flash": { "context_window": 222_222, "max_tokens": 22_222 }
+                }
+            }
+        }),
+    );
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "deepseek-chat", "model": "deepseek-chat", "set": { "max_tokens": 33_333 } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // user > overlay > baseline
+    let user = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-chat");
+    assert_eq!(user.source, ModelSource::UserOverride);
+    assert_eq!(user.max_tokens, 33_333);
+    assert_eq!(
+        user.context_window, 111_111,
+        "overlay value survives under the user patch"
+    );
+    // overlay > baseline
+    let overlay = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(overlay.source, ModelSource::Overlay);
+    assert_eq!(overlay.context_window, 222_222);
+    // Missing baseline ids are retired by the provider snapshot.
+    let baseline = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-pro");
+    assert_eq!(baseline.source, ModelSource::ProviderDefault);
+    // provider default for unknown ids
+    let unknown = catalog.resolve(BackendKind::DeepSeekChat, "never-seen-model");
+    assert_eq!(unknown.source, ModelSource::ProviderDefault);
+    assert_eq!(unknown.context_window, FALLBACK_CONTEXT_WINDOW);
+}
+
+#[test]
+fn user_override_for_unknown_model_derives_from_provider_default() {
+    let home = TempHome::new("unknown-model");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "together-chat", "model": "brand-new-model", "set": {
+                    "max_tokens": 8_192,
+                    "image_input": true
+                } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let metadata = catalog.resolve(BackendKind::TogetherChat, "brand-new-model");
+    assert_eq!(metadata.source, ModelSource::UserOverride);
+    assert_eq!(metadata.max_tokens, 8_192);
+    assert!(metadata.image_input);
+    // Everything else derives from the provider default.
+    assert_eq!(metadata.context_window, FALLBACK_CONTEXT_WINDOW);
+    assert!(metadata
+        .thinking_level_map
+        .is_supported(ReasoningEffort::High));
+    assert!(!metadata
+        .thinking_level_map
+        .is_supported(ReasoningEffort::Xhigh));
+    assert_eq!(
+        metadata.compat.completions_reasoning_field.as_deref(),
+        Some("reasoning")
+    );
+}
+
+#[test]
+fn user_override_dated_snapshot_derives_from_the_family_entry() {
+    let home = TempHome::new("family-derive");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                {
+                    "provider": "anthropic-messages",
+                    "model": "claude-opus-4-6-20261225",
+                    "set": { "max_tokens": 9_999 }
+                }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let metadata = catalog.resolve(BackendKind::AnthropicMessages, "claude-opus-4-6-20261225");
+    assert_eq!(metadata.source, ModelSource::UserOverride);
+    assert_eq!(metadata.max_tokens, 9_999);
+    assert!(metadata.image_input);
+    // The family map (adaptive with the "max" tier) carries over.
+    assert_eq!(
+        metadata
+            .thinking_level_map
+            .wire_value(ReasoningEffort::Xhigh),
+        Some("max")
+    );
+}
+
+#[test]
+fn user_override_patches_the_provider_default() {
+    let home = TempHome::new("patch-default");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                {
+                    "provider": "deepseek-chat",
+                    "model": "_default",
+                    "set": { "context_window": 64_000, "max_tokens": 8_000 }
+                }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // Unknown models clone the patched default (the clone keeps the
+    // ProviderDefault source: the id-swap synthesis is the provider-default
+    // mechanism).
+    let unknown = catalog.resolve(BackendKind::DeepSeekChat, "never-seen-model");
+    assert_eq!(unknown.source, ModelSource::ProviderDefault);
+    assert_eq!(unknown.context_window, 64_000);
+    assert_eq!(unknown.max_tokens, 8_000);
+    // Concrete baseline entries are untouched by the default patch.
+    let known = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(known.source, ModelSource::Baseline);
+    assert_eq!(known.context_window, 1_000_000);
+}
+
+#[test]
+fn malformed_models_json_keeps_the_baseline_with_a_warning() {
+    let home = TempHome::new("malformed-file");
+    std::fs::write(home.path().join("models.json"), "not json {").unwrap();
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        matches!(warnings[0], CatalogWarning::UserOverridesMalformed { .. }),
+        "{warnings:?}"
+    );
+    let metadata = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(metadata.source, ModelSource::Baseline);
+    assert_eq!(metadata.context_window, 1_000_000);
+}
+
+#[test]
+fn invalid_override_entries_are_skipped_individually() {
+    let home = TempHome::new("skip-invalid");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "not-a-provider", "model": "x", "set": {} },
+                { "provider": "deepseek-chat", "model": "deepseek-v4-flash", "set": { "context_window": 100 } },
+                { "provider": "deepseek-chat", "model": "deepseek-v4-flash", "set": { "cost": { "input": -1.0 } } },
+                { "provider": "deepseek-chat", "model": "deepseek-v4-flash", "set": { "max_tokens": 12_345 } },
+                { "provider": "deepseek-chat", "set": {} }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    // Entries 0 (unknown provider), 1 (max_tokens 384000 > context_window
+    // 100), 2 (negative rate) and 4 (missing model) are skipped; entry 3
+    // applies.
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .all(|w| matches!(w, CatalogWarning::UserOverrideSkipped { .. })),
+        "{warnings:?}"
+    );
+    assert!(
+        matches!(&warnings[0], CatalogWarning::UserOverrideSkipped { index, .. } if *index == 0),
+        "{warnings:?}"
+    );
+    assert!(
+        matches!(&warnings[3], CatalogWarning::UserOverrideSkipped { index, .. } if *index == 4),
+        "{warnings:?}"
+    );
+    let metadata = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(metadata.source, ModelSource::UserOverride);
+    assert_eq!(metadata.max_tokens, 12_345);
+    assert_eq!(metadata.context_window, 1_000_000);
+}
+
+#[test]
+fn user_override_cost_patch_without_tiers_keeps_existing_tiers() {
+    // gpt-5.6 ships a baseline tier at 272k prompt tokens.
+    let home = TempHome::new("tiers-kept");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "openai-responses", "model": "gpt-5.6", "set": { "cost": { "input": 6.0 } } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let metadata = catalog.resolve(BackendKind::OpenAiResponses, "gpt-5.6");
+    assert_eq!(metadata.cost.input, 6.0);
+    assert_eq!(metadata.cost.output, 30.0);
+    assert_eq!(metadata.cost.cache_read, 0.5);
+    assert_eq!(metadata.cost.cache_write, 6.25);
+    let tiers = metadata.cost.tiers.as_ref().expect("baseline tiers kept");
+    assert_eq!(tiers.len(), 1);
+    assert_eq!(tiers[0].input_tokens_above, 272_000);
+    assert_eq!(tiers[0].input, 10.0);
+    assert_eq!(tiers[0].output, 45.0);
+    assert_eq!(tiers[0].cache_read, 1.0);
+    assert_eq!(tiers[0].cache_write, 12.5);
+}
+
+#[test]
+fn user_override_cost_patch_with_empty_tiers_clears_them() {
+    let home = TempHome::new("tiers-cleared");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "openai-responses", "model": "gpt-5.6", "set": { "cost": { "input": 6.0, "tiers": [] } } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let metadata = catalog.resolve(BackendKind::OpenAiResponses, "gpt-5.6");
+    assert_eq!(metadata.cost.input, 6.0);
+    assert_eq!(metadata.cost.output, 30.0);
+    assert_eq!(metadata.cost.cache_read, 0.5);
+    assert_eq!(metadata.cost.cache_write, 6.25);
+    assert_eq!(metadata.cost.tiers, Some(vec![]));
+}
+
+#[test]
+fn user_override_tier_buckets_fill_from_the_merged_base_rates() {
+    let home = TempHome::new("tiers-filled");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "openai-responses", "model": "gpt-5.6", "set": {
+                    "cost": {
+                        "input": 1.0, "output": 2.0, "cache_read": 0.1, "cache_write": 0.2
+                    }
+                } },
+                { "provider": "openai-responses", "model": "gpt-5.6", "set": {
+                    "cost": {
+                        "output": 0.0,
+                        "tiers": [ { "input_tokens_above": 100_000, "input": 3.0 } ]
+                    }
+                } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let metadata = catalog.resolve(BackendKind::OpenAiResponses, "gpt-5.6");
+    assert_eq!(
+        metadata.cost.input, 1.0,
+        "omitted bucket keeps resolved base"
+    );
+    assert_eq!(
+        metadata.cost.output, 0.0,
+        "explicit zero replaces resolved base"
+    );
+    assert_eq!(
+        metadata.cost.cache_read, 0.1,
+        "omitted bucket keeps resolved base"
+    );
+    assert_eq!(
+        metadata.cost.cache_write, 0.2,
+        "omitted bucket keeps resolved base"
+    );
+    let tiers = metadata.cost.tiers.as_ref().expect("tier applied");
+    assert_eq!(tiers.len(), 1);
+    assert_eq!(tiers[0].input_tokens_above, 100_000);
+    assert_eq!(tiers[0].input, 3.0);
+    assert_eq!(
+        tiers[0].output, 0.0,
+        "omitted bucket fills from merged base"
+    );
+    assert_eq!(
+        tiers[0].cache_read, 0.1,
+        "omitted bucket fills from merged base"
+    );
+    assert_eq!(
+        tiers[0].cache_write, 0.2,
+        "omitted bucket fills from merged base"
+    );
+}
+
+#[test]
+fn user_override_with_invalid_tier_rate_is_skipped() {
+    let home = TempHome::new("tiers-invalid");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "deepseek-chat", "model": "deepseek-v4-flash", "set": {
+                    "cost": { "input": 1.0, "tiers": [ { "input_tokens_above": 100_000, "output": -2.0 } ] }
+                } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        matches!(&warnings[0], CatalogWarning::UserOverrideSkipped { index, reason }
+            if *index == 0 && reason.contains("invalid tier output rate")),
+        "{warnings:?}"
+    );
+    // The skipped entry leaves the baseline metadata untouched.
+    let metadata = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(metadata.cost.input, 0.14);
+}
+
+#[test]
+fn user_override_tier_without_selector_is_skipped() {
+    let home = TempHome::new("tier-selector-missing");
+    write_models_json(
+        &home,
+        serde_json::json!({
+            "overrides": [
+                { "provider": "deepseek-chat", "model": "deepseek-v4-flash", "set": {
+                    "cost": { "tiers": [ { "input": 3.0 } ] }
+                } }
+            ]
+        }),
+    );
+
+    let (catalog, warnings) = ModelCatalog::load_from_home(Some(home.path()));
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        matches!(&warnings[0], CatalogWarning::UserOverrideSkipped { index, reason }
+            if *index == 0 && reason.contains("missing field `input_tokens_above`")),
+        "{warnings:?}"
+    );
+    // A malformed tier cannot silently become a zero-threshold rate set.
+    let metadata = catalog.resolve(BackendKind::DeepSeekChat, "deepseek-v4-flash");
+    assert_eq!(metadata.cost.input, 0.14);
+    assert_eq!(metadata.cost.tiers, None);
+}

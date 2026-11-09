@@ -1,0 +1,846 @@
+use super::*;
+
+impl SessionService {
+    pub(super) async fn finish_run(&self, run_id: &SessionRunId, outcome: RunOutcome) {
+        loop {
+            if self.finish_run_once(run_id, outcome.clone()).await {
+                return;
+            }
+            let id = run_id.clone();
+            let retry_cleanup = self
+                .coordinate_local(move |service| {
+                    let guard = service.lock_active_operation();
+                    matches!(guard.as_ref(), Some(ActiveSessionOperation::Run(active_run))
+                    if active_run.snapshot.run_id == id && !active_run.finishing)
+                })
+                .await
+                .unwrap_or(false);
+            if !retry_cleanup {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub(super) async fn finish_run_once(&self, run_id: &SessionRunId, outcome: RunOutcome) -> bool {
+        if self.metadata.behavior != sessions::SessionBehavior::Orchestrator {
+            if let Err(error) = self.terminal_manager.settle_run().await {
+                EventSink::bus(self.event_bus.clone())
+                    .emit_async(AgentEvent::Error {
+                        thread_name: None,
+                        message: format!(
+                            "run {run_id} remains active because terminal cleanup is incomplete: {error:#}"
+                        ),
+                    })
+                    .await;
+                return false;
+            }
+        }
+        let id = run_id.clone();
+        let finishing = self
+            .coordinate_local(move |service| service.mark_run_finishing(&id))
+            .await;
+        let Some(finishing_run) = finishing.ok().flatten() else {
+            return false;
+        };
+        self.expire_orchestrator_steering(run_id).await;
+        let (completed_duration_ms, completed_usage) = match &outcome {
+            RunOutcome::Completed(_, usage) => (Some(finishing_run.duration_ms), usage.clone()),
+            RunOutcome::Failed(_, usage) => (None, usage.clone()),
+        };
+        let durable_terminal = if matches!(outcome, RunOutcome::Failed(..)) {
+            DurableRunTerminal::Failed
+        } else {
+            DurableRunTerminal::Completed
+        };
+        let goal_usage = completed_usage.clone();
+        let run_failure = match &outcome {
+            RunOutcome::Failed(failure, _) => {
+                Some(failure.clone().with_recovery_action(match failure.kind {
+                    crate::run_failure::RunFailureKind::Authentication
+                    | crate::run_failure::RunFailureKind::Configuration => {
+                        crate::run_failure::RecoveryAction::Settings
+                    }
+                    _ => crate::run_failure::RecoveryAction::RegenerateWithRewind,
+                }))
+            }
+            RunOutcome::Completed(..) => None,
+        };
+        let goal_disposition = match run_failure.as_ref() {
+            Some(failure) if failure.transient => crate::store::GoalRunDisposition::RetryableFailed,
+            Some(_) => crate::store::GoalRunDisposition::Failed,
+            None => crate::store::GoalRunDisposition::Completed,
+        };
+        if let Some(failure) = run_failure.as_ref() {
+            self.stage_run_failure(run_id, failure).await;
+            self.normalize_failed_run_transcript().await;
+        }
+        let persistence_error = match self
+            .persist_run_snapshot(
+                &finishing_run.snapshot,
+                finishing_run.transcript_baseline,
+                completed_duration_ms,
+                completed_usage,
+                durable_terminal,
+                match (&outcome, run_failure.clone()) {
+                    (RunOutcome::Completed(response, _), _) => {
+                        RunTerminalEvidence::Response(response.clone())
+                    }
+                    (RunOutcome::Failed(..), Some(failure)) => {
+                        RunTerminalEvidence::Failure(failure)
+                    }
+                    (RunOutcome::Failed(..), None) => RunTerminalEvidence::None,
+                },
+            )
+            .await
+        {
+            Ok(()) => None,
+            Err(error) => {
+                eprintln!(
+                    "nac: failed to persist session snapshot for run {}: {error:#}",
+                    finishing_run.snapshot.run_id
+                );
+                Some(format!("{error:#}"))
+            }
+        };
+
+        self.capture_workspace_revision(&finishing_run.snapshot)
+            .await;
+
+        let (child_status, child_report, child_failure) = match &outcome {
+            RunOutcome::Completed(response, _) => (
+                crate::store::TraditionalChildStatus::Completed,
+                Some(response.clone()),
+                None,
+            ),
+            RunOutcome::Failed(failure, _) => (
+                crate::store::TraditionalChildStatus::Failed,
+                None,
+                Some(failure.diagnostic.clone()),
+            ),
+        };
+        self.settle_traditional_child_run(run_id, child_status, child_report, child_failure)
+            .await;
+        #[cfg(any(test, feature = "test-support"))]
+        self.wait_child_terminal_release_for_test().await;
+
+        let goal_attention = self
+            .settle_direct_goal_run(run_id, goal_usage, goal_disposition, run_failure.as_ref())
+            .await;
+        let durable_goal_failure = if self.metadata.behavior
+            != sessions::SessionBehavior::Orchestrator
+        {
+            if let Some(session_id) = self.metadata.session_id.as_deref() {
+                let goal = match crate::store::coordinator::owner_for(&self.metadata.store_path) {
+                    Ok(Some(owner)) => owner.load_session_goal(session_id.to_owned()).await,
+                    Ok(None) => {
+                        crate::store::load_session_goal(&self.metadata.store_path, session_id)
+                    }
+                    Err(error) => Err(error),
+                };
+                goal.ok().flatten().and_then(|goal| goal.last_failure)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let presented_run_failure = durable_goal_failure.or_else(|| run_failure.clone());
+
+        let run_id = finishing_run.snapshot.run_id.clone();
+        let client_id = finishing_run.snapshot.client_id.clone();
+        let attention_success =
+            matches!(&outcome, RunOutcome::Completed(..)) && persistence_error.is_none();
+        let terminal_event = match (outcome, persistence_error) {
+            (RunOutcome::Completed(_, _), Some(error)) => SessionEvent::RunFailed {
+                message: format!("run completed, but failed to persist session snapshot: {error}"),
+                failure: None,
+            },
+            (RunOutcome::Completed(response, _), None) => SessionEvent::RunCompleted {
+                response,
+                duration_ms: completed_duration_ms,
+            },
+            (RunOutcome::Failed(failure, _), Some(error)) => SessionEvent::RunFailed {
+                message: format!(
+                    "{}\nAdditionally, failed to persist session snapshot: {error}",
+                    failure.diagnostic
+                ),
+                failure: Some(presented_run_failure.clone().unwrap_or(failure)),
+            },
+            (RunOutcome::Failed(failure, _), None) => SessionEvent::RunFailed {
+                message: failure.diagnostic.clone(),
+                failure: Some(presented_run_failure.unwrap_or(failure)),
+            },
+        };
+        if let Err(error) = self
+            .event_bus
+            .emit_with_context_async(terminal_event, Some(run_id.clone()), client_id)
+            .await
+        {
+            eprintln!("nac: terminal event caller failed: {error:#}");
+        }
+        let id = run_id.clone();
+        if let Err(error) = self
+            .coordinate_local(move |service| service.clear_finished_run(&id))
+            .await
+        {
+            eprintln!("nac: terminal local cleanup failed: {error:#}");
+            return false;
+        }
+        if self.metadata.behavior != sessions::SessionBehavior::Orchestrator {
+            let selection =
+                if attention_success && goal_attention.known && goal_attention.goal.is_none() {
+                    self.select_direct_continuation_after_settlement(&run_id)
+                        .await
+                } else {
+                    self.select_next_direct_inbox_item().await
+                };
+            match selection {
+                Ok(selection) => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    // Selection has returned: no store transaction, operation
+                    // lease, inbox wake lock or attention hub lock is held.
+                    // The nonshipping owner accepts only actual Idle/IdleUnverified.
+                    let publication = self
+                        .wait_attention_publication_for_test(&run_id, &selection.disposition)
+                        .await;
+                    self.publish_attention_completion(
+                        &run_id,
+                        attention_success,
+                        goal_attention,
+                        selection.disposition,
+                    );
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(publication) = publication {
+                        publication.publication_attempted();
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "nac: failed to promote direct inbox after run settlement: {error:#}"
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    async fn stage_run_failure(
+        &self,
+        run_id: &SessionRunId,
+        failure: &crate::run_failure::RunFailure,
+    ) {
+        let Some(session_id) = self.metadata.session_id.clone() else {
+            return;
+        };
+        let store_path = self.metadata.store_path.clone();
+        let run_id = run_id.to_string();
+        let failure = failure.clone();
+        match crate::store::spawn_blocking_store_caller(move || {
+            crate::store::stage_active_run_failure(&store_path, &session_id, &run_id, &failure)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("nac: failed to stage typed run failure: {error:#}");
+            }
+            Err(error) => {
+                eprintln!("nac: run-failure staging task failed: {error}");
+            }
+        }
+    }
+
+    pub(super) async fn settle_direct_goal_run(
+        &self,
+        run_id: &SessionRunId,
+        usage: Option<crate::model::TokenUsage>,
+        disposition: crate::store::GoalRunDisposition,
+        failure: Option<&crate::run_failure::RunFailure>,
+    ) -> attention::GoalAttentionSettlement {
+        let mut receipt = attention::GoalAttentionSettlement {
+            known: true,
+            goal: None,
+        };
+        if self.metadata.behavior == sessions::SessionBehavior::Orchestrator {
+            return receipt;
+        }
+        if let Some(session_id) = self.metadata.session_id.clone() {
+            let path = self.metadata.store_path.clone();
+            let owned_run_id = run_id.to_string();
+            let failure = failure.cloned();
+            let tokens = usage
+                .as_ref()
+                .map_or(0, crate::model::TokenUsage::billable_tokens);
+            match crate::store::spawn_blocking_store_caller(move || {
+                crate::store::settle_session_goal_run_with_provenance(
+                    &path,
+                    &session_id,
+                    &owned_run_id,
+                    tokens,
+                    now_epoch_ms(),
+                    disposition,
+                    failure.as_ref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok((goal, last_run))) => {
+                    if let Some(goal) = goal {
+                        receipt.known = goal.accounting_run_id.is_none();
+                        if last_run.as_deref() != Some(run_id.as_str()) {
+                            // A completed row can outlive its run. Do not adopt it
+                            // for a later request; unfinished/conflicting goals
+                            // remain unknown rather than becoming goal-free.
+                            receipt.known &= goal.status == crate::store::GoalStatus::Complete
+                                && last_run.is_some()
+                                && goal.continuation_run_id.is_none()
+                                && goal.next_attempt_at_epoch_ms.is_none();
+                        } else {
+                            match u64::try_from(goal.version) {
+                                Ok(version) => {
+                                    receipt.goal = Some(crate::events::AttentionGoal {
+                                        id: goal.goal_id,
+                                        version,
+                                    });
+                                }
+                                Err(_) => receipt.known = false,
+                            }
+                        }
+                    }
+                }
+                Ok(Err(error)) | Err(error) => {
+                    receipt.known = false;
+                    eprintln!("nac: failed to settle durable goal for run {run_id}: {error:#}");
+                }
+            }
+        }
+        self.agent.lock().await.end_goal_run(run_id);
+        receipt
+    }
+
+    pub(super) async fn settle_traditional_child_run(
+        &self,
+        run_id: &SessionRunId,
+        status: crate::store::TraditionalChildStatus,
+        report: Option<String>,
+        failure: Option<String>,
+    ) {
+        if crate::store::coordinator::owner_for(&self.metadata.store_path)
+            .is_ok_and(|owner| owner.is_none())
+        {
+            self.settle_traditional_child_run_sync(run_id, status, report, failure);
+            return;
+        }
+        let service = self.clone();
+        let run_id = run_id.clone();
+        if let Err(error) = crate::store::spawn_blocking_store_caller(move || {
+            service.settle_traditional_child_run_sync(&run_id, status, report, failure);
+        })
+        .await
+        {
+            eprintln!("nac: child settlement caller failed: {error:#}");
+        }
+    }
+
+    fn settle_traditional_child_run_sync(
+        &self,
+        run_id: &SessionRunId,
+        status: crate::store::TraditionalChildStatus,
+        report: Option<String>,
+        failure: Option<String>,
+    ) {
+        let Some(session_id) = self.metadata.session_id.as_deref() else {
+            return;
+        };
+        let child =
+            match crate::store::load_traditional_child(&self.metadata.store_path, session_id) {
+                Ok(Some(child)) => child,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("nac: failed to inspect traditional child settlement: {error:#}");
+                    return;
+                }
+            };
+        let revision = crate::store::workspace_revision_for_run(
+            &self.metadata.store_path,
+            session_id,
+            run_id.as_str(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("nac: failed to read child workspace revision: {error:#}");
+            None
+        });
+        let change_summary = revision.map(|revision| {
+            format!(
+                "{} files changed, +{} -{}",
+                revision.changed_files, revision.additions, revision.deletions
+            )
+        });
+        let verification_summary = report
+            .as_deref()
+            .and_then(|report| extract_report_section(report, "verification"));
+        match crate::store::settle_traditional_child_run(
+            &self.metadata.store_path,
+            session_id,
+            run_id.as_str(),
+            crate::store::TraditionalChildTerminal {
+                status,
+                report,
+                failure,
+                change_summary,
+                verification_summary,
+            },
+        ) {
+            Ok(settlement)
+                if settlement.newly_settled && settlement.child.completion_inbox_id.is_some() =>
+            {
+                if let Ok(controller) =
+                    crate::traditional_children::controller_for(&self.metadata.store_path)
+                {
+                    let parent_session_id = child.parent_session_id;
+                    tokio::spawn(async move {
+                        if let Err(error) = controller.wake(&parent_session_id).await {
+                            eprintln!(
+                                "nac: failed to wake parent after child settlement: {error:#}"
+                            );
+                        }
+                    });
+                }
+                if let Err(error) = crate::store::clear_settled_run_recovery(
+                    &self.metadata.store_path,
+                    session_id,
+                    run_id.as_str(),
+                ) {
+                    eprintln!(
+                        "nac: failed to clear settled child recovery for run {run_id}: {error:#}"
+                    );
+                }
+            }
+            Ok(_) => {
+                if let Err(error) = crate::store::clear_settled_run_recovery(
+                    &self.metadata.store_path,
+                    session_id,
+                    run_id.as_str(),
+                ) {
+                    eprintln!(
+                        "nac: failed to clear settled child recovery for run {run_id}: {error:#}"
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("nac: failed to settle traditional child run {run_id}: {error:#}");
+            }
+        }
+    }
+
+    /// Freeze the checkout as it stands now, so the run can be revisited later.
+    ///
+    /// A revision is a convenience, never a precondition for anything, so every
+    /// failure here is reported and swallowed: a repository nac cannot capture
+    /// still gets its run finished normally.
+    pub(super) async fn capture_workspace_revision(&self, run: &ActiveRunSnapshot) {
+        let (Some(session_id), Some(target)) =
+            (self.metadata.session_id.clone(), self.workspace_git.clone())
+        else {
+            return;
+        };
+        let store_path = self.metadata.store_path.clone();
+        let run_id = run.run_id.to_string();
+        let label = run.prompt_preview.clone();
+        // Recorded now rather than derived later: this is the only moment we
+        // can say for certain which transcript prefix the captured files go
+        // with, and a revert has nothing else to key off.
+        let transcript_len = self.transcript_len().await.ok();
+
+        let outcome = crate::store::spawn_blocking_store_caller(move || -> Result<()> {
+            let previous = crate::store::latest_workspace_revision(&store_path, &session_id)?
+                .map(|revision| revision.commit_sha);
+            let captured = crate::workspace::capture(&target, &session_id, previous.as_deref())?;
+            crate::store::append_workspace_revision(
+                &store_path,
+                &session_id,
+                crate::store::NewWorkspaceRevision {
+                    run_id,
+                    commit_sha: captured.commit,
+                    base_sha: captured.base,
+                    branch: captured.branch,
+                    label,
+                    additions: captured.additions,
+                    deletions: captured.deletions,
+                    changed_files: captured.changed_files,
+                    transcript_len,
+                },
+            )?;
+            Ok(())
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("nac: failed to capture workspace revision: {error:#}");
+            }
+            Err(error) => {
+                eprintln!("nac: workspace revision task failed: {error}");
+            }
+        }
+    }
+
+    /// Run-failure transcript normalization: a run that fails at the
+    /// tool-result commit point leaves a dangling assistant tool-call turn
+    /// in the long-lived agent's transcript AND the transcript log (the
+    /// assistant message committed to both; its tool results are in
+    /// neither). The next run reuses this agent — restore-time
+    /// normalization only runs at session admission — and providers reject
+    /// a transcript whose assistant tool calls have no tool results, so
+    /// every subsequent run would fail at the model call until re-attach.
+    /// Trim the dangling turn from the vec and the log before the run-end
+    /// bookkeeping reads the store. Done here rather than at the failing
+    /// commit point so every commit-point failure is covered uniformly,
+    /// mirroring the cancel path's terminal normalization
+    /// (`append_cancellation_message`). Best-effort: a log failure here
+    /// must not mask the run failure; the next restore re-normalizes the
+    /// stale tail. Prompt/assistant append failures need no normalization
+    /// (log-first: those messages are in neither store).
+    pub(super) async fn normalize_failed_run_transcript(&self) {
+        let mut agent = self.agent.lock().await;
+        let result = if self.metadata.behavior == sessions::SessionBehavior::Orchestrator {
+            agent.normalize_dangling_tail().await
+        } else {
+            agent.normalize_failed_tail_preserving_partial().await
+        };
+        if let Err(error) = result {
+            eprintln!("nac: failed to normalize transcript after run failure: {error:#}");
+        }
+    }
+
+    pub(super) async fn expire_orchestrator_steering(&self, run_id: &SessionRunId) {
+        if crate::store::coordinator::owner_for(&self.metadata.store_path)
+            .is_ok_and(|owner| owner.is_none())
+        {
+            self.expire_orchestrator_steering_sync(run_id);
+            return;
+        }
+        let service = self.clone();
+        let run_id = run_id.clone();
+        if let Err(error) = crate::store::spawn_blocking_store_caller(move || {
+            service.expire_orchestrator_steering_sync(&run_id);
+        })
+        .await
+        {
+            eprintln!("nac: steering expiry caller failed: {error:#}");
+        }
+    }
+
+    pub(super) async fn emit_steering_expired_async(
+        &self,
+        records: Vec<crate::store::ThreadSteeringRecord>,
+    ) {
+        let service = self.clone();
+        if let Err(error) = crate::store::spawn_blocking_store_caller(move || {
+            service.emit_steering_expired(records);
+        })
+        .await
+        {
+            eprintln!("nac: steering expiry publication failed: {error:#}");
+        }
+    }
+
+    fn expire_orchestrator_steering_sync(&self, run_id: &SessionRunId) {
+        let Some(session_id) = self.metadata.session_id.as_deref() else {
+            return;
+        };
+        match crate::store::expire_thread_steering(
+            &self.metadata.store_path,
+            session_id,
+            run_id.as_str(),
+        ) {
+            Ok(records) => self.emit_steering_expired(records),
+            Err(error) => {
+                eprintln!("nac: failed to expire orchestrator steering: {error:#}");
+            }
+        }
+    }
+
+    pub(super) fn emit_steering_expired(&self, records: Vec<crate::store::ThreadSteeringRecord>) {
+        for record in records {
+            let instruction_preview = record.instruction.chars().take(160).collect();
+            if record.thread_name == crate::store::ORCHESTRATOR_STEERING_TARGET {
+                self.event_bus
+                    .emit_agent(AgentEvent::OrchestratorSteeringExpired {
+                        steering_id: record.id,
+                        instruction_preview,
+                    });
+            } else {
+                self.event_bus
+                    .emit_agent(AgentEvent::ThreadSteeringExpired {
+                        name: record.thread_name,
+                        steering_id: record.id,
+                        instruction_preview,
+                    });
+            }
+        }
+    }
+
+    pub(super) fn mark_run_finishing(&self, run_id: &SessionRunId) -> Option<FinishingRun> {
+        let mut guard = self.lock_active_operation();
+        let Some(ActiveSessionOperation::Run(active_run)) = guard.as_mut() else {
+            return None;
+        };
+        if &active_run.snapshot.run_id != run_id || active_run.finishing {
+            return None;
+        }
+        active_run.finishing = true;
+        active_run.snapshot.submitted_user_message = None;
+        Some(FinishingRun {
+            snapshot: active_run.snapshot.clone(),
+            duration_ms: duration_ms(active_run.started_at.elapsed()),
+            transcript_baseline: active_run.transcript_baseline,
+        })
+    }
+
+    pub(super) fn mark_run_cancelling(&self, run_id: &SessionRunId) -> Option<CancellingRun> {
+        let mut guard = self.lock_active_operation();
+        let Some(ActiveSessionOperation::Run(active_run)) = guard.as_mut() else {
+            return None;
+        };
+        if &active_run.snapshot.run_id != run_id || active_run.finishing {
+            return None;
+        }
+        active_run.finishing = true;
+        active_run.snapshot.submitted_user_message = None;
+        Some(CancellingRun {
+            service: self.clone(),
+            snapshot: active_run.snapshot.clone(),
+            task: active_run.task.take(),
+            transcript_baseline: active_run.transcript_baseline,
+            command_cancellation: active_run.command_cancellation.clone(),
+        })
+    }
+
+    pub(super) fn run_prompt_commit(
+        &self,
+        run_id: &SessionRunId,
+    ) -> Option<watch::Sender<RunPromptCommitStatus>> {
+        let guard = self.lock_active_operation();
+        let Some(ActiveSessionOperation::Run(active_run)) = guard.as_ref() else {
+            return None;
+        };
+        (&active_run.snapshot.run_id == run_id).then(|| active_run.prompt_commit.clone())
+    }
+
+    pub(super) fn run_review_intent(&self, run_id: &SessionRunId) -> Option<String> {
+        let guard = self.lock_active_operation();
+        let Some(ActiveSessionOperation::Run(active_run)) = guard.as_ref() else {
+            return None;
+        };
+        (&active_run.snapshot.run_id == run_id)
+            .then(|| active_run.review_intent.clone())
+            .flatten()
+    }
+
+    pub(super) fn run_inbox_prompt(&self, run_id: &SessionRunId) -> Option<RunInboxPrompt> {
+        let guard = self.lock_active_operation();
+        let Some(ActiveSessionOperation::Run(active_run)) = guard.as_ref() else {
+            return None;
+        };
+        if &active_run.snapshot.run_id != run_id {
+            return None;
+        }
+        debug_assert_eq!(
+            active_run.inbox_item_id,
+            active_run.inbox_prompt.as_ref().map(RunInboxPrompt::id),
+            "admitted run must retain its exact inbox prompt identity"
+        );
+        active_run.inbox_prompt.clone()
+    }
+
+    pub(super) fn set_run_task(&self, run_id: &SessionRunId, task: JoinHandle<()>) {
+        let mut guard = self.lock_active_operation();
+        let Some(ActiveSessionOperation::Run(active_run)) = guard.as_mut() else {
+            task.abort();
+            return;
+        };
+        if &active_run.snapshot.run_id != run_id || active_run.finishing {
+            task.abort();
+            return;
+        }
+        active_run.task = Some(task);
+    }
+
+    /// Store the run-start visible-response count captured by the run task
+    /// (step 4). Dropped when the run is already finishing/cancelling — the
+    /// persist path then falls back to the run-end count (exact when the
+    /// task was cancelled before its first append).
+    pub(super) fn set_run_transcript_baseline(&self, run_id: &SessionRunId, baseline: usize) {
+        let mut guard = self.lock_active_operation();
+        if let Some(ActiveSessionOperation::Run(active_run)) = guard.as_mut() {
+            if &active_run.snapshot.run_id == run_id && !active_run.finishing {
+                active_run.transcript_baseline = Some(baseline);
+            }
+        }
+    }
+
+    pub(super) fn clear_finished_run(&self, run_id: &SessionRunId) {
+        let mut guard = self.lock_active_operation();
+        if guard.as_ref().is_some_and(|operation| {
+            matches!(
+                operation,
+                ActiveSessionOperation::Run(active_run)
+                    if &active_run.snapshot.run_id == run_id && active_run.finishing
+            )
+        }) {
+            if let Some(ActiveSessionOperation::Run(run)) = guard.take() {
+                run.settlement.send_replace(true);
+                // Drop the run's operation lease before publishing the idle slot.
+                drop(run);
+            }
+        }
+    }
+
+    pub(super) fn lock_active_operation(&self) -> super::operation_state::ActiveOperationGuard<'_> {
+        super::operation_state::ActiveOperationGuard::new(self)
+    }
+
+    /// Run-end persist (DB-direct transcript workset, step 4 — never-fold):
+    /// performs NO `messages_json` rewrite. The snapshot blob is write-once
+    /// (system head ++ legacy prefix); the transcript lives in the
+    /// transcript log, appends-only. Token/timing bookkeeping diffs
+    /// store-backed visible-response counts: `transcript_baseline` at run
+    /// start (captured by the run task before its first append) vs the count
+    /// at run end, advanced here over the run's appended log rows. Only
+    /// run-state columns are persisted (`save_session_run_state`) and the
+    /// in-memory snapshot is updated in place — no O(n) transcript clone
+    /// anywhere. The in-memory update deliberately happens before the save:
+    /// the duration/usage vectors are count-indexed histories, not diffs, so
+    /// a failed save leaves both copies re-derivable from the counts at the
+    /// next run end.
+    pub(super) async fn persist_run_snapshot(
+        &self,
+        active_run: &ActiveRunSnapshot,
+        transcript_baseline: Option<usize>,
+        completed_duration_ms: Option<u64>,
+        completed_usage: Option<crate::model::TokenUsage>,
+        durable_terminal: DurableRunTerminal,
+        evidence: RunTerminalEvidence,
+    ) -> Result<()> {
+        let (failure, run_result) = match evidence {
+            RunTerminalEvidence::None => (None, None),
+            RunTerminalEvidence::Response(response) => (None, Some(response)),
+            RunTerminalEvidence::Failure(failure) => (Some(failure), None),
+        };
+        let goal_final_billable_tokens = completed_usage
+            .as_ref()
+            .map_or(0, crate::model::TokenUsage::billable_tokens);
+        let heartbeat_settlement = {
+            let operation = self.lock_active_operation();
+            matches!(operation.as_ref(),Some(ActiveSessionOperation::Run(run)) if run.heartbeat && run.snapshot.run_id==active_run.run_id)
+                .then(||crate::store::HeartbeatRunSettlement{
+                    tokens_used:completed_usage.as_ref().map(crate::model::TokenUsage::billable_tokens),
+                    duration_ms:completed_duration_ms.unwrap_or_default(),
+                    terminal_at_epoch_ms:now_epoch_ms(),
+                    needs_human_action:self.heartbeat_context.as_ref().is_some_and(|context|context.needs_human_action()),
+                })
+        };
+        {
+            let snapshot = self.session_snapshot.lock().await;
+            if snapshot.is_none() {
+                return Ok(());
+            }
+        }
+        self.update_transcript_scan().await?;
+        let current_response_count = self.lock_transcript_scan().visible_response_count;
+        let mut update = {
+            let mut snapshot = self.session_snapshot.lock().await;
+            let Some(snapshot) = snapshot.as_mut() else {
+                return Ok(());
+            };
+            // Fallback when the run task never captured a baseline
+            // (cancelled before its first append, or a capture failure):
+            // diffing against the run-end count is exact in the no-append
+            // case and only affects legacy history padding otherwise.
+            let previous_response_count = transcript_baseline.unwrap_or(current_response_count);
+            let response_timing = response_timing_after_run(
+                snapshot,
+                previous_response_count,
+                current_response_count,
+                completed_duration_ms,
+            );
+            let token_usages = token_usages_after_run(
+                &snapshot.token_usages,
+                previous_response_count,
+                current_response_count,
+                completed_usage.clone(),
+            );
+            let unattributed_token_usage = unattributed_usage_after_run(
+                snapshot.unattributed_token_usage.clone(),
+                current_response_count > previous_response_count,
+                completed_usage,
+            );
+            snapshot.apply_run_state(sessions::SessionRunState {
+                last_response_duration_ms: response_timing.last_response_duration_ms,
+                previous_response_duration_ms: response_timing.previous_response_duration_ms,
+                response_durations_ms: response_timing.response_durations_ms,
+                token_usages,
+                unattributed_token_usage,
+            })
+        };
+        match durable_terminal {
+            DurableRunTerminal::Completed | DurableRunTerminal::Cancelled => {
+                update.finished_run_id = Some(active_run.run_id.to_string());
+                update.finished_run_disposition = Some(match durable_terminal {
+                    DurableRunTerminal::Completed => {
+                        crate::store::RunTerminalDisposition::Completed
+                    }
+                    DurableRunTerminal::Cancelled => {
+                        crate::store::RunTerminalDisposition::Cancelled
+                    }
+                    DurableRunTerminal::Failed => unreachable!(),
+                });
+            }
+            DurableRunTerminal::Failed => {
+                update.failed_run_id = Some(active_run.run_id.to_string());
+                update.failed_run_failure = failure.clone();
+            }
+        }
+        if self.metadata.behavior != sessions::SessionBehavior::Orchestrator {
+            update.goal_settlement = Some(crate::store::GoalRunSettlement {
+                run_id: active_run.run_id.to_string(),
+                final_billable_tokens: goal_final_billable_tokens,
+                terminal_at_epoch_ms: now_epoch_ms(),
+                disposition: match durable_terminal {
+                    DurableRunTerminal::Completed => crate::store::GoalRunDisposition::Completed,
+                    DurableRunTerminal::Cancelled => crate::store::GoalRunDisposition::Cancelled,
+                    DurableRunTerminal::Failed
+                        if failure.as_ref().is_some_and(|failure| failure.transient) =>
+                    {
+                        crate::store::GoalRunDisposition::RetryableFailed
+                    }
+                    DurableRunTerminal::Failed => crate::store::GoalRunDisposition::Failed,
+                },
+                failure,
+            });
+        }
+        update.finished_run_result = run_result;
+        update.heartbeat_settlement = heartbeat_settlement;
+        let saved_session_id = update.session_id.clone();
+        let store_path = self.metadata.store_path.clone();
+        crate::store::spawn_blocking_store_caller(move || {
+            sessions::save_session_run_state(&store_path, &update)
+        })
+        .await??;
+
+        self.event_bus
+            .emit_with_context_async(
+                SessionEvent::SnapshotSaved {
+                    session_id: saved_session_id,
+                },
+                Some(active_run.run_id.clone()),
+                active_run.client_id.clone(),
+            )
+            .await?;
+
+        Ok(())
+    }
+}

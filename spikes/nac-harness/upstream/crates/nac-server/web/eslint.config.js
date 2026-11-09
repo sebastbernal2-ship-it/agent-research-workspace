@@ -1,0 +1,66 @@
+import js from "@eslint/js";
+import globals from "globals";
+import reactHooks from "eslint-plugin-react-hooks";
+import reactRefresh from "eslint-plugin-react-refresh";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config([
+  {
+    ignores: [
+      "dist",
+      "packages/nac-client/dist/**",
+      "packages/nac-presentation/dist/**",
+      "../assets/**",
+    ],
+  },
+  {
+    files: ["**/*.{ts,tsx}"],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat["recommended-latest"],
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: globals.browser,
+    },
+    rules: {
+      "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
+    },
+  },
+  {
+    // Design-system atoms, primitives and providers deliberately export their
+    // variant enums and hooks next to the component, which costs those files
+    // Fast Refresh.
+    files: ["src/app/atoms/**", "src/app/ui/**", "src/app/providers/**"],
+    rules: { "react-refresh/only-export-components": "off" },
+  },
+  {
+    // Product code reaches the primitives through the atoms (ADR 0007).
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: ["src/app/atoms/**", "src/app/ui/**", "src/app/providers/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["**/ui", "**/ui/*"],
+              message: "Import the atom; only atoms, providers and primitives use src/app/ui.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    files: ["e2e/**/*.{ts,tsx}", "playwright.config.ts"],
+    languageOptions: { globals: globals.node },
+    rules: {
+      "no-empty-pattern": "off",
+      "react-hooks/rules-of-hooks": "off",
+      "react-refresh/only-export-components": "off",
+    },
+  },
+]);

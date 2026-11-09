@@ -1,0 +1,808 @@
+use super::*;
+
+fn backend() -> Arc<ExecutionBackend> {
+    Arc::new(ExecutionBackend::Local {
+        workspace_cwd: std::env::current_dir().unwrap(),
+    })
+}
+
+struct HeldModelEof {
+    state: crate::terminal::collector::CollectorState,
+    directory: PathBuf,
+}
+
+impl Drop for HeldModelEof {
+    fn drop(&mut self) {
+        self.state.hold_finish_for_test(false);
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(unix)]
+async fn model_with_held_eof(command: &str) -> (TerminalManager, String, HeldModelEof) {
+    use crate::sandbox::ssh_command::shell_quote;
+    let manager = TerminalManager::for_direct();
+    let name = manager.next_session_name();
+    let directory = std::env::temp_dir().join(format!("nac-model-eof-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let release = directory.join("release");
+    let command = format!(
+        // Dropping portable-pty's writer sends LF/VEOF. Keep that cleanup input
+        // from echoing into this fixture's exact retained-output oracle.
+        "stty -echo || exit 1; while [ ! -e {} ]; do sleep 0.01; done; {command}",
+        shell_quote(&release.to_string_lossy())
+    );
+    let environment = nac_contracts::CommandEnvironmentSnapshot::from_parts(
+        std::collections::BTreeMap::new(),
+        vec!["exact-pty-secret".into()],
+    );
+    manager
+        .create_sanitized(
+            name.clone(),
+            &command,
+            None,
+            80,
+            24,
+            &backend(),
+            None,
+            &[],
+            environment,
+        )
+        .await
+        .unwrap();
+    let state = manager
+        .sessions
+        .lock()
+        .await
+        .get(&name)
+        .unwrap()
+        .collector_state();
+    state.hold_finish_for_test(true);
+    (manager, name, HeldModelEof { state, directory })
+}
+
+#[cfg(unix)]
+async fn release_model_and_observe_exit(
+    manager: &TerminalManager,
+    name: &str,
+    hold: &HeldModelEof,
+) {
+    std::fs::write(hold.directory.join("release"), b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut sessions = manager.sessions.lock().await;
+            let session = sessions.get_mut(name).unwrap();
+            session.refresh_status();
+            if session.exit_code() == Some(0) {
+                assert!(!session.output_complete());
+                // Wake an already registered preview only after process exit.
+                session.output_notify().notify_waiters();
+                session.output_notify().notify_one();
+                break;
+            }
+            drop(sessions);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gated exact command did not exit");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn completed_model_preview_waits_for_safe_collector_suffix() {
+    let (manager, name, hold) = model_with_held_eof("printf exact-pty").await;
+    let preview = manager.write_stdin(&name, "", 2_000, 100, None);
+    tokio::pin!(preview);
+    tokio::select! {
+        biased;
+        result = &mut preview => panic!("unreleased command returned early: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    release_model_and_observe_exit(&manager, &name, &hold).await;
+    tokio::select! {
+        biased;
+        result = &mut preview => panic!("process exit overtook held output collection: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    hold.state.hold_finish_for_test(false);
+    let output = tokio::time::timeout(Duration::from_secs(2), &mut preview)
+        .await
+        .expect("safe suffix remained stuck after collector release")
+        .unwrap();
+    assert_eq!(output.content_preview, "exact-pty");
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.session_name.is_none());
+    assert!(manager.get(&name).await.is_none());
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn completed_empty_model_preview_does_not_require_output_bytes() {
+    let (manager, name, hold) = model_with_held_eof("true").await;
+    release_model_and_observe_exit(&manager, &name, &hold).await;
+    let preview = manager.write_stdin(&name, "", 2_000, 100, None);
+    tokio::pin!(preview);
+    tokio::select! {
+        biased;
+        result = &mut preview => panic!("process exit overtook held empty EOF: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    hold.state.hold_finish_for_test(false);
+    let output = tokio::time::timeout(Duration::from_secs(2), &mut preview)
+        .await
+        .expect("empty output must not require a nonempty suffix")
+        .unwrap();
+    assert!(output.content_preview.is_empty());
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.session_name.is_none());
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn model_preview_observes_exit_without_external_status_or_output_notifications() {
+    let (manager, name, hold) = model_with_held_eof("printf exact-pty").await;
+    hold.state.hold_finish_for_test(false);
+    let preview = manager.write_stdin(&name, "", 10_000, 100, None);
+    tokio::pin!(preview);
+    tokio::select! {
+        biased;
+        result = &mut preview => panic!("unreleased command returned early: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    // Do not query/refresh status or inject a notification: the safe prefix
+    // produces no append notification until EOF. The preview must notice exit.
+    std::fs::write(hold.directory.join("release"), b"release").unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(2), &mut preview)
+        .await
+        .expect("preview waited for the full yield instead of observing root exit")
+        .unwrap();
+    assert_eq!(output.content_preview, "exact-pty");
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.session_name.is_none());
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn model_preview_deadline_preserves_late_safe_output_for_paging() {
+    let (manager, name, hold) = model_with_held_eof("printf exact-pty").await;
+    release_model_and_observe_exit(&manager, &name, &hold).await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.write_stdin(&name, "", 0, 100, None),
+    )
+    .await
+    .expect("zero-yield preview waited for held EOF")
+    .unwrap();
+    assert!(output.content_preview.is_empty());
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.session_name.is_none());
+    hold.state.hold_finish_for_test(false);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !hold.state.complete() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late safe output did not finish after held EOF was released");
+    let retained = manager
+        .read_output(&output.output_id, OutputStream::Combined, 0, 100)
+        .unwrap();
+    assert_eq!(retained.content, "exact-pty");
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn retained_agent_natural_exit_is_cached_without_reap_archive_or_preview_reads() {
+    use crate::sandbox::ssh_command::shell_quote;
+    let manager = TerminalManager::for_direct();
+    let id = manager.next_session_name();
+    let release = std::env::temp_dir().join(format!("nac-agent-exit-{}", uuid::Uuid::new_v4()));
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.01; done; exit 17",
+        shell_quote(&release.to_string_lossy())
+    );
+    manager
+        .create_with_cancellation(id.clone(), &command, None, 80, 24, &backend(), None)
+        .await
+        .unwrap();
+    manager.retain_with_cancellation(&id, None).await.unwrap();
+    std::fs::write(&release, b"retained").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = manager.execution_status(&id).await.unwrap();
+            if status.process_state == ExecutionProcessState::CleanupPending {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("natural retained agent exit stayed stale without model polling");
+    assert_eq!(status.process_state, ExecutionProcessState::CleanupPending);
+    assert_eq!(
+        status.exit_code, None,
+        "unreaped ownership withholds settlement"
+    );
+    assert!(status.alive && status.retained && status.stop);
+    assert!(!status.input && !status.resize);
+    assert!(manager.completed_sessions.lock().await.is_empty());
+    {
+        let sessions = manager.sessions.lock().await;
+        let session = sessions.get(&id).unwrap();
+        assert_eq!(session.preview_cursor(), 0);
+        assert!(
+            !session.accepts_user_input(),
+            "pending roots deny fresh input"
+        );
+        assert_eq!(
+            session.exit_code(),
+            None,
+            "viewing must not reap the model owner"
+        );
+    }
+    manager.stop_execution(&id).await.unwrap();
+    let settled = manager.execution_status(&id).await.unwrap();
+    assert_eq!(settled.exit_code, Some(17));
+    assert_eq!(settled.process_state, ExecutionProcessState::Settled);
+    assert!(!settled.alive && !settled.stop);
+    let _ = std::fs::remove_file(release);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn observing_exited_agent_root_preserves_descendant_and_collector_ownership() {
+    use crate::sandbox::ssh_command::shell_quote;
+    let manager = TerminalManager::for_direct();
+    let path = std::env::temp_dir().join(format!("nac-agent-observe-{}", uuid::Uuid::new_v4()));
+    let release = path.with_extension("release");
+    let child = format!(
+        "trap '' HUP TERM; echo $$ > {}; exec sleep 30",
+        shell_quote(&path.to_string_lossy())
+    );
+    let command = format!(
+        "sh -c {} & while [ ! -s {} ]; do sleep 0.01; done; while [ ! -e {} ]; do sleep 0.01; done; exit 19",
+        shell_quote(&child),
+        shell_quote(&path.to_string_lossy()),
+        shell_quote(&release.to_string_lossy())
+    );
+    let id = manager.next_session_name();
+    manager
+        .create_with_cancellation(id.clone(), &command, None, 80, 24, &backend(), None)
+        .await
+        .unwrap();
+    manager.retain_with_cancellation(&id, None).await.unwrap();
+    std::fs::write(&release, b"retained").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = manager.execution_status(&id).await.unwrap();
+            if status.process_state == ExecutionProcessState::CleanupPending {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "viewing killed the descendant"
+    );
+    // Platforms can report PTY EOF at leader hangup even while a descendant
+    // still owns descriptors. Collector completion cannot settle that owner.
+    assert!(status.alive && status.stop);
+    assert_eq!(status.exit_code, None);
+    assert!(manager.completed_sessions.lock().await.is_empty());
+    manager.stop_execution(&id).await.unwrap();
+    let settled = manager.execution_status(&id).await.unwrap();
+    assert_eq!(settled.exit_code, Some(19));
+    assert_eq!(settled.process_state, ExecutionProcessState::Settled);
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(release);
+}
+
+#[tokio::test]
+async fn catalog_observes_existing_human_retained_agent_and_active_pipes_without_mutation() {
+    let manager = TerminalManager::for_direct();
+    let backend = backend();
+    let human = manager.user_terminal_name(uuid::Uuid::new_v4());
+    manager
+        .create_user_terminal(
+            human.clone(),
+            "/bin/sh",
+            backend.default_terminal_cwd(),
+            80,
+            24,
+            &backend,
+            nac_contracts::CommandEnvironmentSnapshot::empty(),
+            None,
+            &ThreadCancellation::default(),
+        )
+        .await
+        .unwrap();
+    let agent = manager.next_session_name();
+    manager
+        .create_with_cancellation(agent.clone(), "sleep 60", None, 80, 24, &backend, None)
+        .await
+        .unwrap();
+    manager
+        .retain_with_cancellation(&agent, None)
+        .await
+        .unwrap();
+    let spawn = |owner: TerminalManager| {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            owner
+                .exec_one_shot(
+                    "printf visible; sleep 60",
+                    None,
+                    80,
+                    24,
+                    60_000,
+                    100,
+                    &backend,
+                    None,
+                )
+                .await
+        })
+    };
+    let pipe = spawn(manager.clone());
+    let pipe_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = manager.execution_catalog().await;
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.representation == ExecutionRepresentation::Log)
+            {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entry.origin, ExecutionOrigin::Agent);
+                assert!(entry.alive && entry.stop && !entry.input && !entry.resize);
+                break entry.id.clone();
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        manager
+            .read_execution_output(&pipe_id, 0, 64)
+            .await
+            .unwrap();
+        let entries = manager.execution_catalog().await;
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.id == agent)
+                .unwrap()
+                .retained
+        );
+        assert_eq!(manager.sessions.lock().await[&agent].preview_cursor(), 0);
+    }
+    let raw_id = manager
+        .pipe_executions
+        .lock()
+        .unwrap()
+        .back()
+        .unwrap()
+        .output_id
+        .clone();
+    assert!(manager.read_execution_output(&raw_id, 0, 64).await.is_err());
+    assert!(TerminalManager::for_direct()
+        .read_execution_output(&pipe_id, 0, 64)
+        .await
+        .is_err());
+    manager.stop_execution(&pipe_id).await.unwrap();
+    assert_eq!(pipe.await.unwrap().status, CommandStatus::Cancelled);
+    assert!(manager.execution_status(&human).await.unwrap().alive);
+    assert!(manager.execution_status(&agent).await.unwrap().alive);
+    let command = spawn(manager.for_human_command("exact-request".into()));
+    let command_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = manager.execution_catalog().await;
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.origin == ExecutionOrigin::HumanCommand)
+            {
+                assert_eq!(entry.request_id.as_deref(), Some("exact-request"));
+                assert!(entries.iter().any(|entry| entry.id == human));
+                assert!(entries
+                    .iter()
+                    .any(|entry| entry.id == agent && entry.retained));
+                break entry.id.clone();
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    manager.stop_execution(&command_id).await.unwrap();
+    assert_eq!(command.await.unwrap().status, CommandStatus::Cancelled);
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn sanitized_pipe_and_pty_pages_never_expose_split_launch_secrets_or_remask_markers() {
+    let manager = TerminalManager::for_direct();
+    let environment = nac_contracts::CommandEnvironmentSnapshot::from_parts(
+        Default::default(),
+        vec!["secret".into(), "REDACTED".into(), "s\x01ecret".into()],
+    );
+    let output = manager
+        .exec_one_shot_sanitized(
+            "printf sec; sleep .03; printf ret; printf ' s\\001ecret tail' >&2",
+            None,
+            80,
+            24,
+            5000,
+            1000,
+            &backend(),
+            None,
+            &[],
+            environment.clone(),
+        )
+        .await;
+    assert_eq!(output.status, CommandStatus::Completed);
+    assert_eq!(output.stdout_preview, "[REDACTED]");
+    assert_eq!(output.stderr_preview, " [REDACTED] tail");
+    let status = manager.execution_catalog().await.pop().unwrap();
+    assert!(!status.alive && status.output_complete);
+    let mut cursor = 0;
+    let mut bytes = Vec::new();
+    loop {
+        let page = manager
+            .read_execution_output(&status.id, cursor, 1)
+            .await
+            .unwrap();
+        cursor = page.next_offset;
+        bytes.extend(page.bytes);
+        if page.caught_up {
+            break;
+        }
+    }
+    assert_eq!(bytes, b"[REDACTED] [REDACTED] tail");
+    let agent = manager.next_session_name();
+    manager
+        .create_sanitized(
+            agent.clone(),
+            // portable-pty's writer Drop sends LF + VEOF. Suppress terminal
+            // echo so cleanup input cannot add bytes to this redaction fixture.
+            "stty -echo; printf sec; sleep .03; printf ret",
+            None,
+            80,
+            24,
+            &backend(),
+            None,
+            &[],
+            environment,
+        )
+        .await
+        .unwrap();
+    let output = manager
+        .write_stdin(&agent, "", 1000, 1000, None)
+        .await
+        .unwrap();
+    assert_eq!(output.content_preview, "[REDACTED]");
+    assert_eq!(
+        manager
+            .read_execution_output(&agent, 0, 100)
+            .await
+            .unwrap()
+            .bytes,
+        b"[REDACTED]"
+    );
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn observing_pipes_does_not_apply_the_pty_session_admission_limit() {
+    let mut manager = TerminalManager::for_direct();
+    manager.max_sessions = 1;
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let mut owner = manager.clone();
+        // Production has no test-only prespawn barrier; isolate those gates
+        // while retaining the same process/output owner for both launches.
+        owner.one_shot_spawn_gate = Arc::new(Mutex::new(()));
+        tasks.push(tokio::spawn(async move {
+            owner
+                .exec_one_shot("sleep 60", None, 80, 24, 60_000, 100, &backend(), None)
+                .await
+        }));
+    }
+    let entries = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = manager.execution_catalog().await;
+            if entries.len() == 2 {
+                break entries;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for entry in entries {
+        manager.stop_execution(&entry.id).await.unwrap();
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap().status, CommandStatus::Cancelled);
+    }
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn natural_human_exit_is_observed_without_archival_or_process_refresh() {
+    let manager = TerminalManager::for_direct();
+    let backend = backend();
+    let id = manager.user_terminal_name(uuid::Uuid::new_v4());
+    manager
+        .create_user_terminal(
+            id.clone(),
+            "printf completed; exit 7",
+            backend.default_terminal_cwd(),
+            80,
+            24,
+            &backend,
+            nac_contracts::CommandEnvironmentSnapshot::empty(),
+            None,
+            &ThreadCancellation::default(),
+        )
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = manager.execution_status(&id).await.unwrap();
+            if !status.alive && status.output_complete {
+                break status;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.exit_code, Some(7));
+    assert_eq!(status.process_state, ExecutionProcessState::Settled);
+    assert!(!status.stop && !status.input && !status.resize);
+    assert!(manager.sessions.lock().await.contains_key(&id));
+    assert!(manager.completed_sessions.lock().await.is_empty());
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_pty_line_endings_do_not_expose_control_bearing_launch_secrets() {
+    let manager = TerminalManager::for_direct();
+    let backend = backend();
+    let environment = nac_contracts::CommandEnvironmentSnapshot::from_parts(
+        std::collections::BTreeMap::from([(
+            "NAC_MULTILINE_SECRET".into(),
+            "synthetic-private\nsecond-line".into(),
+        )]),
+        vec!["synthetic-private\nsecond-line".into()],
+    );
+    let envs = environment
+        .iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect::<Vec<_>>();
+    let agent = manager.next_session_name();
+    manager
+        .create_sanitized(
+            agent.clone(),
+            "printf '%s' \"$NAC_MULTILINE_SECRET\"",
+            None,
+            80,
+            24,
+            &backend,
+            None,
+            &envs,
+            environment.clone(),
+        )
+        .await
+        .unwrap();
+    let output = manager
+        .write_stdin(&agent, "", 1000, 1000, None)
+        .await
+        .unwrap();
+    assert_eq!(output.content_preview, "[REDACTED]");
+    let human = manager.user_terminal_name(uuid::Uuid::new_v4());
+    manager
+        .create_user_terminal(
+            human.clone(),
+            "printf '%s' \"$NAC_MULTILINE_SECRET\"",
+            backend.default_terminal_cwd(),
+            80,
+            24,
+            &backend,
+            environment,
+            None,
+            &ThreadCancellation::default(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !manager
+            .execution_status(&human)
+            .await
+            .unwrap()
+            .output_complete
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        manager
+            .read_execution_output(&human, 0, 1000)
+            .await
+            .unwrap()
+            .bytes,
+        b"[REDACTED]"
+    );
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn pipe_collector_eof_flushes_safe_prefix_while_process_remains_running() {
+    let manager = TerminalManager::for_direct();
+    let owner = manager.clone();
+    let command = tokio::spawn(async move {
+        owner
+            .exec_one_shot_sanitized(
+                "printf sec; exec 1>&- 2>&-; sleep 60",
+                None,
+                80,
+                24,
+                60_000,
+                100,
+                &backend(),
+                None,
+                &[],
+                nac_contracts::CommandEnvironmentSnapshot::from_parts(
+                    Default::default(),
+                    vec!["secret".into()],
+                ),
+            )
+            .await
+    });
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = manager
+                .execution_catalog()
+                .await
+                .into_iter()
+                .find(|status| status.output_complete)
+            {
+                break status;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(status.alive && status.stop);
+    assert_eq!(status.process_state, ExecutionProcessState::Running);
+    assert_eq!(status.exit_code, None);
+    assert_eq!(status.output_error, None);
+    assert_eq!(
+        manager
+            .read_execution_output(&status.id, 0, 100)
+            .await
+            .unwrap()
+            .bytes,
+        b"sec"
+    );
+    manager.stop_execution(&status.id).await.unwrap();
+    let output = command.await.unwrap();
+    assert_eq!(output.status, CommandStatus::Cancelled);
+    assert_eq!(output.stdout_preview, "sec");
+    manager.remove_all().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn pipe_collector_eof_flush_failure_preserves_registry_clear_cleanup_contract() {
+    use crate::sandbox::ssh_command::shell_quote;
+    let manager = TerminalManager::for_direct();
+    let directory = std::env::temp_dir().join(format!("nac-eof-clear-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let ready = directory.join("ready");
+    let close = directory.join("close-output");
+    let release = directory.join("release-side-effect");
+    let target = directory.join("late");
+    let program = r#"
+from pathlib import Path
+import os, sys, time
+ready, close, release, target = map(Path, sys.argv[1:])
+os.write(1, b"sec")
+ready.write_text(str(os.getpid()))
+while not close.exists(): time.sleep(0.005)
+os.close(1)
+os.close(2)
+while not release.exists(): time.sleep(0.005)
+target.write_text("late")
+"#;
+    let text = format!(
+        "exec python3 -c {} {} {} {} {}",
+        shell_quote(program),
+        shell_quote(&ready.to_string_lossy()),
+        shell_quote(&close.to_string_lossy()),
+        shell_quote(&release.to_string_lossy()),
+        shell_quote(&target.to_string_lossy()),
+    );
+    let owner = manager.clone();
+    let command = tokio::spawn(async move {
+        owner
+            .exec_one_shot_sanitized(
+                &text,
+                None,
+                80,
+                24,
+                5_000,
+                100,
+                &backend(),
+                None,
+                &[],
+                nac_contracts::CommandEnvironmentSnapshot::from_parts(
+                    Default::default(),
+                    vec!["secret".into()],
+                ),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("producer did not reach output-close barrier");
+    let status = manager.execution_catalog().await.pop().unwrap();
+    assert!(status.alive && !status.output_complete);
+    assert!(
+        manager
+            .read_execution_output(&status.id, 0, 100)
+            .await
+            .unwrap()
+            .bytes
+            .is_empty(),
+        "the secret prefix must remain buffered until confirmed EOF"
+    );
+    // Explicit lifecycle clear invalidates a pinned sink. Ordinary byte-tail
+    // eviction cannot remove the producer's active artifact.
+    manager.remove_all().await.unwrap();
+    std::fs::write(&close, b"close").unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(2), command)
+        .await
+        .expect("failed EOF flush did not finish existing failure cleanup")
+        .unwrap();
+    assert_eq!(output.status, CommandStatus::SpawnError);
+    assert_eq!(output.exit_code, None);
+    assert!(output.stderr_preview.contains("not found or expired"));
+    let pid = std::fs::read_to_string(&ready)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "invalidated-sink producer survived cleanup"
+    );
+    std::fs::write(&release, b"released").unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !target.exists(),
+        "cleared producer performed a late side effect"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -1,0 +1,61 @@
+[package]
+name = "nac-core"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+name = "nac_core"
+
+[features]
+default = []
+test-support = []
+managed-fault-fixture = []
+# Scripted automatic reviewer for production-build browser journeys only.
+review-fixture = []
+openapi = ["dep:utoipa", "nac-contracts/openapi"]
+
+[dependencies]
+nac-contracts = { path = "../nac-contracts" }
+nac-credential-store = { path = "../nac-credential-store" }
+nac-process = { path = "../nac-process" }
+jiff = { version = "=0.2.38", default-features = false, features = ["std"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+reqwest = { workspace = true, features = ["json", "form", "rustls", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+sse-stream = "0.2"
+bytes = "1"
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+anyhow.workspace = true
+async-trait = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "trace"] }
+uuid = { workspace = true, features = ["serde", "v4"] }
+libc.workspace = true
+portable-pty = "0.9"
+rmcp = { workspace = true, features = ["auth", "client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+toml.workspace = true
+toml_edit = "0.22"
+url = "2"
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
+diffy = { version = "0.5.0", default-features = false }
+fs2 = "0.4"
+sha2.workspace = true
+rand = "0.9"
+regex = "1"
+base64 = "0.22"
+cap-std = "4"
+globset = { version = "0.4", default-features = false }
+grep-matcher = "0.1"
+grep-regex = "0.1"
+ignore = "0.4"
+openssh-sftp-client = { version = "0.15", default-features = false }
+utoipa = { workspace = true, optional = true, features = ["uuid"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+nac-managed = { path = "../nac-managed", features = ["test-support"] }
+nac-process = { path = "../nac-process", features = ["test-support"] }

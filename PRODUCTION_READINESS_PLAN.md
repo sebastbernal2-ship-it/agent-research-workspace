@@ -35,7 +35,7 @@ Record decisions in `decisions/` and link them from the relevant GitHub issue. D
 
 ## Phase 2 — identity, authorization, approvals, and API boundary (issues #6, #7, #14, #16)
 
-Current `InboxApplication` and `ProjectApplication` are reusable injected-principal boundaries; they reject malformed principal values and require an exact nonempty human-user identity shape. They do not authenticate. The demo still uses a fixed fake user, and direct lower-level APIs can bypass the facades.
+Current `InboxApplication` and `ProjectApplication` are reusable injected-principal boundaries; they reject malformed principal values and require an exact nonempty human-user identity shape. They do not authenticate. NAC's vendored permission broker is a candidate for tool-invocation policy reuse, but its local/session scope is not project membership or a product identity provider. The demo still uses a fixed fake user, and direct lower-level APIs can bypass the facades.
 
 - [ ] Implement the selected identity/session adapter; derive principals only from verified server-side sessions/tokens. Reject client-supplied actor identity for every command.
 - [ ] Implement a durable project membership/role policy with explicit actions; cover project creation/invitation, membership change/removal, service accounts, and permission revocation.
@@ -50,7 +50,7 @@ Current `InboxApplication` and `ProjectApplication` are reusable injected-princi
 
 ## Phase 3 — organization planning and durable lifecycle (issue #13)
 
-The current coordinator accepts a caller-provided DAG/factory; it does not yet plan a durable organization autonomously or provide an operator-grade lifecycle.
+The current coordinator accepts a caller-provided DAG/factory; it does not yet plan a durable organization autonomously or provide an operator-grade lifecycle. Before adding equivalent worker/thread lifecycle code, evaluate a typed adapter to NAC's durable thread/episode dispatch and determine whether its coding-session topology can preserve our canonical work and run identities. NAC is statically inspected but not yet built or tested here.
 
 - [ ] Define canonical plan records: objective, decomposed tasks, dependencies, agent roles, budgets, required evidence, acceptance criteria, risk level, capability needs, and approval state.
 - [ ] Add durable plan submission, review, approval/rejection, revision, assignment, and cancellation. Model-generated plans are proposals only and never authorize themselves.
@@ -66,7 +66,7 @@ The current coordinator accepts a caller-provided DAG/factory; it does not yet p
 
 ## Phase 4 — worker isolation, tools, and external effects (issues #7, #15, #4)
 
-Bounded child processes are not sandboxes. Current workers have no production tool integration, and queue fencing does not revoke an external action already dispatched.
+Bounded child processes are not sandboxes. Current workers have no production tool integration, and queue fencing does not revoke an external action already dispatched. NAC has a stronger candidate tool permission kernel and Local/SSH/Podman backends; assess those existing boundaries before implementing a parallel sandbox or tool-policy stack. NAC's thread receipt journal is not a general external-effect outbox.
 
 - [ ] Select and implement OS/container/VM isolation for each supported platform: filesystem mounts, network egress, process tree, CPU/memory/PID limits, syscall/privilege policy, working directory, temp cleanup, and escape testing.
 - [ ] Define secret acquisition through a broker or short-lived scoped injection; no inherited environment, user home, provider credential files, or uncontrolled log capture.

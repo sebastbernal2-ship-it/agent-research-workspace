@@ -1,0 +1,156 @@
+#[cfg(test)]
+use std::sync::Mutex;
+
+mod agent;
+mod agents_md;
+pub mod browser;
+pub mod commands;
+pub mod events;
+mod goals;
+pub mod guide;
+pub mod light_model;
+#[cfg(feature = "managed-fault-fixture")]
+pub mod managed_fault_fixture;
+mod mcp;
+pub mod model;
+pub mod orchestration_control;
+pub mod peer_goal_control;
+pub mod task_followups;
+pub mod task_launch_control;
+
+/// Named, reusable model setups the launch UI offers instead of asking for a
+/// backend, model and base URL every time.
+pub mod model_configurations {
+    pub use crate::store::{
+        delete_model_configuration, insert_model_configuration, list_model_configurations,
+        load_model_configuration, update_model_configuration, ModelConfigurationRecord,
+        ModelConfigurationStoreError, NewModelConfiguration,
+    };
+}
+
+/// Store-scoped project metadata, creation defaults, and session association.
+pub mod projects {
+    pub use crate::store::{
+        assign_session_to_project, delete_project, insert_project, list_projects,
+        load_project_launch_context, reorder_projects, update_project, NewProject,
+        ProjectLaunchContext, ProjectPatch, ProjectRecord, ProjectStoreError,
+    };
+}
+
+/// Named, reusable SSH connections the launch UI offers instead of asking for a
+/// host, port and identity file every time.
+pub mod ssh_configurations {
+    pub use crate::store::{
+        delete_ssh_configuration, insert_ssh_configuration, list_ssh_configurations,
+        load_ssh_configuration, update_ssh_configuration, NewSshConfiguration,
+        SshConfigurationRecord, SshConfigurationStoreError,
+    };
+}
+
+/// Named MCP servers the dashboard manages, plus the library catalog it offers
+/// when adding one. The dashboard edits `config.toml` directly; sessions parse
+/// the file when a worker launches.
+pub mod mcp_configurations {
+    #[cfg(feature = "test-support")]
+    pub use crate::mcp::run_mcp_conformance_client;
+    pub use crate::mcp::{
+        acquire_mcp_configuration_write_lease, begin_mcp_oauth_authorization, clear_mcp_oauth,
+        complete_mcp_oauth_authorization, configure_mcp_oauth, delete_mcp_oauth_profile,
+        delete_mcp_server_configuration, discard_mcp_oauth_pending_authorization,
+        embedded_library_entries, fail_mcp_oauth_authorization, fail_mcp_oauth_callback,
+        fetch_smithery_library_entries, has_mcp_oauth_profile, insert_mcp_server_configuration,
+        list_mcp_server_configurations, load_mcp_defaults, load_mcp_server_configuration,
+        load_mcp_server_configuration_snapshot, mcp_config_path, mcp_error_requires_authorization,
+        mcp_oauth_authorization_is_current, mcp_oauth_callback_is_retryable,
+        mcp_oauth_completion_is_pending, mcp_oauth_pending_authorization_url, mcp_oauth_status,
+        merge_library_entries, probe_mcp_server, rename_mcp_oauth_profile,
+        set_mcp_oauth_redirect_uri, update_mcp_server_configuration,
+        update_mcp_server_configuration_at_revision, McpConfigurationWriteLease,
+        McpHeaderHelperConfig, McpLibraryAuth, McpLibraryEntry, McpOAuthAuthorizationMetadata,
+        McpOAuthAuthorizationSession, McpOAuthConfiguration, McpOAuthRegistration, McpOAuthStatus,
+        McpProbeResult, McpProbedTool, McpProtocolSelection, McpRuntimeManager, McpRuntimeState,
+        McpRuntimeStatus, McpServerConfig, McpServerConfigurationRecord,
+        McpServerConfigurationStoreError, McpToolApproval, McpToolMetadata, McpTransportConfig,
+        SessionMcpRefreshState, SessionMcpRefreshStatus, MCP_OAUTH_CALLBACK_PATH,
+        MCP_OAUTH_REDIRECT_URI, MCP_OAUTH_STATE_TTL, MCP_TRANSPORT_STDIO,
+        MCP_TRANSPORT_STREAMABLE_HTTP,
+    };
+}
+
+/// User-facing metadata for skills discovered by a session.
+pub mod skill_catalog {
+    pub use crate::skills::SkillCatalogEntry;
+}
+
+mod paths;
+pub mod permissions;
+mod process;
+pub mod run_failure;
+pub mod runtime;
+mod sandbox;
+pub use sandbox::{destroy_persisted_container, reconcile_podman_creation_records};
+pub mod session_service;
+pub mod sessions;
+mod skills;
+pub mod store;
+pub mod telemetry;
+mod terminal;
+mod tool_content;
+mod tools;
+pub use tools::shared_workspace_gate_for;
+pub mod traditional_children;
+pub mod types;
+pub mod upgrade;
+pub mod view;
+mod worker;
+mod worker_credentials;
+mod worker_protocol;
+pub mod workspace;
+
+#[cfg(test)]
+mod telemetry_tests;
+
+/// Largest token count that can be persisted exactly and transported through
+/// JavaScript-backed public settings without precision loss.
+pub const MAX_SUPPORTED_TOKEN_COUNT: u64 = 9_007_199_254_740_991;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    pub mod fixture_sessions {
+        pub use crate::sessions::*;
+    }
+
+    pub mod fixture_store {
+        pub use crate::store::*;
+    }
+
+    pub use fixture_sessions as sessions;
+    pub use fixture_store as store;
+
+    pub fn set_default_sandbox_spec(snapshot: &mut crate::sessions::SessionSnapshot) {
+        snapshot.sandbox_spec = Some(crate::sandbox::SandboxSpec::default());
+    }
+
+    pub fn set_sandbox_worktree(
+        snapshot: &mut crate::sessions::SessionSnapshot,
+        repo_root: std::path::PathBuf,
+        path: std::path::PathBuf,
+        fork_point: String,
+    ) {
+        let spec = snapshot
+            .sandbox_spec
+            .get_or_insert_with(crate::sandbox::SandboxSpec::default);
+        spec.worktree = Some(crate::sandbox::SandboxWorktree {
+            scratch_root: path.parent().unwrap_or(repo_root.as_path()).to_path_buf(),
+            repo_root,
+            path,
+            branch: "nac/test-revision-pin".to_string(),
+            fork_point,
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+pub mod product_context;

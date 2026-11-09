@@ -1,0 +1,82 @@
+{
+  "name": "nac-web-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:client && tsc -b && vite build && npm run build:presentation",
+    "build:client": "tsc -p packages/nac-client/tsconfig.json",
+    "typecheck": "tsc -p packages/nac-client/tsconfig.json --noEmit && tsc -b",
+    "lint": "oxlint --deny-warnings --ignore-pattern 'packages/nac-client/dist/**' --ignore-pattern 'packages/nac-presentation/dist/**' . && eslint . --max-warnings 0",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "test": "vitest run && npm run test:client-package && npm run test:generated-inputs",
+    "test:generated-inputs": "node --test ../../../scripts/tests/tailwind-generated-inputs.test.mjs",
+    "test:client-package": "npm run build:client && node scripts/test-client-package.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:remote": "NAC_E2E_REMOTE=1 playwright test remote.e2e.ts",
+    "generate:api": "node scripts/generate-api-types.mjs",
+    "check:api": "node scripts/generate-api-types.mjs --check",
+    "sync-file-icons": "node scripts/sync-file-icons.mjs",
+    "preview": "vite preview",
+    "build:presentation": "vite build --config vite.presentation.config.ts && tsc -p tsconfig.presentation.json && node scripts/presentation-types.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.101.4",
+    "@xterm/xterm": "6.0.0",
+    "clsx": "^2.1.1",
+    "effect": "3.22.2",
+    "lucide-react": "1.61.0",
+    "radix-ui": "1.8.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.18.2",
+    "rehype-mathjax": "^7.1.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "shiki": "4.4.3",
+    "tailwind-merge": "^3.6.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@eslint/js": "^10.0.1",
+    "@locator/babel-jsx": "^0.5.1",
+    "@locator/runtime": "^0.5.1",
+    "@playwright/test": "^1.62.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tanstack/react-query-devtools": "^5.101.4",
+    "@testing-library/react": "^16.3.2",
+    "@types/babel__core": "^7.20.5",
+    "@types/node": "^26.1.2",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "eslint": "^10.8.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.8.0",
+    "jsdom": "^26.1.0",
+    "material-icon-theme": "^5.37.0",
+    "oxfmt": "0.63.0",
+    "oxlint": "1.78.0",
+    "postcss-selector-parser": "^7.1.7",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "@locator/runtime": {
+      "tailwindcss": "4.3.3"
+    },
+    "micromark-extension-math": {
+      "katex": "0.18.2"
+    },
+    "@xmldom/xmldom": "^0.9.12",
+    "tinypool": "~2.1.2",
+    "minimatch@^10": "11.0.3"
+  }
+}

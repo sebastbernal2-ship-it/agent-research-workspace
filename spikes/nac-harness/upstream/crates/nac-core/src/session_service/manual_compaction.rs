@@ -1,0 +1,442 @@
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
+use super::*;
+use crate::agent::{CompactionCompletion, CompactionError, CompactionLifecycle, CompactionResult};
+
+pub type SessionCompactionResult = CompactionResult;
+pub type SessionCompactionError = CompactionError;
+
+pub struct SessionCompactionHandle {
+    pub compaction_id: Uuid,
+    pub client_id: Option<SessionClientId>,
+    completion: oneshot::Receiver<CompactionCompletion>,
+    #[cfg(test)]
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl SessionCompactionHandle {
+    pub async fn wait(self) -> CompactionCompletion {
+        self.completion.await.unwrap_or_else(|_| {
+            Err(CompactionError::Failed {
+                compaction_id: self.compaction_id,
+                failure: CompactionFailure::Cancelled,
+                source: None,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort(&self) {
+        self.abort_handle.abort();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCoordinationError {
+    Store { detail: String },
+    StaleConfiguration { session_id: String },
+    InvalidLease,
+    LocalAgentBusy,
+}
+
+impl SessionCoordinationError {
+    pub(super) fn store(detail: impl Into<String>) -> Self {
+        Self::Store {
+            detail: detail.into(),
+        }
+    }
+
+    pub(super) fn stale_configuration(session_id: &str) -> Self {
+        Self::StaleConfiguration {
+            session_id: session_id.to_string(),
+        }
+    }
+
+    pub(super) fn invalid_lease() -> Self {
+        Self::InvalidLease
+    }
+
+    pub(super) fn local_agent_busy() -> Self {
+        Self::LocalAgentBusy
+    }
+}
+
+impl std::fmt::Display for SessionCoordinationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store { .. } => formatter.write_str("session operation coordination failed"),
+            Self::StaleConfiguration { session_id } => write!(
+                formatter,
+                "session '{session_id}' configuration changed externally; reload it before continuing"
+            ),
+            Self::InvalidLease => {
+                formatter.write_str("supplied operation lease does not belong to this session")
+            }
+            Self::LocalAgentBusy => formatter.write_str("session is busy with a local operation"),
+        }
+    }
+}
+
+impl std::error::Error for SessionCoordinationError {}
+
+impl From<&SessionCoordinationError> for String {
+    fn from(error: &SessionCoordinationError) -> Self {
+        error.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOperationBusy {
+    Local {
+        session_id: String,
+        active_operation: ActiveSessionOperationSnapshot,
+    },
+    External {
+        session_id: String,
+    },
+}
+
+impl SessionOperationBusy {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Local { session_id, .. } | Self::External { session_id } => session_id,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionOperationBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.session_id())
+    }
+}
+
+impl PartialEq<&str> for SessionOperationBusy {
+    fn eq(&self, other: &&str) -> bool {
+        self.session_id() == *other
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCompactionAdmissionError {
+    Busy {
+        active_operation: ActiveSessionOperationSnapshot,
+    },
+    ExternalBusy {
+        session_id: String,
+    },
+    Coordination {
+        message: SessionCoordinationError,
+    },
+    Unavailable,
+}
+
+impl std::fmt::Display for SessionCompactionAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy { .. } => formatter.write_str("session is busy with an active operation"),
+            Self::ExternalBusy { session_id } => write!(
+                formatter,
+                "session '{session_id}' is busy with an active operation in another process"
+            ),
+            Self::Coordination { message } => message.fmt(formatter),
+            Self::Unavailable => formatter.write_str("compaction is unavailable for this session"),
+        }
+    }
+}
+
+impl std::error::Error for SessionCompactionAdmissionError {}
+
+pub(super) struct ActiveCompactionState {
+    pub(super) snapshot: ActiveCompactionSnapshot,
+    pub(super) _operation_lease: Option<Arc<sessions::SessionOperationLease>>,
+}
+
+type SessionCompactionCompletion = CompactionCompletion;
+
+struct ManualCompactionTaskGuard {
+    service: SessionService,
+    snapshot: ActiveCompactionSnapshot,
+    completion: Option<oneshot::Sender<SessionCompactionCompletion>>,
+    lifecycle: Option<CompactionLifecycle>,
+}
+
+async fn settle_manual_compaction(
+    service: SessionService,
+    id: Uuid,
+    result: SessionCompactionCompletion,
+    mut lifecycle: Option<CompactionLifecycle>,
+    completion: Option<oneshot::Sender<SessionCompactionCompletion>>,
+) {
+    if let Ok(CompactionResult::Compacted {
+        projected_context, ..
+    }) = &result
+    {
+        if let Err(error) = service.persist_compaction_context(*projected_context).await {
+            eprintln!("nac: failed to persist compaction context: {error:#}");
+        }
+    }
+    if let Some(lifecycle) = lifecycle.as_mut() {
+        lifecycle.finish(&result).await;
+    }
+    drop(lifecycle);
+    service.clear_manual_compaction_async(id).await;
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+}
+
+impl ManualCompactionTaskGuard {
+    #[expect(
+        clippy::expect_used,
+        reason = "the guard owns a lifecycle until its single completion path consumes it"
+    )]
+    async fn complete(mut self, result: SessionCompactionCompletion) {
+        // Selection transfers the exact result, waiter and lease cleanup before
+        // the first await. Drop may only choose Cancelled before this transfer.
+        let lifecycle = self
+            .lifecycle
+            .take()
+            .expect("manual compaction lifecycle exists");
+        let completion = self.completion.take();
+        let service = self.service.clone();
+        let id = self.snapshot.compaction_id;
+        if let Err(error) = tokio::spawn(settle_manual_compaction(
+            service,
+            id,
+            result,
+            Some(lifecycle),
+            completion,
+        ))
+        .await
+        {
+            eprintln!("nac: compaction completion task failed: {error:#}");
+        }
+    }
+}
+
+impl Drop for ManualCompactionTaskGuard {
+    fn drop(&mut self) {
+        if self.completion.is_none() {
+            return;
+        }
+        let result = self
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.commit_marker().result())
+            .map_or_else(
+                || {
+                    Err(CompactionError::Failed {
+                        compaction_id: self.snapshot.compaction_id,
+                        failure: CompactionFailure::Cancelled,
+                        source: None,
+                    })
+                },
+                Ok,
+            );
+        let lifecycle = self.lifecycle.take();
+        let service = self.service.clone();
+        let id = self.snapshot.compaction_id;
+        let completion = self.completion.take();
+        tokio::spawn(settle_manual_compaction(
+            service, id, result, lifecycle, completion,
+        ));
+    }
+}
+
+impl SessionClientHandle {
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    pub fn try_compact(
+        &self,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        self.service.try_compact_for_client(self.client_id.clone())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    pub fn try_compact_with_lease(
+        &self,
+        lease: sessions::SessionOperationLease,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        self.service
+            .try_compact_for_client_with_lease(self.client_id.clone(), lease)
+    }
+}
+
+impl SessionService {
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    pub fn try_compact(
+        &self,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        self.try_compact_inner(None, None)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    pub fn try_compact_for_client(
+        &self,
+        client_id: SessionClientId,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        self.try_compact_inner(Some(client_id), None)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    pub fn try_compact_with_lease(
+        &self,
+        lease: sessions::SessionOperationLease,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        self.try_compact_inner(None, Some(lease))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    pub fn try_compact_for_client_with_lease(
+        &self,
+        client_id: SessionClientId,
+        lease: sessions::SessionOperationLease,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        self.try_compact_inner(Some(client_id), Some(lease))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "compaction admission errors carry the complete active-operation conflict snapshot"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "persisted sessions acquire a lease during successful compaction admission"
+    )]
+    fn try_compact_inner(
+        &self,
+        client_id: Option<SessionClientId>,
+        supplied_lease: Option<sessions::SessionOperationLease>,
+    ) -> std::result::Result<SessionCompactionHandle, SessionCompactionAdmissionError> {
+        let Some(_session_id) = self.metadata.session_id.as_deref() else {
+            return Err(SessionCompactionAdmissionError::Unavailable);
+        };
+        let _host_admission = self
+            .managed_admission_enabled
+            .then(|| match self.managed_identity.as_deref() {
+                Some(identity) => crate::store::try_admit_managed_work_for_identity(
+                    &self.metadata.store_path,
+                    identity,
+                ),
+                None => crate::store::try_admit_managed_work(&self.metadata.store_path),
+            })
+            .transpose()
+            .map_err(|error| SessionCompactionAdmissionError::Coordination {
+                message: SessionCoordinationError::store(format!(
+                    "failed to acquire managed host compaction admission: {error:#}"
+                )),
+            })?;
+        let mut operation = self.lock_active_operation();
+        if let Some(active_operation) = operation.as_ref() {
+            return Err(SessionCompactionAdmissionError::Busy {
+                active_operation: active_operation.snapshot(),
+            });
+        }
+
+        let operation_lease = self
+            .prepare_operation_admission(supplied_lease)
+            .map_err(|error| match error {
+                OperationAdmissionPreparationError::ExternalBusy { session_id } => {
+                    SessionCompactionAdmissionError::ExternalBusy { session_id }
+                }
+                OperationAdmissionPreparationError::Coordination { message } => {
+                    SessionCompactionAdmissionError::Coordination { message }
+                }
+            })?
+            .expect("persisted compaction sessions acquire an operation lease");
+
+        let snapshot = ActiveCompactionSnapshot {
+            compaction_id: Uuid::new_v4(),
+            client_id,
+            started_at_epoch_ms: now_epoch_ms(),
+        };
+        *operation = Some(ActiveSessionOperation::ManualCompaction(
+            ActiveCompactionState {
+                snapshot: snapshot.clone(),
+                _operation_lease: Some(operation_lease),
+            },
+        ));
+
+        let event_sink =
+            EventSink::bus_with_context(self.event_bus.clone(), None, snapshot.client_id.clone());
+        let lifecycle = CompactionLifecycle::start(
+            event_sink.clone(),
+            snapshot.compaction_id,
+            CompactionReason::Manual,
+        );
+        let commit = lifecycle.commit_marker();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let task_guard = ManualCompactionTaskGuard {
+            service: self.clone(),
+            snapshot: snapshot.clone(),
+            completion: Some(completion_tx),
+            lifecycle: Some(lifecycle),
+        };
+        let agent = Arc::clone(&self.agent);
+        let compaction_id = snapshot.compaction_id;
+        let task = tokio::spawn(async move {
+            let result = {
+                let mut agent = agent.lock().await;
+                agent
+                    .compact_for_session(compaction_id, event_sink, commit)
+                    .await
+            };
+            task_guard.complete(result).await;
+        });
+        #[cfg(test)]
+        let abort_handle = task.abort_handle();
+        drop(task);
+        drop(operation);
+
+        Ok(SessionCompactionHandle {
+            compaction_id: snapshot.compaction_id,
+            client_id: snapshot.client_id,
+            completion: completion_rx,
+            #[cfg(test)]
+            abort_handle,
+        })
+    }
+
+    async fn clear_manual_compaction_async(&self, compaction_id: Uuid) {
+        if let Err(error) = self
+            .coordinate_local(move |service| service.clear_manual_compaction(compaction_id))
+            .await
+        {
+            eprintln!("nac: compaction local cleanup failed: {error:#}");
+        }
+    }
+
+    fn clear_manual_compaction(&self, compaction_id: Uuid) {
+        let mut operation = self.lock_active_operation();
+        if operation.as_ref().is_some_and(|operation| {
+            matches!(
+                operation,
+                ActiveSessionOperation::ManualCompaction(active)
+                    if active.snapshot.compaction_id == compaction_id
+            )
+        }) {
+            *operation = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

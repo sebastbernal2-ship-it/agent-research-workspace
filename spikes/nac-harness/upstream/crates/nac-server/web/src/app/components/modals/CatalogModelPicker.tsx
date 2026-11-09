@@ -1,0 +1,389 @@
+// Browsing `GET /models`: the catalog is local and credential-free, so every
+// model a build knows about can be searched and picked before any key exists.
+// Managed providers the server already authenticates as overlay their live
+// `POST /providers/models` index (same path Create New uses after login).
+
+import { useEffect, useMemo, useRef, useState, type AriaAttributes } from "react";
+
+import {
+  Badge,
+  BadgeColor,
+  Button,
+  ButtonContent,
+  ButtonSize,
+  ButtonVariant,
+  Icon,
+  IconName,
+  Input,
+  InputLeading,
+  InputSize,
+  Popover,
+  PopoverPlacement,
+  TabButton,
+  TabButtonSize,
+  TabButtonVariant,
+} from "@/app/atoms";
+import { useIsMobile } from "@/app/hooks/useMediaQuery";
+import { catalogBaseUrl, type CatalogPick } from "@/app/lib/catalog";
+import { cn } from "@/app/lib/cn";
+import { formatTokensCompact } from "@/app/lib/format";
+import { providerLabel, providerOrder } from "@/app/lib/providers";
+import { modelsForProvider } from "@/app/components/modals/catalogModelOverlay";
+import type {
+  BackendKind,
+  CatalogModel,
+  CatalogProvider,
+  ModelCatalog,
+  ModelCostRates,
+  ProviderModel,
+} from "@/app/types/api";
+
+interface Row {
+  provider: CatalogProvider;
+  model: CatalogModel;
+}
+
+function rowsFor(
+  catalog: ModelCatalog | undefined,
+  query: string,
+  liveByBackend: Map<BackendKind, ProviderModel[] | null>,
+): Row[] {
+  const needle = query.trim().toLowerCase();
+  const providers = [...(catalog?.providers ?? [])].sort((left, right) => {
+    const leftReady = left.auth_status === "ready" ? 0 : 1;
+    const rightReady = right.auth_status === "ready" ? 0 : 1;
+    if (leftReady !== rightReady) return leftReady - rightReady;
+    return providerOrder(left.id) - providerOrder(right.id);
+  });
+  const rows: Row[] = [];
+  for (const provider of providers) {
+    for (const model of modelsForProvider(provider, liveByBackend.get(provider.id))) {
+      if (needle) {
+        const haystack = `${model.id} ${model.display_name ?? ""} ${provider.id}`.toLowerCase();
+        if (!haystack.includes(needle)) continue;
+      }
+      rows.push({ provider, model });
+    }
+  }
+  return rows;
+}
+
+function rate(value: number): string | null {
+  return Number.isFinite(value) && value > 0 ? `$${Number(value.toFixed(2))}` : null;
+}
+
+/** Catalog rates are $/1M tokens; all-zero means unknown pricing, never free. */
+function pricing(cost: ModelCostRates): string {
+  const input = rate(cost.input);
+  const output = rate(cost.output);
+  return input && output ? `${input}/${output} per 1M` : "pricing unknown";
+}
+
+function modelMeta(model: CatalogModel): string {
+  const context =
+    model.context_window > 0 ? `${formatTokensCompact(model.context_window)} ctx` : "";
+  return [context, pricing(model.cost)].filter(Boolean).join(" · ");
+}
+
+const modelName = (model: CatalogModel) => model.display_name || model.id;
+
+/**
+ * A missing credential never blocks a pick — the badge only says what has to
+ * happen before the session can run, which for an API-key provider is the key
+ * asked for right below this row.
+ */
+function ProviderBadges({ provider }: { provider: CatalogProvider }) {
+  if (provider.auth_status === "ready") {
+    return (
+      <Badge text="available" color={BadgeColor.Green} className="shrink-0 whitespace-nowrap" />
+    );
+  }
+  return (
+    <Badge
+      text={provider.managed_base_url ? "login required" : "no credential detected"}
+      color={BadgeColor.Yellow}
+      className="shrink-0 whitespace-nowrap"
+    />
+  );
+}
+
+export function CatalogModelPicker({
+  catalog,
+  loading,
+  failed,
+  disabled = false,
+  compact = false,
+  liveByBackend,
+  value,
+  onSelect,
+  "aria-invalid": ariaInvalid,
+  "aria-describedby": ariaDescribedBy,
+}: {
+  catalog: ModelCatalog | undefined;
+  loading: boolean;
+  failed: boolean;
+  /** Prevents a seed pick while an authoritative managed index is settling. */
+  disabled?: boolean;
+  /** Compact composer trigger; the searchable unified panel stays identical. */
+  compact?: boolean;
+  liveByBackend: Map<BackendKind, ProviderModel[] | null>;
+  value: CatalogPick | null;
+  onSelect: (pick: CatalogPick) => void;
+} & Pick<AriaAttributes, "aria-invalid" | "aria-describedby">) {
+  const isMobile = useIsMobile();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  // Where the arrow keys are, once they have been used at all: an opening list
+  // lights nothing, so the only highlight is one the reader is causing.
+  const [active, setActive] = useState<number | null>(null);
+  // Where the pointer is, while it is over a row at all. The highlight follows
+  // it and leaves with it, so a list the pointer has left keeps no row lit as
+  // though it were picked.
+  const [hovered, setHovered] = useState<number | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const tabSize = isMobile ? TabButtonSize.Large : TabButtonSize.Medium;
+  const rows = useMemo(
+    () => rowsFor(catalog, query, liveByBackend),
+    [catalog, query, liveByBackend],
+  );
+  // A shorter list can leave the highlight past its end.
+  const keyboardIndex = active === null ? null : Math.min(active, Math.max(rows.length - 1, 0));
+  // The lit row, if any: the pointer outranks the keyboard while it is in the
+  // list, and neither has to be anywhere.
+  const index = hovered !== null && hovered < rows.length ? hovered : keyboardIndex;
+
+  // The highlight belongs to the list a query produced, so it is reset next to
+  // the query itself: an effect would land a frame later, over rows the search
+  // has already replaced.
+  const search = (next: string) => {
+    setQuery(next);
+    setActive(null);
+    // A pointer resting over the list sends nothing while the rows change
+    // underneath it, so its position no longer means the row it meant.
+    setHovered(null);
+  };
+
+  // Keeps the keyboard highlight visible without scrolling the modal behind it.
+  // Only the keyboard's row: scrolling a row the pointer is already on would
+  // move the list out from under it.
+  useEffect(() => {
+    if (!open || keyboardIndex === null) return;
+    listRef.current
+      ?.querySelector(`[data-row="${keyboardIndex}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [open, keyboardIndex]);
+
+  const selected = rows.find(
+    (row) => row.provider.id === value?.backend && row.model.id === value?.model,
+  );
+
+  // A dismissal under a resting pointer leaves no mouseleave behind, and a
+  // stale highlight of either kind would light a row on the way back in.
+  const close = () => {
+    setOpen(false);
+    setActive(null);
+    setHovered(null);
+  };
+
+  const pick = (row: Row) => {
+    onSelect({
+      backend: row.provider.id,
+      model: row.model.id,
+      baseUrl: catalogBaseUrl(row.provider),
+    });
+    setOpen(false);
+    search("");
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    // Enter commits the IME composition before it can choose a model.
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!rows.length) return;
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      // From the lit row, so the keyboard carries on from where the pointer
+      // left the highlight rather than jumping back to its own last position.
+      // With nothing lit the first key lands on an end of the list.
+      const from = index ?? (step === 1 ? -1 : 0);
+      setActive((from + step + rows.length) % rows.length);
+      setHovered(null);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      // Nothing lit means the reader has only typed, so Enter takes the closest
+      // match rather than nothing at all.
+      const row = rows[index ?? 0];
+      if (row) pick(row);
+    }
+  };
+
+  const triggerDisabled = !catalog || disabled;
+  const label = value
+    ? selected
+      ? modelName(selected.model)
+      : value.model
+    : loading
+      ? "Loading models…"
+      : failed
+        ? "Model catalog unavailable"
+        : "Select a model";
+
+  return (
+    <Popover
+      open={open}
+      onClose={close}
+      // Grows leftwards from the control column, which keeps a panel this wide
+      // inside the dialog instead of hanging off its right edge.
+      placement={compact ? PopoverPlacement.TopRight : PopoverPlacement.BottomLeft}
+      size="w-[520px]"
+      // Portalled: the dialog scrolls its own body, which would clip the list.
+      sticky
+      // Popover's root defaults to `w-fit`, which swallows `w-full` on the trigger.
+      className={cn(compact ? "min-w-0" : "shrink-0", isMobile && "w-full")}
+      panelClassName="p-2 overflow-hidden"
+      // The sheet sizes to its content by default (only max-h). Pin the sheet
+      // itself to 70dvh — a height on the child alone loses to flex-1 + auto parent.
+      sheetClassName="h-[70dvh] max-h-[70dvh] min-h-[70dvh] overflow-hidden [&>*]:min-h-0 [&>*]:h-full [&>*]:flex [&>*]:flex-col"
+      content={
+        <div className={cn("flex flex-col min-h-0", isMobile ? "h-full" : "h-[340px]")}>
+          <div className="shrink-0 p-4 pt-0 md:p-0 md:pb-2">
+            <Input
+              inputSize={isMobile ? InputSize.Large : InputSize.Medium}
+              leading={InputLeading.Icon}
+              leadingIconName={IconName.Search}
+              placeholder="Search models…"
+              aria-label="Search models"
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              value={query}
+              onChange={(event) => search(event.target.value)}
+              onKeyDown={onKeyDown}
+            />
+          </div>
+          <div
+            ref={listRef}
+            role="group"
+            aria-label="Model results"
+            className="flex flex-col flex-1 gap-1 min-h-0 overflow-auto [&>*]:shrink-0"
+          >
+            {rows.length === 0 ? (
+              <p
+                role="status"
+                className="px-4 md:px-2 py-3 text-small !leading-[22px] text-basic-secondary"
+              >
+                {loading
+                  ? "Reading the catalog…"
+                  : failed
+                    ? "The model catalog could not be read."
+                    : `No model matches "${query.trim()}".`}
+              </p>
+            ) : (
+              rows.map((row, position) => {
+                const first = position === 0 || rows[position - 1].provider.id !== row.provider.id;
+                const chosen = row.provider.id === value?.backend && row.model.id === value?.model;
+                return (
+                  <div key={`${row.provider.id}/${row.model.id}`} className="px-2 md:px-0">
+                    {first ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2 px-2 pt-4 pb-2">
+                        <span className="label-small text-basic-secondary whitespace-nowrap shrink-0">
+                          {providerLabel(row.provider.id)}
+                        </span>
+                        <ProviderBadges provider={row.provider} />
+                      </div>
+                    ) : null}
+                    <TabButton
+                      size={tabSize}
+                      variant={TabButtonVariant.Regular}
+                      active={chosen}
+                      aria-pressed={chosen}
+                      className={cn(
+                        "!h-auto min-h-11 !items-start !py-3",
+                        position === index && "bg-elevation-sublevel-variant-A",
+                      )}
+                      data-row={position}
+                      onMouseEnter={() => setHovered(position)}
+                      onMouseLeave={() =>
+                        setHovered((current) => (current === position ? null : current))
+                      }
+                      onClick={() => pick(row)}
+                    >
+                      <span className="flex min-w-0 flex-1 flex-col gap-1 text-left whitespace-normal">
+                        <span className="label-small !leading-[22px] break-words">
+                          {modelName(row.model)}
+                        </span>
+                        {modelName(row.model) !== row.model.id ? (
+                          <span className="code-small text-basic-secondary break-all">
+                            {row.model.id}
+                          </span>
+                        ) : null}
+                        <span className="text-micro text-basic-secondary font-normal">
+                          {modelMeta(row.model)}
+                        </span>
+                      </span>
+                    </TabButton>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      }
+    >
+      <Button
+        variant={compact ? ButtonVariant.Ghost : ButtonVariant.Secondary}
+        size={compact ? ButtonSize.Small : isMobile ? ButtonSize.Large : ButtonSize.Medium}
+        content={compact ? ButtonContent.Text : ButtonContent.IconRight}
+        disabled={triggerDisabled}
+        onClick={() => (open ? close() : setOpen(true))}
+        aria-expanded={open}
+        aria-label={compact ? "Model" : undefined}
+        aria-invalid={ariaInvalid}
+        aria-describedby={ariaDescribedBy}
+        className={
+          compact
+            ? "min-w-0 max-w-full !gap-1 !rounded-[4px] !px-2"
+            : "w-full md:w-[280px] !h-auto min-h-11 !py-2"
+        }
+      >
+        <span
+          className={cn(
+            "min-w-0 text-left",
+            compact
+              ? cn("label-micro truncate", isMobile ? "max-w-[64px]" : "max-w-[96px]")
+              : "flex flex-1 flex-col gap-1",
+          )}
+        >
+          <span className={compact ? "truncate" : "whitespace-normal break-words"}>{label}</span>
+          {!compact && value && providerLabel(value.backend) !== label ? (
+            <span className="text-micro text-basic-secondary whitespace-normal break-words font-normal">
+              {providerLabel(value.backend)}
+            </span>
+          ) : null}
+        </span>
+        {compact && value && providerLabel(value.backend) !== label ? (
+          <span
+            className={cn(
+              "text-micro font-normal truncate",
+              isMobile ? "max-w-[64px]" : "max-w-[96px]",
+              triggerDisabled ? "text-basic-muted" : "text-basic-tertiary",
+            )}
+          >
+            {providerLabel(value.backend)}
+          </span>
+        ) : null}
+        {compact ? null : (
+          <Icon
+            iconName={IconName.Down}
+            className={cn(
+              "transition-transform duration-150 ease-out",
+              open ? "rotate-180" : "rotate-0",
+            )}
+          />
+        )}
+      </Button>
+    </Popover>
+  );
+}

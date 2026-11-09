@@ -1,0 +1,165 @@
+<p align="center">
+  <img src="docs/images/header.jpg" alt="nac from Arcee" />
+</p>
+
+<p align="center">
+  <a href="https://arcee.ai">Arcee</a> &bull;
+  <a href="#documentation">Documentation</a> &bull;
+  <a href="https://github.com/arcee-ai/nac/releases">Releases</a> &bull;
+  <a href="https://platform.arcee.ai">Arcee Open Model API</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/arcee-ai/nac/actions/workflows/stable-release.yml">
+    <img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white" alt="CI" />
+  </a>
+</p>
+
+nac is an open-source agent harness for longer, ambitious tasks — experiments, training runs, infrastructure, and prototyping that has to stay aligned with the original intent. It uses a thread-and-episode architecture inspired by [slate](https://randomlabs.ai/blog/slate): a central orchestrator plans and decomposes work but cannot execute commands or edit files; it only launches threads, which return episodes — structured summaries of what they accomplished. Also takes inspiration from [nanocode](https://github.com/1rgs/nanocode) and [pi](https://github.com/badlogic/pi-mono). For the technical write-up, see the [nac blog post](https://arcee.ai/blog/nac).
+
+## Quickstart
+
+**By Hand.** Install the latest stable release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arcee-ai/nac/main/scripts/install.sh | sh
+```
+
+The installer puts `nac-web` in `$HOME/.local/bin`. Add that directory to your `PATH` if needed, then start the dashboard from your project,
+
+```sh
+nac-web
+```
+
+and navigate to the interface in your browser (default: [http://127.0.0.1:3210](http://127.0.0.1:3210/)).
+
+**By Agent.** Nac provides a portable onboarding skill and MCP integration; paste this into your chosen agent harness to install nac, configure it, and connect the MCP:
+
+> Install the nac onboarding skill with `curl -fsSL https://raw.githubusercontent.com/arcee-ai/nac/main/scripts/install-skill.sh | sh -s -- --target agents`, load `nac-onboarding`, and walk me through installing nac, selecting Arcee login, ChatGPT Codex login, or an OpenAI-compatible API key, adding MCP servers, and connecting your MCP client to nac.
+
+**Upgrade.** Nac ships with a native upgrade function which can be used to install the latest stable release of nac.
+
+```sh
+nac-web upgrade
+```
+
+### Model Provider Authentication
+
+Pick one before you start a session, or configure it later from the dashboard.
+
+```sh
+# Recommended: Arcee device-code login → Latest Open & Arcee Trinity models
+nac-web arcee-auth login
+
+# ChatGPT account via OAuth → OpenAI models
+nac-web codex-auth login
+
+# Any catalog provider (DeepSeek, Fireworks, Together, OpenAI, Anthropic, arcee-api, …)
+export OPENAI_API_KEY=...   # or ANTHROPIC_API_KEY, TOGETHER_API_KEY, ARCEE_API_KEY, …
+```
+
+More details can be found in [Providers and logins](docs/configuration/credentials.md) and [Model configuration](docs/configuration/model.md).
+
+
+### Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arcee-ai/nac/main/scripts/uninstall.sh | sh
+```
+
+## Documentation
+
+- [Usage](docs/usage/README.md)
+  - [Release lifecycle](docs/usage/releases.md)
+  - [AGENTS.md Files](docs/usage/agents-md.md)
+  - [Skills](docs/usage/skills.md)
+  - [Sandbox](docs/usage/sandbox.md)
+- [Configuration](docs/configuration/README.md)
+  - [Data stores](docs/configuration/data-stores.md)
+  - [Example config](docs/configuration/example.md)
+  - [Model configuration](docs/configuration/model.md)
+  - [Catalog and cost](docs/configuration/catalog.md)
+  - [Providers and logins](docs/configuration/credentials.md)
+- [HTTP API](docs/api/http.md)
+- [Model request security](docs/security/model-requests.md)
+
+## Contributing
+
+Pull requests are welcome. A CLA-signing bot checks every PR against arcee-ai's [CLA](https://github.com/arcee-ai/mergekit/blob/main/CLA.md); comment `I have read the CLA Document and I hereby sign the CLA` on your PR to sign it (or `recheck` to re-run the check).
+
+The supported source workflow starts with one dependency setup per fresh
+worktree:
+
+```sh
+make setup
+make dev
+```
+
+`make dev` runs the Rust API at `http://127.0.0.1:3210` and the React app at
+`http://127.0.0.1:5173`, with Vite HMR and API proxying. Both process trees are
+supervised together; Ctrl-C or either process failing stops the other. Use
+`make build` to rebuild the committed frontend bundle and compile the complete
+production-embedded debug application, then `make run` to build and run that
+production-equivalent application from the current checkout. Set
+`RUN_BIND=127.0.0.1:4321` when the default port is already in use.
+
+For day-to-day use without replacing a stable installation, install the source
+build under its development name:
+
+```sh
+make install-dev
+# defaults to $HOME/.local/bin/nac-web-dev
+
+make install-dev DEV_INSTALL_DIR="$HOME/bin" DEV_BIN_NAME="nac-my-branch"
+```
+
+Source builds have the `dev` build track and report the exact source revision.
+Without an override they use `dev.db` under `NAC_HOME` (or the normal NAC
+configuration directory), isolated from `beta.db` and `stable.db`. Set
+`NAC_HOME=/path/to/branch-state` for a fully separate development home, or pass
+`DEV_STORE_PATH=/path/to/branch.db` to `make dev` and `--store-path` to the
+installed executable. Configuration-level storage overrides remain
+authoritative too. Database migrations are forward-only: when testing revisions
+that may move backward across an incompatible schema, use a disposable
+per-worktree or per-branch store rather than a shared development database.
+
+The local verification lanes are `make test-web` for frontend unit/component
+tests, `make test-e2e` for isolated real-browser tests against the embedded
+server and a credential-free scripted model, and `make test-durability` for the
+focused lifecycle/crash-window regressions. `make test-managed-load` runs the
+bounded deterministic 1/2/4-orchestrator load and fault scenario described in
+[the managed-load guide](docs/managed/deterministic-load.md). Install the E2E
+browser once with `npm --prefix crates/nac-server/web exec -- playwright install chromium`.
+`make ci` is the portable unit, lint, formatting, and committed-asset lane.
+Run `make test-e2e` as the matching production-browser release gate and
+`make test-durability` as a faster focused rerun of crash-window contracts that
+are also covered by the broader Rust suites. Release packaging and installer
+checks remain workflow-only.
+
+For an explicitly provisioned remote Managed NAC using the legacy BasicAuth
+gateway, set
+
+```text
+NAC_E2E_REMOTE_URL
+NAC_E2E_REMOTE_USERNAME
+NAC_E2E_REMOTE_PASSWORD
+```
+
+through a private runtime secret source and run `make test-e2e-remote`. This
+lane verifies gateway denial, authenticated health/readiness, release identity,
+and production-client loading without modifying remote state. Optionally set
+`NAC_E2E_REMOTE_EXPECTED_VERSION` to pin the expected release.
+
+For a portal-owned host, set `NAC_E2E_REMOTE_AUTH_MODE=portal-launch`, keep
+`NAC_E2E_REMOTE_URL` at the HTTPS host root, and inject the single-use URL as
+`NAC_E2E_REMOTE_LAUNCH_URL`; do not set the BasicAuth variables. The launch URL
+must use the exact target origin and managed launch route. Portal mode redeems
+it once into an isolated browser context, disables trace, screenshot, and video
+artifacts before redemption, and refuses `DEBUG` or `PWDEBUG`. An optional
+`NAC_E2E_REMOTE_ENVIRONMENT` non-secret label is included with the recorded
+build and schema identity.
+
+Never put remote credentials, launch URLs, or cookie values in Git, command
+arguments, shell history, test artifacts, or CI logs. The remote smoke lane
+complements rather than replaces the isolated local `make test-e2e` suite, and
+it remains non-mutating in both authentication modes.

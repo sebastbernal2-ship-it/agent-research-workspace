@@ -1,0 +1,69 @@
+{
+  "name": "@arcee-ai/nac-client-all-121",
+  "version": "0.0.0-all-121",
+  "private": true,
+  "description": "Revision-pinned experimental NAC HTTP/SSE client artifact for ALL-121",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arcee-ai/nac.git",
+    "directory": "crates/nac-server/web/packages/nac-client"
+  },
+  "files": [
+    "crates/nac-server/web/packages/nac-client/dist",
+    "crates/nac-server/web/packages/nac-client/README.md",
+    "crates/nac-server/web/packages/nac-presentation/dist",
+    "crates/nac-server/web/packages/nac-presentation/README.md"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "main": "./crates/nac-server/web/packages/nac-client/dist/index.js",
+  "module": "./crates/nac-server/web/packages/nac-client/dist/index.js",
+  "types": "./crates/nac-server/web/packages/nac-client/dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./crates/nac-server/web/packages/nac-client/dist/index.d.ts",
+      "import": "./crates/nac-server/web/packages/nac-client/dist/index.js",
+      "default": "./crates/nac-server/web/packages/nac-client/dist/index.js"
+    },
+    "./client": {
+      "types": "./crates/nac-server/web/packages/nac-client/dist/nacClient.d.ts",
+      "import": "./crates/nac-server/web/packages/nac-client/dist/nacClient.js",
+      "default": "./crates/nac-server/web/packages/nac-client/dist/nacClient.js"
+    },
+    "./stream": {
+      "types": "./crates/nac-server/web/packages/nac-client/dist/eventStream.d.ts",
+      "import": "./crates/nac-server/web/packages/nac-client/dist/eventStream.js",
+      "default": "./crates/nac-server/web/packages/nac-client/dist/eventStream.js"
+    },
+    "./presentation": {
+      "types": "./crates/nac-server/web/packages/nac-presentation/dist/index.d.ts",
+      "import": "./crates/nac-server/web/packages/nac-presentation/dist/index.js"
+    },
+    "./presentation/styles.css": "./crates/nac-server/web/packages/nac-presentation/dist/styles.css",
+    "./presentation/assets.json": "./crates/nac-server/web/packages/nac-presentation/dist/assets.json",
+    "./presentation/assets/*": "./crates/nac-server/web/packages/nac-presentation/dist/assets/*"
+  },
+  "peerDependencies": {
+    "react": ">=19.2.6 <20",
+    "react-dom": ">=19.2.6 <20",
+    "react-router-dom": ">=7.15.0 <8",
+    "@tanstack/react-query": ">=5.100.10 <6"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    },
+    "react-router-dom": {
+      "optional": true
+    },
+    "@tanstack/react-query": {
+      "optional": true
+    }
+  }
+}

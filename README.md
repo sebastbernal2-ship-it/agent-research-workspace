@@ -6,6 +6,7 @@ Research and development for a project-first collaborative AI workspace.
 
 - [Harness completion and production-readiness plan](PRODUCTION_READINESS_PLAN.md) — phased, testable acceptance plan for issues #2–#18, explicit owner decisions, release gates, dependencies, and operational evidence. The current system remains an offline prototype until those gates pass.
 - [External-effect protocol](design/EXTERNAL_EFFECT_PROTOCOL.md) — proposed durable intent, dispatch, idempotency, ambiguity, and reconciliation contract; design only, not a general outbox implementation.
+- [NAC harness evaluation](spikes/nac-harness/README.md) — pinned source review of NAC's worker episodes, tool permission broker, sandbox/runtime, API, and persistence; not built or executed here.
 - [Agent-system foundation evaluation](research/agent-system-foundation-evaluation.md) — source-backed comparison and recommended composition.
 - [AgenticX deep dive](research/agenticx-deep-dive.md) — platform architecture, gaps, safety and dependency review, and pilot decision gates.
 - [Component evaluation and Frankenstein architecture](research/component-evaluation-and-frankenstein-architecture.md) — role-specific alternatives, integration contracts, and a staged fusion/pilot plan.

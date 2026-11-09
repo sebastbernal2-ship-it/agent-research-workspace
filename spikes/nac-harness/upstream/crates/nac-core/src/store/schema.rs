@@ -1,0 +1,1983 @@
+use super::*;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+mod completion_migration_tests;
+mod completion_tables;
+mod delegation_receipts;
+#[cfg(test)]
+mod fresh_task_migration_tests;
+mod fresh_task_tables;
+mod heartbeat_calendar;
+#[cfg(test)]
+mod heartbeat_calendar_tests;
+#[cfg(test)]
+mod heartbeat_migration_tests;
+pub(super) mod heartbeat_tables;
+#[cfg(test)]
+mod native_task_launch_migration_tests;
+mod native_task_launches;
+#[cfg(test)]
+mod peer_goal_start_migration_tests;
+mod peer_goal_starts;
+#[cfg(test)]
+mod session_mcp_refresh_migration_tests;
+#[cfg(test)]
+mod task_followup_delegation_migration_tests;
+mod task_followup_delegations;
+mod task_followups;
+#[cfg(test)]
+mod task_question_migration_tests;
+
+#[cfg(test)]
+mod task_followup_migration_tests;
+
+#[cfg(test)]
+#[path = "schema/child_input_migration_tests.rs"]
+mod child_input_migration_tests;
+#[cfg(test)]
+mod lineage_retention_tests;
+mod managed_tables;
+mod migration_status;
+mod model_configurations;
+mod transaction_observation;
+mod transcript_tables;
+mod wal_preflight;
+
+#[cfg(test)]
+use migration_status::has_migration_observation;
+use migration_status::{begin_migration, finish_migration};
+pub use migration_status::{
+    migration_status, observe_probe_migration_status, StoreFutureSchemaError,
+    StoreMigrationFailure, StoreMigrationState, StoreMigrationStatus,
+};
+
+pub(super) use managed_tables::create_managed_maintenance_tables;
+use managed_tables::create_terminal_remote_cleanups_table;
+use model_configurations::create_model_configurations_table;
+use transcript_tables::{
+    autoincrement_sequence, backfill_run_counts, create_session_run_recovery_table,
+    create_transcript_append_receipts_table, restore_autoincrement_sequence,
+};
+
+#[cfg(test)]
+#[path = "schema/startup_tests.rs"]
+mod startup_tests;
+
+#[cfg(test)]
+#[path = "schema/terminal_selection_migration_tests.rs"]
+mod terminal_selection_migration_tests;
+
+#[cfg(test)]
+#[path = "schema/terminal_union_migration_tests.rs"]
+mod terminal_union_migration_tests;
+
+#[cfg(test)]
+#[path = "schema/connection_capacity_tests.rs"]
+mod connection_capacity_tests;
+
+#[cfg(test)]
+#[path = "schema/future_schema_tests.rs"]
+mod future_schema_tests;
+
+#[cfg(test)]
+#[path = "schema/permission_reviewer_tests.rs"]
+mod permission_reviewer_tests;
+
+use wal_preflight::read_schema_version_header;
+
+// 50 extends the occurrence source format for calendar cadence.
+// 49 adds the physical completion ledger; runtime production remains separately owned.
+// 48 adds standalone fresh-task schedule ownership and retained-resource receipts.
+// 47 binds new task follow-ups to retained service-issued human delegation.
+// 46 retains exact structured questions and identified answer continuations.
+// 45 adds session-scoped, revision-checked MCP mount refresh intent.
+// 44 adds same-chat heartbeat schedules, occurrences and control receipts.
+// 42 retains caller-bound native independent task launch receipts.
+// 41 retains retry-safe agent follow-up receipts independently of delivery.
+// 40 composes automatic permission review with the retained-task/child-input schema.
+// 39 adds retained task launch receipts and saved Git source bindings.
+// 38 retains bounded run and replaced/cleared goal outcomes for task reads.
+// 37 binds queued foreground intent to crash-safe exact-input waiting authority.
+// 36 retains requested child execution mode with queued input across recovery.
+// 35 retains terminal results for each delegated generation independently of
+// the mutable current child/managed-orchestrator relationship.
+// 34 unifies both historical v33 shapes without rewriting their durable facts:
+// identified terminal-selection inbox admission and the human shell journal.
+// 33 independently introduced each of those additions on its owning branch.
+// 32 adds retained remote terminal cleanup ownership.
+// 31 adds host-owned worker dispatch admission and atomic episode receipts.
+// 30 adds transactional transcript append replay receipts.
+// 29 adds the public-HTTP opt-in to reusable configurations and durable sessions.
+// 28 adds typed run-failure and bounded goal-retry metadata.
+// 27 composes the independently shipped v25 Managed NAC maintenance schema and
+// v25/v26 permission-mode schema so either predecessor shape is repaired.
+// 26 adds a durable revision for linearizable permission-mode transitions.
+// 25 adds durable Managed NAC maintenance and authenticated-control replay
+// records plus the durable per-session permission approval mode. 24 adds
+// session_forks (conversation clones plus deleted tombstones). 22 adds
+// durable direct-parent managed orchestrator relationships. 21 adds
+// durable traditional child sessions. 20 added durable direct-session
+// goals. 19 added revision/backend-bound direct permission grants. 18 added the durable
+// direct-session inbox. 17 added the immutable session
+// behavior discriminator and is also the
+// downgrade barrier: older binaries reject the future schema instead of
+// reconstructing a direct session as an orchestrator. 16 added project
+// presentation columns (pin, order, version). 15 added projects
+// and their one-to-many session links. 14 added the bounded interrupted-run
+// recovery row. 13 added the light-model columns (`light_model_json` on both
+// `sessions` and `model_configurations`) — `open_runtime_connection` returns
+// early whenever the stored version already equals this one. (12 carries the
+// same schema as 11, which added episodes.status; 10 added the
+// ssh_configurations table; 9 the per-session ssh port and key columns.)
+const STORE_SCHEMA_VERSION: i64 = 50;
+const HTTP_OPT_IN_COLUMN: &str = "INTEGER NOT NULL DEFAULT 0 CHECK (allow_insecure_http IN (0, 1))";
+pub const MINIMUM_MIGRATABLE_SCHEMA_VERSION: i64 = 0;
+
+/// Current durable-store schema version for credential-free readiness and
+/// operational status reporting.
+pub fn schema_version() -> i64 {
+    STORE_SCHEMA_VERSION
+}
+
+/// Schema version that introduced `sessions.run_count`. Databases older than
+/// this have never had the column populated from their message history.
+const RUN_COUNT_BACKFILL_VERSION: i64 = 5;
+
+/// Schema version that introduced the denormalized session-summary columns.
+/// Later versions add columns without touching them, so a store at or past this
+/// one does not need its whole message history walked again.
+const SESSION_SUMMARY_BACKFILL_VERSION: i64 = 8;
+/// Hard SQLite checkout limits for one NAC process.
+///
+/// Connections are operation-scoped, but concurrent opens still need a
+/// descriptor bound: at most 32 connections may be opening or checked out in
+/// one process, and at most four of those may target the same canonical store.
+/// Cached sessions and writers do not own capacity while idle.
+const PROCESS_CONNECTION_LIMIT: usize = 32;
+const STORE_CONNECTION_LIMIT: usize = 4;
+const CONNECTION_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ConnectionCapacityState {
+    total: usize,
+    by_store: HashMap<PathBuf, usize>,
+}
+
+struct ConnectionCapacity {
+    process_limit: usize,
+    store_limit: usize,
+    state: Mutex<ConnectionCapacityState>,
+    available: Condvar,
+}
+
+impl ConnectionCapacity {
+    fn new(process_limit: usize, store_limit: usize) -> Arc<Self> {
+        assert!(
+            process_limit > 0,
+            "SQLite process connection limit must be positive"
+        );
+        assert!(
+            store_limit > 0,
+            "SQLite store connection limit must be positive"
+        );
+        Arc::new(Self {
+            process_limit,
+            store_limit,
+            state: Mutex::new(ConnectionCapacityState::default()),
+            available: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>, store_path: &Path, timeout: Duration) -> Result<ConnectionPermit> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            let store_count = state.by_store.get(store_path).copied().unwrap_or(0);
+            if state.total < self.process_limit && store_count < self.store_limit {
+                state.total += 1;
+                *state.by_store.entry(store_path.to_path_buf()).or_default() += 1;
+                return Ok(ConnectionPermit {
+                    capacity: Arc::clone(self),
+                    store_path: store_path.to_path_buf(),
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("timed out waiting for SQLite connection capacity"));
+            }
+            let (next, wait) = self
+                .available
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if wait.timed_out() {
+                let store_count = state.by_store.get(store_path).copied().unwrap_or(0);
+                if state.total >= self.process_limit || store_count >= self.store_limit {
+                    return Err(anyhow!("timed out waiting for SQLite connection capacity"));
+                }
+            }
+        }
+    }
+
+    fn counts(&self, store_path: &Path) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.total,
+            state.by_store.get(store_path).copied().unwrap_or(0),
+        )
+    }
+}
+
+struct ConnectionPermit {
+    capacity: Arc<ConnectionCapacity>,
+    store_path: PathBuf,
+}
+
+impl Drop for ConnectionPermit {
+    #[expect(
+        clippy::expect_used,
+        reason = "permit construction and drop maintain exact per-store and total connection counts"
+    )]
+    fn drop(&mut self) {
+        let mut state = self
+            .capacity
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.total = state
+            .total
+            .checked_sub(1)
+            .expect("SQLite process connection count underflow");
+        let remove_store = {
+            let store_count = state
+                .by_store
+                .get_mut(&self.store_path)
+                .expect("SQLite store connection count missing");
+            *store_count = store_count
+                .checked_sub(1)
+                .expect("SQLite store connection count underflow");
+            *store_count == 0
+        };
+        if remove_store {
+            state.by_store.remove(&self.store_path);
+        }
+        let process_count = state.total;
+        let store_count = state.by_store.get(&self.store_path).copied().unwrap_or(0);
+        drop(state);
+        crate::telemetry::emit_connection_counts(
+            process_count,
+            store_count,
+            crate::telemetry::Correlation::default(),
+        );
+        self.capacity.available.notify_all();
+    }
+}
+
+static CONNECTION_CAPACITY: std::sync::LazyLock<Arc<ConnectionCapacity>> =
+    std::sync::LazyLock::new(|| {
+        ConnectionCapacity::new(PROCESS_CONNECTION_LIMIT, STORE_CONNECTION_LIMIT)
+    });
+
+pub(crate) struct StoreConnection {
+    connection: Option<Connection>,
+    _permit: ConnectionPermit,
+    _transaction_observation: Option<Box<transaction_observation::TransactionObservation>>,
+}
+
+impl Drop for StoreConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            if let Some(observation) = &self._transaction_observation {
+                observation.detach(&connection);
+            }
+            drop(connection);
+            if let Some(observation) = &mut self._transaction_observation {
+                observation.finish_abandoned();
+            }
+        }
+    }
+}
+
+impl Deref for StoreConnection {
+    type Target = Connection;
+
+    #[expect(
+        clippy::expect_used,
+        reason = "construction installs a connection; only exclusive Drop takes it"
+    )]
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("store connection is live until drop")
+    }
+}
+
+impl StoreConnection {
+    // Keep the native connection's identity fixed: mutable Deref would permit
+    // replacing it while its raw callbacks still reference this owner's Box.
+    #[expect(
+        clippy::expect_used,
+        reason = "construction installs a connection; only exclusive Drop takes it"
+    )]
+    fn connection_mut(&mut self) -> &mut Connection {
+        self.connection
+            .as_mut()
+            .expect("store connection is live until drop")
+    }
+
+    pub(crate) fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.connection_mut().transaction()
+    }
+
+    pub(crate) fn transaction_with_behavior(
+        &mut self,
+        behavior: rusqlite::TransactionBehavior,
+    ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.connection_mut().transaction_with_behavior(behavior)
+    }
+}
+
+#[cfg(test)]
+static TRACKED_CONNECTION_OPENS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreTrack {
+    Dev,
+    Beta,
+    Stable,
+}
+
+impl StoreTrack {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Dev => "dev.db",
+            Self::Beta => "beta.db",
+            Self::Stable => "stable.db",
+        }
+    }
+}
+
+/// Default development SQLite store path.
+pub fn default_store_path() -> PathBuf {
+    default_store_path_for_track(StoreTrack::Dev)
+}
+
+/// Default SQLite store path isolated by immutable runtime build track.
+pub fn default_store_path_for_track(track: StoreTrack) -> PathBuf {
+    let root = crate::paths::nac_home_dir()
+        .map(|home| home.join(track.filename()))
+        .unwrap_or_else(|| PathBuf::from(".nac").join(track.filename()));
+    if track != StoreTrack::Stable || path_entry_exists(&root) {
+        return root;
+    }
+    let legacy = root.with_file_name("store.db");
+    if path_entry_exists(&legacy) {
+        eprintln!(
+            "nac: using legacy stable store {}; stable.db is absent and no data was copied",
+            legacy.display()
+        );
+        return legacy;
+    }
+    root
+}
+
+fn path_entry_exists(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+coordinated_command! {
+pub fn initialize(path: &Path) -> Result<()> {
+    initialize_with_hooks(path, || {}, || {}, || Ok(()))
+}
+command InitializeCommand {
+}
+call |_command| ()
+correlation |_command| crate::telemetry::Correlation::default();
+port public;
+}
+
+fn initialize_with_hooks(
+    path: &Path,
+    after_preflight: impl FnOnce(),
+    after_lock: impl FnOnce(),
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let path = resolved_store_path(path)?;
+    begin_migration(
+        &path,
+        StoreMigrationStatus {
+            supported_schema_version: STORE_SCHEMA_VERSION,
+            opened_schema_version: read_opened_schema_version(&path),
+            state: StoreMigrationState::Migrating,
+            failure: None,
+        },
+    );
+    match open_connection_with_hooks(&path, after_preflight, after_lock, before_commit) {
+        Ok(connection) => {
+            drop(connection);
+            finish_migration(
+                &path,
+                StoreMigrationStatus {
+                    supported_schema_version: STORE_SCHEMA_VERSION,
+                    opened_schema_version: Some(STORE_SCHEMA_VERSION),
+                    state: StoreMigrationState::Current,
+                    failure: None,
+                },
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let opened_schema_version = read_opened_schema_version(&path);
+            let failure =
+                if opened_schema_version.is_some_and(|version| version > STORE_SCHEMA_VERSION) {
+                    StoreMigrationFailure::FutureSchema
+                } else {
+                    StoreMigrationFailure::MigrationFailed
+                };
+            finish_migration(
+                &path,
+                StoreMigrationStatus {
+                    supported_schema_version: STORE_SCHEMA_VERSION,
+                    opened_schema_version,
+                    state: StoreMigrationState::Failed,
+                    failure: Some(failure),
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+fn read_opened_schema_version(path: &Path) -> Option<i64> {
+    if let Ok(Some(version)) = read_schema_version_header(path) {
+        if version > STORE_SCHEMA_VERSION {
+            return Some(version);
+        }
+    }
+    let connection = connect_existing(path).ok()?;
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .ok()
+}
+
+/// Read the effective schema version without opening a SQLite pager or creating
+/// sidecars. Managed replacement admission uses this before any read-only
+/// ledger query so a future database is rejected without filesystem mutation.
+pub(super) fn preflight_schema_version(path: &Path) -> Result<Option<i64>> {
+    read_schema_version_header(path)
+}
+
+#[cfg(test)]
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn reject_future_schema_before_open(path: &Path) -> Result<()> {
+    if let Some(version) = preflight_schema_version(path)? {
+        if version > STORE_SCHEMA_VERSION {
+            return Err(StoreFutureSchemaError::new(version).into());
+        }
+    }
+    Ok(())
+}
+
+coordinated_command! {
+/// Verify that session-serving traffic can check out, open, and query the
+/// initialized store without creating or migrating a replacement database.
+pub fn check_readiness(path: &Path) -> Result<()> {
+    crate::telemetry::observe_store(
+        crate::telemetry::StoreOperation::Readiness,
+        crate::telemetry::Correlation::default(),
+        || check_readiness_inner(path),
+    )
+}
+command CheckReadinessCommand {
+}
+call |_command| ()
+correlation |_command| crate::telemetry::Correlation::default();
+port public;
+}
+
+fn check_readiness_inner(path: &Path) -> Result<()> {
+    reject_future_schema_before_open(path)?;
+    let conn = connect_existing(path)?;
+    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version != STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "SQLite store schema version {schema_version} is not ready (expected {STORE_SCHEMA_VERSION})"
+        ));
+    }
+    let _: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions LIMIT 1)", [], |row| {
+        row.get(0)
+    })?;
+    Ok(())
+}
+
+pub(crate) fn resolved_store_path(path: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file_name = path
+                .file_name()
+                .context("SQLite store path must name a file")?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create store dir {}", parent.display()))?;
+            let parent = std::fs::canonicalize(parent)
+                .with_context(|| format!("failed to resolve store dir {}", parent.display()))?;
+            Ok(parent.join(file_name))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to resolve SQLite store {}", path.display()))
+        }
+    }
+}
+
+fn connect_with_capacity_using(
+    path: &Path,
+    capacity: &Arc<ConnectionCapacity>,
+    timeout: Duration,
+    open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
+) -> Result<StoreConnection> {
+    let path = resolved_store_path(path)?;
+    super::coordinator::require_execution_owner(&path)?;
+    connect_after_authority_check(&path, capacity, timeout, open)
+}
+
+fn connect_after_authority_check(
+    path: &Path,
+    capacity: &Arc<ConnectionCapacity>,
+    timeout: Duration,
+    open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
+) -> Result<StoreConnection> {
+    crate::telemetry::observe_store(
+        crate::telemetry::StoreOperation::ConnectionAcquire,
+        crate::telemetry::Correlation::default(),
+        || {
+            let path = path.to_path_buf();
+            let permit = capacity.acquire(&path, timeout)?;
+            let connection = open(&path)
+                .with_context(|| format!("failed to open SQLite store {}", path.display()))?;
+            let transaction_observation = transaction_observation::install(&connection);
+            let conn = StoreConnection {
+                connection: Some(connection),
+                _permit: permit,
+                _transaction_observation: transaction_observation,
+            };
+            #[cfg(test)]
+            {
+                let mut tracked = TRACKED_CONNECTION_OPENS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(count) = tracked.get_mut(&path) {
+                    *count += 1;
+                }
+            }
+            conn.busy_timeout(Duration::from_secs(5))?;
+            let (process_count, store_count) = capacity.counts(&path);
+            crate::telemetry::emit_connection_counts(
+                process_count,
+                store_count,
+                crate::telemetry::Correlation::default(),
+            );
+            Ok(conn)
+        },
+    )
+}
+
+fn connect_with_capacity(
+    path: &Path,
+    capacity: &Arc<ConnectionCapacity>,
+    timeout: Duration,
+) -> Result<StoreConnection> {
+    connect_with_capacity_using(path, capacity, timeout, |path| Connection::open(path))
+}
+
+fn connect(path: &Path) -> Result<StoreConnection> {
+    connect_with_capacity(path, &CONNECTION_CAPACITY, CONNECTION_WAIT_TIMEOUT)
+}
+
+fn connect_existing(path: &Path) -> Result<StoreConnection> {
+    connect_with_capacity_using(
+        path,
+        &CONNECTION_CAPACITY,
+        CONNECTION_WAIT_TIMEOUT,
+        |path| {
+            Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        },
+    )
+}
+
+fn connect_read_only(path: &Path) -> Result<StoreConnection> {
+    let path = std::fs::canonicalize(path).with_context(|| {
+        format!(
+            "failed to resolve initialized SQLite store {}",
+            path.display()
+        )
+    })?;
+    connect_with_capacity_using(
+        &path,
+        &CONNECTION_CAPACITY,
+        CONNECTION_WAIT_TIMEOUT,
+        |path| {
+            Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        },
+    )
+}
+
+// This narrow observer cannot obtain executor authority or a writable
+// connection. Ordinary opens above continue to require the execution owner.
+fn connect_probe_read_only(path: &Path) -> Result<StoreConnection> {
+    let path = std::fs::canonicalize(path)?;
+    connect_after_authority_check(
+        &path,
+        &CONNECTION_CAPACITY,
+        CONNECTION_WAIT_TIMEOUT,
+        |path| {
+            Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        },
+    )
+}
+
+pub(crate) fn open_probe_read_connection(path: &Path) -> Result<StoreConnection> {
+    reject_future_schema_before_open(path)?;
+    let conn = connect_probe_read_only(path)?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    anyhow::ensure!(
+        version == STORE_SCHEMA_VERSION,
+        "probe store is not initialized"
+    );
+    heartbeat_calendar::verify_format(&conn)?;
+    Ok(conn)
+}
+
+/// Opens an already initialized store for read-only runtime observation.
+/// Unlike `open_connection`, this never takes migration/write admission or
+/// repairs database-wide pragmas. Callers fail closed if initialization is not
+/// complete.
+pub(crate) fn open_initialized_read_connection(path: &Path) -> Result<StoreConnection> {
+    let conn = connect_read_only(path)?;
+    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version != STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "store schema version {schema_version} is not initialized for runtime reads; expected {STORE_SCHEMA_VERSION}"
+        ));
+    }
+    heartbeat_calendar::verify_format(&conn)?;
+    Ok(conn)
+}
+
+pub(crate) fn open_runtime_connection(path: &Path) -> Result<StoreConnection> {
+    reject_future_schema_before_open(path)?;
+    let conn = connect(path)?;
+    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version > STORE_SCHEMA_VERSION {
+        return Err(StoreFutureSchemaError::new(schema_version).into());
+    }
+    if schema_version == STORE_SCHEMA_VERSION {
+        heartbeat_calendar::verify_format(&conn)?;
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let journal_mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        // journal_mode is database-wide and persistent. Normal runtime opens
+        // only verify the initialized mode; recovery from external changes
+        // performs the transition once.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+    }
+    if schema_version != STORE_SCHEMA_VERSION {
+        drop(conn);
+        return open_connection(path);
+    }
+    Ok(conn)
+}
+
+#[cfg(test)]
+pub(crate) fn track_connection_opens(path: &Path) {
+    let path = resolved_store_path(path).unwrap();
+    TRACKED_CONNECTION_OPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path, 0);
+}
+
+#[cfg(test)]
+pub(crate) fn tracked_connection_opens(path: &Path) -> usize {
+    let path = resolved_store_path(path).unwrap();
+    TRACKED_CONNECTION_OPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&path)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn active_connection_counts(path: &Path) -> Result<(usize, usize)> {
+    let path = resolved_store_path(path)?;
+    Ok(CONNECTION_CAPACITY.counts(&path))
+}
+
+pub(crate) fn open_connection(path: &Path) -> Result<StoreConnection> {
+    open_connection_with_hooks(path, || {}, || {}, || Ok(()))
+}
+
+fn open_connection_with_hooks(
+    path: &Path,
+    after_preflight: impl FnOnce(),
+    after_lock: impl FnOnce(),
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<StoreConnection> {
+    reject_future_schema_before_open(path)?;
+    let mut conn = connect(path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let preflight_schema_version: i64 =
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if preflight_schema_version > STORE_SCHEMA_VERSION {
+        return Err(StoreFutureSchemaError::new(preflight_schema_version).into());
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    if preflight_schema_version == STORE_SCHEMA_VERSION {
+        heartbeat_calendar::verify_format(&conn)?;
+        return Ok(conn);
+    }
+    after_preflight();
+    // journal_mode is database-wide and persistent, so future schemas must be
+    // rejected before this binary changes even their SQLite configuration.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    after_lock();
+    let schema_version: i64 =
+        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version == STORE_SCHEMA_VERSION {
+        heartbeat_calendar::verify_format(&transaction)?;
+        before_commit()?;
+        transaction.commit()?;
+        return Ok(conn);
+    }
+    let needs_session_summary_backfill = schema_version < SESSION_SUMMARY_BACKFILL_VERSION;
+    match schema_version {
+        0 | 1 => {
+            create_base_schema(&transaction)?;
+            ensure_workset_items_acceptance_column(&transaction)?;
+            ensure_column(&transaction, "sessions", "backend", "TEXT")?;
+            ensure_column(&transaction, "sessions", "reasoning_effort", "TEXT")?;
+            ensure_column(
+                &transaction,
+                "sessions",
+                "last_response_duration_ms",
+                "INTEGER",
+            )?;
+            ensure_column(
+                &transaction,
+                "sessions",
+                "previous_response_duration_ms",
+                "INTEGER",
+            )?;
+            ensure_column(
+                &transaction,
+                "sessions",
+                "response_durations_ms_json",
+                "TEXT",
+            )?;
+            ensure_column(&transaction, "sessions", "host_id", "TEXT")?;
+            ensure_column(&transaction, "sessions", "api_key_env", "TEXT")?;
+            ensure_column(&transaction, "sessions", "extra_headers_json", "TEXT")?;
+            ensure_column(&transaction, "sessions", "token_usages_json", "TEXT")?;
+            ensure_column(
+                &transaction,
+                "sessions",
+                "config_version",
+                "INTEGER NOT NULL DEFAULT 0 CHECK (config_version >= 0)",
+            )?;
+
+            // Both v0 and v1 may contain some or all of the branch's v1
+            // auxiliary tables. Rebuild every table that exists and create the
+            // missing ones before applying the v3 addition.
+            migrate_thread_steering(&transaction)?;
+            migrate_thread_events(&transaction)?;
+            transaction.execute_batch("DROP TABLE IF EXISTS session_overviews")?;
+        }
+        2..=49 => {}
+        unsupported => {
+            if unsupported > STORE_SCHEMA_VERSION {
+                return Err(StoreFutureSchemaError::new(unsupported).into());
+            }
+            return Err(anyhow!(
+                "unsupported store schema version {unsupported}; this build supports versions {MINIMUM_MIGRATABLE_SCHEMA_VERSION} through {STORE_SCHEMA_VERSION}"
+            ));
+        }
+    }
+
+    ensure_column(
+        &transaction,
+        "sessions",
+        "allow_insecure_http",
+        HTTP_OPT_IN_COLUMN,
+    )?;
+    ensure_column(
+        &transaction,
+        "sessions",
+        "orchestrator_compaction_threshold",
+        &format!(
+            "INTEGER CHECK (orchestrator_compaction_threshold IS NULL OR (typeof(orchestrator_compaction_threshold) = 'integer' AND orchestrator_compaction_threshold > 0 AND orchestrator_compaction_threshold <= {}))",
+            crate::MAX_SUPPORTED_TOKEN_COUNT
+        ),
+    )?;
+    ensure_column(
+        &transaction,
+        "sessions",
+        "run_count",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (run_count >= 0)",
+    )?;
+    ensure_column(
+        &transaction,
+        "sessions",
+        "visible_message_count",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (visible_message_count >= 0)",
+    )?;
+    ensure_column(&transaction, "sessions", "last_user_prompt", "TEXT")?;
+    // A remote session records its whole connection, not just the host name, so
+    // resume reaches the same machine without depending on the ssh config of
+    // whoever restarts nac. NULL means "whatever ssh decides", which is what a
+    // session created before these columns existed always relied on.
+    ensure_column(
+        &transaction,
+        "sessions",
+        "ssh_port",
+        "INTEGER CHECK (ssh_port IS NULL OR (ssh_port > 0 AND ssh_port <= 65535))",
+    )?;
+    ensure_column(&transaction, "sessions", "ssh_identity_file", "TEXT")?;
+    // Episodes recorded before dispatches could fail are all handoffs, so the
+    // default is exactly right for them.
+    ensure_column(
+        &transaction,
+        "episodes",
+        "status",
+        "TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'error', 'timed_out', 'cancelled'))",
+    )?;
+    // Light worker model; NULL keeps single-model behavior, so legacy rows
+    // load unchanged.
+    ensure_column(&transaction, "sessions", "light_model_json", "TEXT")?;
+    ensure_column(
+        &transaction,
+        "sessions",
+        "behavior",
+        "TEXT NOT NULL DEFAULT 'orchestrator' CHECK (behavior IN ('orchestrator', 'direct', 'direct-with-orchestrator'))",
+    )?;
+    // Manual is the fail-closed compatibility default. The option belongs to
+    // exactly one session and survives restart without changing config_version
+    // or the scope of remembered grants.
+    ensure_column(
+        &transaction,
+        "sessions",
+        "permission_approval_mode",
+        "TEXT NOT NULL DEFAULT 'manual' CHECK (permission_approval_mode IN ('manual', 'auto_approve'))",
+    )?;
+    ensure_column(
+        &transaction,
+        "sessions",
+        "permission_auto_approve_generation",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (permission_auto_approve_generation >= 0)",
+    )?;
+    ensure_column(
+        &transaction,
+        "sessions",
+        "permission_approval_revision",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (permission_approval_revision >= 0)",
+    )?;
+    // The automatic reviewer pairs only with the manual answer policy, which
+    // is how the review mode is stored without rebuilding `sessions` to widen
+    // the mode CHECK. Existing rows keep their mode with the human reviewer.
+    ensure_column(
+        &transaction,
+        "sessions",
+        "permission_reviewer",
+        "TEXT NOT NULL DEFAULT 'user' CHECK (permission_reviewer IN ('user', 'auto_review') AND (permission_reviewer = 'user' OR permission_approval_mode = 'manual'))",
+    )?;
+    // The messages a person typed to this session tree, as JSON, written
+    // when each reaches the model and cleared when Approve for me is turned
+    // off. Automatic review uses them as intent.
+    ensure_column(&transaction, "sessions", "permission_review_intent", "TEXT")?;
+    if schema_version < RUN_COUNT_BACKFILL_VERSION {
+        backfill_run_counts(&transaction)?;
+    }
+    if needs_session_summary_backfill {
+        backfill_session_summaries(&transaction)?;
+    }
+    create_orchestrator_compaction_checkpoints_table(&transaction)?;
+    create_workspace_revisions_table(&transaction)?;
+    // Revisions recorded before revert existed cannot say which transcript
+    // prefix they describe; NULL is that "unknown", and a revert simply does
+    // not consider them.
+    ensure_column(
+        &transaction,
+        "workspace_revisions",
+        "transcript_len",
+        "INTEGER CHECK (transcript_len IS NULL OR transcript_len >= 0)",
+    )?;
+    create_model_configurations_table(&transaction)?;
+    ensure_column(
+        &transaction,
+        "model_configurations",
+        "light_model_json",
+        "TEXT",
+    )?;
+    ensure_column(
+        &transaction,
+        "model_configurations",
+        "allow_insecure_http",
+        HTTP_OPT_IN_COLUMN,
+    )?;
+    create_projects_tables(&transaction)?;
+    create_ssh_configurations_table(&transaction)?;
+    create_session_run_recovery_table(&transaction)?;
+    create_transcript_append_receipts_table(&transaction)?;
+    ensure_column(
+        &transaction,
+        "session_run_recovery",
+        "terminal_disposition",
+        "TEXT CHECK (terminal_disposition IN ('completed', 'cancelled'))",
+    )?;
+    ensure_column(&transaction, "session_run_recovery", "failure_json", "TEXT")?;
+    create_session_inbox_table(&transaction)?;
+    ensure_column(
+        &transaction,
+        "session_inbox",
+        "admission_id",
+        "TEXT CHECK (admission_id IS NULL OR length(admission_id)=36)",
+    )?;
+    ensure_column(&transaction, "session_inbox", "admission_digest", "TEXT CHECK ((admission_digest IS NULL) = (admission_id IS NULL)) CHECK (admission_digest IS NULL OR (length(admission_digest)=64 AND admission_digest NOT GLOB '*[^0-9a-f]*'))")?;
+    ensure_column(
+        &transaction,
+        "session_inbox",
+        "child_execution_mode",
+        "TEXT CHECK (child_execution_mode IN ('foreground', 'background'))",
+    )?;
+    ensure_column(
+        &transaction,
+        "session_inbox",
+        "child_wait_id",
+        "TEXT CHECK (child_wait_id IS NULL OR length(child_wait_id) = 36)",
+    )?;
+    transaction.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_session_inbox_admission ON session_inbox(session_id,admission_id) WHERE admission_id IS NOT NULL")?;
+    // What a person typed on a human-facing route, kept with the item and
+    // recorded as review intent when the item reaches the model. NULL for
+    // input from agents, MCP clients and NAC itself.
+    ensure_column(&transaction, "session_inbox", "review_intent", "TEXT")?;
+    ensure_column(&transaction, "thread_steering", "review_intent", "TEXT")?;
+    create_permission_grants_table(&transaction)?;
+    create_session_goals_table(&transaction)?;
+    ensure_column(
+        &transaction,
+        "session_goals",
+        "consecutive_transient_failures",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_transient_failures >= 0)",
+    )?;
+    ensure_column(
+        &transaction,
+        "session_goals",
+        "next_attempt_at_epoch_ms",
+        "INTEGER CHECK (next_attempt_at_epoch_ms IS NULL OR next_attempt_at_epoch_ms >= 0)",
+    )?;
+    ensure_column(&transaction, "session_goals", "last_failure_json", "TEXT")?;
+    create_traditional_children_table(&transaction)?;
+    create_managed_orchestrators_table(&transaction)?;
+    delegation_receipts::create_and_seed(&transaction)?;
+    // Execution mode records how a generation was admitted and must remain
+    // immutable. Deletion suppresses completion delivery independently.
+    ensure_column(
+        &transaction,
+        "traditional_children",
+        "completion_suppressed",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (completion_suppressed IN (0, 1))",
+    )?;
+    ensure_column(
+        &transaction,
+        "managed_orchestrators",
+        "completion_suppressed",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (completion_suppressed IN (0, 1))",
+    )?;
+    create_session_forks_table(&transaction)?;
+    create_managed_maintenance_tables(&transaction)?;
+    create_terminal_remote_cleanups_table(&transaction)?;
+    ensure_column(
+        &transaction,
+        "managed_host_maintenance",
+        "accepted_identity_json",
+        "TEXT",
+    )?;
+    super::worker_dispatches::create_worker_dispatches_table(&transaction)?;
+    ensure_column(
+        &transaction,
+        "worker_dispatches",
+        "history_start_id",
+        "INTEGER",
+    )?;
+    ensure_column(
+        &transaction,
+        "worker_dispatches",
+        "history_boundary_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    super::shell_commands::create_shell_commands_table(&transaction)?;
+    ensure_column(&transaction, "session_goals", "last_run_id", "TEXT")?;
+    super::task_evidence::create_task_evidence_tables(&transaction)?;
+    super::task_launches::create_tables(&transaction)?;
+    task_followups::create_tables(&transaction)?;
+    task_followup_delegations::create_tables(&transaction)?;
+    native_task_launches::create_tables(&transaction)?;
+    peer_goal_starts::create_tables(&transaction)?;
+    heartbeat_tables::create_heartbeat_tables(&transaction)?;
+    super::session_mcp_refresh::create_table(&transaction)?;
+    super::task_questions::create_table(&transaction)?;
+    fresh_task_tables::migrate(&transaction)?;
+    completion_tables::create_tables(&transaction)?;
+    heartbeat_calendar::rebuild_occurrences_for_calendar(&transaction)?;
+    heartbeat_calendar::verify_format(&transaction)?;
+    verify_auxiliary_foreign_keys(&transaction)?;
+
+    before_commit()?;
+    transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(conn)
+}
+
+fn create_base_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS threads (
+             name TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (name, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS episodes (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             thread_name TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             action TEXT NOT NULL,
+             content TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             status TEXT NOT NULL DEFAULT 'ok'
+                 CHECK (status IN ('ok', 'error', 'timed_out', 'cancelled')),
+             FOREIGN KEY (thread_name, session_id) REFERENCES threads(name, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS worksets (
+             id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             instruction TEXT NOT NULL,
+             status TEXT NOT NULL,
+             summary TEXT NOT NULL,
+             verification_recipe TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (id, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS workset_items (
+             workset_id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             title TEXT NOT NULL,
+             thread_name TEXT NOT NULL,
+             scope TEXT NOT NULL,
+             description TEXT NOT NULL,
+             item_kind TEXT NOT NULL,
+             status TEXT NOT NULL,
+             source_threads_json TEXT NOT NULL,
+             last_summary TEXT,
+             acceptance TEXT NOT NULL DEFAULT '',
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (workset_id, session_id, position),
+             FOREIGN KEY (workset_id, session_id) REFERENCES worksets(id, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS sessions (
+             session_id TEXT PRIMARY KEY,
+             behavior TEXT NOT NULL DEFAULT 'orchestrator'
+                 CHECK (behavior IN ('orchestrator', 'direct', 'direct-with-orchestrator')),
+             permission_approval_mode TEXT NOT NULL DEFAULT 'manual'
+                 CHECK (permission_approval_mode IN ('manual', 'auto_approve')),
+             permission_auto_approve_generation INTEGER NOT NULL DEFAULT 0
+                 CHECK (permission_auto_approve_generation >= 0),
+             permission_approval_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (permission_approval_revision >= 0),
+             cwd TEXT NOT NULL,
+             store_path TEXT NOT NULL,
+             model TEXT NOT NULL,
+             base_url TEXT NOT NULL,
+             allow_insecure_http INTEGER NOT NULL DEFAULT 0 CHECK (allow_insecure_http IN (0, 1)),
+             backend TEXT,
+             reasoning_effort TEXT,
+             sandbox_json TEXT,
+             messages_json TEXT NOT NULL,
+             visible_message_count INTEGER NOT NULL DEFAULT 0
+                 CHECK (visible_message_count >= 0),
+             last_user_prompt TEXT,
+             last_response_duration_ms INTEGER,
+             previous_response_duration_ms INTEGER,
+             response_durations_ms_json TEXT,
+             api_key_env TEXT,
+             extra_headers_json TEXT,
+             token_usages_json TEXT,
+             config_version INTEGER NOT NULL DEFAULT 0 CHECK (config_version >= 0),
+             run_count INTEGER NOT NULL DEFAULT 0 CHECK (run_count >= 0),
+             orchestrator_compaction_threshold INTEGER
+                 CHECK (orchestrator_compaction_threshold IS NULL OR
+                        (typeof(orchestrator_compaction_threshold) = 'integer' AND
+                         orchestrator_compaction_threshold > 0 AND
+                         orchestrator_compaction_threshold <= {})),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_presentations (
+             session_id TEXT PRIMARY KEY
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             title TEXT,
+             pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+             sort_order INTEGER NOT NULL DEFAULT 0 CHECK (sort_order >= 0),
+             version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0)
+         );
+         CREATE INDEX IF NOT EXISTS idx_episodes_thread_session_created
+             ON episodes(thread_name, session_id, id);
+         CREATE INDEX IF NOT EXISTS idx_worksets_session_updated
+             ON worksets(session_id, updated_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_workset_items_workset_position
+             ON workset_items(workset_id, session_id, position);
+         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
+             ON sessions(updated_at DESC);",
+        crate::MAX_SUPPORTED_TOKEN_COUNT,
+    ))?;
+    Ok(())
+}
+
+fn migrate_thread_steering(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "thread_steering")? {
+        create_thread_steering_table(conn, "thread_steering")?;
+        create_thread_steering_indexes(conn)?;
+        return Ok(());
+    }
+
+    let prior_sequence = autoincrement_sequence(conn, "thread_steering")?;
+    let (source_count, orphan_count) = owned_row_counts(conn, "thread_steering")?;
+    report_omitted_orphans("thread_steering", orphan_count);
+    let has_v2_identity = column_exists(conn, "thread_steering", "dispatch_id")?
+        && column_exists(conn, "thread_steering", "claimed_at")?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS thread_steering_v2")?;
+    create_thread_steering_table(conn, "thread_steering_v2")?;
+    let copied = if has_v2_identity {
+        conn.execute(
+            "INSERT INTO thread_steering_v2
+                 (id, session_id, thread_name, dispatch_id, instruction, status,
+                  created_at, claimed_at, delivered_at, expired_at)
+             SELECT t.id, t.session_id, t.thread_name, t.dispatch_id, t.instruction,
+                    t.status, t.created_at, t.claimed_at, t.delivered_at, t.expired_at
+             FROM thread_steering t
+             INNER JOIN sessions s ON s.session_id = t.session_id",
+            [],
+        )?
+    } else {
+        let migration_at = now_utc();
+        conn.execute(
+            "INSERT INTO thread_steering_v2
+                 (id, session_id, thread_name, dispatch_id, instruction, status,
+                  created_at, claimed_at, delivered_at, expired_at)
+             SELECT t.id, t.session_id, t.thread_name,
+                    'legacy-v1:' || CAST(t.id AS TEXT), t.instruction,
+                    CASE WHEN t.status = 'queued' THEN 'expired' ELSE t.status END,
+                    t.created_at,
+                    CASE WHEN t.status = 'delivered'
+                         THEN COALESCE(t.delivered_at, t.created_at) ELSE NULL END,
+                    CASE WHEN t.status = 'delivered'
+                         THEN COALESCE(t.delivered_at, t.created_at) ELSE NULL END,
+                    CASE WHEN t.status = 'queued' THEN ?1
+                         WHEN t.status = 'expired'
+                         THEN COALESCE(t.expired_at, t.created_at) ELSE NULL END
+             FROM thread_steering t
+             INNER JOIN sessions s ON s.session_id = t.session_id",
+            params![migration_at],
+        )?
+    };
+    verify_copy_count("thread_steering", source_count, orphan_count, copied)?;
+    conn.execute_batch(
+        "DROP TABLE thread_steering;
+         ALTER TABLE thread_steering_v2 RENAME TO thread_steering;",
+    )?;
+    restore_autoincrement_sequence(conn, "thread_steering", prior_sequence)?;
+    create_thread_steering_indexes(conn)?;
+    Ok(())
+}
+
+fn migrate_thread_events(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "thread_events")? {
+        create_thread_events_table(conn, "thread_events")?;
+        create_thread_events_index(conn)?;
+        return Ok(());
+    }
+
+    let prior_sequence = autoincrement_sequence(conn, "thread_events")?;
+    let (source_count, orphan_count) = owned_row_counts(conn, "thread_events")?;
+    report_omitted_orphans("thread_events", orphan_count);
+    let records = {
+        let mut statement = conn.prepare(
+            "SELECT e.id, e.session_id, e.thread_name, e.event_json, e.created_at
+             FROM thread_events e
+             INNER JOIN sessions s ON s.session_id = e.session_id
+             ORDER BY e.id",
+        )?;
+        let records = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        records
+    };
+
+    conn.execute_batch("DROP TABLE IF EXISTS thread_events_v2")?;
+    create_thread_events_table(conn, "thread_events_v2")?;
+    let mut copied = 0_i64;
+    let mut unsafe_events = 0_i64;
+    for (id, session_id, thread_name, event_json, created_at) in records {
+        // Transcript log rows (store/transcript.rs) are NOT AgentEvents: they
+        // are the orchestrator's durable transcript and must be carried
+        // through verbatim. Running them through AgentEvent sanitize-drop
+        // would silently destroy the transcript. Any FUTURE rebuild-migration
+        // of thread_events MUST preserve transcript log rows the same way —
+        // detect them with is_transcript_log_payload, never via AgentEvent.
+        let event_json = if is_transcript_log_payload(&event_json) {
+            event_json
+        } else {
+            let sanitized = serde_json::from_str::<crate::events::AgentEvent>(&event_json)
+                .ok()
+                .and_then(crate::events::sanitize_external_agent_event);
+            let Some(event) = sanitized else {
+                unsafe_events += 1;
+                continue;
+            };
+            serde_json::to_string(&event)?
+        };
+        conn.execute(
+            "INSERT INTO thread_events_v2
+                 (id, session_id, thread_name, event_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, session_id, thread_name, event_json, created_at],
+        )?;
+        copied += 1;
+    }
+    if copied
+        .checked_add(orphan_count)
+        .and_then(|count| count.checked_add(unsafe_events))
+        != Some(source_count)
+    {
+        return Err(anyhow!(
+            "failed to account for all thread_events rows during migration"
+        ));
+    }
+    if unsafe_events > 0 {
+        eprintln!(
+            "nac: schema migration omitted {unsafe_events} malformed, unsupported, or internal thread event row(s)"
+        );
+    }
+    conn.execute_batch(
+        "DROP TABLE thread_events;
+         ALTER TABLE thread_events_v2 RENAME TO thread_events;",
+    )?;
+    restore_autoincrement_sequence(conn, "thread_events", prior_sequence)?;
+    create_thread_events_index(conn)?;
+    Ok(())
+}
+
+fn create_thread_steering_table(conn: &Connection, table: &str) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE {table} (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             thread_name TEXT NOT NULL,
+             dispatch_id TEXT NOT NULL CHECK (length(trim(dispatch_id)) > 0),
+             instruction TEXT NOT NULL,
+             status TEXT NOT NULL DEFAULT 'queued'
+                 CHECK (status IN ('queued', 'claimed', 'delivered', 'expired')),
+             created_at TEXT NOT NULL,
+             claimed_at TEXT,
+             delivered_at TEXT,
+             expired_at TEXT,
+             CHECK (
+                 (status = 'queued' AND claimed_at IS NULL
+                     AND delivered_at IS NULL AND expired_at IS NULL)
+                 OR (status = 'claimed' AND claimed_at IS NOT NULL
+                     AND delivered_at IS NULL AND expired_at IS NULL)
+                 OR (status = 'delivered' AND claimed_at IS NOT NULL
+                     AND delivered_at IS NOT NULL AND expired_at IS NULL)
+                 OR (status = 'expired' AND delivered_at IS NULL
+                     AND expired_at IS NOT NULL)
+             )
+         );"
+    ))?;
+    Ok(())
+}
+
+fn create_thread_events_table(conn: &Connection, table: &str) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE {table} (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             thread_name TEXT NOT NULL,
+             event_json TEXT NOT NULL,
+             created_at TEXT NOT NULL
+         );"
+    ))?;
+    Ok(())
+}
+
+fn create_thread_steering_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX idx_thread_steering_target_pending
+             ON thread_steering(session_id, dispatch_id, status, id);
+         CREATE INDEX idx_thread_steering_session_thread
+             ON thread_steering(session_id, thread_name, id);",
+    )?;
+    Ok(())
+}
+
+fn create_thread_events_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX idx_thread_events_session_thread_id
+             ON thread_events(session_id, thread_name, id DESC);",
+    )?;
+    Ok(())
+}
+
+fn create_orchestrator_compaction_checkpoints_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS orchestrator_compaction_checkpoints (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             previous_checkpoint_id INTEGER,
+             summary TEXT NOT NULL CHECK (length(trim(summary)) > 0),
+             tail_start_message_index INTEGER NOT NULL
+                 CHECK (tail_start_message_index >= 0),
+             source_prefix_sha256 BLOB NOT NULL
+                 CHECK (length(source_prefix_sha256) = 32),
+             system_policy_sha256 BLOB NOT NULL
+                 CHECK (length(system_policy_sha256) = 32),
+             prompt_policy_version INTEGER NOT NULL
+                 CHECK (prompt_policy_version > 0
+                        AND prompt_policy_version <= 4294967295),
+             old_context_estimate INTEGER NOT NULL
+                 CHECK (old_context_estimate >= 0
+                        AND old_context_estimate <= {max}),
+             summary_prompt_tokens INTEGER
+                 CHECK (summary_prompt_tokens IS NULL OR
+                        (summary_prompt_tokens >= 0
+                         AND summary_prompt_tokens <= {max})),
+             summary_completion_tokens INTEGER
+                 CHECK (summary_completion_tokens IS NULL OR
+                        (summary_completion_tokens >= 0
+                         AND summary_completion_tokens <= {max})),
+             new_context_estimate INTEGER NOT NULL
+                 CHECK (new_context_estimate >= 0
+                        AND new_context_estimate <= {max}),
+             created_at TEXT NOT NULL,
+             UNIQUE (session_id, id),
+             FOREIGN KEY (session_id, previous_checkpoint_id)
+                 REFERENCES orchestrator_compaction_checkpoints(session_id, id)
+                 ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_orchestrator_compaction_checkpoints_latest
+             ON orchestrator_compaction_checkpoints(session_id, id DESC);",
+        max = crate::MAX_SUPPORTED_TOKEN_COUNT,
+    ))?;
+    Ok(())
+}
+
+fn create_workspace_revisions_table(conn: &Connection) -> Result<()> {
+    // The tree itself lives in the repository as a git commit, so the widest
+    // column here is the prompt kept for labelling; a revision costs the store
+    // almost nothing no matter how large the checkout is.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_revisions (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             run_id TEXT NOT NULL,
+             commit_sha TEXT NOT NULL CHECK (length(trim(commit_sha)) > 0),
+             base_sha TEXT,
+             branch TEXT,
+             label TEXT NOT NULL,
+             additions INTEGER NOT NULL DEFAULT 0 CHECK (additions >= 0),
+             deletions INTEGER NOT NULL DEFAULT 0 CHECK (deletions >= 0),
+             changed_files INTEGER NOT NULL DEFAULT 0 CHECK (changed_files >= 0),
+             created_at TEXT NOT NULL,
+             transcript_len INTEGER CHECK (transcript_len IS NULL OR transcript_len >= 0),
+             UNIQUE (session_id, run_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_workspace_revisions_session
+             ON workspace_revisions(session_id, id DESC);",
+    )?;
+    Ok(())
+}
+
+/// Explicit project metadata and the optional, immutable session association.
+///
+/// Location identity mirrors session launch: NULL `ssh_host` means local;
+/// otherwise the complete stored SSH invocation tuple scopes the remote path.
+fn create_projects_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+             project_id TEXT PRIMARY KEY,
+             name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+             description TEXT,
+             cwd TEXT NOT NULL CHECK (length(trim(cwd)) > 0),
+             ssh_host TEXT,
+             ssh_port INTEGER CHECK (ssh_port IS NULL OR (ssh_port > 0 AND ssh_port <= 65535)),
+             ssh_identity_file TEXT,
+             default_model_config_id TEXT
+                 REFERENCES model_configurations(config_id) ON DELETE RESTRICT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             CHECK (
+                 (ssh_host IS NULL AND ssh_port IS NULL AND ssh_identity_file IS NULL)
+                 OR (ssh_host IS NOT NULL AND length(trim(ssh_host)) > 0)
+             )
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_location
+             ON projects (
+                 cwd,
+                 COALESCE(ssh_host, ''),
+                 COALESCE(ssh_port, 0),
+                 COALESCE(ssh_identity_file, '')
+             );
+         CREATE INDEX IF NOT EXISTS idx_projects_default_model_config
+             ON projects(default_model_config_id)
+             WHERE default_model_config_id IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS session_projects (
+             session_id TEXT PRIMARY KEY
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             project_id TEXT NOT NULL
+                 REFERENCES projects(project_id) ON DELETE RESTRICT
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_projects_project
+             ON session_projects(project_id, session_id);",
+    )?;
+    // Pin, order, and the optimistic-concurrency counter mirror
+    // `session_presentations`, but live on `projects` itself because a project
+    // row always exists before it can be ordered.
+    ensure_column(
+        conn,
+        "projects",
+        "pinned",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1))",
+    )?;
+    ensure_column(
+        conn,
+        "projects",
+        "sort_order",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (sort_order >= 0)",
+    )?;
+    ensure_column(
+        conn,
+        "projects",
+        "presentation_version",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (presentation_version >= 0)",
+    )?;
+    Ok(())
+}
+
+/// Named SSH connection presets the launch UI can reuse.
+///
+/// Global rather than per-session (no foreign key): a saved host is chosen when
+/// starting a session, then the session row keeps its own copy of the fields.
+fn create_ssh_configurations_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ssh_configurations (
+             config_id TEXT PRIMARY KEY,
+             name TEXT NOT NULL UNIQUE,
+             ssh_host TEXT NOT NULL,
+             ssh_port INTEGER CHECK (ssh_port IS NULL OR (ssh_port > 0 AND ssh_port <= 65535)),
+             ssh_identity_file TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_ssh_configurations_name ON ssh_configurations(name);",
+    )?;
+    Ok(())
+}
+/// Conversation forks of a session. Neither session id is a foreign key:
+/// deleting the fork leaves a tombstone on the original, and deleting the
+/// original still lets the fork tab name where it came from (`source_title`).
+fn create_session_forks_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_forks (
+             source_session_id TEXT NOT NULL,
+             fork_session_id TEXT NOT NULL,
+             source_message_idx INTEGER NOT NULL
+                 CHECK (source_message_idx >= 0),
+             created_at TEXT NOT NULL,
+             source_title TEXT,
+             PRIMARY KEY (source_session_id, fork_session_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_forks_source
+             ON session_forks(source_session_id, source_message_idx);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_forks_fork
+             ON session_forks(fork_session_id);",
+    )?;
+    ensure_column(conn, "session_forks", "source_title", "TEXT")?;
+    rebuild_session_forks_without_source_fk(conn)?;
+    Ok(())
+}
+
+/// An earlier draft of schema 17 cascaded the origin row away with the source
+/// chat. Rebuild so a fork still knows it is a fork after that chat is gone.
+fn rebuild_session_forks_without_source_fk(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_forks'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if !sql.to_ascii_uppercase().contains("REFERENCES") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE session_forks_new (
+             source_session_id TEXT NOT NULL,
+             fork_session_id TEXT NOT NULL,
+             source_message_idx INTEGER NOT NULL
+                 CHECK (source_message_idx >= 0),
+             created_at TEXT NOT NULL,
+             source_title TEXT,
+             PRIMARY KEY (source_session_id, fork_session_id)
+         );
+         INSERT INTO session_forks_new (
+             source_session_id, fork_session_id, source_message_idx, created_at, source_title
+         )
+         SELECT source_session_id, fork_session_id, source_message_idx, created_at, source_title
+         FROM session_forks;
+         DROP TABLE session_forks;
+         ALTER TABLE session_forks_new RENAME TO session_forks;
+         CREATE INDEX IF NOT EXISTS idx_session_forks_source
+             ON session_forks(source_session_id, source_message_idx);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_forks_fork
+             ON session_forks(fork_session_id);",
+    )?;
+    Ok(())
+}
+
+/// Durable user/child input for persistent direct sessions. Pending rows are
+/// editable; delivery wins only in the same transaction that appends their
+/// canonical User message to the transcript.
+fn create_session_inbox_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_inbox (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             delivery TEXT NOT NULL CHECK (delivery IN ('steer', 'queue')),
+             status TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'delivered', 'cancelled')),
+             content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+             target_run_id TEXT,
+             client_id TEXT,
+             delivered_run_id TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             delivered_at TEXT,
+             cancelled_at TEXT,
+             version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+             CHECK (delivery = 'steer' OR target_run_id IS NULL),
+             CHECK (
+                 (status = 'pending' AND delivered_run_id IS NULL AND delivered_at IS NULL AND cancelled_at IS NULL)
+                 OR (status = 'delivered' AND delivered_run_id IS NOT NULL AND delivered_at IS NOT NULL AND cancelled_at IS NULL)
+                 OR (status = 'cancelled' AND delivered_run_id IS NULL AND delivered_at IS NULL AND cancelled_at IS NOT NULL)
+             )
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_inbox_pending
+             ON session_inbox(session_id, status, id);
+         CREATE INDEX IF NOT EXISTS idx_session_inbox_target
+             ON session_inbox(session_id, target_run_id, status, id);",
+    )?;
+    Ok(())
+}
+
+/// Remembered direct-session approvals. The backend class and session-config
+/// revision are part of the authority boundary: patching a session cannot
+/// carry old grants onto a new target or workspace.
+fn create_permission_grants_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS permission_grants (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             action TEXT NOT NULL CHECK (length(trim(action)) > 0),
+             resource TEXT NOT NULL CHECK (length(trim(resource)) > 0),
+             backend TEXT NOT NULL CHECK (backend IN ('local', 'podman', 'ssh')),
+             session_config_version INTEGER NOT NULL
+                 CHECK (session_config_version >= 0),
+             created_at TEXT NOT NULL,
+             UNIQUE (session_id, action, resource, backend, session_config_version)
+         );
+         CREATE INDEX IF NOT EXISTS idx_permission_grants_session
+             ON permission_grants(session_id, backend, session_config_version, created_at, id);",
+    )?;
+    Ok(())
+}
+
+/// At most one durable goal generation belongs to a direct session. The
+/// accounting fields bind the currently participating run and are cleared at
+/// settlement; `continuation_run_id` distinguishes service-owned continuation
+/// from an ordinary user/inbox run for crash reconciliation and diagnostics.
+fn create_session_goals_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_goals (
+             session_id TEXT PRIMARY KEY
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             goal_id TEXT NOT NULL UNIQUE CHECK (length(trim(goal_id)) > 0),
+             objective TEXT NOT NULL CHECK (length(trim(objective)) > 0),
+             status TEXT NOT NULL
+                 CHECK (status IN ('active', 'paused', 'blocked', 'usage_limited', 'budget_limited', 'complete')),
+             token_budget INTEGER
+                 CHECK (token_budget IS NULL OR token_budget > 0),
+             tokens_used INTEGER NOT NULL DEFAULT 0 CHECK (tokens_used >= 0),
+             time_used_ms INTEGER NOT NULL DEFAULT 0 CHECK (time_used_ms >= 0),
+             accounting_run_id TEXT,
+             accounting_token_baseline INTEGER
+                 CHECK (accounting_token_baseline IS NULL OR accounting_token_baseline >= 0),
+             accounting_started_at_epoch_ms INTEGER
+                 CHECK (accounting_started_at_epoch_ms IS NULL OR accounting_started_at_epoch_ms >= 0),
+             continuation_run_id TEXT,
+             consecutive_transient_failures INTEGER NOT NULL DEFAULT 0
+                 CHECK (consecutive_transient_failures >= 0),
+             next_attempt_at_epoch_ms INTEGER
+                 CHECK (next_attempt_at_epoch_ms IS NULL OR next_attempt_at_epoch_ms >= 0),
+             last_failure_json TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+             CHECK (
+                 (accounting_run_id IS NULL AND accounting_token_baseline IS NULL
+                  AND accounting_started_at_epoch_ms IS NULL AND continuation_run_id IS NULL)
+                 OR
+                 (accounting_run_id IS NOT NULL AND accounting_token_baseline IS NOT NULL
+                  AND accounting_started_at_epoch_ms IS NOT NULL
+                  AND (continuation_run_id IS NULL OR continuation_run_id = accounting_run_id))
+             )
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_goals_status
+             ON session_goals(status, updated_at, session_id);",
+    )?;
+    Ok(())
+}
+
+/// Durable relationship and latest execution generation for an OpenCode-like
+/// traditional child session. The child is still a normal row in `sessions`;
+/// this table adds ownership, profile, bounded nesting, and exactly-once
+/// background completion delivery.
+fn create_traditional_children_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS traditional_children (
+             child_session_id TEXT PRIMARY KEY
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             parent_session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             root_session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             profile TEXT NOT NULL CHECK (profile IN ('general')),
+             description TEXT NOT NULL CHECK (
+                 length(trim(description)) > 0 AND length(description) <= 120
+             ),
+             nesting_depth INTEGER NOT NULL CHECK (nesting_depth = 1),
+             status TEXT NOT NULL DEFAULT 'idle'
+                 CHECK (status IN ('idle', 'running', 'completed', 'failed', 'cancelled', 'interrupted')),
+             generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+             run_id TEXT,
+             execution_mode TEXT CHECK (execution_mode IN ('foreground', 'background')),
+             report TEXT,
+             failure TEXT,
+             change_summary TEXT,
+             verification_summary TEXT,
+             completion_inbox_id INTEGER
+                 REFERENCES session_inbox(id) ON DELETE SET NULL,
+             completion_suppressed INTEGER NOT NULL DEFAULT 0
+                 CHECK (completion_suppressed IN (0, 1)),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+             CHECK (child_session_id <> parent_session_id),
+             CHECK (
+                 (status = 'idle' AND generation = 0 AND run_id IS NULL
+                  AND execution_mode IS NULL AND report IS NULL AND failure IS NULL
+                  AND change_summary IS NULL AND verification_summary IS NULL
+                  AND completion_inbox_id IS NULL)
+                 OR
+                 (status = 'running' AND generation > 0 AND run_id IS NOT NULL
+                  AND execution_mode IS NOT NULL AND report IS NULL AND failure IS NULL
+                  AND change_summary IS NULL AND verification_summary IS NULL
+                  AND completion_inbox_id IS NULL)
+                 OR
+                 (status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                  AND generation > 0 AND run_id IS NOT NULL
+                  AND execution_mode IS NOT NULL)
+             )
+         );
+         CREATE INDEX IF NOT EXISTS idx_traditional_children_parent
+             ON traditional_children(parent_session_id, created_at, child_session_id);
+         CREATE INDEX IF NOT EXISTS idx_traditional_children_root_running
+             ON traditional_children(root_session_id, status, updated_at, child_session_id);",
+    )?;
+    Ok(())
+}
+
+/// Durable ownership and latest run generation for an orchestrator session
+/// launched by a direct-with-orchestrator parent.
+fn create_managed_orchestrators_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS managed_orchestrators (
+             orchestrator_session_id TEXT PRIMARY KEY
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             parent_session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             root_session_id TEXT NOT NULL
+                 REFERENCES sessions(session_id) ON DELETE CASCADE,
+             description TEXT NOT NULL CHECK (
+                 length(trim(description)) > 0 AND length(description) <= 120
+             ),
+             status TEXT NOT NULL DEFAULT 'idle'
+                 CHECK (status IN ('idle', 'running', 'completed', 'failed', 'cancelled', 'interrupted')),
+             generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+             run_id TEXT,
+             execution_mode TEXT CHECK (execution_mode IN ('foreground', 'background')),
+             report TEXT,
+             failure TEXT,
+             completion_inbox_id INTEGER
+                 REFERENCES session_inbox(id) ON DELETE SET NULL,
+             completion_suppressed INTEGER NOT NULL DEFAULT 0
+                 CHECK (completion_suppressed IN (0, 1)),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+             CHECK (orchestrator_session_id <> parent_session_id),
+             CHECK (
+                 (status = 'idle' AND generation = 0 AND run_id IS NULL
+                  AND execution_mode IS NULL AND report IS NULL AND failure IS NULL
+                  AND completion_inbox_id IS NULL)
+                 OR
+                 (status = 'running' AND generation > 0 AND run_id IS NOT NULL
+                  AND execution_mode IS NOT NULL AND report IS NULL AND failure IS NULL
+                  AND completion_inbox_id IS NULL)
+                 OR
+                 (status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                  AND generation > 0 AND run_id IS NOT NULL
+                  AND execution_mode IS NOT NULL)
+             )
+         );
+         CREATE INDEX IF NOT EXISTS idx_managed_orchestrators_parent
+             ON managed_orchestrators(parent_session_id, created_at, orchestrator_session_id);
+         CREATE INDEX IF NOT EXISTS idx_managed_orchestrators_root_running
+             ON managed_orchestrators(root_session_id, status, updated_at, orchestrator_session_id);",
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+         )",
+        params![table],
+        |row| row.get(0),
+    )?)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn owned_row_counts(conn: &Connection, table: &str) -> Result<(i64, i64)> {
+    let source_count = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    let orphan_count = conn.query_row(
+        &format!(
+            "SELECT COUNT(*)
+             FROM {table} child
+             LEFT JOIN sessions parent ON parent.session_id = child.session_id
+             WHERE parent.session_id IS NULL"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((source_count, orphan_count))
+}
+
+fn report_omitted_orphans(table: &str, count: i64) {
+    if count > 0 {
+        eprintln!("nac: schema migration omitted {count} session-orphan row(s) from {table}");
+    }
+}
+
+fn verify_copy_count(
+    table: &str,
+    source_count: i64,
+    orphan_count: i64,
+    copied: usize,
+) -> Result<()> {
+    let expected = source_count
+        .checked_sub(orphan_count)
+        .ok_or_else(|| anyhow!("invalid migration counts for {table}"))?;
+    if i64::try_from(copied).ok() != Some(expected) {
+        return Err(anyhow!(
+            "failed to preserve all session-owned {table} rows during migration"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_auxiliary_foreign_keys(conn: &Connection) -> Result<()> {
+    for table in [
+        "thread_steering",
+        "thread_events",
+        "orchestrator_compaction_checkpoints",
+        "workspace_revisions",
+        "session_run_recovery",
+        "session_completion_bindings",
+        "session_completion_marks",
+        "session_completion_occurrences",
+        "session_inbox",
+        "task_followups",
+        "session_mcp_refresh",
+        "human_shell_operations",
+        "permission_grants",
+        "traditional_children",
+        "managed_orchestrators",
+        "traditional_child_terminal_receipts",
+        "managed_orchestrator_terminal_receipts",
+        "session_forks",
+        "terminal_remote_cleanups",
+        "projects",
+        "session_projects",
+    ] {
+        let mut statement = conn.prepare(&format!("PRAGMA foreign_key_check({table})"))?;
+        if statement.query([])?.next()?.is_some() {
+            return Err(anyhow!(
+                "foreign key check failed for migrated table {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_workset_items_acceptance_column(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "workset_items", "acceptance")? {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE workset_items ADD COLUMN acceptance TEXT NOT NULL DEFAULT ''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    conn.execute(&alter, [])?;
+    Ok(())
+}
+
+fn backfill_session_summaries(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut statement = conn.prepare("SELECT session_id, messages_json FROM sessions")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (session_id, messages_json) in rows {
+        let messages: Vec<crate::types::Message> = serde_json::from_str(&messages_json)
+            .with_context(|| {
+                format!("failed to parse stored messages for session '{session_id}'")
+            })?;
+        let blob_visible = crate::sessions::visible_message_count(&messages);
+        let log_from_idx =
+            u64::try_from(messages.len()).context("session transcript length overflowed")?;
+        let log_visible =
+            crate::store::count_visible_transcript_log_messages(conn, &session_id, log_from_idx)?;
+        let visible_count = i64::try_from(
+            blob_visible
+                .checked_add(log_visible)
+                .context("session visible message count overflowed")?,
+        )
+        .context("session visible message count overflowed")?;
+        let last_user_prompt =
+            crate::store::last_transcript_log_user_prompt(conn, &session_id, log_from_idx)?
+                .or_else(|| crate::sessions::last_user_prompt(&messages));
+        conn.execute(
+            "UPDATE sessions
+             SET visible_message_count = ?1, last_user_prompt = ?2
+             WHERE session_id = ?3",
+            params![visible_count, last_user_prompt, session_id],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "schema_tests.rs"]
+mod tests;

@@ -1,0 +1,1867 @@
+use super::*;
+use rusqlite::OptionalExtension;
+
+#[tokio::test]
+async fn lost_permission_mode_cas_is_an_http_conflict() {
+    let response = ApiError::from(anyhow::Error::new(
+        nac_core::permissions::PermissionApprovalModeUpdateError::ConcurrentChange,
+    ))
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_body(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("changed concurrently"));
+}
+
+#[tokio::test]
+async fn attaching_direct_session_wakes_oldest_persisted_inbox_item() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_inbox_reattach");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-reattach-test-key"));
+    let (base_url, request_finished) = scripted_direct_response();
+    seed_direct_session_with_base_url(&root, "direct", base_url);
+    let store_path = root.join("store.db");
+    let pending = nac_core::store::create_session_inbox_item(
+        &store_path,
+        "direct",
+        InboxDelivery::Queue,
+        "survive restart",
+        None,
+        None,
+    )
+    .unwrap();
+
+    let manager = test_manager(&root);
+    let service = manager.attach_session("direct").await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        request_finished
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.has_active_operation() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reattached direct run should finish");
+
+    let delivered =
+        nac_core::store::load_session_inbox_item(&store_path, "direct", pending.id).unwrap();
+    assert_eq!(delivered.status, nac_core::store::InboxStatus::Delivered);
+    assert!(delivered.delivered_run_id.is_some());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn attaching_direct_session_reconciles_one_stale_goal_claim_without_duplicate_start() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_goal_reattach");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-goal-reattach-key"));
+    let (base_url, request_finished) = scripted_direct_response();
+    seed_direct_session_with_base_url(&root, "direct", base_url);
+    let store_path = root.join("store.db");
+    nac_core::store::create_session_goal(
+        &store_path,
+        "direct",
+        "resume exactly once",
+        Some(15),
+        None,
+    )
+    .unwrap();
+    nac_core::store::bind_session_goal_run(
+        &store_path,
+        "direct",
+        &nac_core::store::GoalRunBaseline {
+            run_id: "stale-run".to_string(),
+            billable_tokens: 0,
+            started_at_epoch_ms: 1,
+            continuation: true,
+        },
+    )
+    .unwrap();
+
+    let manager = test_manager(&root);
+    let service = manager.attach_session("direct").await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        request_finished
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let goal = service.direct_goal().unwrap().unwrap();
+            if !service.has_active_operation() && goal.status == GoalStatus::BudgetLimited {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("one recovered continuation should settle at its budget");
+    let goal = service.direct_goal().unwrap().unwrap();
+    assert_eq!(goal.tokens_used, 15);
+    assert!(goal.continuation_run_id.is_none());
+    assert_ne!(goal.accounting_run_id.as_deref(), Some("stale-run"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn session_review_intent(store_path: &std::path::Path) -> Option<String> {
+    rusqlite::Connection::open(store_path)
+        .unwrap()
+        .query_row(
+            "SELECT permission_review_intent FROM sessions WHERE session_id = 'direct'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn item_review_intent(store_path: &std::path::Path, item_id: i64) -> Option<String> {
+    rusqlite::Connection::open(store_path)
+        .unwrap()
+        .query_row(
+            "SELECT review_intent FROM session_inbox WHERE id = ?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn only_human_routes_tag_input_and_intent_waits_for_delivery() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_review_intent");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-intent-test-key"));
+    seed_direct_session(&root, "direct");
+    let store_path = root.join("store.db");
+    // Holding the lease keeps queued items from starting a run.
+    let _lease = sessions::SessionOperationLease::try_acquire(&store_path, "direct").unwrap();
+    let manager = test_manager(&root);
+    let app = router(manager.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/direct/inbox")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"delivery": "queue", "prompt": "fix the parser test"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let person: InboxItemResponse = serde_json::from_slice(&response_body(response).await).unwrap();
+    // The item carries what the person typed; it becomes intent only when
+    // it reaches the model, so a queued item never widens the running task.
+    assert_eq!(
+        item_review_intent(&store_path, person.id).as_deref(),
+        Some("fix the parser test")
+    );
+    assert_eq!(session_review_intent(&store_path), None);
+
+    let automation = manager
+        .create_direct_inbox_item(
+            "direct",
+            CreateInboxItemRequest {
+                delivery: InboxDelivery::Queue,
+                prompt: "publish the release".to_string(),
+            },
+            nac_core::store::InputOrigin::Automation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(item_review_intent(&store_path, automation.id), None);
+
+    // Cancelling before delivery never publishes it.
+    let cancelled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/direct/inbox/{}", person.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"expected_version":{}}}"#,
+                    person.version
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(session_review_intent(&store_path), None);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn direct_inbox_http_api_lists_edits_and_cancels_pending_input() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_inbox_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-inbox-test-key"));
+    seed_direct_session(&root, "direct");
+    seed_editable_session(&root, "orchestrator");
+    let store_path = root.join("store.db");
+    let _lease = sessions::SessionOperationLease::try_acquire(&store_path, "direct").unwrap();
+    let app = router(test_manager(&root));
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/direct/inbox")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"delivery":"queue","prompt":"do this later"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let create_status = create.status();
+    let create_body = response_body(create).await;
+    assert_eq!(
+        create_status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&create_body)
+    );
+    let created: InboxItemResponse = serde_json::from_slice(&create_body).unwrap();
+    assert_eq!(created.status, nac_core::store::InboxStatus::Pending);
+    assert_eq!(created.prompt, "do this later");
+    // What a person typed travels with the item until it reaches the model.
+    assert_eq!(
+        item_review_intent(&store_path, created.id).as_deref(),
+        Some("do this later")
+    );
+    assert_eq!(session_review_intent(&store_path), None);
+
+    let list = get_response(app.clone(), "/sessions/direct/inbox", None).await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let listed: Vec<InboxItemResponse> =
+        serde_json::from_slice(&response_body(list).await).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, created.id);
+
+    let update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/sessions/direct/inbox/{}", created.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"expected_version":{},"delivery":"steer"}}"#,
+                    created.version
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let updated: InboxItemResponse = serde_json::from_slice(&response_body(update).await).unwrap();
+    assert_eq!(updated.delivery, InboxDelivery::Steer);
+    assert_eq!(updated.target_run_id, None);
+
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/sessions/direct/inbox/{}", created.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"expected_version":{},"delivery":"queue"}}"#,
+                    created.version
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let cancel = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/direct/inbox/{}", created.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"expected_version":{}}}"#,
+                    updated.version
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::OK);
+    let cancelled: InboxItemResponse =
+        serde_json::from_slice(&response_body(cancel).await).unwrap();
+    assert_eq!(cancelled.status, nac_core::store::InboxStatus::Cancelled);
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/orchestrator/inbox")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"delivery":"queue","prompt":"not here"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn approve_for_me_requires_existing_arcee_auth_and_preserves_the_previous_mode() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_review_mode_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-permission-test-key"));
+    seed_direct_session(&root, "direct");
+    let app = router(test_manager(&root));
+    let put_mode = |mode: &'static str| {
+        Request::builder()
+            .method("PUT")
+            .uri("/sessions/direct/permissions/mode")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"mode":"{mode}"}}"#)))
+            .unwrap()
+    };
+
+    let auto = app.clone().oneshot(put_mode("auto_approve")).await.unwrap();
+    assert_eq!(auto.status(), StatusCode::NO_CONTENT);
+    let rejected = app.clone().oneshot(put_mode("review")).await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(response_body(rejected).await.to_vec()).unwrap();
+    assert!(
+        body.contains(nac_core::model::ARCEE_REVIEW_CREDENTIAL_REQUIRED),
+        "{body}"
+    );
+    let state: PermissionStateResponse = serde_json::from_slice(
+        &response_body(get_response(app.clone(), "/sessions/direct/permissions", None).await).await,
+    )
+    .unwrap();
+    assert_eq!(
+        state.approval_mode,
+        nac_core::permissions::PermissionApprovalMode::AutoApprove,
+        "a failed selection keeps the previous mode"
+    );
+
+    // A configured Arcee API key is enough; no separate reviewer credential.
+    unsafe { std::env::set_var("ARCEE_API_KEY", "synthetic-arcee-test-key") };
+    let enabled = app.clone().oneshot(put_mode("review")).await.unwrap();
+    assert_eq!(enabled.status(), StatusCode::NO_CONTENT);
+    let state: PermissionStateResponse = serde_json::from_slice(
+        &response_body(get_response(app.clone(), "/sessions/direct/permissions", None).await).await,
+    )
+    .unwrap();
+    assert_eq!(
+        state.approval_mode,
+        nac_core::permissions::PermissionApprovalMode::Review
+    );
+    assert!(state.reviews.is_empty());
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/direct/permissions/reviews/missing/authorize-retry")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let manual = app.clone().oneshot(put_mode("manual")).await.unwrap();
+    assert_eq!(manual.status(), StatusCode::NO_CONTENT);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn approve_for_me_accepts_an_existing_arcee_login() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_review_mode_login");
+    let nac_home = root.join("nac-home");
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-permission-test-key"));
+    write_arcee_auth(&nac_home, "https://api.arcee.ai/api/v1");
+    seed_direct_session(&root, "direct");
+    let app = router(test_manager(&root));
+
+    let enabled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/sessions/direct/permissions/mode")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"mode":"review"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        nac_core::sessions::load_permission_approval_mode(&root.join("store.db"), "direct")
+            .unwrap(),
+        nac_core::permissions::PermissionApprovalMode::Review
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn blocked_review(id: &str) -> nac_core::permissions::PermissionReview {
+    let review = nac_core::permissions::PermissionReview {
+        id: id.to_string(),
+        session_id: "direct".to_string(),
+        call_id: Some("call-1".to_string()),
+        tool: "exec_command".to_string(),
+        backend: "local".to_string(),
+        resources: vec![nac_core::permissions::ReviewResource {
+            action: "execute".to_string(),
+            resource: "command:[git][push]".to_string(),
+            display: "git push".to_string(),
+        }],
+        user_authorized_retry: false,
+        outcome: Some(nac_core::permissions::PermissionReviewOutcome::Rejected),
+        code: Some(nac_core::permissions::PermissionReviewCode::ReviewRejected),
+        category: Some(nac_core::permissions::ReviewCategory::OutOfScope),
+        failure_reason: None,
+        duration_ms: Some(5),
+        reviewer: "test".to_string(),
+        created_at_epoch_ms: 1,
+    };
+    review
+}
+
+#[tokio::test]
+async fn authorize_retry_queues_one_steer_and_rolls_back_when_enqueue_fails() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_review_retry_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-permission-test-key"));
+    unsafe { std::env::set_var("ARCEE_API_KEY", "synthetic-arcee-test-key") };
+    seed_direct_session(&root, "direct");
+    let manager = test_manager(&root);
+    let app = router(manager.clone());
+    let service = manager.attach_session("direct").await.unwrap();
+    let broker = service.permission_broker_for_test().unwrap();
+    let authorize = |review_id: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/sessions/direct/permissions/reviews/{review_id}/authorize-retry"
+            ))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let state = |app: axum::Router| async move {
+        serde_json::from_slice::<PermissionStateResponse>(
+            &response_body(get_response(app, "/sessions/direct/permissions", None).await).await,
+        )
+        .unwrap()
+    };
+
+    // A failed enqueue leaves the action authorizable and nothing queued.
+    broker.insert_blocked_review_for_test(blocked_review("review-fail"));
+    nac_core::session_service::SessionService::fail_next_retry_enqueue_for_test();
+    let failed = app.clone().oneshot(authorize("review-fail")).await.unwrap();
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let after_failure = state(app.clone()).await;
+    assert_eq!(
+        after_failure.authorizable_review_ids,
+        vec!["review-fail".to_string()]
+    );
+    assert!(service.list_direct_inbox().unwrap().is_empty());
+
+    // A successful authorization queues exactly one user-authored steer and
+    // is single use.
+    let authorized = app.clone().oneshot(authorize("review-fail")).await.unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body: nac_core::permissions::PermissionReview =
+        serde_json::from_slice(&response_body(authorized).await).unwrap();
+    assert_eq!(body.id, "review-fail");
+    let inbox = service.list_direct_inbox().unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].delivery, nac_core::store::InboxDelivery::Steer);
+    assert!(
+        inbox[0].content.contains("git push"),
+        "{}",
+        inbox[0].content
+    );
+    assert!(inbox[0].content.contains("reviewed again"));
+    assert!(state(app.clone()).await.authorizable_review_ids.is_empty());
+    let again = app.clone().oneshot(authorize("review-fail")).await.unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn a_retry_wake_failure_after_recording_keeps_one_request_and_one_authorization() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_review_retry_wake");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-permission-test-key"));
+    seed_direct_session(&root, "direct");
+    let manager = test_manager(&root);
+    let app = router(manager.clone());
+    let service = manager.attach_session("direct").await.unwrap();
+    let broker = service.permission_broker_for_test().unwrap();
+    broker.insert_blocked_review_for_test(blocked_review("review-wake"));
+    let authorize = || {
+        Request::builder()
+            .method("POST")
+            .uri("/sessions/direct/permissions/reviews/review-wake/authorize-retry")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // The request is recorded, then starting a run fails.
+    nac_core::session_service::SessionService::fail_next_retry_wake_for_test();
+    let recorded = app.clone().oneshot(authorize()).await.unwrap();
+    assert_eq!(recorded.status(), StatusCode::OK);
+    let inbox = service.list_direct_inbox().unwrap();
+    assert_eq!(inbox.len(), 1, "the durable request stays queued");
+    assert_eq!(inbox[0].delivery, nac_core::store::InboxDelivery::Steer);
+    assert_eq!(
+        broker.pending_retry_authorizations_for_test(),
+        1,
+        "the authorization stays with the queued request"
+    );
+    assert!(broker.blocked_reviews().is_empty());
+
+    // A second attempt cannot add another request or authorization.
+    let again = app.clone().oneshot(authorize()).await.unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    assert_eq!(service.list_direct_inbox().unwrap().len(), 1);
+    assert_eq!(broker.pending_retry_authorizations_for_test(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn direct_permission_http_api_lists_replies_and_removes_revision_bound_grants() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_permission_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-permission-test-key"));
+    seed_direct_session(&root, "direct");
+    seed_direct_session(&root, "child");
+    seed_editable_session(&root, "orchestrator");
+    nac_core::store::create_traditional_child_relationship(
+        &root.join("store.db"),
+        "direct",
+        "child",
+        nac_core::store::GENERAL_CHILD_PROFILE,
+        "separate permission scope",
+    )
+    .unwrap();
+    let grant_id = nac_core::store::insert_permission_grants(
+        &root.join("store.db"),
+        "direct",
+        "execute",
+        &["command:[cargo][test]*".to_string()],
+        "local",
+        0,
+    )
+    .unwrap()[0]
+        .id
+        .clone();
+    let app = router(test_manager(&root));
+
+    let list = get_response(app.clone(), "/sessions/direct/permissions", None).await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let state: PermissionStateResponse =
+        serde_json::from_slice(&response_body(list).await).unwrap();
+    assert_eq!(
+        state.approval_mode,
+        nac_core::permissions::PermissionApprovalMode::Manual
+    );
+    assert!(state.requests.is_empty());
+    assert_eq!(state.grants.len(), 1);
+    assert_eq!(state.grants[0].id, grant_id);
+    let config_before =
+        nac_core::sessions::load_session_config(&root.join("store.db"), "direct").unwrap();
+
+    let enable_auto = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/sessions/direct/permissions/mode")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"mode":"auto_approve"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enable_auto.status(), StatusCode::NO_CONTENT);
+    let list = get_response(app.clone(), "/sessions/direct/permissions", None).await;
+    let state: PermissionStateResponse =
+        serde_json::from_slice(&response_body(list).await).unwrap();
+    assert_eq!(
+        state.approval_mode,
+        nac_core::permissions::PermissionApprovalMode::AutoApprove
+    );
+    assert_eq!(
+        nac_core::sessions::load_permission_approval_mode(&root.join("store.db"), "direct")
+            .unwrap(),
+        nac_core::permissions::PermissionApprovalMode::AutoApprove
+    );
+    let child_list = get_response(app.clone(), "/sessions/child/permissions", None).await;
+    assert_eq!(child_list.status(), StatusCode::OK);
+    let child_state: PermissionStateResponse =
+        serde_json::from_slice(&response_body(child_list).await).unwrap();
+    assert_eq!(
+        child_state.approval_mode,
+        nac_core::permissions::PermissionApprovalMode::AutoApprove
+    );
+    assert!(
+        child_state.grants.is_empty(),
+        "parent grants stay child-local"
+    );
+    let config_after =
+        nac_core::sessions::load_session_config(&root.join("store.db"), "direct").unwrap();
+    assert_eq!(config_after.config_version, config_before.config_version);
+    assert_eq!(config_after.backend, config_before.backend);
+
+    let missing_reply = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/direct/permissions/missing")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"reply":"once"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_reply.status(), StatusCode::NOT_FOUND);
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/direct/permissions/grants/{grant_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    let list = get_response(app.clone(), "/sessions/direct/permissions", None).await;
+    let state: PermissionStateResponse =
+        serde_json::from_slice(&response_body(list).await).unwrap();
+    assert!(state.grants.is_empty());
+
+    let rejected = get_response(app.clone(), "/sessions/orchestrator/permissions", None).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/sessions/orchestrator/permissions/mode")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"mode":"auto_approve"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_update.status(), StatusCode::BAD_REQUEST);
+    let rejected_child_update = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/sessions/child/permissions/mode")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"mode":"auto_approve"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_child_update.status(), StatusCode::CONFLICT);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn direct_goal_http_api_creates_edits_pauses_resumes_and_clears() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("direct_goal_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("direct-goal-test-key"));
+    seed_direct_session(&root, "direct");
+    seed_editable_session(&root, "orchestrator");
+    let endpoint = point_session_at_hanging_endpoint(&root, "direct").await;
+    let manager = test_manager(&root);
+    manager
+        .submit_prompt(
+            "direct",
+            SubmitPromptRequest {
+                prompt: "hold the local run open".to_string(),
+            },
+            nac_core::store::InputOrigin::Automation,
+        )
+        .await
+        .unwrap();
+    let app = router(manager.clone());
+
+    let empty = get_response(app.clone(), "/sessions/direct/goal", None).await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(response_body(empty).await.as_ref(), b"null");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/direct/goal")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"objective":"ship the feature","token_budget":500}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let created: SessionGoalRecord = serde_json::from_slice(&response_body(create).await).unwrap();
+    assert_eq!(created.status, GoalStatus::Active);
+    assert_eq!(created.token_budget, Some(500));
+
+    let pause = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/sessions/direct/goal/{}", created.goal_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"expected_version":{},"objective":"ship safely","token_budget":null,"status":"paused"}}"#,
+                        created.version
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(pause.status(), StatusCode::OK);
+    let paused: SessionGoalRecord = serde_json::from_slice(&response_body(pause).await).unwrap();
+    assert_eq!(paused.objective, "ship safely");
+    assert_eq!(paused.token_budget, None);
+    assert_eq!(paused.status, GoalStatus::Paused);
+
+    let resume = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/sessions/direct/goal/{}", paused.goal_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"expected_version":{},"status":"active"}}"#,
+                    paused.version
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume.status(), StatusCode::OK);
+    let resumed: SessionGoalRecord = serde_json::from_slice(&response_body(resume).await).unwrap();
+    assert_eq!(resumed.status, GoalStatus::Active);
+
+    let clear = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/direct/goal/{}", resumed.goal_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"expected_version":{}}}"#,
+                    resumed.version
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear.status(), StatusCode::NO_CONTENT);
+
+    let rejected = get_response(app, "/sessions/orchestrator/goal", None).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    manager.cancel_active_run("direct").await.unwrap();
+    endpoint.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn traditional_child_goal_http_api_is_bad_request() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("traditional_child_goal_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("child-goal-test-key"));
+    seed_direct_session(&root, "direct");
+    let manager = test_manager(&root);
+    let child_session_id = manager
+        .create_traditional_child_session("direct", "general", "child goal ownership")
+        .await
+        .unwrap();
+    let app = router(manager);
+
+    let response = get_response(app, &format!("/sessions/{child_session_id}/goal"), None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    assert_eq!(
+        body["error"],
+        serde_json::Value::String(
+            "traditional child sessions cannot own autonomous goals".to_string()
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_orchestrator_http_api_runs_foreground_then_delivers_background_completion() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("managed_orchestrator_http");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("managed-orchestrator-test-key"));
+    let (base_url, requests) = scripted_direct_responses(&[
+        "foreground orchestrator done",
+        "background orchestrator done",
+        "parent received orchestrator completion",
+    ]);
+    seed_direct_with_orchestrator_session_with_base_url(&root, "delegating", base_url);
+    seed_direct_session(&root, "ordinary-direct");
+    seed_editable_session(&root, "orchestrator");
+    let manager = test_manager(&root);
+    let app = router(manager.clone());
+
+    let foreground = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/delegating/orchestrators")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"description":"implement durable control","prompt":"complete the first pass","background":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(foreground.status(), StatusCode::CREATED);
+    let foreground: ManagedOrchestratorRecord =
+        serde_json::from_slice(&response_body(foreground).await).unwrap();
+    assert_eq!(foreground.status, ManagedOrchestratorStatus::Completed);
+    assert_eq!(foreground.generation, 1);
+    assert_eq!(
+        foreground.report.as_deref(),
+        Some("foreground orchestrator done")
+    );
+    assert_eq!(requests.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    let child_snapshot =
+        sessions::load_session(&root.join("store.db"), &foreground.orchestrator_session_id)
+            .unwrap();
+    assert_eq!(
+        child_snapshot.behavior,
+        sessions::SessionBehavior::Orchestrator
+    );
+    let lineage_response = get_response(
+        app.clone(),
+        &format!(
+            "/sessions/{}?include_sessions=false",
+            foreground.orchestrator_session_id
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(lineage_response.status(), StatusCode::OK);
+    let lineage_json = response_json(lineage_response).await;
+    assert_eq!(lineage_json["lineage"]["kind"], "managed-orchestrator");
+    assert_eq!(lineage_json["lineage"]["parent_session_id"], "delegating");
+    assert_eq!(
+        lineage_json["lineage"]["description"],
+        "implement durable control"
+    );
+
+    let background = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/delegating/orchestrators")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"description":"implement durable control","prompt":"complete the second pass","orchestrator_session_id":"{}","background":true}}"#,
+                        foreground.orchestrator_session_id
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(background.status(), StatusCode::CREATED);
+    let background: ManagedOrchestratorRecord =
+        serde_json::from_slice(&response_body(background).await).unwrap();
+    assert_eq!(background.status, ManagedOrchestratorStatus::Running);
+    assert_eq!(background.generation, 2);
+    assert_eq!(
+        background.execution_mode,
+        Some(ManagedOrchestratorExecutionMode::Background)
+    );
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(requests.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        assert_eq!(requests.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let orchestrator = manager
+                .delegation()
+                .managed_orchestrator("delegating", &foreground.orchestrator_session_id)
+                .unwrap();
+            if orchestrator.status == ManagedOrchestratorStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background orchestrator should settle");
+    let completed = manager
+        .delegation()
+        .managed_orchestrator("delegating", &foreground.orchestrator_session_id)
+        .unwrap();
+    assert_eq!(completed.generation, 2);
+    assert_eq!(
+        completed.report.as_deref(),
+        Some("background orchestrator done")
+    );
+    assert!(completed.completion_inbox_id.is_some());
+    let inbox = nac_core::store::list_session_inbox(&root.join("store.db"), "delegating").unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].status, nac_core::store::InboxStatus::Delivered);
+    assert!(inbox[0]
+        .content
+        .contains(&foreground.orchestrator_session_id));
+
+    assert_eq!(
+        get_response(app.clone(), "/sessions/ordinary-direct/orchestrators", None)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get_response(app, "/sessions/orchestrator/orchestrators", None)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_binding_failure_precedes_run_and_prompt_execution() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("managed_binding_before_execution");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("managed-bind-test-key"));
+    seed_editable_session(&root, "orchestrator");
+    let manager = test_manager(&root);
+    let orchestrator = "orchestrator".to_string();
+    let store_path = root.join("store.db");
+
+    let error = manager
+        .submit_managed_orchestrator_prompt(
+            &orchestrator,
+            SubmitPromptRequest {
+                prompt: "must never execute".to_string(),
+            },
+            ManagedOrchestratorExecutionMode::Background,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "session operation coordination failed");
+    let service = manager
+        .inner
+        .active_sessions
+        .read()
+        .await
+        .get(&orchestrator)
+        .cloned()
+        .unwrap();
+    assert!(service.active_run().is_none());
+    assert!(
+        nac_core::store::load_run_recovery(&store_path, &orchestrator)
+            .unwrap()
+            .is_none()
+    );
+    assert!(sessions::load_session(&store_path, &orchestrator)
+        .unwrap()
+        .messages
+        .is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_orchestrator_cancel_propagates_and_delivers_once() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("managed_orchestrator_cancel");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("managed-orchestrator-cancel-key"));
+    let (base_url, requests, release) = stalled_then_scripted_direct_response();
+    seed_direct_with_orchestrator_session_with_base_url(&root, "delegating", base_url);
+    let manager = test_manager(&root);
+    let app = router(manager.clone());
+
+    let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/delegating/orchestrators")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"description":"cancel flow","prompt":"wait until cancelled","background":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(started.status(), StatusCode::CREATED);
+    let running: ManagedOrchestratorRecord =
+        serde_json::from_slice(&response_body(started).await).unwrap();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(requests.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    })
+    .await
+    .unwrap();
+
+    let expected_run_id = running.run_id.as_deref().unwrap();
+    let store_path = root.join("store.db");
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    connection
+        .execute(
+            "UPDATE managed_orchestrators SET run_id = 'superseded-run' \
+             WHERE orchestrator_session_id = ?1",
+            rusqlite::params![&running.orchestrator_session_id],
+        )
+        .unwrap();
+    let mismatch = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager
+            .delegation()
+            .cancel_managed_orchestrator("delegating", &running.orchestrator_session_id),
+    )
+    .await
+    .expect("a managed run identity mismatch must fail without monitoring")
+    .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("is no longer active"),
+        "unexpected managed cancellation mismatch: {mismatch:#}"
+    );
+    assert_eq!(
+        manager
+            .attach_session(&running.orchestrator_session_id)
+            .await
+            .unwrap()
+            .active_run()
+            .as_ref()
+            .map(|active| active.run_id.as_str()),
+        Some(expected_run_id),
+        "a stale managed cancellation must not cancel the active replacement"
+    );
+    connection
+        .execute(
+            "UPDATE managed_orchestrators SET run_id = ?2 \
+             WHERE orchestrator_session_id = ?1",
+            rusqlite::params![&running.orchestrator_session_id, expected_run_id],
+        )
+        .unwrap();
+
+    // Foreground steering waits for this input's delivery, so start it
+    // concurrently with the deliberate cancellation of the held provider.
+    let controller = nac_core::orchestration_control::controller_for(&store_path).unwrap();
+    let continuation_id = running.orchestrator_session_id.clone();
+    let continued = tokio::spawn(async move {
+        controller
+            .start(
+                nac_core::orchestration_control::ManagedOrchestratorStartRequest {
+                    parent_session_id: "delegating".to_owned(),
+                    orchestrator_session_id: Some(continuation_id),
+                    description: "cancel flow".to_owned(),
+                    prompt: "additional foreground steering".to_owned(),
+                    execution_mode: ManagedOrchestratorExecutionMode::Foreground,
+                },
+            )
+            .await
+    });
+    let steering_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let id = connection
+                .query_row(
+                    "SELECT id FROM thread_steering WHERE session_id = ?1 ORDER BY id LIMIT 1",
+                    [&running.orchestrator_session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap();
+            if let Some(id) = id {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("foreground steering must persist its exact receipt before cancellation");
+    let steering = nac_core::store::load_thread_steering(
+        &store_path,
+        &running.orchestrator_session_id,
+        steering_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(steering.dispatch_id, expected_run_id);
+    assert_eq!(steering.instruction, "additional foreground steering");
+    assert_eq!(steering.status, "queued");
+    assert!(
+        !continued.is_finished(),
+        "foreground steering must not report queued input as delivered"
+    );
+    let current =
+        nac_core::store::load_managed_orchestrator(&store_path, &running.orchestrator_session_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        current.execution_mode,
+        Some(ManagedOrchestratorExecutionMode::Background),
+        "continuation must not rewrite the admitted generation mode"
+    );
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/sessions/delegating/orchestrators/{}/cancel",
+                    running.orchestrator_session_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("managed orchestrator cancellation should not hang")
+    .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    let cancelled: ManagedOrchestratorRecord =
+        serde_json::from_slice(&response_body(cancelled).await).unwrap();
+    assert_eq!(cancelled.status, ManagedOrchestratorStatus::Cancelled);
+    assert_eq!(
+        cancelled.execution_mode,
+        Some(ManagedOrchestratorExecutionMode::Background)
+    );
+    release.send(()).unwrap();
+    let continuation_error = tokio::time::timeout(Duration::from_secs(5), continued)
+        .await
+        .expect("cancelled foreground steering must settle instead of hanging")
+        .unwrap()
+        .unwrap_err();
+    assert!(continuation_error.to_string().contains("before this steering message was delivered"),
+        "unconsumed steering must not inherit cancellation as successful execution: {continuation_error:#}");
+    let steering = nac_core::store::load_thread_steering(
+        &store_path,
+        &running.orchestrator_session_id,
+        steering_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(steering.status, "expired");
+    assert!(steering.delivered_at.is_none());
+
+    let inbox = nac_core::store::list_session_inbox(&root.join("store.db"), "delegating").unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert!(inbox[0].content.contains("cancelled"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn parent_attachment_reconciles_abandoned_managed_orchestrator_once() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("managed_orchestrator_restart");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("managed-orchestrator-restart-key"));
+    let (base_url, requests) =
+        scripted_direct_responses(&["parent acknowledged interrupted orchestrator"]);
+    seed_direct_with_orchestrator_session_with_base_url(&root, "delegating", base_url);
+    let store_path = root.join("store.db");
+
+    let first = test_manager(&root);
+    let child_session_id = first
+        .create_managed_orchestrator_session("delegating", "survive restart")
+        .await
+        .unwrap();
+    nac_core::store::begin_managed_orchestrator_run(
+        &store_path,
+        &child_session_id,
+        "abandoned-orchestrator-run",
+        ManagedOrchestratorExecutionMode::Background,
+    )
+    .unwrap();
+    nac_core::store::TranscriptLogWriter::new(&store_path)
+        .unwrap()
+        .append_run_prompt(
+            &child_session_id,
+            0,
+            &Message::User {
+                content: "work interrupted by restart".to_string(),
+            },
+            "abandoned-orchestrator-run",
+        )
+        .unwrap();
+    drop(first);
+
+    let rebuilt = test_manager(&root);
+    rebuilt.snapshot("delegating").await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(requests.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let relation =
+                nac_core::store::load_managed_orchestrator(&store_path, &child_session_id)
+                    .unwrap()
+                    .unwrap();
+            let inbox = nac_core::store::list_session_inbox(&store_path, "delegating").unwrap();
+            if relation.status.is_terminal()
+                && inbox
+                    .first()
+                    .is_some_and(|item| item.status == nac_core::store::InboxStatus::Delivered)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restart reconciliation should interrupt and deliver");
+    rebuilt.snapshot("delegating").await.unwrap();
+    let relation = nac_core::store::load_managed_orchestrator(&store_path, &child_session_id)
+        .unwrap()
+        .unwrap();
+    let inbox = nac_core::store::list_session_inbox(&store_path, "delegating").unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(relation.status, ManagedOrchestratorStatus::Interrupted);
+    assert_eq!(relation.completion_inbox_id, Some(inbox[0].id));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn parent_attachment_settles_canonical_managed_terminal_once_after_restart() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("managed_orchestrator_terminal_restart");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("managed-terminal-restart-key"));
+    let (base_url, requests) =
+        scripted_direct_responses(&["parent acknowledged completed orchestrator"]);
+    seed_direct_with_orchestrator_session_with_base_url(&root, "delegating", base_url);
+    let store_path = root.join("store.db");
+
+    let first = test_manager(&root);
+    let orchestrator = first
+        .create_managed_orchestrator_session("delegating", "finish before restart")
+        .await
+        .unwrap();
+    nac_core::store::begin_managed_orchestrator_run(
+        &store_path,
+        &orchestrator,
+        "terminal-run",
+        ManagedOrchestratorExecutionMode::Background,
+    )
+    .unwrap();
+    let snapshot = sessions::load_session(&store_path, &orchestrator).unwrap();
+    let start_idx = snapshot.messages.len() as u64;
+    let writer = nac_core::store::TranscriptLogWriter::new(&store_path).unwrap();
+    writer
+        .append_run_prompt(
+            &orchestrator,
+            start_idx,
+            &Message::User {
+                content: "complete durably".to_string(),
+            },
+            "terminal-run",
+        )
+        .unwrap();
+    writer
+        .append(
+            &orchestrator,
+            start_idx + 1,
+            &Message::Assistant {
+                content: Some("durable orchestrator report".to_string()),
+                reasoning_text: None,
+                reasoning_details: None,
+                tool_calls: None,
+                duration_ms: None,
+                model_origin: None,
+                reasoning_field: None,
+            },
+        )
+        .unwrap();
+    let mut terminal_snapshot = snapshot;
+    let mut update = terminal_snapshot.apply_run_state(sessions::SessionRunState::default());
+    update.finished_run_id = Some("terminal-run".to_string());
+    update.finished_run_disposition = Some(nac_core::store::RunTerminalDisposition::Completed);
+    sessions::save_session_run_state(&store_path, &update).unwrap();
+    assert!(
+        nac_core::store::load_run_recovery(&store_path, &orchestrator)
+            .unwrap()
+            .unwrap()
+            .terminal_disposition
+            .is_some()
+    );
+    drop(first);
+
+    let rebuilt = test_manager(&root);
+    rebuilt.snapshot("delegating").await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(requests.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let relation = nac_core::store::load_managed_orchestrator(&store_path, &orchestrator)
+                .unwrap()
+                .unwrap();
+            if relation.status == ManagedOrchestratorStatus::Completed
+                && relation.completion_inbox_id.is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canonical terminal obligation should settle");
+    rebuilt.snapshot("delegating").await.unwrap();
+    let relation = nac_core::store::load_managed_orchestrator(&store_path, &orchestrator)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        relation.report.as_deref(),
+        Some("durable orchestrator report")
+    );
+    assert!(
+        nac_core::store::load_run_recovery(&store_path, &orchestrator)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        nac_core::store::list_session_inbox(&store_path, "delegating")
+            .unwrap()
+            .len(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn deleting_parent_removes_managed_orchestrator_sessions() {
+    let root = temp_root("managed_orchestrator_delete");
+    seed_direct_with_orchestrator_session_with_base_url(
+        &root,
+        "delegating",
+        "https://api.openai.com/v1".to_string(),
+    );
+    let manager = test_manager(&root);
+    let child_session_id = manager
+        .create_managed_orchestrator_session("delegating", "delete with parent")
+        .await
+        .unwrap();
+    manager.delete_session("delegating").await.unwrap();
+    let store_path = root.join("store.db");
+    assert!(sessions::load_session(&store_path, "delegating").is_err());
+    assert!(sessions::load_session(&store_path, &child_session_id).is_err());
+    assert!(
+        nac_core::store::load_managed_orchestrator(&store_path, &child_session_id)
+            .unwrap()
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn deleting_project_skips_descendants_already_removed_by_parent_cascade() {
+    let root = temp_root("project_parent_cascade_delete")
+        .canonicalize()
+        .unwrap();
+    seed_direct_with_orchestrator_session_with_base_url(
+        &root,
+        "delegating",
+        "https://api.openai.com/v1".to_string(),
+    );
+    let manager = test_manager(&root);
+    let project = manager
+        .projects()
+        .create(application::projects::CreateProject {
+            name: Some("Cascade delete".to_string()),
+            description: None,
+            cwd: root.clone(),
+            ssh_host: None,
+            ssh_port: None,
+            ssh_identity_file: None,
+            default_model_config_id: None,
+        })
+        .await
+        .unwrap();
+    manager
+        .projects()
+        .assign_session(&project.project_id, "delegating")
+        .unwrap();
+    let child_session_id = manager
+        .create_managed_orchestrator_session("delegating", "cascade with project")
+        .await
+        .unwrap();
+    manager
+        .session_catalog()
+        .update_presentation("delegating", "Pinned parent", true, 0)
+        .await
+        .unwrap();
+
+    let deleted = manager
+        .projects()
+        .delete(
+            &project.project_id,
+            application::projects::ProjectSessionDisposition::Delete,
+        )
+        .await
+        .unwrap();
+    assert!(deleted
+        .deleted_session_ids
+        .contains(&"delegating".to_string()));
+    assert!(deleted.deleted_session_ids.contains(&child_session_id));
+    let store_path = root.join("store.db");
+    assert!(sessions::load_session(&store_path, "delegating").is_err());
+    assert!(sessions::load_session(&store_path, &child_session_id).is_err());
+    assert!(projects::list_projects(&store_path).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn direct_goal_and_inbox_invalid_updates_are_bad_requests_without_mutation() {
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("validation400_original_bodies");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("validation400-test-key"));
+    seed_direct_session(&root, "direct");
+    let path = root.join("store.db");
+    let lease = sessions::SessionOperationLease::try_acquire(&path, "direct").unwrap();
+    let goal =
+        nac_core::store::create_session_goal(&path, "direct", "retain goal", Some(500), None)
+            .unwrap();
+    let goal = nac_core::store::update_session_goal_by_user(
+        &path,
+        "direct",
+        &goal.goal_id,
+        goal.version,
+        nac_core::store::UserGoalUpdate {
+            status: Some(GoalStatus::Paused),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let item = nac_core::store::create_session_inbox_item(
+        &path,
+        "direct",
+        InboxDelivery::Queue,
+        "retain pending input",
+        None,
+        None,
+    )
+    .unwrap();
+    let manager = test_manager(&root);
+    manager.attach_session("direct").await.unwrap();
+    let app = router(manager.clone());
+    let missing_goal = "/sessions/direct/goal/00000000-0000-0000-0000-000000000000";
+    let missing_item = "/sessions/direct/inbox/9223372036854775800";
+    let goal_path = format!("/sessions/direct/goal/{}", goal.goal_id);
+    let item_path = format!("/sessions/direct/inbox/{}", item.id);
+    let mut actual = Vec::new();
+    for (method, uri, raw, message) in [
+        (
+            "PATCH",
+            missing_goal,
+            r#"{"expected_version": 1, "status": null}"#,
+            "goal update is empty",
+        ),
+        (
+            "PATCH",
+            missing_goal,
+            r#"{"expected_version": 1}"#,
+            "goal update is empty",
+        ),
+        (
+            "PATCH",
+            missing_item,
+            r#"{"expected_version": -1, "delivery": "queue"}"#,
+            "inbox item version must not be negative",
+        ),
+        (
+            "PATCH",
+            goal_path.as_str(),
+            r#"{"expected_version": 1, "objective": null}"#,
+            "goal update is empty",
+        ),
+        (
+            "PATCH",
+            item_path.as_str(),
+            r#"{"expected_version": -1, "delivery": "queue"}"#,
+            "inbox item version must not be negative",
+        ),
+        (
+            "DELETE",
+            item_path.as_str(),
+            r#"{"expected_version": -1}"#,
+            "inbox item version must not be negative",
+        ),
+        (
+            "DELETE",
+            missing_item,
+            r#"{"expected_version": -1}"#,
+            "inbox item version must not be negative",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(raw))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).unwrap();
+        eprintln!("QA400_ORIGINAL {method} {uri} {raw} => {status} {body}");
+        assert_eq!(body["error"], message);
+        assert_eq!(
+            nac_core::store::load_session_goal(&path, "direct").unwrap(),
+            Some(goal.clone())
+        );
+        assert_eq!(
+            nac_core::store::list_session_inbox(&path, "direct").unwrap(),
+            vec![item.clone()]
+        );
+        actual.push(status);
+    }
+    drop(app);
+    drop(manager);
+    drop(lease);
+    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(actual, vec![StatusCode::BAD_REQUEST; 7]);
+}
+
+#[tokio::test]
+async fn direct_validation_mapping_preserves_valid_updates_conflicts_missing_and_internal_failures()
+{
+    async fn mutate(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            serde_json::from_slice(&response_body(response).await).unwrap(),
+        )
+    }
+    let _env_lock = SERVER_MODEL_ENV_LOCK.lock().unwrap();
+    let root = temp_root("validation400_controls");
+    let nac_home = root.join("nac-home");
+    std::fs::create_dir_all(&nac_home).unwrap();
+    let _env = ScopedModelEnv::isolated(&nac_home, Some("validation400-controls-key"));
+    seed_direct_session(&root, "direct");
+    seed_direct_session(&root, "empty");
+    let path = root.join("store.db");
+    let lease = sessions::SessionOperationLease::try_acquire(&path, "direct").unwrap();
+    let goal =
+        nac_core::store::create_session_goal(&path, "direct", "retain goal", Some(500), None)
+            .unwrap();
+    let goal = nac_core::store::update_session_goal_by_user(
+        &path,
+        "direct",
+        &goal.goal_id,
+        goal.version,
+        nac_core::store::UserGoalUpdate {
+            status: Some(GoalStatus::Paused),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let item = nac_core::store::create_session_inbox_item(
+        &path,
+        "direct",
+        InboxDelivery::Queue,
+        "retain pending input",
+        None,
+        None,
+    )
+    .unwrap();
+    let manager = test_manager(&root);
+    manager.attach_session("direct").await.unwrap();
+    let app = router(manager.clone());
+    let goal_path = format!("/sessions/direct/goal/{}", goal.goal_id);
+    let item_path = format!("/sessions/direct/inbox/{}", item.id);
+    let (status, body) = mutate(
+        app.clone(),
+        "PATCH",
+        &goal_path,
+        serde_json::json!({"expected_version":goal.version,"token_budget":null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cleared: SessionGoalRecord = serde_json::from_value(body).unwrap();
+    assert_eq!(cleared.token_budget, None);
+    assert_eq!(cleared.objective, goal.objective);
+    assert_eq!(cleared.status, GoalStatus::Paused);
+    assert_eq!(cleared.version, goal.version + 1);
+    let (status, body) = mutate(
+        app.clone(),
+        "PATCH",
+        &goal_path,
+        serde_json::json!({"expected_version":cleared.version,"objective":"updated goal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let edited: SessionGoalRecord = serde_json::from_value(body).unwrap();
+    assert_eq!(edited.objective, "updated goal");
+    assert_eq!(edited.version, cleared.version + 1);
+    let (status, _) = mutate(
+        app.clone(),
+        "PATCH",
+        &goal_path,
+        serde_json::json!({"expected_version":cleared.version,"objective":"stale edit"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = mutate(
+        app.clone(),
+        "PATCH",
+        "/sessions/direct/goal/00000000-0000-0000-0000-000000000000",
+        serde_json::json!({"expected_version":edited.version,"objective":"replaced goal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    for (method, uri, body, expected) in [
+        (
+            "PATCH",
+            "/sessions/empty/goal/00000000-0000-0000-0000-000000000000",
+            serde_json::json!({"expected_version":0,"objective":"missing goal"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "PATCH",
+            "/sessions/direct/inbox/9223372036854775800",
+            serde_json::json!({"expected_version":0,"delivery":"queue"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "DELETE",
+            "/sessions/direct/inbox/9223372036854775800",
+            serde_json::json!({"expected_version":0}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "PATCH",
+            goal_path.as_str(),
+            serde_json::json!({"objective":"missing version"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PATCH",
+            goal_path.as_str(),
+            serde_json::json!({"expected_version":edited.version,"status":"bogus"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PATCH",
+            item_path.as_str(),
+            serde_json::json!({"expected_version":item.version,"delivery":42}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(mutate(app.clone(), method, uri, body).await.0, expected);
+        assert_eq!(
+            nac_core::store::load_session_goal(&path, "direct").unwrap(),
+            Some(edited.clone())
+        );
+        assert_eq!(
+            nac_core::store::list_session_inbox(&path, "direct").unwrap(),
+            vec![item.clone()]
+        );
+    }
+    let malformed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(&goal_path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        nac_core::store::load_session_goal(&path, "direct").unwrap(),
+        Some(edited.clone())
+    );
+    let (status, body) = mutate(
+        app.clone(),
+        "PATCH",
+        &item_path,
+        serde_json::json!({"expected_version":item.version,"delivery":"steer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let updated: InboxItemResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(updated.delivery, InboxDelivery::Steer);
+    assert_eq!(updated.version, item.version + 1);
+    let (status, _) = mutate(
+        app.clone(),
+        "PATCH",
+        &item_path,
+        serde_json::json!({"expected_version":item.version,"delivery":"queue"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        nac_core::store::load_session_inbox_item(&path, "direct", item.id)
+            .unwrap()
+            .version,
+        updated.version
+    );
+    assert_eq!(
+        mutate(
+            app.clone(),
+            "DELETE",
+            &item_path,
+            serde_json::json!({"expected_version":updated.version})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let cancelled = nac_core::store::load_session_inbox_item(&path, "direct", item.id).unwrap();
+    assert_eq!(cancelled.status, nac_core::store::InboxStatus::Cancelled);
+    assert_eq!(cancelled.version, updated.version + 1);
+    assert_eq!(
+        mutate(
+            app.clone(),
+            "DELETE",
+            &item_path,
+            serde_json::json!({"expected_version":cancelled.version})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        nac_core::store::load_session_inbox_item(&path, "direct", item.id).unwrap(),
+        cancelled
+    );
+    // A real durable read failure remains500 rather than being reclassified as
+    // an input error. Only this disposable fixture loses its goal table name.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("ALTER TABLE session_goals RENAME TO unavailable_goals")
+        .unwrap();
+    assert_eq!(
+        mutate(
+            app.clone(),
+            "PATCH",
+            &goal_path,
+            serde_json::json!({"expected_version":edited.version,"objective":"must not save"})
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let retained: (String, i64) = connection
+        .query_row(
+            "SELECT objective,version FROM unavailable_goals WHERE session_id='direct'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, (edited.objective, edited.version));
+    drop(connection);
+    drop(app);
+    drop(manager);
+    drop(lease);
+    let _ = std::fs::remove_dir_all(root);
+}

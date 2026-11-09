@@ -1,0 +1,358 @@
+.PHONY: test-capture-qualification all setup build dev run install-dev release install ci test test-rust test-web test-release test-stable-binary test-source-workflow test-source-binary test-source-size lint-workflows test-workflow-lint test-mcp-conformance test-nightly-portability test-terminal-browser generate-api-contract test-api-contract test-assets test-e2e test-e2e-review test-e2e-remote test-durability test-managed-load test-managed-fault-fixture test-managed-image-contract managed-image test-managed-image check lint fix format-check fmt crate-check crate-test crate-build clean help
+
+CARGO ?= cargo
+PKG := nac-server
+BIN := nac-web
+WEB_DIR := crates/$(PKG)/web
+RELEASE_TEST_DIR := .github/scripts
+MANAGED_IMAGE ?= nac-managed:local
+
+DEV_BIND ?= 127.0.0.1:3210
+DEV_STORE_PATH ?=
+VITE_HOST ?= 127.0.0.1
+VITE_PORT ?= 5173
+DEV_OPEN ?= 1
+RUN_BIND ?= 127.0.0.1:3210
+DEV_INSTALL_DIR ?= $(HOME)/.local/bin
+DEV_BIN_NAME ?= nac-web-dev
+
+export DEV_BIND DEV_STORE_PATH VITE_HOST VITE_PORT DEV_OPEN
+
+
+# Matches the location used by scripts/install.sh ($(INSTALL_ROOT)/bin).
+INSTALL_ROOT ?= $(HOME)/.local
+
+# Default target
+all: build
+
+## Prepare a fresh worktree with all locked development dependencies
+setup:
+	@command -v "$(CARGO)" >/dev/null 2>&1 || { \
+		printf '%s\n' 'error: make setup requires Cargo; install Rust from https://rustup.rs'; \
+		exit 1; \
+	}
+	@command -v npm >/dev/null 2>&1 || { \
+		printf '%s\n' 'error: make setup requires npm; install Node.js from https://nodejs.org'; \
+		exit 1; \
+	}
+	$(CARGO) fetch --locked
+	npm --prefix $(RELEASE_TEST_DIR) ci
+	npm --prefix $(WEB_DIR) ci
+	npm --prefix $(WEB_DIR) exec -- playwright install chromium
+
+## Rebuild the frontend and complete production-embedded application (debug)
+build:
+	npm --prefix $(WEB_DIR) run build
+	$(CARGO) build --locked -p $(PKG) --bin $(BIN)
+
+## Run the Rust API and Vite/HMR frontend with supervised cleanup
+dev:
+	CARGO="$(CARGO)" ./start_dev.sh
+
+## Build and run the production-equivalent embedded application
+run: build
+	./target/debug/$(BIN) --bind "$(RUN_BIND)"
+
+## Build and install this dev source under a deliberate non-stable name
+install-dev:
+	npm --prefix $(WEB_DIR) run build
+	$(CARGO) build --release --locked -p $(PKG) --bin $(BIN)
+	./scripts/install-dev.sh "$(CURDIR)/target/release/$(BIN)" "$(DEV_INSTALL_DIR)" "$(DEV_BIN_NAME)"
+
+## Build the nac-web binary (release)
+release:
+	$(CARGO) build --release --locked -p $(PKG) --bin $(BIN)
+
+## Install nac-web into $(INSTALL_ROOT)/bin
+install:
+	$(CARGO) install --path crates/$(PKG) --bin $(BIN) --locked --force --root $(INSTALL_ROOT)
+
+## Run portable formatting, lint, unit, and asset gates (release CI also runs test-e2e)
+ci: lint-workflows test-workflow-lint format-check lint test
+
+## Run workspace Rust tests, frontend tests, source-size, and web asset checks
+test: test-nac-guide test-capture-qualification test-source-size test-source-workflow test-source-binary test-rust test-web test-release test-assets test-managed-load test-managed-image-contract test-manual-stack-override
+
+.PHONY: generate-nac-guide test-nac-guide
+## Rebuild release-local documentation from canonical maintained Markdown
+generate-nac-guide:
+	python3 scripts/nac-guide/generate.py
+
+## Check guide source/heading/link/fingerprint drift and generator contracts
+test-nac-guide:
+	python3 scripts/nac-guide/generate.py --check
+	python3 -m unittest discover -s scripts/nac-guide -p 'test_*.py'
+
+test-rust:
+	$(CARGO) test --workspace --locked
+
+## Run broader native macOS Rust coverage and reviewed ignored integrations
+# Evidence is kept outside the source tree; requires make setup first.
+test-nightly-portability:
+	CARGO="$(CARGO)" python3 .github/scripts/nightly-portability.py \
+		--expected-sha "$$(git rev-parse HEAD)" --output "$${PORTABILITY_OUTPUT:-/tmp/nac-nightly-portability}"
+
+## Run one native terminal browser journey and its deterministic byte negative control
+test-terminal-browser:
+	CARGO="$(CARGO)" python3 .github/scripts/terminal-browser.py \
+		--expected-sha "$$(git rev-parse HEAD)" --output "$${TERMINAL_BROWSER_OUTPUT:-/tmp/nac-terminal-browser}"
+	CARGO="$(CARGO)" python3 .github/scripts/terminal-browser-cancel.py \
+		--expected-sha "$$(git rev-parse HEAD)" --output "$${TERMINAL_BROWSER_OUTPUT:-/tmp/nac-terminal-browser}/cancellation-control"
+
+## Run the official frozen client requirements for every advertised MCP revision
+test-mcp-conformance:
+	CARGO="$(CARGO)" sh scripts/test-mcp-conformance.sh --seed
+
+.PHONY: test-mcp-conformance-contract
+## Check conformance inventory, failure propagation, and applicability without compiling Rust
+test-mcp-conformance-contract:
+	node --test scripts/mcp-conformance/*.test.mjs
+
+## Run frontend unit and component tests
+test-web:
+	npm --prefix $(WEB_DIR) test
+
+## Validate Release Please configuration and pre-1.0 release calculation
+test-release:
+	bash -n .github/scripts/stable-release-preparation.sh
+	sh -n .github/scripts/stable-release-rollout.sh
+	node --test .github/scripts/release-policy.test.mjs
+	node --test .github/scripts/pr-*.test.mjs
+	python3 .github/scripts/browser-proof.test.py
+	python3 .github/scripts/browser-inventory.test.py
+	python3 .github/scripts/ci-timings.test.py
+	$(MAKE) test-stable-binary
+
+## Build a stable binary and exercise its real readiness/status identity contract
+test-stable-binary:
+	@version="$$(tr -d '[:space:]' < version.txt)"; \
+	source_revision="$$(git rev-parse HEAD)"; \
+	NAC_BUILD_TRACK=stable NAC_BUILD_ID="v$$version" NAC_SOURCE_REVISION="$$source_revision" \
+		$(CARGO) test --locked -p nac-server --test stable_binary_contract -- --nocapture
+
+## Verify source command, installer, and dual-process supervision contracts
+test-source-workflow:
+	bash scripts/test-source-workflow.sh
+
+## Exercise the real unset-track source binary under a custom installed name
+test-source-binary:
+	env -u NAC_BUILD_TRACK -u NAC_BUILD_ID -u NAC_SOURCE_REVISION \
+		$(CARGO) test --locked -p nac-server --test source_binary_contract -- --nocapture
+
+## Run isolated nonshipping current-contents contract probes (ALL-417)
+test-capture-qualification:
+	python3 -m unittest discover -s scripts/capture-qualification -p 'test_*.py' -v
+
+## Keep tracked human-authored files within the agent-context budget
+test-source-size:
+	bash scripts/check-source-size.sh
+
+.PHONY: test-manual-stack-override
+## Exercise the human-only stack override without GitHub mutations
+test-manual-stack-override:
+	node --test scripts/manual-stack-override.test.mjs scripts/manual-stack-admission.test.mjs
+
+.PHONY: generate-codeowners
+## Regenerate ownership files from the verified owner roster
+generate-codeowners:
+	node .github/scripts/update-codeowners.mjs --write
+
+## Regenerate the checked-in OpenAPI document and frontend schema types
+generate-api-contract:
+	$(CARGO) run --locked -p nac-server --example export-openapi -- $(WEB_DIR)/openapi.json
+	npm --prefix $(WEB_DIR) run generate:api
+
+## Fail when Rust routes/schemas and checked-in frontend contract types drift
+test-api-contract:
+	$(CARGO) run --locked -p nac-server --example export-openapi -- --check $(WEB_DIR)/openapi.json
+	npm --prefix $(WEB_DIR) run check:api
+
+# Mirrors the release workflow: the browser bundle and experimental ALL-121
+# client package are committed, so stale build output has to fail here.
+test-assets: test-api-contract
+	npm --prefix $(WEB_DIR) run lint
+	npm --prefix $(WEB_DIR) run typecheck
+	npm --prefix $(WEB_DIR) run build
+	@if [ -n "$$(git status --porcelain -- crates/$(PKG)/assets/dist $(WEB_DIR)/packages/nac-client/dist $(WEB_DIR)/packages/nac-presentation/dist)" ]; then \
+		printf '%s\n' "error: committed web/client build output is stale; rebuild and commit it"; \
+		git status --porcelain -- crates/$(PKG)/assets/dist $(WEB_DIR)/packages/nac-client/dist $(WEB_DIR)/packages/nac-presentation/dist; \
+		exit 1; \
+	fi
+
+## Run production-embedded Playwright tests with an isolated scripted provider
+test-e2e:
+	npm --prefix $(WEB_DIR) run build
+	$(CARGO) build --locked -p $(PKG) --bin $(BIN)
+	NAC_E2E_BINARY="$(CURDIR)/target/debug/$(BIN)" npm --prefix $(WEB_DIR) run test:e2e
+
+## Run the Approve for me browser journey against a scripted-reviewer build
+test-e2e-review:
+	npm --prefix $(WEB_DIR) run build
+	$(CARGO) build --locked -p $(PKG) --bin $(BIN) --features review-fixture --target-dir target/review-fixture
+	NAC_E2E_REVIEW_FIXTURE=1 NAC_E2E_BINARY="$(CURDIR)/target/review-fixture/debug/$(BIN)" npm --prefix $(WEB_DIR) run test:e2e -- review.e2e.ts
+
+## Run non-destructive BasicAuth or portal-launch smoke checks against a remote Managed NAC
+test-e2e-remote:
+	npm --prefix $(WEB_DIR) run test:e2e:remote
+
+## Run focused deterministic lifecycle and crash-window regressions
+test-durability:
+	$(CARGO) test --locked -p nac-core human_shell_real_process_death_never_repeats_effects
+	$(CARGO) test --locked -p nac-core store::worker_dispatches
+	$(CARGO) test --locked -p nac-core host_completion_protocol
+	$(CARGO) test --locked -p nac-core store_process_lease
+	$(CARGO) test --locked -p nac-core stale_session_owner_is_fenced_until_process_death_then_restart_acquires
+	$(CARGO) test --locked -p nac-core current_schema_initialize_is_byte_exact_and_does_not_enter_a_writer_transaction
+	$(CARGO) test --locked -p nac-core current_schema_delete_mode_initialize_is_read_only_even_during_a_writer_transaction
+	$(CARGO) test --locked -p nac-core invalid_wal_cannot_mask_future_main_schema_or_mutate_any_file
+	$(CARGO) test --locked -p nac-core killed_migrator_rolls_back_and_waiting_process_migrates_exactly_once
+	$(CARGO) test --locked -p nac-core store::heartbeats::tests::calendar
+	$(CARGO) test --locked -p nac-core store::schema::heartbeat_calendar_tests
+	$(CARGO) test --locked -p nac-server heartbeat_calendar_scheduler_two_owners_bound_missed_range_and_admit_once
+	$(CARGO) test --locked -p nac-core cancellation_adopts_a_committed_single_direct_steer_after_async_abort
+	$(CARGO) test --locked -p nac-core followup
+	$(CARGO) test --locked -p nac-server task_followup
+	$(CARGO) test --locked -p nac-core canonical_terminal_recovery_is_retained_until_relationship_settlement
+	$(CARGO) test --locked -p nac-core child_terminal_crash_window_recovers_report_and_delivers_once
+	$(CARGO) test --locked -p nac-core child_pre_prompt_crash_is_interrupted_and_delivered_once_after_restart
+	$(CARGO) test --locked -p nac-core shared_store_recovery_after_peer_crash_preserves_committed_transcript
+	$(CARGO) test --locked -p nac-server parent_deletion_excludes_late_child_relationship_commit
+	$(CARGO) test --locked -p nac-server serving_store_ownership_rejects_a_second_manager_and_allows_restart
+	$(CARGO) test --locked -p nac-server serving_managers_can_own_separate_stores_concurrently
+	$(CARGO) test --locked -p nac-server managed_monitor_treats_peer_lease_as_live
+	$(CARGO) test --locked -p nac-server managed_binding_failure_precedes_run_and_prompt_execution
+	$(CARGO) test --locked -p nac-server parent_attachment_settles_canonical_managed_terminal_once_after_restart
+	$(CARGO) test --locked -p nac-server wrong_parent_relationship_reads_are_opaque_not_found
+
+## Verify compile-gated one-shot controls for private managed fault images
+test-managed-fault-fixture:
+	$(CARGO) test --locked -p nac-core --features managed-fault-fixture managed_fault_fixture::tests
+	$(CARGO) test --locked -p nac-core --features managed-fault-fixture private_fixture_ack_failure_follows_real_commit_and_replay_is_once
+	$(CARGO) test --locked -p nac-server --features managed-fault-fixture private_monitor_fault_is_generation_scoped_once_and_subsequent_read_recovers
+	$(CARGO) clippy --locked -p nac-server --features managed-fault-fixture --lib --bins -- -D warnings
+
+## Reproduce the deterministic 1/2/4 Managed NAC orchestration load scenario
+test-managed-load:
+	$(CARGO) build --locked -p $(PKG) --bin $(BIN)
+	NAC_MANAGED_LOAD_WORKER="$${CARGO_TARGET_DIR:-$(CURDIR)/target}/debug/$(BIN)" \
+		$(CARGO) test --locked -p nac-server \
+			tests::managed_load::managed_load_scenario -- --ignored --exact --nocapture --test-threads=1
+
+## Check the managed image/workflow contract without a container runtime
+test-managed-image-contract:
+	sh -n docker/managed/entrypoint.sh
+	sh -n scripts/smoke-managed-git-lfs.sh
+	sh -n scripts/smoke-managed-image.sh
+	sh -n scripts/test-managed-image-contract.sh
+	sh scripts/test-managed-image-contract.sh
+
+## Build the linux/amd64 managed image with Docker or Podman
+managed-image:
+	@runtime="$${CONTAINER_RUNTIME:-}"; \
+	if [ -z "$$runtime" ]; then \
+		if command -v docker >/dev/null 2>&1; then runtime=docker; \
+		elif command -v podman >/dev/null 2>&1; then runtime=podman; \
+		else printf '%s\n' 'error: managed-image requires Docker or Podman'; exit 2; fi; \
+	fi; \
+	"$$runtime" build --platform linux/amd64 --file docker/managed/Dockerfile --tag "$(MANAGED_IMAGE)" .
+
+## Build and smoke the managed image, including readiness/restart/SIGTERM
+test-managed-image:
+	MANAGED_IMAGE="$(MANAGED_IMAGE)" sh scripts/smoke-managed-image.sh
+
+## Check source ownership size and type-check without producing binaries
+check: test-source-size
+	$(CARGO) check --workspace --locked
+
+## Check every tracked workflow, embedded shell block, and standalone shell script
+lint-workflows:
+	node .github/scripts/update-codeowners.mjs --check
+	node .github/scripts/workflow-lint.mjs
+
+## Prove workflow/shell enforcement with real pinned tools and invalid fixtures
+test-workflow-lint:
+	python3 -B .github/scripts/github-asset.test.py
+	node --test .github/scripts/workflow-lint.test.mjs .github/scripts/workflow-lint-tools.test.mjs .github/scripts/image-token-callers.test.mjs
+
+## Lint frontend and production Rust targets
+lint:
+	npm --prefix $(WEB_DIR) run lint
+	$(CARGO) clippy --workspace --locked --lib --bins -- -D warnings
+
+## Apply machine-safe Rust lint fixes, then format the workspace
+fix:
+	$(CARGO) clippy --workspace --locked --lib --bins --fix --allow-dirty --allow-staged
+	$(CARGO) fmt --all
+
+## Check frontend and Rust formatting
+format-check:
+	npm --prefix $(WEB_DIR) run format:check
+	$(CARGO) fmt --all -- --check
+
+## Format frontend and Rust sources
+fmt:
+	npm --prefix $(WEB_DIR) run format
+	$(CARGO) fmt --all
+
+## Format-check and lint one crate: make crate-check CRATE=nac-core
+crate-check:
+	@test -n "$(CRATE)" || { printf '%s\n' 'error: set CRATE, e.g. make crate-check CRATE=nac-core'; exit 2; }
+	$(CARGO) fmt --package $(CRATE) -- --check
+	$(CARGO) clippy --locked --package $(CRATE) --lib --bins -- -D warnings
+
+## Test one crate: make crate-test CRATE=nac-core
+crate-test:
+	@test -n "$(CRATE)" || { printf '%s\n' 'error: set CRATE, e.g. make crate-test CRATE=nac-core'; exit 2; }
+	$(CARGO) test --locked --package $(CRATE)
+
+## Build one crate: make crate-build CRATE=nac-core
+crate-build:
+	@test -n "$(CRATE)" || { printf '%s\n' 'error: set CRATE, e.g. make crate-build CRATE=nac-core'; exit 2; }
+	$(CARGO) build --locked --package $(CRATE)
+
+## Remove build artifacts
+clean:
+	$(CARGO) clean
+
+## Show available targets
+help:
+	@printf '%s\n' \
+		'Usage: make [target]' \
+		'' \
+		'Targets:' \
+		'  setup        Install locked Rust/web dependencies and Playwright Chromium' \
+		'  build        Rebuild the frontend and production-embedded app [default]' \
+		'  dev          Run the Rust API plus Vite/HMR frontend with supervised cleanup' \
+		'  run          Build and run the production-equivalent embedded app' \
+		'  install-dev  Install this dev source as $$DEV_INSTALL_DIR/$$DEV_BIN_NAME' \
+		'  release      Build nac-web (release)' \
+		'  install      Install nac-web into $$INSTALL_ROOT/bin (~/.local)' \
+		'  ci           Run formatting, lint, and test gates' \
+		'  test         Run Rust/frontend tests and web asset checks' \
+		'  test-nightly-portability Run native workspace and selected ignored integrations' \
+		'  test-rust    Run cargo test --workspace --locked' \
+		'  test-mcp-conformance Run both locked MCP revisions and seeded failure proof' \
+		'  test-mcp-conformance-contract Check MCP inventory and failure controls' \
+		'  test-web     Run frontend unit and component tests' \
+		'  test-release Validate stable release preparation policy' \
+		'  test-source-workflow Verify source commands, install safety, and supervision' \
+		'  test-source-binary Verify unset-track identity, custom name, store, and upgrade guard' \
+		'  test-source-size Enforce the 2,000-line human-source ceiling' \
+		'  test-assets  Lint, typecheck and rebuild the web app' \
+		'  test-e2e     Run production-embedded Playwright tests' \
+		'  test-durability Run focused lifecycle/crash-window regressions' \
+		'  test-managed-image-contract Check managed image/workflow statically' \
+		'  managed-image Build the linux/amd64 managed developer image' \
+		'  test-managed-image Build and smoke the managed image locally' \
+		'  check        Run cargo check --workspace --locked' \
+		'  lint-workflows Lint all tracked Actions workflows and shell scripts' \
+		'  test-workflow-lint Exercise seeded workflow/shell enforcement failures' \
+		'  lint         Lint frontend and production Rust targets' \
+		'  fix          Apply safe Rust lint fixes and format Rust sources' \
+		'  format-check Check frontend and Rust formatting' \
+		'  fmt          Format frontend and Rust sources' \
+		'  crate-check  Format-check and lint $$CRATE' \
+		'  crate-test   Test $$CRATE' \
+		'  crate-build  Build $$CRATE' \
+		'  clean        Remove target/ artifacts' \
+		'  help         Show this help'

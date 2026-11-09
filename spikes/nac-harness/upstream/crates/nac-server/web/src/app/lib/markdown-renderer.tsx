@@ -1,0 +1,392 @@
+import { useNativeRuntime } from "@/app/runtime/RuntimeContext";
+import {
+  Suspense,
+  isValidElement,
+  memo,
+  use,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import ReactMarkdown from "react-markdown";
+import { useLocation, useNavigate } from "react-router-dom";
+import remarkGfm from "remark-gfm";
+
+import CodeBlock, { CodeBlockSize } from "@/app/atoms/code-block";
+import { useIsMobile } from "@/app/hooks/useMediaQuery";
+import { PerfProfiler } from "@/app/lib/PerfProfiler";
+import { splitMarkdownBlocks } from "@/app/lib/markdown-blocks";
+import { FENCE, closesFence } from "@/app/lib/markdown-lines";
+import { scopeMathjaxStyles } from "@/app/lib/mathjax-styles";
+import { usePresentationPortalTarget } from "@/app/providers/PresentationBoundary";
+import { normalizeMath } from "@/app/lib/math-source";
+import { perfRender } from "@/app/lib/perfDebug";
+import { isNumber, isString } from "@/app/lib/primitive";
+import type { RunError } from "@/app/lib/providerError";
+import { routes, sessionIdFromPath } from "@/app/lib/routes";
+import { classifyMarkdownHref, markdownUrlTransform } from "@/app/lib/workspaceLink";
+import { useToast } from "@/app/providers/ToastProvider";
+
+import { queryKeys } from "@/app/services/queries";
+
+import type { SessionSnapshotResponse } from "@/app/types/api";
+
+const remarkPlugins = [remarkGfm];
+
+/** A plugin list as react-markdown takes it; the tuple types are not exported. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type PluginList = any[];
+
+interface MathPlugins {
+  remark: PluginList;
+  rehype: PluginList;
+}
+
+const mathPlugins = new Map<string | undefined, Promise<MathPlugins>>();
+
+/**
+ * The pipeline with MathJax in it, assembled once the chunk carrying it lands.
+ * The promise is cached so `use` only ever suspends on the first formula in a
+ * session, and never again after that.
+ */
+function loadMathPlugins(fontURL?: string): Promise<MathPlugins> {
+  let plugins = mathPlugins.get(fontURL);
+  if (!plugins) {
+    plugins = import("@/app/lib/markdown-mathjax").then(
+      ({ createMathjaxPlugin, remarkMathPlugin }) => ({
+        remark: [...remarkPlugins, remarkMathPlugin],
+        rehype: [createMathjaxPlugin(fontURL)],
+      }),
+    );
+    mathPlugins.set(fontURL, plugins);
+  }
+  return plugins;
+}
+
+/** Text of a fenced block, for the clipboard. Nested spans carry the tokens. */
+function textOf(node: ReactNode): string {
+  if (isString(node)) return node;
+  if (isNumber(node)) return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    return textOf(node.props.children);
+  }
+  return "";
+}
+
+function languageOf(node: ReactNode): string {
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(node)) {
+    return "plaintext";
+  }
+  const className = node.props.className ?? "";
+  const match = /language-([\w+-]+)/.exec(className);
+  if (match?.[1]) return match[1];
+  return languageOf(node.props.children);
+}
+
+/**
+ * Fenced block rendered as the design-system CodeBlock (header, copy,
+ * fullscreen) — same chrome ArceeFM uses via CodeInput, with matching `my-6`.
+ */
+function CodeFence({ children }: { children?: ReactNode }) {
+  const code = textOf(children).replace(/\n$/, "");
+  const language = languageOf(children);
+  return (
+    <CodeBlock
+      code={code}
+      language={language === "plaintext" ? undefined : language}
+      title={language}
+      size={CodeBlockSize.Small}
+      copyable
+      expandable
+      className="my-6"
+    />
+  );
+}
+
+function wrapStreaming(children: ReactNode, streaming: boolean): ReactNode {
+  if (!streaming) return children;
+  return <span className="streaming-chunk">{children}</span>;
+}
+
+/** Stable digest of a stylesheet, used only to tell two of them apart. */
+function fingerprint(css: string): string {
+  let hash = 0;
+  for (let index = 0; index < css.length; index += 1) {
+    hash = (hash * 31 + css.charCodeAt(index)) | 0;
+  }
+  return `${css.length.toString(36)}-${(hash >>> 0).toString(36)}`;
+}
+
+interface MarkdownRendererProps {
+  children: string;
+  /** Fade newly painted prose while the turn is still streaming. */
+  streaming?: boolean;
+}
+
+/**
+ * Chat links that point at workspace files. On a local session, ask nac-web to
+ * open the path with the OS; otherwise fall back to the Files panel. A bare
+ * relative href would otherwise resolve against the document origin, leave the
+ * hash route, and land on the homescreen.
+ */
+function MarkdownLink({ href, children, ...props }: ComponentPropsWithoutRef<"a">) {
+  const { selectRevision, selectFileListing, selectFile, revealSidePanel } =
+    useNativeRuntime().stores.sessionLayoutStore;
+
+  const { api } = useNativeRuntime();
+
+  const navigate = useNavigate();
+  const location = useLocation();
+  const isMobile = useIsMobile();
+  const toast = useToast();
+  const client = useQueryClient();
+  const sessionId = sessionIdFromPath(location.pathname);
+  const snapshot = sessionId
+    ? client.getQueryData<SessionSnapshotResponse>(queryKeys.sessionSnapshot(sessionId))
+    : undefined;
+  const kind = classifyMarkdownHref(href, [
+    snapshot?.workspace?.host_root,
+    snapshot?.metadata.workspace_host_path,
+    snapshot?.metadata.cwd,
+  ]);
+
+  const openInFilesPanel = (path: string) => {
+    if (!sessionId) return;
+    selectRevision(null);
+    selectFileListing("tree");
+    selectFile(path);
+    revealSidePanel(isMobile);
+    navigate(routes.session(sessionId, "files"));
+  };
+
+  if (kind.kind === "workspace" && sessionId) {
+    return (
+      <a
+        {...props}
+        href={href}
+        onClick={(event) => {
+          event.preventDefault();
+          void api.openWorkspacePath(sessionId, kind.path).catch((error: RunError) => {
+            // Remote / sandbox sessions cannot open a host path; the Files
+            // panel is the next-best place to land.
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/only available for local sessions|lives only inside the sandbox/i.test(message)) {
+              toast.error(`Could not open file: ${message}`);
+            }
+            openInFilesPanel(kind.path);
+          });
+        }}
+      >
+        {children}
+      </a>
+    );
+  }
+
+  if (kind.kind === "workspace" || kind.kind === "blocked") {
+    // No session to open into (or an absolute path we cannot map): keep the
+    // label, but do not let the browser leave the hash route.
+    return (
+      <a {...props} href={href} onClick={(event) => event.preventDefault()}>
+        {children}
+      </a>
+    );
+  }
+
+  return (
+    <a {...props} href={kind.href} target="_blank" rel="noopener noreferrer nofollow">
+      {children}
+    </a>
+  );
+}
+
+// react-markdown never injects raw HTML, so no sanitizer is needed; links still
+// have to be neutered because the model controls their target.
+function buildComponents(streaming: boolean) {
+  return {
+    a: MarkdownLink,
+    pre: ({ children }: { children?: ReactNode }) => <CodeFence>{children}</CodeFence>,
+    table: ({ ...props }: ComponentPropsWithoutRef<"table">) => (
+      <div className="overflow-x-auto">
+        <table {...props} />
+      </div>
+    ),
+    // The only stylesheet that can reach here is the one MathJax ships with
+    // each formula it typesets, and those overlap almost entirely: a streamed
+    // turn produces one per block, every message another copy. Naming them
+    // lets React hoist them into the head and keep one of each instead.
+    style: ({ children }: ComponentPropsWithoutRef<"style">) => {
+      const css = isString(children) ? children : "";
+      if (!css) return null;
+      return (
+        <style href={`mathjax-${fingerprint(css)}`} precedence="mathjax">
+          {css}
+        </style>
+      );
+    },
+    p: ({ children, ...props }: ComponentPropsWithoutRef<"p">) => (
+      <p {...props}>{wrapStreaming(children, streaming)}</p>
+    ),
+    li: ({ children, ...props }: ComponentPropsWithoutRef<"li">) => (
+      <li {...props}>{wrapStreaming(children, streaming)}</li>
+    ),
+    h1: ({ children, ...props }: ComponentPropsWithoutRef<"h1">) => (
+      <h1 {...props}>{wrapStreaming(children, streaming)}</h1>
+    ),
+    h2: ({ children, ...props }: ComponentPropsWithoutRef<"h2">) => (
+      <h2 {...props}>{wrapStreaming(children, streaming)}</h2>
+    ),
+    h3: ({ children, ...props }: ComponentPropsWithoutRef<"h3">) => (
+      <h3 {...props}>{wrapStreaming(children, streaming)}</h3>
+    ),
+    h4: ({ children, ...props }: ComponentPropsWithoutRef<"h4">) => (
+      <h4 {...props}>{wrapStreaming(children, streaming)}</h4>
+    ),
+    h5: ({ children, ...props }: ComponentPropsWithoutRef<"h5">) => (
+      <h5 {...props}>{wrapStreaming(children, streaming)}</h5>
+    ),
+    h6: ({ children, ...props }: ComponentPropsWithoutRef<"h6">) => (
+      <h6 {...props}>{wrapStreaming(children, streaming)}</h6>
+    ),
+  };
+}
+
+// Built once per mode rather than per render: react-markdown passes these
+// straight through as element types, so a fresh object would give every
+// paragraph, heading and list item a new type on each delta and React would
+// remount the whole message instead of updating its text.
+const streamingComponents = buildComponents(true);
+const staticComponents = buildComponents(false);
+
+function Parsed({ source, streaming }: { source: string; streaming: boolean }) {
+  // The delimiters a model writes are not the ones remark-math reads, and the
+  // dollars it means as money have to be neutered before the parser pairs them
+  // up — both only work on the source, so they happen here.
+  const math = normalizeMath(source);
+  const components = streaming ? streamingComponents : staticComponents;
+  const withoutMath = (
+    <ReactMarkdown
+      remarkPlugins={remarkPlugins}
+      urlTransform={markdownUrlTransform}
+      components={components}
+    >
+      {math.source}
+    </ReactMarkdown>
+  );
+  if (!math.hasMath) return withoutMath;
+  // Until MathJax has loaded the very same text renders without it, TeX source
+  // and all, which is a far better wait than a hole in the message.
+  return (
+    <Suspense fallback={withoutMath}>
+      <ParsedWithMath source={math.source} components={components} />
+    </Suspense>
+  );
+}
+
+/** The same parse with MathJax in the pipeline, once its chunk has arrived. */
+function ParsedWithMath({
+  source,
+  components,
+}: {
+  source: string;
+  components: ReturnType<typeof buildComponents>;
+}) {
+  const runtime = useNativeRuntime();
+  const plugins = use(loadMathPlugins(runtime.assets?.mathjaxFontUrl));
+  const portal = usePresentationPortalTarget();
+  const selectedComponents = runtime.assets
+    ? {
+        ...components,
+        // Packed consumers keep formula sheets in their view lifetime. Scope the
+        // generated rules and font families so caller MathJax remains independent.
+        style: ({ children }: ComponentPropsWithoutRef<"style">) => {
+          const css = isString(children) ? children : "";
+          return css && runtime.id !== undefined ? (
+            <style>{scopeMathjaxStyles(css, runtime.id, portal)}</style>
+          ) : null;
+        },
+      }
+    : components;
+  return (
+    <ReactMarkdown
+      remarkPlugins={plugins.remark}
+      rehypePlugins={plugins.rehype}
+      urlTransform={markdownUrlTransform}
+      components={selectedComponents}
+    >
+      {source}
+    </ReactMarkdown>
+  );
+}
+
+/**
+ * A block of a message that is still streaming. Memoized because a stream only
+ * appends: once a later block exists this text is settled, and re-parsing it is
+ * pure waste that grows with every delta.
+ */
+const StreamedBlock = memo(function StreamedBlock({ source }: { source: string }) {
+  return <Parsed source={source} streaming />;
+});
+
+/**
+ * A line that may define a link reference or a footnote, also inside quotes
+ * and list items, however deeply indented.
+ */
+const DEFINITION = /^[ \t]*(?:(?:>|[-*+]|\d{1,9}[.)])[ \t]*)*\[[^\]\n]+\]:/;
+
+/**
+ * Whether the text may define a link reference or a footnote. Fenced code is
+ * skipped: lines such as `[key: string]: T;` define nothing there, and a false
+ * match would cost the reply the steady settle.
+ */
+function mayDefine(source: string): boolean {
+  let fence: string | null = null;
+  for (const line of source.split("\n")) {
+    if (fence !== null) {
+      if (closesFence(line, fence)) fence = null;
+      continue;
+    }
+    const opener = FENCE.exec(line);
+    if (opener) fence = opener[1];
+    else if (DEFINITION.test(line)) return true;
+  }
+  return false;
+}
+
+/**
+ * Heavy half of the markdown support: the parser plus the syntax highlighter.
+ * Always reach it through `lib/markdown`, which loads this chunk on demand.
+ *
+ * A live message is parsed block by block so a delta only costs the block it
+ * landed in; a finished one is parsed as a single document, which is both the
+ * canonical reading of the text and cheap now that it is parsed once. A message
+ * that streamed in this view stays in blocks once it settles: switching would
+ * remount every paragraph and code block the moment the stream ends, and the
+ * code would repaint plain before it is highlighted again. One that may define
+ * a link reference or a footnote switches all the same, as only the whole
+ * document resolves those.
+ */
+const MarkdownRenderer = memo(function MarkdownRenderer({
+  children,
+  streaming = false,
+}: MarkdownRendererProps) {
+  perfRender("Markdown");
+  const [streamed, setStreamed] = useState(streaming);
+  if (streaming && !streamed) setStreamed(true);
+  const blocks = streaming || (streamed && !mayDefine(children));
+  return (
+    <PerfProfiler id="markdown">
+      {blocks ? (
+        splitMarkdownBlocks(children).map((source, index) => (
+          // Blocks are append-only, so their position is their identity.
+          <StreamedBlock key={index} source={source} />
+        ))
+      ) : (
+        <Parsed source={children} streaming={false} />
+      )}
+    </PerfProfiler>
+  );
+});
+
+export default MarkdownRenderer;

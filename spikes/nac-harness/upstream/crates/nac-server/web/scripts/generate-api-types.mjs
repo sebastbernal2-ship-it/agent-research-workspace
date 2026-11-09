@@ -1,0 +1,407 @@
+// Generates runtime-free TypeScript schema types from nac-server's OpenAPI 3.1
+// document. The converter intentionally supports only the JSON Schema features
+// emitted by this repository's utoipa contract; encountering a new construct
+// fails generation instead of silently widening the public API to `any`.
+
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { clientApiSurface } from "./client-api-surface.mjs";
+import { spawnSync } from "node:child_process";
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const webDir = path.resolve(scriptDir, "..");
+const inputPath = path.join(webDir, "openapi.json");
+const webOutputPath = path.join(webDir, "src/app/types/openapi.generated.ts");
+const clientSurfaceOutputPath = path.join(webDir, "packages/nac-client/src/surface.generated.ts");
+const clientOutputPath = path.join(webDir, "packages/nac-client/src/openapi.generated.ts");
+const check = process.argv.slice(2).includes("--check");
+
+const clientSchemaRoots = [
+  "ProductContext",
+  "ProductDestination",
+  "ProductDestinationInfo",
+  "ProductNavigationRequest",
+  "ProductNavigationResolution",
+
+  "GitIdentityResponse",
+  "UpdateGitIdentityRequest",
+  "McpOAuthStatusResponse",
+  "AuthenticateMcpOAuthRequest",
+  "AuthenticateMcpOAuthResponse",
+  "ConfigureMcpOAuthRequest",
+
+  "HealthResponse",
+  "AssignSessionRequest",
+  "BranchList",
+  "BrowseListing",
+  "CommitOutcome",
+  "CommitWorkspaceRequest",
+  "CompactSessionResponse",
+  "CreateGoalRequest",
+  "CreateMcpServerRequest",
+  "CreateModelConfigurationRequest",
+  "CreateProjectRequest",
+  "CreateSessionRequest",
+  "CreateSshConfigurationRequest",
+  "DeleteProjectResponse",
+  "DeleteProjectSessions",
+  "DeviceLoginStartedResponse",
+  "DeviceLoginStateResponse",
+  "ForkSessionResponse",
+  "GeneratedCredential",
+  "GitHubBranchListResponse",
+  "GitHubLoginStartedResponse",
+  "GitHubLoginStateResponse",
+  "GitHubRepositoryListResponse",
+  "GitHubStatusResponse",
+  "InboxDelivery",
+  "InboxItemResponse",
+  "LaunchModelDefaults",
+  "LaunchModelDefaultsRequest",
+  "ManagedAuthListResponse",
+  "ManagedAuthProvider",
+  "ManagedAuthStatusResponse",
+  "ManagedCloneOperation",
+  "ManagedHostStatusResponse",
+  "ManagedOrchestratorRecord",
+  "ManagedSecretList",
+  "ManagedSecretSummary",
+  "ManagedSessionSummary",
+  "McpLibraryResponse",
+  "McpRuntimeStatus",
+  "McpRuntimeStatusList",
+  "McpServerList",
+  "McpServerView",
+  "MessagesPageResponse",
+  "ModelConfigurationList",
+  "ModelConfigurationRecord",
+  "ModelListing",
+  "OpenLocalPathResult",
+  "OrchestratorSteeringResponse",
+  "PermissionApprovalMode",
+  "PermissionReply",
+  "PermissionStateResponse",
+  "ProjectList",
+  "ProjectRecord",
+  "ProviderModelList",
+  "ProviderModelsRequest",
+  "RawSessionConfig",
+  "ReorderProjectsRequest",
+  "ReorderProjectsResponse",
+  "ReorderSessionsRequest",
+  "ReorderSessionsResponse",
+  "ResolvedModelConfiguration",
+  "RevertSessionResponse",
+  "SandboxActivity",
+  "SandboxAvailability",
+  "SessionGoalRecord",
+  "SessionSummarySnapshot",
+  "SkillCatalogEntry",
+  "SlashCommandDefinition",
+  "SshBrowseRequest",
+  "SshConfigurationList",
+  "SshConfigurationRecord",
+  "StartManagedCloneRequest",
+  "StartManagedOrchestratorRequest",
+  "StartTraditionalChildRequest",
+  "StoreInfo",
+  "StoredCredentialList",
+  "SwitchBranchRequest",
+  "TestMcpServerRequest",
+  "TestMcpServerResponse",
+  "ThreadEventPage",
+  "ThreadSteeringResponse",
+  "TraditionalChildRecord",
+  "UpdateConfigRequest",
+  "UpdateGoalRequest",
+  "UpdateMcpServerRequest",
+  "UpdateModelConfigurationRequest",
+  "UpdateProjectRequest",
+  "UpdateSessionPresentationRequest",
+  "UpdateSshConfigurationRequest",
+  "WorkspaceFileContent",
+  "WorkspaceFileDiff",
+  "WorkspaceFileList",
+  "WorkspaceRevisionChanges",
+  "WorkspaceRevisionRecord",
+  "UiConfiguration",
+  "AssistantStreamDelta",
+  "LaggedEvent",
+  "ReadinessResponse",
+  "RecentEventsResponse",
+  "ReplayBoundaryEvent",
+  "ReplayGapEvent",
+  "SessionEventBoundary",
+  "SessionEventEnvelope",
+  "SessionSnapshotResponse",
+  "SubmitPromptResponse",
+  "ShellCommandRequest",
+  "ShellCommandSnapshot",
+  "ShellOutputPage",
+  "ExecutionListResponse",
+  "ExecutionFrameResponse",
+  "ExecutionHistoryResponse",
+];
+
+const document = JSON.parse(await readFile(inputPath, "utf8"));
+if (document.openapi !== "3.1.0") {
+  throw new Error(`expected OpenAPI 3.1.0, received ${JSON.stringify(document.openapi)}`);
+}
+
+const schemas = document.components?.schemas;
+if (!schemas || typeof schemas !== "object" || Array.isArray(schemas)) {
+  throw new Error("OpenAPI document has no components.schemas object");
+}
+
+const operations = Object.entries(document.paths).flatMap(([path, item]) =>
+  Object.entries(item)
+    .filter(([method]) => ["get", "post", "put", "patch", "delete"].includes(method))
+    .map(([method, operation]) => ({ key: `${method.toUpperCase()} ${path}`, operation })),
+);
+const operationKeys = new Set(operations.map(({ key }) => key));
+for (const { key } of operations) {
+  if (!clientApiSurface[key]) throw new Error(`Unclassified client operation ${key}`);
+}
+for (const key of Object.keys(clientApiSurface)) {
+  if (!operationKeys.has(key)) throw new Error(`Client coverage names missing operation ${key}`);
+}
+
+function quote(value) {
+  return JSON.stringify(value);
+}
+
+function propertyName(name) {
+  return /^[$A-Z_a-z][$\w]*$/u.test(name) ? name : quote(name);
+}
+
+function refType(ref) {
+  const prefix = "#/components/schemas/";
+  if (!ref.startsWith(prefix)) {
+    throw new Error(`unsupported OpenAPI reference ${quote(ref)}`);
+  }
+  const name = decodeURIComponent(ref.slice(prefix.length));
+  if (!(name in schemas)) {
+    throw new Error(`unknown OpenAPI schema reference ${quote(name)}`);
+  }
+  return `components["schemas"][${quote(name)}]`;
+}
+
+function union(types) {
+  const unique = [...new Set(types)];
+  return unique.length === 1 ? unique[0] : unique.map((type) => `(${type})`).join(" | ");
+}
+
+function intersection(types) {
+  const unique = [...new Set(types)];
+  return unique.length === 1 ? unique[0] : unique.map((type) => `(${type})`).join(" & ");
+}
+
+function primitive(type, schema, location) {
+  switch (type) {
+    case "null":
+      return "null";
+    case "boolean":
+      return "boolean";
+    case "integer":
+    case "number":
+      return "number";
+    case "string":
+      return "string";
+    case "array":
+      return `(${schemaType(schema.items ?? {}, `${location}.items`)})[]`;
+    case "object":
+      return objectType(schema, location);
+    default:
+      throw new Error(`${location}: unsupported schema type ${quote(type)}`);
+  }
+}
+
+function objectType(schema, location) {
+  const properties = schema.properties ?? {};
+  const required = new Set(schema.required ?? []);
+  const fields = Object.entries(properties).map(([name, property]) => {
+    const optional = required.has(name) ? "" : "?";
+    return `${propertyName(name)}${optional}: ${schemaType(property, `${location}.${name}`)};`;
+  });
+
+  let object = fields.length === 0 ? "Record<string, never>" : `{ ${fields.join(" ")} }`;
+  if (schema.additionalProperties !== undefined && schema.additionalProperties !== false) {
+    const value =
+      schema.additionalProperties === true
+        ? "unknown"
+        : schemaType(schema.additionalProperties, `${location}.additionalProperties`);
+    const record = `Record<string, ${value}>`;
+    object = fields.length === 0 ? record : intersection([object, record]);
+  }
+  return object;
+}
+
+function schemaType(schema, location) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error(`${location}: expected a schema object`);
+  }
+  if (schema.$ref) {
+    return refType(schema.$ref);
+  }
+  if (schema.enum) {
+    return union(schema.enum.map((value) => quote(value)));
+  }
+  if (schema.oneOf) {
+    return union(
+      schema.oneOf.map((entry, index) => schemaType(entry, `${location}.oneOf[${index}]`)),
+    );
+  }
+  if (schema.anyOf) {
+    return union(
+      schema.anyOf.map((entry, index) => schemaType(entry, `${location}.anyOf[${index}]`)),
+    );
+  }
+  if (schema.allOf) {
+    return intersection(
+      schema.allOf.map((entry, index) => schemaType(entry, `${location}.allOf[${index}]`)),
+    );
+  }
+  if (Array.isArray(schema.type)) {
+    return union(schema.type.map((type) => primitive(type, schema, location)));
+  }
+  if (typeof schema.type === "string") {
+    return primitive(schema.type, schema, location);
+  }
+  if (schema.properties || schema.additionalProperties !== undefined) {
+    return objectType(schema, location);
+  }
+  if (
+    Object.keys(schema).every((key) =>
+      ["description", "example", "format", "writeOnly"].includes(key),
+    )
+  ) {
+    return "unknown";
+  }
+  throw new Error(`${location}: unsupported schema keys ${Object.keys(schema).sort().join(", ")}`);
+}
+
+function referencedSchemaNames(schema, names) {
+  if (!schema || typeof schema !== "object") return;
+  if (Array.isArray(schema)) {
+    for (const entry of schema) referencedSchemaNames(entry, names);
+    return;
+  }
+  if (typeof schema.$ref === "string") {
+    const prefix = "#/components/schemas/";
+    if (!schema.$ref.startsWith(prefix)) {
+      throw new Error(`unsupported OpenAPI reference ${quote(schema.$ref)}`);
+    }
+    const name = decodeURIComponent(schema.$ref.slice(prefix.length));
+    if (!(name in schemas)) {
+      throw new Error(`unknown OpenAPI schema reference ${quote(name)}`);
+    }
+    names.add(name);
+  }
+  for (const [key, value] of Object.entries(schema)) {
+    if (key !== "$ref") referencedSchemaNames(value, names);
+  }
+}
+
+function transitiveSchemas(roots) {
+  const selected = new Set();
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const name = pending.pop();
+    if (selected.has(name)) continue;
+    if (!(name in schemas)) throw new Error(`unknown client schema root ${quote(name)}`);
+    selected.add(name);
+    const referenced = new Set();
+    referencedSchemaNames(schemas[name], referenced);
+    for (const dependency of referenced) {
+      if (!selected.has(dependency)) pending.push(dependency);
+    }
+  }
+  return [...selected];
+}
+
+// Include every request/response dependency for deliberately supported operations.
+const operationSchemaRoots = new Set(clientSchemaRoots);
+for (const { key, operation } of operations) {
+  if (!clientApiSurface[key].startsWith("private:"))
+    referencedSchemaNames(operation, operationSchemaRoots);
+}
+
+function generatedSource(schemaNames, banner) {
+  const entries = schemaNames
+    .sort((left, right) => left.localeCompare(right, "en"))
+    .map(
+      (name) =>
+        `    ${propertyName(name)}: ${schemaType(schemas[name], `components.schemas.${name}`)};`,
+    )
+    .join("\n");
+
+  return `// @generated by ${banner}.
+// Do not edit by hand. Run \`make generate-api-contract\` from the repository root.
+
+export interface components {
+  schemas: {
+${entries}
+  };
+}
+
+export type ApiSchema<Name extends keyof components["schemas"]> = components["schemas"][Name];
+`;
+}
+
+async function formattedSource(unformatted, filename) {
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "nac-openapi-types-"));
+  const temporaryOutput = path.join(temporaryDirectory, filename);
+  try {
+    await writeFile(temporaryOutput, unformatted);
+    const formatter = path.join(webDir, "node_modules/.bin/oxfmt");
+    const result = spawnSync(formatter, ["--write", temporaryOutput], { encoding: "utf8" });
+    if (result.status !== 0) {
+      throw new Error(`oxfmt failed: ${result.stderr || result.stdout}`);
+    }
+    return await readFile(temporaryOutput, "utf8");
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+const outputs = [
+  {
+    path: clientSurfaceOutputPath,
+    source: `// @generated by scripts/generate-api-types.mjs.
+// Coverage is not hosted authorization. Run make generate-api-contract.
+export const NAC_API_SURFACE = ${JSON.stringify(clientApiSurface, null, 2)} as const;
+`,
+  },
+  {
+    path: webOutputPath,
+    source: generatedSource(
+      Object.keys(schemas),
+      "scripts/generate-api-types.mjs from ../../openapi.json",
+    ),
+  },
+  {
+    path: clientOutputPath,
+    source: generatedSource(
+      transitiveSchemas(operationSchemaRoots),
+      "../../../scripts/generate-api-types.mjs from ../../../openapi.json",
+    ),
+  },
+];
+
+for (const output of outputs) {
+  const generated = await formattedSource(output.source, path.basename(output.path));
+  if (check) {
+    const existing = await readFile(output.path, "utf8");
+    if (existing !== generated) {
+      throw new Error(
+        `${path.relative(process.cwd(), output.path)} is stale; run make generate-api-contract`,
+      );
+    }
+    console.log(`${path.relative(process.cwd(), output.path)} is current`);
+  } else {
+    await writeFile(output.path, generated);
+    console.log(`wrote ${path.relative(process.cwd(), output.path)}`);
+  }
+}

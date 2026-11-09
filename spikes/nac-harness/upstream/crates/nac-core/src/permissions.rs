@@ -1,0 +1,286 @@
+//! Permission policy for persistent direct sessions.
+//!
+//! Authorization is deliberately separate from execution confinement. An
+//! allow decision authorizes the prepared invocation through its already
+//! selected [`crate::sandbox::ExecutionBackend`]; it never changes backends.
+
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::sandbox::ExecutionBackend;
+use crate::tools::kernel::PermissionResource;
+
+pub(crate) mod attention;
+mod broker;
+mod broker_review;
+mod command_classification;
+mod evaluation;
+mod hard_policy;
+mod opaque_policy;
+mod resource_binding;
+mod resource_projection;
+mod review;
+mod review_failure;
+mod shell_parser;
+pub(crate) mod task_observation;
+
+use command_classification::*;
+pub use evaluation::wildcard_match;
+use hard_policy::*;
+use opaque_policy::*;
+pub(crate) use resource_binding::bind_authorized_shell_command;
+use resource_binding::*;
+pub(crate) use resource_projection::{
+    canonicalize_authorization_resources, file_resources, shell_resources,
+    unbounded_interactive_input,
+};
+use resource_projection::{lexical_normalize, path_contains_component};
+use review::{blocked_message, invocation_fingerprint, BlockedReview, ReviewMemory};
+pub(crate) use review::{
+    is_secret_name, review_eligibility, review_request, ExactSecrets, ReviewBackendSource,
+};
+pub use review::{
+    retry_authorization_message, PermissionReview, PermissionReviewCode, PermissionReviewOutcome,
+    PermissionReviewer, ReviewCategory, ReviewRequest, ReviewResource, ReviewVerdict,
+    REVIEW_DEADLINE,
+};
+pub use review_failure::{PermissionReviewFailureReason, ReviewUnavailable};
+pub(crate) use shell_parser::canonical_command;
+use shell_parser::{command_grant_candidate, parse_shell, ParsedShell};
+
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const APPROVAL_SUBSCRIBER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const APPROVAL_MODE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DELEGATED_APPROVAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum PermissionEffect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PermissionRule {
+    pub action: String,
+    pub resource: String,
+    pub effect: PermissionEffect,
+}
+
+impl PermissionRule {
+    pub fn new(
+        action: impl Into<String>,
+        resource: impl Into<String>,
+        effect: PermissionEffect,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            resource: resource.into(),
+            effect,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionBackend {
+    Local,
+    Podman,
+    Ssh,
+}
+
+impl PermissionBackend {
+    pub(crate) fn from_execution_backend(backend: &ExecutionBackend) -> Self {
+        match backend {
+            ExecutionBackend::Local { .. } => Self::Local,
+            ExecutionBackend::Sandbox(_) => Self::Podman,
+            ExecutionBackend::Ssh(_) => Self::Ssh,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionDecision {
+    pub effect: PermissionEffect,
+    pub hard_denial: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PermissionPolicy {
+    rules: Vec<PermissionRule>,
+    backend_rule_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PermissionRequestResource {
+    pub action: String,
+    pub resource: String,
+    pub display: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_resource: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PermissionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub call_id: Option<String>,
+    pub tool: String,
+    pub resources: Vec<PermissionRequestResource>,
+    pub created_at_epoch_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum PermissionReply {
+    Once,
+    Always,
+    Reject,
+}
+
+/// User-selected approval behavior for one durable direct ownership tree.
+///
+/// This is deliberately an answer policy at the broker boundary, not an
+/// execution backend or a reusable resource grant.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum PermissionApprovalMode {
+    #[default]
+    Manual,
+    AutoApprove,
+    /// Eligible Ask requests are answered by an automatic reviewer. Rejected,
+    /// uncertain and failed reviews return unexecuted errors; ineligible
+    /// requests keep the manual path.
+    Review,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionApprovalModeUpdateError {
+    ConcurrentChange,
+    /// Review mode was requested but the reviewer cannot run, for example
+    /// because no Arcee credential is available. The previous mode remains.
+    ReviewerUnavailable(String),
+}
+
+impl std::fmt::Display for PermissionApprovalModeUpdateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConcurrentChange => formatter
+                .write_str("permission approval mode changed concurrently; refresh and try again"),
+            Self::ReviewerUnavailable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PermissionApprovalModeUpdateError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthorizationOutcome {
+    Allowed,
+    Denied(String),
+}
+
+struct PendingPermission {
+    explicit_human: bool,
+    request: PermissionRequest,
+    reply: tokio::sync::oneshot::Sender<PermissionReply>,
+}
+
+#[derive(Default)]
+struct PermissionBrokerState {
+    pending: HashMap<String, PendingPermission>,
+}
+
+#[derive(Default)]
+struct PermissionApprovalObserver {
+    last_checked: Option<Instant>,
+    observed_generation: Option<Result<i64, String>>,
+}
+
+struct PendingPermissionGuard {
+    broker: Weak<PermissionBroker>,
+    request_id: String,
+}
+
+struct PermissionWaiterLiveness {
+    live: Arc<crate::store::PermissionGrantWaiter>,
+}
+
+impl Drop for PermissionWaiterLiveness {
+    fn drop(&mut self) {
+        self.live.abort();
+    }
+}
+
+impl Drop for PendingPermissionGuard {
+    fn drop(&mut self) {
+        if let Some(broker) = self.broker.upgrade() {
+            broker.dismiss_pending(
+                &self.request_id,
+                "the operation awaiting approval ended before a reply".to_string(),
+            );
+        }
+    }
+}
+
+/// Per-requesting-session approval coordinator. Traditional children resolve
+/// answer policy through their durable root owner, while pending prompts and
+/// remembered grants remain scoped to the requesting session. A restart drops
+/// the waiting call, after which ordinary interrupted-run recovery takes over
+/// without pretending an approval survived.
+pub struct PermissionBroker {
+    policy: PermissionPolicy,
+    store_path: PathBuf,
+    session_id: String,
+    backend: &'static str,
+    session_config_version: i64,
+    event_bus: StdMutex<Option<crate::events::SessionEventBus>>,
+    state: StdMutex<PermissionBrokerState>,
+    attention: StdMutex<attention::BrokerAttention>,
+    approval_observer: tokio::sync::Mutex<PermissionApprovalObserver>,
+    reviewer: StdMutex<Option<Arc<dyn PermissionReviewer>>>,
+    review: StdMutex<ReviewMemory>,
+    review_deadline: StdMutex<Duration>,
+    command_environment: StdMutex<Option<Arc<dyn nac_contracts::CommandEnvironmentProvider>>>,
+    review_backend: StdMutex<review::ReviewBackendSource>,
+    /// The session's saved project; membership is immutable once set.
+    caller_project: std::sync::OnceLock<String>,
+}
+
+/// Project one validated backend path into the action being performed plus an
+/// external-directory guard when it lies outside the backend workspace.
+
+#[cfg(test)]
+#[path = "permissions_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "permission_grant_tests.rs"]
+mod grant_tests;
+
+#[cfg(test)]
+#[path = "permission_mode_tests.rs"]
+mod mode_tests;
+
+#[cfg(test)]
+#[path = "permission_review_tests.rs"]
+mod review_tests;
+
+#[cfg(test)]
+#[path = "permission_persistence_tests.rs"]
+mod persistence_tests;
+mod scheduled_tasks;
+pub(crate) use scheduled_tasks::authorize_human_retained_allowance;
+pub use scheduled_tasks::{authorize_local_scheduled_project, ScheduledProjectAdmissionRequired};

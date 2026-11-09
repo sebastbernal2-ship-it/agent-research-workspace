@@ -1,0 +1,1569 @@
+/** @vitest-environment jsdom */
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ChatInputBox } from "@/app/components/inspector/ChatInputBox";
+import { SessionActionsProvider } from "@/app/providers/SessionActionsProvider";
+import { ToastProvider } from "@/app/providers/ToastProvider";
+import { draftPrompt, sendPrompt } from "@/app/store/composerStore";
+import { purgeAll, get as getDraft } from "@/app/store/promptDraftStore";
+import { api } from "@/app/services/api";
+import { queryKeys } from "@/app/services/queries";
+import { resetRuntime, syncRunFromSnapshot } from "@/app/store/runtimeStore";
+import type {
+  InboxItem,
+  ManagedSessionSummary,
+  SessionBehavior,
+  SessionGoalRecord,
+  SessionSnapshotResponse,
+  SkillCatalogEntry,
+  SlashCommandDefinition,
+  ShellCommandSnapshot,
+} from "@/app/types/api";
+
+// The component runs against the real providers, stores, and api object; the
+// network is replaced by spies on the api methods, delegating to these
+// per-test fakes. jsdom lacks matchMedia, so a desktop stub stands in.
+const fakes = {
+  listSessionCommands: vi.fn(),
+  listSessionSkills: vi.fn(),
+  submitRun: vi.fn(),
+  submitShellCommand: vi.fn(),
+  getShellCommand: vi.fn(),
+  steerOrchestrator: vi.fn(),
+  compactSession: vi.fn(),
+  createInboxItem: vi.fn(),
+  updateInboxItem: vi.fn(),
+  cancelInboxItem: vi.fn(),
+  createGoal: vi.fn(),
+  updateGoal: vi.fn(),
+  clearGoal: vi.fn(),
+  getGoal: vi.fn(),
+  cancelActiveRun: vi.fn(),
+  getModelCatalog: vi.fn(),
+  getStore: vi.fn(),
+};
+
+vi.spyOn(api, "listSessionCommands").mockImplementation((...args) =>
+  fakes.listSessionCommands(...args),
+);
+vi.spyOn(api, "listSessionSkills").mockImplementation((...args) =>
+  fakes.listSessionSkills(...args),
+);
+vi.spyOn(api, "submitShellCommand").mockImplementation((...args) =>
+  fakes.submitShellCommand(...args),
+);
+vi.spyOn(api, "getShellCommand").mockImplementation((...args) => fakes.getShellCommand(...args));
+vi.spyOn(api, "submitRun").mockImplementation((...args) => fakes.submitRun(...args));
+vi.spyOn(api, "steerOrchestrator").mockImplementation((...args) =>
+  fakes.steerOrchestrator(...args),
+);
+vi.spyOn(api, "compactSession").mockImplementation((...args) => fakes.compactSession(...args));
+vi.spyOn(api, "createInboxItem").mockImplementation((...args) => fakes.createInboxItem(...args));
+vi.spyOn(api, "updateInboxItem").mockImplementation((...args) => fakes.updateInboxItem(...args));
+vi.spyOn(api, "cancelInboxItem").mockImplementation((...args) => fakes.cancelInboxItem(...args));
+vi.spyOn(api, "createGoal").mockImplementation((...args) => fakes.createGoal(...args));
+vi.spyOn(api, "updateGoal").mockImplementation((...args) => fakes.updateGoal(...args));
+vi.spyOn(api, "clearGoal").mockImplementation((...args) => fakes.clearGoal(...args));
+vi.spyOn(api, "getGoal").mockImplementation((...args) => fakes.getGoal(...args));
+vi.spyOn(api, "cancelActiveRun").mockImplementation((...args) => fakes.cancelActiveRun(...args));
+vi.spyOn(api, "getModelCatalog").mockImplementation((...args) => fakes.getModelCatalog(...args));
+vi.spyOn(api, "getStore").mockImplementation((...args) => fakes.getStore(...args));
+
+const compactDefinition: SlashCommandDefinition = {
+  command: "compact",
+  name: "compact",
+  description: "Compact the current session context",
+  accepts_arguments: false,
+};
+
+const goalDefinition: SlashCommandDefinition = {
+  command: "goal",
+  name: "goal",
+  description: "Create or control a durable direct-session goal",
+  accepts_arguments: true,
+};
+
+function goal(status: SessionGoalRecord["status"] = "active"): SessionGoalRecord {
+  return {
+    session_id: "session",
+    goal_id: "goal-1",
+    objective: "existing objective",
+    status,
+    token_budget: null,
+    tokens_used: 0,
+    time_used_ms: 0,
+    accounting_run_id: null,
+    accounting_token_baseline: null,
+    accounting_started_at_epoch_ms: null,
+    continuation_run_id: null,
+    consecutive_transient_failures: 0,
+    next_attempt_at_epoch_ms: null,
+    last_failure: null,
+    created_at: "2026-08-25T00:00:00Z",
+    updated_at: "2026-08-25T00:00:00Z",
+    version: 3,
+  };
+}
+
+function inbox(delivery: InboxItem["delivery"] = "steer"): InboxItem {
+  return {
+    id: 7,
+    session_id: "session",
+    delivery,
+    status: "pending",
+    prompt: "pending instruction",
+    target_run_id: "run-live",
+    client_id: null,
+    delivered_run_id: null,
+    created_at: "2026-08-25T00:00:00Z",
+    updated_at: "2026-08-25T00:00:00Z",
+    delivered_at: null,
+    cancelled_at: null,
+    version: 2,
+  };
+}
+
+/** The slash-command list the next composed editor starts with, if loaded. */
+let commandFixtures: SlashCommandDefinition[] | undefined;
+let skillFixtures: SkillCatalogEntry[] | undefined;
+let mobile = false;
+const mediaListeners = new Set<() => void>();
+
+function resizeComposer(phone: boolean) {
+  act(() => {
+    mobile = phone;
+    for (const listener of mediaListeners) listener();
+  });
+}
+
+function composer(
+  {
+    behavior = null,
+    sessionId = "session",
+    goalState = null,
+    inboxItems = [],
+    lineage = null,
+    entryAvailable = true,
+    snapshotAvailable = false,
+    shellCommands = [],
+    messages = [],
+  }: {
+    behavior?: SessionBehavior | null;
+    sessionId?: string;
+    goalState?: SessionGoalRecord | null;
+    inboxItems?: InboxItem[];
+    lineage?: ManagedSessionSummary["lineage"];
+    entryAvailable?: boolean;
+    snapshotAvailable?: boolean;
+    shellCommands?: ShellCommandSnapshot[];
+    messages?: SessionSnapshotResponse["messages"];
+  } = {},
+  expectInput = true,
+) {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Infinity },
+      mutations: { retry: false },
+    },
+  });
+  if (commandFixtures !== undefined) {
+    client.setQueryData(queryKeys.sessionCommands(sessionId), commandFixtures);
+  }
+  if (skillFixtures !== undefined) {
+    client.setQueryData(queryKeys.sessionSkills(sessionId), skillFixtures);
+  }
+  if (behavior) {
+    client.setQueryData(queryKeys.sessionPermissions(sessionId), { requests: [], grants: [] });
+    client.setQueryData(queryKeys.sessionGoal(sessionId), goalState);
+    fakes.getGoal.mockResolvedValue(goalState);
+    client.setQueryData(queryKeys.sessionInbox(sessionId), inboxItems);
+    client.setQueryData(queryKeys.traditionalChildren(sessionId), []);
+  }
+  const knownEntry: ManagedSessionSummary = {
+    active: false,
+    lineage,
+    summary: {
+      session_id: sessionId,
+      behavior: behavior ?? "orchestrator",
+      cwd: "/tmp/project",
+      model: "gpt-5.6-sol",
+      backend: "openai-responses",
+      visible_message_count: 0,
+      last_user_prompt: null,
+      sandboxed: false,
+      ssh_host: null,
+      title: null,
+      created_at: "2026-08-25T00:00:00Z",
+      updated_at: "2026-08-25T00:00:00Z",
+      run_count: 0,
+    },
+  };
+  const entry = entryAvailable ? knownEntry : null;
+  const snapshot = snapshotAvailable
+    ? ({
+        metadata: {
+          session_id: sessionId,
+          behavior: behavior ?? "orchestrator",
+          cwd: "/tmp/project",
+          workspace_host_path: "/tmp/project",
+          store_path: "/tmp/store.db",
+          model: "gpt-5.6-sol",
+          backend: "openai-responses",
+          sandbox_status: "off",
+          agents_md_status: "off",
+        },
+        messages,
+        shell_commands: shellCommands,
+        response_timing: {
+          last_response_duration_ms: null,
+          previous_response_duration_ms: null,
+          response_durations_ms: null,
+        },
+      } as unknown as SessionSnapshotResponse)
+    : null;
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <ToastProvider>
+          <SessionActionsProvider>
+            <ChatInputBox sessionId={sessionId} snapshot={snapshot} entry={entry} />
+          </SessionActionsProvider>
+        </ToastProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  if (!expectInput) return null as never;
+  const textarea = screen.getByRole("combobox", { name: "Message" });
+  act(() => textarea.focus());
+  // SAFETY: the composer renders a single textarea as its combobox input.
+  return textarea as HTMLTextAreaElement;
+}
+
+function type(textarea: HTMLTextAreaElement, value: string) {
+  fireEvent.change(textarea, { target: { value } });
+}
+
+function pending<T>(): Promise<T> {
+  return Promise.withResolvers<T>().promise;
+}
+
+beforeEach(() => {
+  purgeAll();
+  resetRuntime("session");
+  mobile = false;
+  mediaListeners.clear();
+  commandFixtures = [compactDefinition, goalDefinition];
+  skillFixtures = [
+    {
+      name: "code-review",
+      description: "Review code for correctness, security, completeness, and maintainability",
+      compatibility: null,
+    },
+    {
+      name: "test",
+      description: "Run focused tests",
+      compatibility: null,
+    },
+  ];
+  // Queries that stay pending keep their loading state, matching the previous
+  // module mocks' `data: undefined`.
+  fakes.listSessionCommands.mockReset().mockImplementation(() => pending());
+  fakes.listSessionSkills.mockReset().mockImplementation(() => pending());
+  fakes.submitShellCommand.mockReset().mockImplementation(async (_session, request) => ({
+    request_id: request.request_id,
+    operation_id: "operation",
+    command: request.command,
+    state: "completed",
+    timeout_ms: 30000,
+    accepted_at_epoch_ms: 1,
+    stdout: "result",
+    stderr: "",
+  }));
+  fakes.getShellCommand.mockReset();
+  fakes.submitRun.mockReset().mockResolvedValue({
+    status: "accepted",
+    requestId: "request-run",
+    response: {
+      run_id: "run",
+      client_id: null,
+      display_prompt: "prompt",
+    },
+  });
+  fakes.steerOrchestrator.mockReset().mockResolvedValue({ status: "queued" });
+  fakes.compactSession.mockReset().mockResolvedValue({
+    status: "compacted",
+    compaction_id: "compaction",
+  });
+  fakes.createInboxItem.mockReset().mockImplementation(async (_id, delivery, prompt) => ({
+    ...inbox(delivery),
+    prompt,
+  }));
+  fakes.updateInboxItem
+    .mockReset()
+    .mockImplementation(async (_id, _itemId, _version, delivery) => ({
+      ...inbox(delivery),
+      version: 3,
+    }));
+  fakes.cancelInboxItem.mockReset().mockResolvedValue({
+    ...inbox(),
+    status: "cancelled",
+    version: 3,
+  });
+  fakes.createGoal.mockReset().mockImplementation(async (_id, payload) => ({
+    ...goal(),
+    objective: payload.objective,
+  }));
+  fakes.updateGoal.mockReset().mockImplementation(async (_id, _goalId, payload) => ({
+    ...goal(payload.status ?? "active"),
+    version: 4,
+  }));
+  fakes.clearGoal.mockReset().mockResolvedValue(undefined);
+  fakes.getGoal.mockReset().mockResolvedValue(null);
+  fakes.cancelActiveRun.mockReset().mockResolvedValue(undefined);
+  fakes.getModelCatalog.mockReset().mockImplementation(() => pending());
+  fakes.getStore.mockReset().mockImplementation(() => pending());
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    get matches() {
+      return mobile && query === "(max-width: 767.98px)";
+    },
+    media: query,
+    onchange: null,
+    addEventListener: (_event: string, listener: () => void) => mediaListeners.add(listener),
+    removeEventListener: (_event: string, listener: () => void) => mediaListeners.delete(listener),
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  }));
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    callback(0);
+    return 1;
+  });
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+    configurable: true,
+    value: vi.fn(),
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  resetRuntime("session");
+  vi.unstubAllGlobals();
+});
+
+describe("responsive Session settings target", () => {
+  it.each([false, true])("keeps the settings action and draft on mobile=%s", async (phone) => {
+    mobile = phone;
+    const readConfig = vi.spyOn(api, "getConfig").mockImplementation(() => pending());
+    try {
+      const textarea = composer({ behavior: "direct" });
+      type(textarea, "Unsent draft before opening settings");
+      const button = screen.getByRole("button", { name: "Session settings" });
+      for (const token of ["!size-11", "!min-h-11", "!min-w-11"])
+        expect(button.classList.contains(token)).toBe(phone);
+      expect(button.classList.contains("btn-small")).toBe(true);
+      expect(button.querySelector("svg")?.getAttribute("width")).toBe("16");
+      fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog", { name: "Session settings" });
+      await waitFor(() => expect(readConfig).toHaveBeenCalled());
+      expect(readConfig.mock.calls[0]?.[0]).toBe("session");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+      await waitFor(() =>
+        expect(screen.queryByRole("dialog", { name: "Session settings" })).toBeNull(),
+      );
+      expect(textarea.value).toBe("Unsent draft before opening settings");
+      expect(fakes.submitRun).not.toHaveBeenCalled();
+    } finally {
+      readConfig.mockRestore();
+    }
+  });
+
+  it("preserves the focused action and draft through mobile and desktop resize", async () => {
+    const readConfig = vi.spyOn(api, "getConfig").mockImplementation(() => pending());
+    try {
+      const textarea = composer({ behavior: "direct" });
+      type(textarea, "Unsent draft survives responsive target changes");
+      const button = screen.getByRole("button", { name: "Session settings" });
+      act(() => button.focus());
+      resizeComposer(true);
+      expect(screen.getByRole("button", { name: "Session settings" })).toBe(button);
+      expect(button.classList.contains("!size-11")).toBe(true);
+      expect(document.activeElement).toBe(button);
+      resizeComposer(false);
+      expect(screen.getByRole("button", { name: "Session settings" })).toBe(button);
+      expect(button.classList.contains("!size-11")).toBe(false);
+      expect(document.activeElement).toBe(button);
+      expect(textarea.value).toBe("Unsent draft survives responsive target changes");
+      fireEvent.click(button);
+      expect(await screen.findByRole("dialog", { name: "Session settings" })).toBeTruthy();
+      await waitFor(() => expect(readConfig).toHaveBeenCalled());
+      expect(readConfig.mock.calls[0]?.[0]).toBe("session");
+      expect(fakes.submitRun).not.toHaveBeenCalled();
+    } finally {
+      readConfig.mockRestore();
+    }
+  });
+});
+
+describe("responsive Enter behavior", () => {
+  it("lets mobile Enter insert a newline without submitting", () => {
+    mobile = true;
+    const textarea = composer();
+    type(textarea, "line one");
+
+    expect(textarea.getAttribute("enterkeyhint")).toBe("enter");
+    expect(fireEvent.keyDown(textarea, { key: "Enter" })).toBe(true);
+
+    expect(textarea.value).toBe("line one");
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+  });
+
+  it("lets mobile Enter insert a newline while a suggestion is open", () => {
+    mobile = true;
+    const textarea = composer();
+    type(textarea, "/co");
+
+    expect(screen.getByRole("option", { name: /compact/i })).toBeTruthy();
+    expect(fireEvent.keyDown(textarea, { key: "Enter" })).toBe(true);
+
+    expect(textarea.value).toBe("/co");
+    expect(screen.getByRole("option", { name: /compact/i })).toBeTruthy();
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["metaKey", "ctrlKey"] as const)(
+    "uses mobile %s+Enter to complete before executing a suggestion",
+    async (modifier) => {
+      mobile = true;
+      const textarea = composer();
+      type(textarea, "/co");
+
+      expect(fireEvent.keyDown(textarea, { key: "Enter", [modifier]: true })).toBe(false);
+      expect(textarea.value).toBe("/compact");
+      expect(fakes.compactSession).not.toHaveBeenCalled();
+      expect(fakes.submitRun).not.toHaveBeenCalled();
+
+      expect(fireEvent.keyDown(textarea, { key: "Enter", [modifier]: true })).toBe(false);
+      await waitFor(() => expect(fakes.compactSession).toHaveBeenCalledWith("session"));
+      expect(fakes.submitRun).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps desktop bare Enter submission and Shift+Enter newline behavior", async () => {
+    const textarea = composer();
+    type(textarea, "desktop prompt");
+
+    expect(textarea.getAttribute("enterkeyhint")).toBeNull();
+    expect(fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true })).toBe(true);
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+
+    expect(fireEvent.keyDown(textarea, { key: "Enter" })).toBe(false);
+    await waitFor(() => expect(fakes.submitRun).toHaveBeenCalledWith("session", "desktop prompt"));
+  });
+});
+
+describe("slash-command suggestions", () => {
+  it("offers goal commands only to direct behaviors", () => {
+    const orchestrator = composer({ behavior: "orchestrator" });
+    type(orchestrator, "/g");
+    expect(screen.getByRole("listbox").textContent).toContain("No matching commands");
+    expect(screen.queryByRole("option", { name: /goal/i })).toBeNull();
+
+    cleanup();
+    const direct = composer({ behavior: "direct" });
+    type(direct, "/g");
+    expect(screen.getByRole("option", { name: /goal/i })).toBeTruthy();
+  });
+
+  it("opens from the initial token, filters case-insensitively, and exposes active-option semantics", () => {
+    const textarea = composer();
+    type(textarea, "  /C");
+
+    const listbox = screen.getByRole("listbox", { name: "Slash commands" });
+    const option = screen.getByRole("option", { name: /compact/i });
+    expect(option.getAttribute("aria-selected")).toBe("true");
+    expect(textarea.getAttribute("aria-expanded")).toBe("true");
+    expect(textarea.getAttribute("aria-controls")).toBe(listbox.id);
+    expect(textarea.getAttribute("aria-activedescendant")).toBe(option.id);
+    expect(screen.getByRole("status").textContent).toContain("1 slash command available");
+    expect(option.querySelector(".text-basic-secondary")?.className).not.toContain("truncate");
+
+    type(textarea, "  /CO");
+    expect(screen.getByRole("option", { name: /compact/i })).toBeTruthy();
+  });
+
+  it("does not open for ordinary prose or path-like text", () => {
+    const textarea = composer();
+    type(textarea, "Please mention /compact in the documentation");
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    type(textarea, "/tmp/session");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("shows no matches and waits for dismissal before unknown-command submission", async () => {
+    const textarea = composer();
+    fakes.submitRun.mockRejectedValueOnce(new Error("unknown slash command: /xyz"));
+    type(textarea, "/xyz");
+
+    expect(screen.getByRole("listbox").textContent).toContain("No matching commands");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await Promise.resolve();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("/xyz");
+
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.submitRun).toHaveBeenCalledWith("session", "/xyz"));
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    await waitFor(() =>
+      // The composer reports through `humanErrorText`, which opens a backend
+      // message as a sentence — the server sends this one lower-case.
+      expect(screen.getByText("Failed to send: Unknown slash command: /xyz")).toBeTruthy(),
+    );
+  });
+
+  it("clamps arrow navigation and Tab-completes without execution", () => {
+    commandFixtures = [
+      compactDefinition,
+      {
+        command: "compact",
+        name: "continue",
+        description: "Continue the session",
+        accepts_arguments: false,
+      },
+    ];
+    const textarea = composer();
+    type(textarea, "/c");
+
+    fireEvent.keyDown(textarea, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: /continue/i }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    fireEvent.keyDown(textarea, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: /continue/i }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    fireEvent.keyDown(textarea, { key: "Tab" });
+
+    expect(textarea.value).toBe("/continue");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  it("first Enter completes and the subsequent Enter executes compact", async () => {
+    const textarea = composer();
+    type(textarea, "/co");
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("/compact");
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.compactSession).toHaveBeenCalledWith("session"));
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it("submits discovered MCP prompt commands through the ordinary prompt API", async () => {
+    commandFixtures = [
+      {
+        command: "mcp_prompt",
+        name: "mcp__docs__review",
+        description: "Review a document (MCP server: docs)",
+        accepts_arguments: true,
+        arguments: [{ name: "tone", description: "Review tone", required: true }],
+      },
+    ];
+    const textarea = composer();
+    type(textarea, '/mcp__docs__review {"tone":"strict"}');
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(fakes.submitRun).toHaveBeenCalledWith(
+        "session",
+        '/mcp__docs__review {"tone":"strict"}',
+      ),
+    );
+  });
+
+  it("Send completes an active suggestion before executing it", async () => {
+    const textarea = composer();
+    type(textarea, "/co");
+    const send = screen.getByRole("button", { name: "Send" });
+
+    expect(fireEvent.pointerDown(send)).toBe(false);
+    fireEvent.click(send);
+    expect(textarea.value).toBe("/compact");
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+
+    fireEvent.click(send);
+    await waitFor(() => expect(fakes.compactSession).toHaveBeenCalledWith("session"));
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it("pointer completion keeps focus and argument commands append one space", () => {
+    commandFixtures = [
+      {
+        command: "goal",
+        name: "run",
+        description: "Run a workset",
+        accepts_arguments: true,
+      },
+    ];
+    const textarea = composer();
+    type(textarea, "/r");
+    const option = screen.getByRole("option", { name: /run/i });
+
+    fireEvent.pointerDown(option);
+    fireEvent.click(option);
+
+    expect(textarea.value).toBe("/run ");
+    expect(textarea.selectionStart).toBe(5);
+    expect(document.activeElement).toBe(textarea);
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps Escape and completion dismissed until the value changes", () => {
+    const textarea = composer();
+    type(textarea, "/");
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    textarea.blur();
+    textarea.focus();
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    type(textarea, "/c");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    type(textarea, "/compac");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+  });
+
+  it("preserves Shift+Enter and ignores popup and submit keys during composition", () => {
+    const textarea = composer();
+    type(textarea, "/c");
+
+    fireEvent.keyDown(textarea, { key: "ArrowDown", isComposing: true });
+    fireEvent.keyDown(textarea, { key: "Tab", isComposing: true });
+    fireEvent.keyDown(textarea, { key: "Escape", isComposing: true });
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    expect(textarea.value).toBe("/c");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it("deduplicates submits while command metadata is loading", async () => {
+    const pending = Promise.withResolvers<SlashCommandDefinition[]>();
+    commandFixtures = undefined;
+    // A failed mount fetch leaves the query idle with no data, so the
+    // component's own refetch is the call that reaches the fake.
+    fakes.listSessionCommands.mockRejectedValue(new Error("mount skipped"));
+    const textarea = composer();
+    await waitFor(() => expect(fakes.listSessionCommands).toHaveBeenCalledOnce());
+    fakes.listSessionCommands.mockClear();
+    fakes.listSessionCommands.mockReturnValueOnce(pending.promise);
+    type(textarea, "/compact");
+    fireEvent.keyDown(textarea, { key: "Escape" });
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(fakes.listSessionCommands).toHaveBeenCalledOnce();
+
+    pending.resolve([compactDefinition]);
+    await waitFor(() => expect(fakes.compactSession).toHaveBeenCalledOnce());
+  });
+
+  it("gates slash submission on metadata but leaves ordinary prompts available", async () => {
+    commandFixtures = undefined;
+    // A failed mount fetch leaves the query idle with no data, so the
+    // component's own refetch is the call that reaches the fake.
+    fakes.listSessionCommands.mockRejectedValue(new Error("mount skipped"));
+    const textarea = composer();
+    await waitFor(() => expect(fakes.listSessionCommands).toHaveBeenCalledOnce());
+    fakes.listSessionCommands.mockClear();
+    fakes.listSessionCommands.mockResolvedValue([compactDefinition]);
+    type(textarea, "/compact");
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() => expect(fakes.listSessionCommands).toHaveBeenCalledOnce());
+    await waitFor(() => expect(fakes.compactSession).toHaveBeenCalledWith("session"));
+
+    cleanup();
+    commandFixtures = undefined;
+    fakes.listSessionCommands.mockRejectedValue(new Error("unavailable"));
+    const failedTextarea = composer();
+    await waitFor(() => expect(fakes.listSessionCommands).toHaveBeenCalled());
+    type(failedTextarea, "/compact");
+    fireEvent.keyDown(failedTextarea, { key: "Escape" });
+    fireEvent.keyDown(failedTextarea, { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("Unable to load slash commands")).toBeTruthy());
+    expect(fakes.compactSession).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    commandFixtures = undefined;
+    const ordinaryTextarea = composer();
+    type(ordinaryTextarea, "ordinary prompt");
+    fireEvent.keyDown(ordinaryTextarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.submitRun).toHaveBeenCalledWith("session", "ordinary prompt"));
+  });
+});
+
+describe("direct inbox and goal journeys", () => {
+  it.each([false, true])("offers no subagent launch control (mobile: %s)", (phone) => {
+    mobile = phone;
+    for (const behavior of ["direct", "direct-with-orchestrator"] as const) {
+      composer({ behavior });
+      for (const name of ["Spawn", "Launch coding agent", "Launch NAC orchestrator"]) {
+        expect(screen.queryByRole("button", { name })).toBeNull();
+      }
+      cleanup();
+    }
+  });
+
+  it("fails closed until ownership is known and keeps delegated transcripts non-composable", () => {
+    composer({ entryAvailable: false }, false);
+    expect(screen.getByText("Loading session controls…")).toBeTruthy();
+    expect(screen.queryByRole("combobox", { name: "Message" })).toBeNull();
+    cleanup();
+
+    composer(
+      {
+        behavior: "direct",
+        lineage: {
+          kind: "traditional-child",
+          parent_session_id: "parent",
+          root_session_id: "parent",
+          description: "Review ownership",
+        },
+      },
+      false,
+    );
+    expect(screen.getByRole("textbox", { name: "Send a message" })).toBeTruthy();
+    expect(screen.queryByRole("combobox", { name: "Message" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Permissions" })).toBeTruthy();
+  });
+
+  it("preserves a steer drafted while the initial run submission settles", async () => {
+    const submitted = Promise.withResolvers<{
+      status: "accepted";
+      requestId: string;
+      response: { run_id: string; client_id: null; display_prompt: string };
+    }>();
+    fakes.submitRun.mockReturnValue(submitted.promise);
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "start the run");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(fakes.submitRun).toHaveBeenCalled());
+
+    type(textarea, "drafted steer");
+    submitted.resolve({
+      status: "accepted",
+      requestId: "request-live",
+      response: {
+        run_id: "run-live",
+        client_id: null,
+        display_prompt: "start the run",
+      },
+    });
+
+    await waitFor(() => expect(textarea.value).toBe("drafted steer"));
+  });
+
+  it("uses ordinary active-run Send for a durable steer", async () => {
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "adjust the implementation");
+
+    fireEvent.click(screen.getByRole("button", { name: "Steer active run" }));
+
+    await waitFor(() =>
+      expect(fakes.createInboxItem).toHaveBeenCalledWith(
+        "session",
+        "steer",
+        "adjust the implementation",
+      ),
+    );
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("");
+  });
+
+  it("steers an active classic orchestrator while keeping Stop separate", async () => {
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer({ behavior: "orchestrator" });
+    type(textarea, "adjust the orchestration");
+
+    fireEvent.click(screen.getByRole("button", { name: "Steer active run" }));
+
+    await waitFor(() =>
+      expect(fakes.steerOrchestrator).toHaveBeenCalledWith("session", "adjust the orchestration"),
+    );
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(fakes.createInboxItem).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("");
+    expect(screen.getByRole("button", { name: "Stop run" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Queue Next" })).toBeNull();
+  });
+
+  it("keeps a classic steering draft when the active run finishes before acceptance", async () => {
+    fakes.steerOrchestrator.mockRejectedValueOnce(new Error("the active run already finished"));
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer({ behavior: "orchestrator" });
+    type(textarea, "preserve this steer");
+
+    fireEvent.click(screen.getByRole("button", { name: "Steer active run" }));
+
+    expect(await screen.findByText(/Failed to send: The active run already finished/)).toBeTruthy();
+    expect(textarea.value).toBe("preserve this steer");
+  });
+
+  it("keeps idle classic orchestrator submission unchanged", async () => {
+    const textarea = composer({ behavior: "orchestrator" });
+    type(textarea, "start ordinary work");
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(fakes.submitRun).toHaveBeenCalledWith("session", "start ordinary work"),
+    );
+    expect(fakes.steerOrchestrator).not.toHaveBeenCalled();
+  });
+
+  it("offers Queue Next and a separate direct-run stop action", async () => {
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "follow-up work");
+
+    fireEvent.click(screen.getByRole("button", { name: "Queue Next" }));
+    await waitFor(() =>
+      expect(fakes.createInboxItem).toHaveBeenCalledWith("session", "queue", "follow-up work"),
+    );
+    expect(screen.getByRole("button", { name: "Stop run" })).toBeTruthy();
+  });
+
+  it("stops by session identity when the list entry is unavailable", async () => {
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working",
+      started_at_epoch_ms: Date.now(),
+    });
+    composer({ behavior: "direct", entryAvailable: false, snapshotAvailable: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop run" }));
+
+    await waitFor(() => expect(fakes.cancelActiveRun).toHaveBeenCalledWith("session"));
+  });
+
+  it("keeps Stop available when both ownership projections are unavailable", async () => {
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working",
+      started_at_epoch_ms: Date.now(),
+    });
+    composer({ behavior: "direct", entryAvailable: false, snapshotAvailable: false }, false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop run" }));
+
+    await waitFor(() => expect(fakes.cancelActiveRun).toHaveBeenCalledWith("session"));
+  });
+
+  it("does not project another session's active run into the visible composer", () => {
+    resetRuntime("other-session");
+    syncRunFromSnapshot({
+      run_id: "run-live",
+      prompt_preview: "working elsewhere",
+      started_at_epoch_ms: Date.now(),
+    });
+    composer({ behavior: "direct", entryAvailable: false, snapshotAvailable: false }, false);
+
+    expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
+  });
+
+  it("shows pending durable input and permits delivery edits and cancellation", async () => {
+    composer({ behavior: "direct", inboxItems: [inbox()] });
+
+    expect(screen.getByLabelText("Pending messages").textContent).toContain("pending instruction");
+    fireEvent.click(screen.getByRole("button", { name: "Change to queue" }));
+    await waitFor(() =>
+      expect(fakes.updateInboxItem).toHaveBeenCalledWith("session", 7, 2, "queue"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(fakes.cancelInboxItem).toHaveBeenCalledWith("session", 7, 3));
+  });
+
+  it("renders typed pending terminal evidence passively and leaves lookalikes ordinary", async () => {
+    const { selectionEvidence } =
+      await import("@/app/features/terminal-selection/attachmentFixture.test-support");
+    const pending = {
+      ...inbox("queue"),
+      prompt: "exact canonical envelope",
+      terminal_selection: selectionEvidence,
+    };
+    composer({ behavior: "direct", inboxItems: [pending] });
+    expect(screen.getByRole("region", { name: "Terminal selection" })).toBeTruthy();
+    expect(screen.getByLabelText("Attached terminal output").textContent).toBe(
+      selectionEvidence.text,
+    );
+    expect(screen.getByLabelText("Attached accompanying message").textContent).toBe(
+      selectionEvidence.user_text,
+    );
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(fakes.createInboxItem).not.toHaveBeenCalled();
+    expect(fakes.updateInboxItem).not.toHaveBeenCalled();
+    expect(fakes.cancelInboxItem).not.toHaveBeenCalled();
+    cleanup();
+    composer({
+      behavior: "direct",
+      inboxItems: [
+        {
+          ...inbox(),
+          prompt: '{"source_kind":"user_supplied_rendered_selection","text":"copied"}',
+        },
+      ],
+    });
+    expect(screen.queryByRole("region", { name: "Terminal selection" })).toBeNull();
+    expect(screen.getByLabelText("Pending messages").textContent).toContain('"text":"copied"');
+  });
+
+  it("surfaces pending-message edit and cancellation failures", async () => {
+    fakes.updateInboxItem.mockRejectedValueOnce(new Error("edit conflict"));
+    composer({ behavior: "direct", inboxItems: [inbox()] });
+    fireEvent.click(screen.getByRole("button", { name: "Change to queue" }));
+    expect(await screen.findByText(/Unable to change pending message: edit conflict/)).toBeTruthy();
+
+    cleanup();
+    fakes.cancelInboxItem.mockRejectedValueOnce(new Error("cancel conflict"));
+    composer({ behavior: "direct", inboxItems: [inbox()] });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(
+      await screen.findByText(/Unable to cancel pending message: cancel conflict/),
+    ).toBeTruthy();
+  });
+
+  it("implements literal goal creation and controls without sending a model prompt", async () => {
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "/goal ship the durable slice");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(fakes.createGoal).toHaveBeenCalledWith("session", {
+        objective: "ship the durable slice",
+      }),
+    );
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+
+    cleanup();
+    const pause = composer({ behavior: "direct", goalState: goal() });
+    type(pause, "/goal pause");
+    fireEvent.keyDown(pause, { key: "Enter" });
+    await waitFor(() =>
+      expect(fakes.updateGoal).toHaveBeenCalledWith("session", "goal-1", {
+        expected_version: 3,
+        status: "paused",
+      }),
+    );
+  });
+
+  it("opens the detailed goal editor for /goal edit", async () => {
+    const textarea = composer({ behavior: "direct", goalState: goal() });
+    type(textarea, "/goal edit");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(await screen.findByRole("textbox", { name: "Goal objective" })).toBeTruthy();
+    expect(screen.getByText("Current Goal")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close goal editor" })).toBeTruthy();
+    expect(screen.getByDisplayValue("existing objective")).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    "preserves a goal draft across viewport changes from mobile=%s",
+    async (phone) => {
+      mobile = phone;
+      const textarea = composer({
+        behavior: "direct",
+        goalState: { ...goal(), token_budget: 500 },
+      });
+      fireEvent.blur(textarea);
+      fireEvent.click(screen.getByRole("button", { name: "Edit goal: Active" }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Goal objective" }), {
+        target: { value: "unsaved objective" },
+      });
+      fireEvent.keyDown(screen.getByRole("slider", { name: "Token budget" }), {
+        key: "ArrowRight",
+      });
+
+      resizeComposer(!phone);
+      expect(
+        (screen.getByRole("textbox", { name: "Goal objective" }) as HTMLTextAreaElement).value,
+      ).toBe("unsaved objective");
+      expect(
+        screen.getByRole("slider", { name: "Token budget" }).getAttribute("aria-valuenow"),
+      ).toBe("600");
+      resizeComposer(phone);
+      expect(
+        (screen.getByRole("textbox", { name: "Goal objective" }) as HTMLTextAreaElement).value,
+      ).toBe("unsaved objective");
+      expect(
+        screen.getByRole("slider", { name: "Token budget" }).getAttribute("aria-valuenow"),
+      ).toBe("600");
+      fireEvent.click(screen.getByRole("button", { name: "Update" }));
+      await waitFor(() =>
+        expect(fakes.updateGoal).toHaveBeenCalledWith("session", "goal-1", {
+          expected_version: 3,
+          objective: "unsaved objective",
+          token_budget: 600,
+        }),
+      );
+    },
+  );
+
+  it("preserves a pending or failed goal edit across viewport changes", async () => {
+    const update = Promise.withResolvers<SessionGoalRecord>();
+    fakes.updateGoal.mockImplementationOnce(() => update.promise);
+    const textarea = composer({ behavior: "direct", goalState: goal() });
+    fireEvent.blur(textarea);
+    fireEvent.click(screen.getByRole("button", { name: "Edit goal: Active" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Goal objective" }), {
+      target: { value: "keep this failed edit" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    resizeComposer(true);
+    expect((screen.getByRole("button", { name: "Update" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    await act(async () => update.reject(new Error("version conflict")));
+    expect(await screen.findByText(/Unable to update goal: version conflict/)).toBeTruthy();
+    resizeComposer(false);
+    expect(
+      (screen.getByRole("textbox", { name: "Goal objective" }) as HTMLTextAreaElement).value,
+    ).toBe("keep this failed edit");
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() =>
+      expect(fakes.updateGoal).toHaveBeenLastCalledWith("session", "goal-1", {
+        expected_version: 3,
+        objective: "keep this failed edit",
+      }),
+    );
+  });
+
+  it("starts from the stored goal after explicitly closing a resized editor", () => {
+    const textarea = composer({ behavior: "direct", goalState: { ...goal(), token_budget: 500 } });
+    fireEvent.blur(textarea);
+    fireEvent.click(screen.getByRole("button", { name: "Edit goal: Active" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Goal objective" }), {
+      target: { value: "discard only on close" },
+    });
+    resizeComposer(true);
+    resizeComposer(false);
+    fireEvent.click(screen.getByRole("button", { name: "Close goal editor" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit goal: Active" }));
+    expect(
+      (screen.getByRole("textbox", { name: "Goal objective" }) as HTMLTextAreaElement).value,
+    ).toBe("existing objective");
+    expect(screen.getByRole("slider", { name: "Token budget" }).getAttribute("aria-valuenow")).toBe(
+      "500",
+    );
+    expect(fakes.updateGoal).not.toHaveBeenCalled();
+  });
+});
+
+describe("skill suggestions", () => {
+  it("opens at a dollar prefix with accessible options and a truncated description", () => {
+    const textarea = composer();
+    type(textarea, "$c");
+
+    const listbox = screen.getByRole("listbox", { name: "Skills" });
+    const option = screen.getByRole("option", { name: /code-review/i });
+    expect(option.getAttribute("aria-selected")).toBe("true");
+    expect(option.querySelector(".truncate")?.textContent).toContain("Review code");
+    expect(textarea.getAttribute("aria-expanded")).toBe("true");
+    expect(textarea.getAttribute("aria-controls")).toBe(listbox.id);
+    expect(textarea.getAttribute("aria-activedescendant")).toBe(option.id);
+    expect(screen.getByRole("status").textContent).toContain("1 skill available");
+  });
+
+  it("canonically completes an interior reference without submitting", () => {
+    const textarea = composer();
+    type(textarea, "Use $co, please");
+    textarea.setSelectionRange(7, 7);
+    fireEvent.select(textarea);
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(textarea.value).toBe("Use $code-review, please");
+    expect(textarea.selectionStart).toBe(16);
+    expect(document.activeElement).toBe(textarea);
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps focus long enough for Send to complete a skill suggestion", () => {
+    const textarea = composer();
+    type(textarea, "$te");
+    const send = screen.getByRole("button", { name: "Send" });
+
+    expect(fireEvent.pointerDown(send)).toBe(false);
+    fireEvent.click(send);
+
+    expect(textarea.value).toBe("$test");
+    expect(document.activeElement).toBe(textarea);
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+
+  it("clears the completion caret when the canonical reference is already present", () => {
+    const textarea = composer();
+    type(textarea, "$test");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.selectionStart).toBe(5);
+
+    type(textarea, "$testx");
+    expect(textarea.selectionStart).toBe(6);
+  });
+
+  it("does not offer a completion whose preserved suffix invalidates expansion", () => {
+    const textarea = composer();
+    type(textarea, "$codeX");
+    textarea.setSelectionRange(5, 5);
+    fireEvent.select(textarea);
+
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+  });
+
+  it("dismisses one caret query without suppressing another in the same value", () => {
+    const textarea = composer();
+    type(textarea, "$co and $te");
+    textarea.setSelectionRange(3, 3);
+    fireEvent.select(textarea);
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    fireEvent.select(textarea);
+    expect(screen.getByRole("option", { name: /\$test/i })).toBeTruthy();
+  });
+
+  it("renders only exact expandable references in the inert mirror", () => {
+    const textarea = composer();
+    type(textarea, "Use $code-review, not $code-reviewer or $unknown");
+
+    const emphasized = screen.getByText("$code-review", { selector: "strong" });
+    const mirror = emphasized.closest("[aria-hidden='true']");
+    expect(mirror).toBeTruthy();
+    expect(mirror?.className).toContain("pointer-events-none");
+    expect(mirror?.textContent).toContain("$code-reviewer");
+    expect(mirror?.querySelectorAll("strong")).toHaveLength(1);
+    expect(emphasized.className).toContain("text-danger-primary");
+    expect(emphasized.style.webkitTextStroke).toBe("0.45px currentColor");
+    expect(textarea.style.color).toBe("transparent");
+  });
+
+  it("matches the textarea gutter and adopts its scroll when the mirror mounts", () => {
+    const textarea = composer();
+    type(textarea, "$code-revie");
+    textarea.scrollTop = 37;
+
+    type(textarea, "$code-review");
+
+    const mirror = screen.getByText("$code-review", { selector: "strong" }).parentElement;
+    expect(mirror?.scrollTop).toBe(37);
+    expect(mirror?.className).toContain("[scrollbar-gutter:stable]");
+    expect(textarea.className).toContain("[scrollbar-gutter:stable]");
+  });
+
+  it("restores mirror scroll after the mobile collapsed view remounts it", () => {
+    mobile = true;
+    const textarea = composer();
+    type(textarea, "$code-review");
+    textarea.scrollTop = 29;
+    fireEvent.scroll(textarea);
+
+    textarea.blur();
+    textarea.focus();
+
+    const mirror = screen
+      .getAllByText("$code-review", { selector: "strong" })
+      .map((element) => element.closest("[aria-hidden='true']"))
+      .find((element) => element !== null);
+    expect(mirror?.scrollTop).toBe(29);
+  });
+
+  it("keeps loading feedback open while a skill prefix is typed", () => {
+    skillFixtures = undefined;
+    const textarea = composer();
+    type(textarea, "$foo bar");
+
+    expect(screen.getByRole("listbox", { name: "Skills" }).textContent).toContain("Loading skills");
+    expect(screen.getByRole("status").textContent).toBe("Loading skills");
+  });
+
+  it("allows ordinary submission while skill metadata is unavailable", async () => {
+    skillFixtures = undefined;
+    fakes.listSessionSkills.mockRejectedValue(new Error("unavailable"));
+    const textarea = composer();
+    type(textarea, "$");
+
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Skills unavailable"));
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() => expect(fakes.submitRun).toHaveBeenCalledWith("session", "$"));
+  });
+});
+
+describe("human command composer integration", () => {
+  it("preserves command bytes and bypasses slash/model/inbox delivery", async () => {
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "!  printf exact\n\t");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.submitShellCommand).toHaveBeenCalledOnce());
+    expect(fakes.submitShellCommand.mock.calls[0][1].command).toBe("  printf exact\n\t");
+    await waitFor(() => expect(textarea.value).toBe(""));
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(fakes.createInboxItem).not.toHaveBeenCalled();
+    expect(fakes.steerOrchestrator).not.toHaveBeenCalled();
+  });
+  it("sends escaped bang as literal prompt rather than a human command", async () => {
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "\\!literal");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.submitRun).toHaveBeenCalled());
+    expect(fakes.submitRun.mock.calls[0][1]).toBe("!literal");
+    expect(fakes.submitShellCommand).not.toHaveBeenCalled();
+  });
+  it("rejects bang execution in a classic chat or while a human command is active", async () => {
+    for (const behavior of ["orchestrator", "direct"] as const) {
+      const textarea = composer({
+        behavior,
+        snapshotAvailable: true,
+        shellCommands: [
+          {
+            request_id: "active",
+            operation_id: "operation",
+            command: "sleep",
+            state: "started",
+            timeout_ms: 30000,
+            accepted_at_epoch_ms: 1,
+            stdout: "",
+            stderr: "",
+          },
+        ],
+      });
+      type(textarea, "!echo must-not-run");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await screen.findByText("Shell commands require an idle direct-primary chat");
+      expect(fakes.submitShellCommand).not.toHaveBeenCalled();
+      expect(fakes.submitRun).not.toHaveBeenCalled();
+      cleanup();
+    }
+  });
+  it("does not clear a newer draft when the command admission settles", async () => {
+    let accept!: (value: unknown) => void;
+    fakes.submitShellCommand.mockImplementation(
+      (_session, request) =>
+        new Promise((resolve) => {
+          accept = () => resolve({ request_id: request.request_id, state: "completed" });
+        }),
+    );
+    const textarea = composer({ behavior: "direct" });
+    type(textarea, "!first");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.submitShellCommand).toHaveBeenCalledOnce());
+    type(textarea, "next draft");
+    await act(async () => accept(undefined));
+    await waitFor(() => expect(textarea.value).toBe("next draft"));
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+  });
+});
+
+describe("primary composer draft lifetime", () => {
+  it("restores independent exact text across session remounts without sending", () => {
+    const text = "  雪🙂\n\n!echo untouched  \n";
+    type(composer(), text);
+    cleanup();
+    resetRuntime("b");
+    type(composer({ sessionId: "b" }), "/compact");
+    cleanup();
+    resetRuntime("session");
+    expect(composer().value).toBe(text);
+    cleanup();
+    resetRuntime("b");
+    expect(composer({ sessionId: "b" }).value).toBe("/compact");
+    expect(fakes.submitRun).not.toHaveBeenCalled();
+    expect(fakes.submitShellCommand).not.toHaveBeenCalled();
+    expect(fakes.compactSession).not.toHaveBeenCalled();
+  });
+
+  it("clears a successful originating submission after navigation without touching another draft", async () => {
+    const result = Promise.withResolvers<unknown>();
+    fakes.steerOrchestrator.mockReturnValue(result.promise);
+    syncRunFromSnapshot({
+      run_id: "run",
+      prompt_preview: "running",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer();
+    type(textarea, "send me");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.steerOrchestrator).toHaveBeenCalled());
+    cleanup();
+    resetRuntime("b");
+    const other = composer({ sessionId: "b" });
+    type(other, "keep b");
+    await act(async () => result.resolve({ status: "queued" }));
+    expect(other.value).toBe("keep b");
+    expect(getDraft("session").text).toBe("");
+    cleanup();
+    resetRuntime("session");
+    expect(composer().value).toBe("");
+  });
+
+  it("retains identical text at a newer revision after a late successful steer", async () => {
+    const result = Promise.withResolvers<unknown>();
+    fakes.steerOrchestrator.mockReturnValue(result.promise);
+    syncRunFromSnapshot({
+      run_id: "run",
+      prompt_preview: "running",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer();
+    type(textarea, "same text");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.steerOrchestrator).toHaveBeenCalled());
+    type(textarea, "different");
+    type(textarea, "same text");
+    await act(async () => result.resolve({ status: "queued" }));
+    expect(textarea.value).toBe("same text");
+    cleanup();
+    expect(composer().value).toBe("same text");
+  });
+
+  it("retains rejected text after leaving the originating view", async () => {
+    const result = Promise.withResolvers<unknown>();
+    fakes.steerOrchestrator.mockReturnValue(result.promise);
+    syncRunFromSnapshot({
+      run_id: "run",
+      prompt_preview: "running",
+      started_at_epoch_ms: Date.now(),
+    });
+    const textarea = composer();
+    type(textarea, "retry later");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(fakes.steerOrchestrator).toHaveBeenCalled());
+    cleanup();
+    resetRuntime(null);
+    await act(async () => result.reject(new Error("rejected")));
+    resetRuntime("session");
+    expect(composer().value).toBe("retry later");
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+  });
+});
+
+it("checkpoints explicit draft handoffs and completions without auto-sending restored text", () => {
+  const textarea = composer();
+  act(() => draftPrompt("session", "  handoff\nexact  "));
+  expect(textarea.value).toBe("  handoff\nexact  ");
+  cleanup();
+  const restored = composer();
+  expect(restored.value).toBe("  handoff\nexact  ");
+  type(restored, "/comp");
+  fireEvent.keyDown(restored, { key: "Tab" });
+  cleanup();
+  expect(composer().value).toBe("/compact");
+  expect(fakes.submitRun).not.toHaveBeenCalled();
+  expect(fakes.compactSession).not.toHaveBeenCalled();
+});
+
+it("keeps a field draft even when a starter prompt has identical text", async () => {
+  const textarea = composer();
+  type(textarea, "starter text");
+  act(() => sendPrompt("starter text"));
+  await waitFor(() => expect(fakes.submitRun).toHaveBeenCalledOnce());
+  await act(async () => {});
+  expect(textarea.value).toBe("starter text");
+});
+
+it("keeps history previews ephemeral and checkpoints committed history", () => {
+  const options = {
+    snapshotAvailable: true,
+    messages: [
+      { role: "user", content: "earlier exact\ntext" },
+    ] as SessionSnapshotResponse["messages"],
+  };
+  const textarea = composer(options);
+  fireEvent.keyDown(textarea, { key: "ArrowUp" });
+  expect(textarea.value).toBe("");
+  expect(getDraft("session").text).toBe("");
+  cleanup();
+  const restored = composer(options);
+  expect(restored.value).toBe("");
+  fireEvent.keyDown(restored, { key: "ArrowUp" });
+  fireEvent.keyDown(restored, { key: "Tab" });
+  expect(restored.value).toBe("earlier exact\ntext");
+  cleanup();
+  expect(composer(options).value).toBe("earlier exact\ntext");
+});
+
+it.each(["send", "queue", "compact", "shell"] as const)(
+  "settles accepted %s after the originating view unmounts",
+  async (kind) => {
+    const result = Promise.withResolvers<unknown>();
+    const fake =
+      kind === "send"
+        ? fakes.submitRun
+        : kind === "queue"
+          ? fakes.createInboxItem
+          : kind === "compact"
+            ? fakes.compactSession
+            : fakes.submitShellCommand;
+    fake.mockReturnValue(result.promise);
+    if (kind === "queue")
+      syncRunFromSnapshot({
+        run_id: "live",
+        prompt_preview: "working",
+        started_at_epoch_ms: Date.now(),
+      });
+    const textarea = composer({ behavior: "direct" });
+    type(
+      textarea,
+      kind === "shell" ? "!echo accepted" : kind === "compact" ? "/compact" : "accepted prompt",
+    );
+    if (kind === "compact") fireEvent.keyDown(textarea, { key: "Escape" });
+    if (kind === "queue") fireEvent.click(screen.getByRole("button", { name: "Queue Next" }));
+    else fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(fake).toHaveBeenCalled());
+    cleanup();
+    resetRuntime("b");
+    const other = composer({ sessionId: "b" });
+    type(other, "keep other");
+    await act(async () =>
+      result.resolve(
+        kind === "send"
+          ? {
+              status: "accepted",
+              response: { run_id: "run", client_id: null, display_prompt: "accepted prompt" },
+            }
+          : kind === "shell"
+            ? { request_id: "command", state: "completed" }
+            : {},
+      ),
+    );
+    expect(other.value).toBe("keep other");
+    expect(getDraft("session").text).toBe("");
+  },
+);
+
+it.each(["send", "steer", "queue", "compact", "shell"] as const)(
+  "keeps an outstanding %s guarded across A → B → A remounts",
+  async (kind) => {
+    const result = Promise.withResolvers<unknown>();
+    const fake =
+      kind === "send"
+        ? fakes.submitRun
+        : kind === "steer"
+          ? fakes.steerOrchestrator
+          : kind === "queue"
+            ? fakes.createInboxItem
+            : kind === "compact"
+              ? fakes.compactSession
+              : fakes.submitShellCommand;
+    fake.mockReturnValue(result.promise);
+    const active = kind === "steer" || kind === "queue";
+    const options = {
+      behavior: kind === "steer" ? ("orchestrator" as const) : ("direct" as const),
+    };
+    const running = () => {
+      if (active)
+        syncRunFromSnapshot({
+          run_id: "live",
+          prompt_preview: "working",
+          started_at_epoch_ms: Date.now(),
+        });
+    };
+    running();
+    const text =
+      kind === "shell" ? "!echo once" : kind === "compact" ? "/compact" : "deliver this once";
+    const input = composer(options);
+    type(input, text);
+    if (kind === "compact") fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: kind === "queue" ? "Queue Next" : active ? "Steer active run" : "Send",
+      }),
+    );
+    await waitFor(() => expect(fake).toHaveBeenCalledOnce());
+    cleanup();
+    resetRuntime("b");
+    type(composer({ sessionId: "b" }), "separate draft");
+    cleanup();
+    resetRuntime("session");
+    running();
+    const restored = composer(options);
+    expect(restored.value).toBe(text);
+    if (kind === "compact") fireEvent.keyDown(restored, { key: "Escape" });
+    const send = screen.getByRole("button", {
+      name: kind === "queue" ? "Queue Next" : active ? "Steer active run" : "Send",
+    });
+    // A stale keyboard callback must also be unable to admit the revision twice.
+    fireEvent.keyDown(restored, { key: "Enter" });
+    await act(async () => {});
+    expect(fake).toHaveBeenCalledOnce();
+    expect((send as HTMLButtonElement).disabled).toBe(true);
+    type(restored, "newer draft");
+    await act(async () =>
+      result.resolve(
+        kind === "send"
+          ? {
+              status: "accepted",
+              response: { run_id: "run", client_id: null, display_prompt: text },
+            }
+          : kind === "shell"
+            ? { request_id: "command", state: "completed" }
+            : {},
+      ),
+    );
+    await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(false));
+    expect(restored.value).toBe("newer draft");
+    expect(getDraft("b").text).toBe("separate draft");
+  },
+);

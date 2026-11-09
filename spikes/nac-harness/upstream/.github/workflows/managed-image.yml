@@ -1,0 +1,93 @@
+name: Managed NAC image
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Immutable candidate from the caller's preparation job
+        required: true
+        type: string
+      quality_receipt:
+        description: Exact-candidate complete successful quality results from the same caller run
+        default: ''
+        type: string
+      policy_mode:
+        description: Event-bound policy mode from the caller; standalone runs derive it
+        default: ''
+        type: string
+      trusted_policy_sha:
+        description: Ordinary trusted policy pin; publication resolves canonical dev independently
+        default: ''
+        type: string
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-image-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.candidate.outputs.sha }}
+      short_sha: ${{ steps.candidate.outputs.short_sha }}
+      policy_mode: ${{ steps.policy.outputs.mode }}
+      policy_sha: ${{ steps.policy.outputs.policy_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+      - id: candidate
+        name: Resolve immutable candidate
+        shell: bash
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:12}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.22.1
+      - name: Bind image policy to the eligible caller event
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_POLICY_MODE: ${{ inputs.policy_mode }}
+          REQUESTED_POLICY_SHA: ${{ inputs.trusted_policy_sha }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: node scripts/security/image-policy.mjs select "$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
+  quality:
+    needs: prepare
+    uses: ./.github/workflows/managed-quality.yml
+    with:
+      source_sha: ${{ needs.prepare.outputs.sha }}
+      quality_receipt: ${{ inputs.quality_receipt }}
+
+  build-smoke:
+    needs: prepare
+    uses: ./.github/workflows/managed-image-build.yml
+    with:
+      source_sha: ${{ needs.prepare.outputs.sha }}
+      policy_mode: ${{ needs.prepare.outputs.policy_mode }}
+      trusted_policy_sha: ${{ needs.prepare.outputs.policy_sha }}
+
+  result:
+    name: Managed checks complete
+    if: ${{ always() }}
+    needs: [prepare, quality, build-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha || github.sha }}
+      - name: Reject any missing, skipped, cancelled or failed managed work
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EXPECTED_SHA: ${{ inputs.source_sha || github.sha }}
+        run: node .github/scripts/pr-checks.mjs managed-aggregate

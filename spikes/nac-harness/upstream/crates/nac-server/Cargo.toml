@@ -1,0 +1,50 @@
+[package]
+name = "nac-server"
+version = "0.1.4"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+name = "nac_server"
+
+[[bin]]
+name = "nac-web"
+path = "src/main.rs"
+
+[features]
+managed-fault-fixture = ["nac-core/managed-fault-fixture"]
+review-fixture = ["nac-core/review-fixture"]
+
+[dependencies]
+nac-contracts = { path = "../nac-contracts" }
+nac-core = { path = "../nac-core", features = ["openapi"] }
+nac-managed = { path = "../nac-managed", features = ["openapi"] }
+anyhow.workspace = true
+async-stream = "0.3"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+futures-core = "0.3"
+include_dir = "0.7"
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors"] }
+url = "2"
+uuid = { workspace = true, features = ["v4"] }
+utoipa.workspace = true
+utoipa-axum = "0.3"
+utoipa-swagger-ui = { version = "10.0.2", default-features = false, features = ["axum", "vendored"] }
+
+[dev-dependencies]
+base64.workspace = true
+flate2 = "1"
+nac-core = { path = "../nac-core", features = ["test-support"] }
+nac-managed = { path = "../nac-managed", features = ["openapi", "test-support"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2.workspace = true
+ring.workspace = true
+tower = { version = "0.5", features = ["util"] }
