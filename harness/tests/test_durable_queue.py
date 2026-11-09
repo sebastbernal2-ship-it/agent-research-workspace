@@ -234,6 +234,30 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.queue.claim_next("worker.next", now=201, lease_seconds=10), None,
         )
 
+    async def test_heartbeat_renews_lease_during_long_running_adapter(self):
+        coordinator = OrganizationCoordinator(self.store)
+
+        async def execute(_context):
+            await asyncio.sleep(1.2)
+            return ExecutionSignal.COMPLETED
+
+        def resolve(job):
+            descriptor = job["payload"]
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.heartbeat.g{job['leaseGeneration']}",
+                correlation_id=descriptor["correlationId"], actor=descriptor["actor"],
+                adapter=descriptor["adapter"], context_hash=descriptor["contextHash"],
+                verification_actor=descriptor["verificationActor"],
+                execute=execute, verify=lambda _: True,
+            )
+
+        outcome = await coordinator.run_queued(
+            self.queue, "worker.heartbeat", resolve, lease_seconds=1,
+        )
+        self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
+        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+
     async def test_supervised_worker_loop_runs_jobs_until_stop_requested(self):
         coordinator = OrganizationCoordinator(self.store)
         stop = asyncio.Event()
