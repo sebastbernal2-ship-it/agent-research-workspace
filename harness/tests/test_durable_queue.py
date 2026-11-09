@@ -424,6 +424,58 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(self.store.events(PROJECT_ID)), 6)
 
+    async def test_staged_receipt_import_requires_explicit_expired_lease_recovery(self):
+        claim = self.queue.claim_next("worker.receipt", now=650, lease_seconds=10)
+        output_lease = {
+            "jobId": "job.runtime", "workerId": "worker.receipt",
+            "leaseToken": claim["leaseToken"], "leaseGeneration": 1,
+        }
+        RunLedger(self.store).start(
+            PROJECT_ID, WORK_ID, run_id="run.receipt.g1", agent=SPECIALIST,
+            adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
+            occurred_at=NOW, queue_lease={**output_lease, "now": 651},
+        )
+        content_ref, content_hash = self.store.put_blob("staged receipt output")
+        receipt_event = {
+            "recordType": "event", "schemaVersion": "0.1",
+            "eventId": "event.receipt.queued", "projectId": PROJECT_ID,
+            "eventType": "discussion.message_added", "actor": SPECIALIST,
+            "occurredAt": NOW, "causationId": None, "correlationId": "queue.integration",
+            "idempotencyKey": "idem.event.receipt.queued",
+            "payload": {
+                "workId": WORK_ID, "threadId": "thread.receipt", "messageType": "status",
+                "contentRef": content_ref, "contentHash": content_hash,
+                "runId": "run.receipt.g1", "visibleTo": ["agent.vp"],
+            },
+        }
+        self.store.prepare_adapter_invocation("invocation.queued-receipt", PROJECT_ID, "a" * 64)
+        self.store.start_adapter_invocation("invocation.queued-receipt")
+        with self.store.queued_write_context(output_lease, lambda: 652):
+            self.store.stage_adapter_receipt("invocation.queued-receipt", [receipt_event])
+        self.assertIsNone(self.queue.claim_next("worker.recovery", now=661, lease_seconds=10))
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "requires its active execution lease context"):
+            self.store.commit_adapter_receipt("invocation.queued-receipt")
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "not covered by explicit expired-lease recovery"):
+            self.store.commit_adapter_receipt(
+                "invocation.queued-receipt", recovery_job_ids={"wrong.job"},
+                attest_no_live_worker=True,
+            )
+        self.assertEqual(
+            RunLedger(self.store).recover_interrupted(
+                PROJECT_ID, occurred_at=NOW, recovery_job_ids={"job.runtime"},
+                attest_no_live_worker=True,
+            ),
+            ["run.receipt.g1"],
+        )
+        invocation = next(
+            item for item in self.store.list_adapter_invocations(PROJECT_ID)
+            if item["invocationId"] == "invocation.queued-receipt"
+        )
+        self.assertEqual(invocation["state"], "imported")
+        state = Projector(self.store).replay(PROJECT_ID)
+        self.assertEqual(state["agentRuns"]["run.receipt.g1"]["status"], "interrupted")
+        self.assertEqual(len(state["messages"]), 1)
+
     async def test_queued_execution_rejects_canonical_write_after_expiry_before_recovery_poll(self):
         coordinator = OrganizationCoordinator(self.store)
         now = [700.0]

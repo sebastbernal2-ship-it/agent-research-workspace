@@ -666,14 +666,61 @@ class SQLiteEventStore:
         finally:
             conn.close()
 
-    def commit_adapter_receipt(self, invocation_id: str) -> list[AppendResult]:
-        """Atomically append a staged receipt and mark its invocation imported."""
+    @staticmethod
+    def _assert_recovery_receipt_fences(
+        conn: sqlite3.Connection,
+        events: list[dict[str, Any]],
+        recovery_job_ids: set[str],
+    ) -> None:
+        run_refs = {
+            (event.get("projectId"), event["payload"].get("runId"))
+            for event in events
+            if isinstance(event, dict) and isinstance(event.get("payload"), dict)
+            and isinstance(event["payload"].get("runId"), str)
+        }
+        fenced_jobs: set[str] = set()
+        for project_id, run_id in run_refs:
+            fence = conn.execute(
+                "SELECT job_id, lease_generation FROM queued_run_fences WHERE project_id=? AND run_id=?",
+                (project_id, run_id),
+            ).fetchone()
+            if fence is None:
+                continue
+            fenced_jobs.add(fence["job_id"])
+            lease = conn.execute(
+                "SELECT state, lease_generation FROM scheduled_work WHERE job_id=? AND project_id=?",
+                (fence["job_id"], project_id),
+            ).fetchone()
+            if (
+                fence["job_id"] not in recovery_job_ids or lease is None
+                or lease["state"] != "recovery_required"
+                or lease["lease_generation"] != fence["lease_generation"]
+            ):
+                raise ConcurrentWriteConflict("staged receipt is not covered by explicit expired-lease recovery")
+        if fenced_jobs and not fenced_jobs.issubset(recovery_job_ids):
+            raise ConcurrentWriteConflict("recovery authorization does not cover every queued receipt run")
+
+    def commit_adapter_receipt(
+        self,
+        invocation_id: str,
+        *,
+        recovery_job_ids: set[str] | None = None,
+        attest_no_live_worker: bool = False,
+    ) -> list[AppendResult]:
+        """Atomically append a receipt under its live lease or explicit expired-job recovery."""
         conn = self._connect()
         lease_context = self._queue_lease_context.get()
         queue_lease = None
         if lease_context is not None:
             queue_lease = {key: value for key, value in lease_context.items() if key != "clock"}
             queue_lease["now"] = lease_context["clock"]()
+        recovery_job_ids = set() if recovery_job_ids is None else recovery_job_ids
+        if recovery_job_ids and (
+            attest_no_live_worker is not True or queue_lease is not None
+            or not all(isinstance(job_id, str) and job_id for job_id in recovery_job_ids)
+        ):
+            conn.close()
+            raise EventStoreError("receipt recovery requires job IDs, an explicit no-live-worker attestation, and no active lease")
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -690,9 +737,13 @@ class SQLiteEventStore:
             if hashlib.sha256(receipt_json.encode("utf-8")).hexdigest() != row["receipt_hash"]:
                 raise IntegrityFailure(f"staged adapter receipt {invocation_id!r} failed its content hash")
             events = json.loads(receipt_json)["events"]
-            if queue_lease is not None:
-                self._assert_queue_lease(conn, events, queue_lease)
-            self._assert_active_run_fences(conn, events, queue_lease)
+            if not already_imported:
+                if recovery_job_ids:
+                    self._assert_recovery_receipt_fences(conn, events, recovery_job_ids)
+                else:
+                    if queue_lease is not None:
+                        self._assert_queue_lease(conn, events, queue_lease)
+                    self._assert_active_run_fences(conn, events, queue_lease)
             results: list[AppendResult] = []
             for event in events:
                 candidate = dict(event)
@@ -738,11 +789,13 @@ class SQLiteEventStore:
                 "UPDATE adapter_invocations SET state='imported', result_json=? WHERE invocation_id=?",
                 (result_json, invocation_id),
             )
-            if lease_context is not None:
+            if not already_imported and lease_context is not None:
                 final_lease = {key: value for key, value in lease_context.items() if key != "clock"}
                 final_lease["now"] = lease_context["clock"]()
                 self._assert_queue_lease(conn, events, final_lease)
                 self._assert_active_run_fences(conn, events, final_lease)
+            elif not already_imported and recovery_job_ids:
+                self._assert_recovery_receipt_fences(conn, events, recovery_job_ids)
             conn.execute("COMMIT")
             return results
         except sqlite3.IntegrityError as exc:
@@ -775,14 +828,26 @@ class SQLiteEventStore:
             "receiptHash": row["receipt_hash"],
         } for row in rows]
 
-    def reconcile_staged_adapter_receipts(self, project_id: str) -> list[str]:
-        """Import persisted canonical receipts before run recovery closes active runs."""
+    def reconcile_staged_adapter_receipts(
+        self,
+        project_id: str,
+        *,
+        recovery_job_ids: set[str] | None = None,
+        attest_no_live_worker: bool = False,
+    ) -> list[str]:
+        """Import receipts normally under lease or under explicitly approved expired-job recovery."""
         staged = [
             item["invocationId"] for item in self.list_adapter_invocations(project_id)
             if item["state"] == "receipt_staged"
         ]
         for invocation_id in staged:
-            self.commit_adapter_receipt(invocation_id)
+            if recovery_job_ids:
+                self.commit_adapter_receipt(
+                    invocation_id, recovery_job_ids=recovery_job_ids,
+                    attest_no_live_worker=attest_no_live_worker,
+                )
+            else:
+                self.commit_adapter_receipt(invocation_id)
         return staged
 
     def mark_ambiguous_adapter_invocations(self, project_id: str) -> list[str]:

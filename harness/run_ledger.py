@@ -295,9 +295,19 @@ class RunLedger:
             )
         return active_ids
 
-    def recover_interrupted(self, project_id: str, *, occurred_at: str | None = None) -> list[str]:
-        """Import durable adapter receipts, then close runs left active by restart."""
-        self.store.reconcile_staged_adapter_receipts(project_id)
+    def recover_interrupted(
+        self,
+        project_id: str,
+        *,
+        occurred_at: str | None = None,
+        recovery_job_ids: Iterable[str] = (),
+        attest_no_live_worker: bool = False,
+    ) -> list[str]:
+        """Import durable receipts and close active runs under explicit queue recovery authorization."""
+        self.store.reconcile_staged_adapter_receipts(
+            project_id, recovery_job_ids=set(recovery_job_ids),
+            attest_no_live_worker=attest_no_live_worker,
+        )
         self.store.mark_ambiguous_adapter_invocations(project_id)
         state = self.control.projector.replay(project_id)
         active_ids = [
