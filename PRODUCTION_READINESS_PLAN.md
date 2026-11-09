@@ -71,7 +71,7 @@ Bounded child processes are not sandboxes. Current workers have no production to
 - [ ] Select and implement OS/container/VM isolation for each supported platform: filesystem mounts, network egress, process tree, CPU/memory/PID limits, syscall/privilege policy, working directory, temp cleanup, and escape testing.
 - [ ] Define secret acquisition through a broker or short-lived scoped injection; no inherited environment, user home, provider credential files, or uncontrolled log capture.
 - [ ] Enforce canonical capability grants at the actual tool/MCP/filesystem/network/remote-call boundary immediately before each operation. Bind subject, project, work, action, resource, expiry, budget, and revocation; deny by default.
-- [ ] Add a durable effect-intent/outbox protocol: persist intent/idempotency key before dispatch, record provider receipt/result, reconcile after crash, and surface ambiguous outcomes without automatic replay. Ensure each external connector documents its idempotency semantics.
+- [ ] Implement the durable effect-intent/outbox protocol in [`design/EXTERNAL_EFFECT_PROTOCOL.md`](design/EXTERNAL_EFFECT_PROTOCOL.md): persist intent/idempotency key before dispatch, record provider receipt/result, reconcile after crash, and surface ambiguous outcomes without automatic replay. Ensure each external connector documents its idempotency semantics. The design is written; no general outbox is implemented.
 - [ ] Couple cancellation/lease loss to process-tree termination and prevent stale workers from starting additional effects; test delayed, duplicated, reordered, partially completed, and timeout responses.
 - [ ] Review isolation and effect controls independently before enabling tools or user data.
 
