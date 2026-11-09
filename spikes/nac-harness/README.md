@@ -2,7 +2,7 @@
 
 **Upstream inspected:** [`arcee-ai/nac`](https://github.com/arcee-ai/nac), branch `dev`, commit `f27b5b4a92b38567580a1a43576137bf5b436f95` (repository default branch at inspection). `upstream/` is a filtered source snapshot at that exact revision (2,310 files, 34 MiB). It contains application source, tests, technical documentation, examples, and lockfiles; it does not contain Git history, repository instruction files, generated dependency trees, generated frontend bundles, legal-notice documents, or the legal-notice design-preview component and icon. The root README's legal badge/footer was omitted; the legal-notice design-preview component was also omitted from its preview page; the rest of upstream implementation code was not changed.
 
-**Review method:** static source and documentation review only. No NAC build, test suite, server, model, credential, or tool execution was performed. This environment has no Cargo/Rust toolchain, so all NAC behavior below is attributed to source/tests/docs and is not independently verified here.
+**Review and validation:** source/docs were reviewed statically, then NAC was built and exercised from a separate complete clone at `/tmp/nac-upstream` (the filtered vendored snapshot was not built). Rust 1.99.1, Node 24.22.1, locked Cargo/npm dependencies, and Playwright Chromium were installed for this evaluation. `RUST_TEST_THREADS=4 make test` and `RUST_TEST_THREADS=4 make ci` passed; the focused `make test-durability` gates also passed, as did `make test-mcp-conformance` for revisions `2025-11-25` and `2026-07-28` plus the seeded omitted-tool-call failure. The first unrestricted-parallel Rust run had 27 timeout failures; rerunning at four test threads passed. `make test-e2e` reported 285 passed, 5 skipped, and 3 failed: two repeatable `setup-form-review` save-retry cases, plus the portal-launch host-mismatch check timing out on `https://localhost` in this environment (the BasicAuth companion passed). A minimal browser smoke initially lacked `libasound.so.2`; the library was unpacked under `/tmp` without system changes, after which the suite ran. No real model, provider credential, or private data was used. The managed-load test attempted an uncredentialed Smithery registry listing and received HTTP 500; that failure was logged but did not fail its deterministic test.
 
 ## What NAC is
 
@@ -26,7 +26,7 @@ NAC is a Rust + React coding-agent harness and local web application. Its centra
 - **Worker receipt fencing:** the host admits a dispatch before spawning; the result is tied to session, run, thread, dispatch ID, and generation. Durable episode and terminal receipt commit together; exact replay returns the existing episode while conflicting or stale generations fail. Recovery does not treat a lost acknowledgment as permission to rerun work.
 - **Store ownership and typed persistence commands:** one server process owns the SQLite path; cross-process open is excluded by an OS lock; a bounded typed FIFO executes mutations; accepted work drains at shutdown; uncertain acknowledgments are reconciled rather than automatically retried.
 - **Explicit backend invariants:** authorization cannot switch execution from the selected Local/SSH/Podman backend or escape that backend's safety policy. Tool visibility is not authorization.
-- **Tests and operational evidence:** the repository includes focused permission, migration, dispatch, crash, restart, cancellation, managed-load, and browser lanes. The presence of those tests is promising, not a passing result for this repository's environment.
+- **Tests and operational evidence:** the full upstream Rust/frontend/asset/managed-load/CI gates passed at four Rust test threads; browser results were 285 passed, 5 skipped, and 3 failed. Three browser failures are recorded above and remain unresolved. Passing tests characterize this pinned candidate and environment, not production security or multi-tenant readiness.
 
 ## Important mismatch / boundaries
 
@@ -54,4 +54,4 @@ Use source-level API characterization and scripted tools first. Do not wire the 
 - The snapshot is pinned to the recorded commit; it is not a moving branch checkout.
 - Vendored source/docs/tests are ordinary tracked files; dependency trees and Git metadata are absent.
 - License/notice documents were not imported, per the user's instruction.
-- Build and runtime claims require a later test environment with the NAC Rust toolchain and project setup. No claims here mean NAC's code was executed.
+- Validation used the complete temporary clone, not the filtered vendored copy; generated bundles and omitted legal-notice UI mean the latter is for inspection and adapter design, not a turnkey checkout.

@@ -50,7 +50,7 @@ Current `InboxApplication` and `ProjectApplication` are reusable injected-princi
 
 ## Phase 3 — organization planning and durable lifecycle (issue #13)
 
-The current coordinator accepts a caller-provided DAG/factory; it does not yet plan a durable organization autonomously or provide an operator-grade lifecycle. Before adding equivalent worker/thread lifecycle code, evaluate a typed adapter to NAC's durable thread/episode dispatch and determine whether its coding-session topology can preserve our canonical work and run identities. NAC is statically inspected but not yet built or tested here.
+The current coordinator accepts a caller-provided DAG/factory; it does not yet plan a durable organization autonomously or provide an operator-grade lifecycle. Before adding equivalent worker/thread lifecycle code, evaluate a typed adapter to NAC's durable thread/episode dispatch and determine whether its coding-session topology can preserve our canonical work and run identities. NAC's complete upstream clone passed `make test` and `make ci` at four Rust test threads; its browser suite had three recorded failures. See `spikes/nac-harness/README.md`; no NAC adapter has been evaluated against our canonical work contract yet.
 
 - [ ] Define canonical plan records: objective, decomposed tasks, dependencies, agent roles, budgets, required evidence, acceptance criteria, risk level, capability needs, and approval state.
 - [ ] Add durable plan submission, review, approval/rejection, revision, assignment, and cancellation. Model-generated plans are proposals only and never authorize themselves.
