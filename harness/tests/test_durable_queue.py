@@ -391,6 +391,12 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.store.queued_write_context(output_lease, lambda: 559):
             self.store.append(message("event.queue.output.before-expiry"))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                detached = pool.submit(self.store.append, message("event.queue.output.detached"))
+                with self.assertRaisesRegex(
+                    ConcurrentWriteConflict, "requires its active execution lease context",
+                ):
+                    detached.result()
         # Reopening reconstructs this operational fence from canonical run.started history.
         conn = self.store._connect()
         try:

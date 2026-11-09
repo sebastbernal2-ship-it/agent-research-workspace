@@ -623,8 +623,15 @@ class SQLiteEventStore:
         receipt_json = self._canonical_json({"events": normalized})
         receipt_hash = hashlib.sha256(receipt_json.encode("utf-8")).hexdigest()
         conn = self._connect()
+        lease_context = self._queue_lease_context.get()
+        queue_lease = None
+        if lease_context is not None:
+            queue_lease = {key: value for key, value in lease_context.items() if key != "clock"}
+            queue_lease["now"] = lease_context["clock"]()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if queue_lease is not None:
+                self._assert_queue_lease(conn, normalized, queue_lease)
             row = conn.execute(
                 "SELECT * FROM adapter_invocations WHERE invocation_id=?", (invocation_id,),
             ).fetchone()
@@ -633,7 +640,7 @@ class SQLiteEventStore:
             if row["project_id"] != next(iter(project_ids)):
                 raise EventStoreError("adapter receipt project does not match its invocation")
             if row["state"] == "executing":
-                self._assert_active_run_fences(conn, normalized)
+                self._assert_active_run_fences(conn, normalized, queue_lease)
             if row["state"] in {"receipt_staged", "imported"}:
                 if row["receipt_hash"] != receipt_hash:
                     raise IdempotencyConflict(f"adapter invocation {invocation_id!r} returned a changed receipt")
@@ -645,6 +652,11 @@ class SQLiteEventStore:
                 )
             else:
                 raise EventStoreError("adapter receipt cannot be staged before invocation dispatch")
+            if lease_context is not None:
+                final_lease = {key: value for key, value in lease_context.items() if key != "clock"}
+                final_lease["now"] = lease_context["clock"]()
+                self._assert_queue_lease(conn, normalized, final_lease)
+                self._assert_active_run_fences(conn, normalized, final_lease)
             conn.execute("COMMIT")
             return self.get_adapter_invocation(invocation_id)
         except Exception:
@@ -657,6 +669,11 @@ class SQLiteEventStore:
     def commit_adapter_receipt(self, invocation_id: str) -> list[AppendResult]:
         """Atomically append a staged receipt and mark its invocation imported."""
         conn = self._connect()
+        lease_context = self._queue_lease_context.get()
+        queue_lease = None
+        if lease_context is not None:
+            queue_lease = {key: value for key, value in lease_context.items() if key != "clock"}
+            queue_lease["now"] = lease_context["clock"]()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -673,6 +690,9 @@ class SQLiteEventStore:
             if hashlib.sha256(receipt_json.encode("utf-8")).hexdigest() != row["receipt_hash"]:
                 raise IntegrityFailure(f"staged adapter receipt {invocation_id!r} failed its content hash")
             events = json.loads(receipt_json)["events"]
+            if queue_lease is not None:
+                self._assert_queue_lease(conn, events, queue_lease)
+            self._assert_active_run_fences(conn, events, queue_lease)
             results: list[AppendResult] = []
             for event in events:
                 candidate = dict(event)
@@ -718,6 +738,11 @@ class SQLiteEventStore:
                 "UPDATE adapter_invocations SET state='imported', result_json=? WHERE invocation_id=?",
                 (result_json, invocation_id),
             )
+            if lease_context is not None:
+                final_lease = {key: value for key, value in lease_context.items() if key != "clock"}
+                final_lease["now"] = lease_context["clock"]()
+                self._assert_queue_lease(conn, events, final_lease)
+                self._assert_active_run_fences(conn, events, final_lease)
             conn.execute("COMMIT")
             return results
         except sqlite3.IntegrityError as exc:
