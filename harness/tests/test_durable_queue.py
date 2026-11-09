@@ -11,6 +11,7 @@ from harness.durable_queue import QueueError, SQLiteWorkQueue
 from harness.organization_runtime import (
     ExecutionSignal, OrganizationCoordinator, WorkflowStatus, WorkExecution,
 )
+from harness.projection import Projector
 from harness.event_store import ConcurrentWriteConflict, SQLiteEventStore
 from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
@@ -395,7 +396,17 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.queue.recover_expired("job.runtime", now=562, attest_no_live_worker=True)
         with self.assertRaisesRegex(ConcurrentWriteConflict, "lease was fenced"):
             self.store.append(message("event.queue.output.after-fence"))
-        self.assertEqual(len(self.store.events(PROJECT_ID)), 5)
+        ledger = RunLedger(self.store)
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "lease was fenced"):
+            ledger.finish(
+                PROJECT_ID, "run.output.g1", terminal_status="succeeded",
+                actor=SPECIALIST, occurred_at=NOW,
+            )
+        self.assertEqual(ledger.recover_interrupted(PROJECT_ID, occurred_at=NOW), ["run.output.g1"])
+        self.assertEqual(
+            Projector(self.store).replay(PROJECT_ID)["agentRuns"]["run.output.g1"]["status"], "interrupted",
+        )
+        self.assertEqual(len(self.store.events(PROJECT_ID)), 6)
 
     async def test_expired_active_job_requires_run_recovery_and_explicit_retry(self):
         coordinator = OrganizationCoordinator(self.store)
