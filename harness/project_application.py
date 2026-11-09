@@ -49,6 +49,31 @@ class ProjectApplication:
         state = self.projector.replay(project_id)
         return list(state["workItems"].values())
 
+    def list_agent_runs(self, project_id: str) -> list[dict[str, Any]]:
+        self._authorize(project_id, "run.read")
+        state = self.projector.replay(project_id)
+        return list(state["agentRuns"].values())
+
+    def list_evidence(self, project_id: str) -> list[dict[str, Any]]:
+        self._authorize(project_id, "evidence.read")
+        state = self.projector.replay(project_id)
+        return list(state["evidence"].values())
+
+    def list_artifacts(self, project_id: str) -> list[dict[str, Any]]:
+        self._authorize(project_id, "artifact.read")
+        state = self.projector.replay(project_id)
+        return list(state["artifacts"].values())
+
+    def list_messages(self, project_id: str) -> list[dict[str, Any]]:
+        self._authorize(project_id, "discussion.read")
+        state = self.projector.replay(project_id)
+        return list(state["messages"])
+
+    def list_capability_grants(self, project_id: str) -> list[dict[str, Any]]:
+        self._authorize(project_id, "capability.read")
+        state = self.projector.replay(project_id)
+        return list(state["capabilityGrants"].values())
+
     def create_work(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
         actor = self._authorize(project_id, "work.create")
         if not isinstance(record, dict) or record.get("projectId") != project_id:

@@ -60,6 +60,20 @@ class ProjectApplicationTests(unittest.TestCase):
             self.app.get_project("project.other")
         self.assertEqual(self.membership.calls[-1][2], "project.read")
 
+    def test_project_scoped_reads_use_distinct_authorization_actions(self):
+        self.assertEqual(self.app.list_agent_runs(PROJECT_ID), [])
+        self.assertEqual(self.app.list_evidence(PROJECT_ID), [])
+        self.assertEqual(self.app.list_artifacts(PROJECT_ID), [])
+        self.assertEqual(self.app.list_messages(PROJECT_ID), [])
+        self.assertEqual(self.app.list_capability_grants(PROJECT_ID), [])
+        self.assertEqual(
+            [call[2] for call in self.membership.calls],
+            ["run.read", "evidence.read", "artifact.read", "discussion.read", "capability.read"],
+        )
+        self.membership.allowed_projects.clear()
+        with self.assertRaisesRegex(InboxForbidden, "membership"):
+            self.app.list_evidence(PROJECT_ID)
+
     def test_work_creation_derives_creator_from_authenticated_principal(self):
         record = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
         record.update(
