@@ -22,10 +22,10 @@ from .runtime import PROJECT_ID, PrototypeRuntime
 
 STATIC_ROOT = Path(__file__).resolve().parent
 MAX_JSON_BODY_BYTES = 16 * 1024
-PROJECT_PATH = re.compile(r"^/api/projects/([^/]+)$")
-INBOX_LIST_PATH = re.compile(r"^/api/projects/([^/]+)/inbox$")
-INBOX_DETAIL_PATH = re.compile(r"^/api/projects/([^/]+)/inbox/([^/]+)$")
-INBOX_COMMAND_PATH = re.compile(r"^/api/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
+PROJECT_PATH = re.compile(r"^/api/v1/projects/([^/]+)$")
+INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
+INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
+INBOX_COMMAND_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
@@ -157,7 +157,7 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
 
-        if path == "/api/health":
+        if path == "/api/v1/health":
             self._run(lambda: self._send_json(200, self.runtime.health()))
             return
 

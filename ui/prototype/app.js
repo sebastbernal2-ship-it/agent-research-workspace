@@ -1,7 +1,7 @@
 "use strict";
 
 const PROJECT_ID = "project.northstar";
-const PROJECT_API = `/api/projects/${encodeURIComponent(PROJECT_ID)}`;
+const PROJECT_API = `/api/v1/projects/${encodeURIComponent(PROJECT_ID)}`;
 const views = ["overview", "work", "conversation", "inbox", "agents", "evidence"];
 let projectData = null;
 let openQuestions = [];
@@ -486,7 +486,7 @@ async function runQuestionCommand(dialogId, command) {
 
 async function bootstrap() {
   try {
-    const health = await apiRequest("/api/health");
+    const health = await apiRequest("/api/v1/health");
     if (health.mode !== "local-synthetic-demo") throw new Error("Unexpected service mode.");
     setServiceState(true, "Local synthetic project · inbox persists to SQLite · model providers disconnected");
     await loadProject();

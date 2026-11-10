@@ -27,6 +27,9 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, path, *, method="GET", payload=None, headers=None):
+        # Legacy test path shorthand maps only to the currently implemented v1 API.
+        if path.startswith("/api/") and not path.startswith("/api/v"):
+            path = "/api/v1/" + path[len("/api/"):]
         request_headers = {"Accept": "application/json", **(headers or {})}
         data = None
         if payload is not None:
@@ -225,6 +228,14 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             urlopen(request, timeout=3)
         self.assertEqual(raised.exception.code, 413)
         self.assertEqual(json.loads(raised.exception.read())["error"], "request_too_large")
+
+    def test_api_v1_is_explicit_and_unknown_api_versions_fail_closed(self):
+        status, health, _ = self.request("/api/v1/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(health["mode"], "local-synthetic-demo")
+        status, error, _ = self.request("/api/v2/health")
+        self.assertEqual(status, 404)
+        self.assertEqual(error["error"], "not_found")
 
     def test_cross_project_and_unknown_paths_do_not_disclose_project_data(self):
         status, error, _ = self.request("/api/projects/project.other/inbox")
