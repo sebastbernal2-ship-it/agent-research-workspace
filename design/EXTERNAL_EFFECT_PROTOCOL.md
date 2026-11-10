@@ -1,6 +1,6 @@
 # External-effect intent, dispatch, and recovery protocol
 
-**Status:** design contract for issue #15; not implemented as a general-purpose outbox. Current lease-fenced Meldwork adapter invocation journal covers receipt delivery for that adapter only. Do not enable real external effects on the strength of this document.
+**Status:** design contract for issue #15; not implemented as a general-purpose outbox. The adapter-specific dispatch-marker crash boundary has a new deterministic regression test in `harness/tests/test_event_store.py`; the Meldwork invocation journal still covers only its adapter receipt path. Do not enable real external effects on the strength of this document.
 
 ## Goal and non-goal
 
@@ -92,6 +92,10 @@ Connectors without safe idempotency/reconciliation stay disabled for unattended 
 - duplicated, reordered, late, oversized, malformed, and forged receipts fail closed;
 - budgets, deadlines, redaction, audit attribution, and retention limits are enforced.
 
+## Contract-version and implementation gate
+
+Issue #2 remains open. The reader currently accepts only the closed v0.1 contract, and `Projector` rejects unknown event types. Do not mutate v0.1 or encode effect state as an unrelated artifact/message to avoid the versioning work. The first canonical implementation must land a new additive versioned effect record/event contract with a reader/projection path while preserving v0.1 fixtures byte-for-byte. The dispatchable outbox/relay row must be a rebuildable projection of those canonical events, updated atomically with the canonical append in the same SQLite transaction; it cannot be a competing state authority. Implement this contract/schema/version reader under #2 before general relay code under #15. Existing code provides neither that event projection nor a trusted identity source for grants, approvals, or recovery.
+
 ## Current boundary
 
-The existing Meldwork path has a stable invocation ID, queued job/generation binding, a lease-checked prepared→executing transition, staged receipt import, and ambiguous no-auto-replay behavior. This is useful precedent, but it lacks the general capability/approval binding, provider idempotency contract, authenticated reconciler, and remote-effect test doubles required above. It is not an external-effect guarantee.
+The existing Meldwork path has a stable invocation ID, queued job/generation binding, a lease-checked prepared→executing transition, staged receipt import, and ambiguous no-auto-replay behavior. The regression test simulates a crash after the durable dispatch marker but before a provider call; restart marks the call ambiguous, a retry cannot start or stage a receipt, and canonical history stays unchanged. This proves only the adapter-specific local state transition. It lacks general capability/approval binding, a provider idempotency contract, authenticated reconciliation, and remote-effect test doubles. It is not an external-effect guarantee.

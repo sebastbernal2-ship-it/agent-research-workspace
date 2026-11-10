@@ -178,6 +178,34 @@ class SQLiteEventStoreTests(unittest.TestCase):
             reopened.commit_adapter_receipt("invocation.ambiguous")
         self.assertEqual(reopened.events("project.alpha"), [])
 
+    def test_dispatch_marker_crash_is_ambiguous_and_never_replays(self):
+        invocation_id = "invocation.crash-before-provider-call"
+        request_hash = "e" * 64
+        self.store.prepare_adapter_invocation(invocation_id, "project.alpha", request_hash)
+        dispatch = self.store.start_adapter_invocation(invocation_id)
+        self.assertTrue(dispatch["started"])
+        self.assertEqual(dispatch["state"], "executing")
+
+        # Simulate a process crash after the durable dispatch marker but before
+        # any provider call. Recovery cannot know that no bytes reached a provider.
+        restarted = SQLiteEventStore(self.path)
+        self.assertEqual(
+            restarted.mark_ambiguous_adapter_invocations("project.alpha"), [invocation_id],
+        )
+        retry = restarted.prepare_adapter_invocation(invocation_id, "project.alpha", request_hash)
+        self.assertEqual(retry["state"], "ambiguous")
+        retry_dispatch = restarted.start_adapter_invocation(invocation_id)
+        self.assertEqual(retry_dispatch["state"], "ambiguous")
+        self.assertFalse(retry_dispatch["started"])
+
+        provider_calls = []
+        if retry_dispatch["started"]:
+            provider_calls.append("would-be external effect")
+        self.assertEqual(provider_calls, [])
+        with self.assertRaisesRegex(EventStoreError, "cannot be staged before invocation dispatch"):
+            restarted.stage_adapter_receipt(invocation_id, initial_events())
+        self.assertEqual(restarted.events("project.alpha"), [])
+
     def test_adapter_receipt_batch_rolls_back_fully_on_import_conflict(self):
         invocation_id = "invocation.rollback"
         self.store.prepare_adapter_invocation(invocation_id, "project.alpha", "d" * 64)
