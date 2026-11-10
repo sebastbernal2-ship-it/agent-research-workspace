@@ -12,16 +12,34 @@
 5. Separate observed standalone behavior from cluster/HA claims; inspect actual coordination and durable ownership rather than relying on roadmap/features.
 6. Decide whether to adopt the runtime, keep only a narrow component, or reject it. Close the issue only when every acceptance item has evidence; this document does not mark incomplete checks as passed.
 
-## Initial evidence
+## Route inventory and authentication findings
+
+`create_studio_app()` was instantiated in-process using the pinned venv, a temporary `HOME`, and a nonempty test token. No lifespan was started and no network listener was created. The app exposed **264 API/websocket route-method entries**: 197 handlers where source inspection found an apparent auth check, 2 health/readiness exemptions, and **65 handlers with no auth check visible in the endpoint**. The 65 are all routes registered by `agenticx.studio.kb.routes`, `agenticx.brain.routes`, `agenticx.studio.code_index.routes`, `agenticx.studio.web_search.routes`, and `agenticx.studio.typesafe_routes`. They cover reads and writes (including document upload/delete, indexing, config changes, knowledge search, and provider test operations). This is a source-level audit classification, not proof the 197 apparent checks are correct.
+
+Representative in-process TestClient requests with `AGX_DESKTOP_TOKEN` set:
+
+| Route | No token | Wrong token | Correct token | Interpretation |
+|---|---:|---:|---:|---|
+| `GET /api/session` | 401 | 401 | 200 | Inline protected route behaves as expected. |
+| `GET /api/health` | 200 | 200 | 200 | Unauthenticated health exemption. |
+| `GET /api/ready` | 200 | 200 | 200 | Unauthenticated readiness exemption. |
+| `GET /api/kb/config` | 200 | 200 | 200 | **Unauthenticated router route; misconfigured relative to fail-closed requirement.** |
+| `GET /api/brains` | 200 | 200 | 200 | **Unauthenticated router route; misconfigured.** |
+| `GET /api/code-index/config` | 200 | 200 | 200 | **Unauthenticated router route; misconfigured.** |
+| `GET /api/web-search/config` | 200 | 200 | 200 | **Unauthenticated router route; misconfigured.** |
+
+The mounted `changeplane_routes` webhook separately validates `AGENTICX_CHANGEPLANE_WEBHOOK_SECRET` and returns 403 if it is unset or incorrect. Other mounted route families (`run_replay`, voice, memory graph, data sources, commands) receive a token-check callback and were source-classified as apparently checked. Static presence is not an exhaustive behavioral verification. Framework docs/OpenAPI routes are outside this API count and must also be considered if the app is ever network-exposed.
+
+**Gate result: FAIL. Do not launch Studio, even on loopback, as a security control.** A loopback bind limits remote reachability but does not repair the 65 missing route guards. No safe wrapper can claim the complete acceptance criteria while these remain.
+
+## Other evidence and gaps
 
 - `create_studio_app` sets `desktop_token = os.getenv("AGX_DESKTOP_TOKEN", "").strip()`. Its `_check_token` returns successfully when the value is empty; the CLI's documented default is wildcard bind with no token. Therefore the upstream server is not fail-closed by default.
-- The Studio app mounts several route modules with a supplied token checker, but also mounts `changeplane_routes` independently. That webhook uses its own `AGENTICX_CHANGEPLANE_WEBHOOK_SECRET` and fails closed when unset; it is a separate authentication path that must be included in the inventory. This is a concrete reason not to infer full route coverage from searching inline `_check_token` calls.
-- `/api/health` and `/api/ready` are documented token exemptions in the current spike notes; their exact output/data exposure remains to be verified.
 - Upstream persistence tests: `tests/test_session_manager_persistence.py` and `tests/test_reasoning_chain_persistence.py`: **44 passed** in the pinned venv. These exercise persistence/reconstruction helpers, not a whole-server process restart or duplicate external side-effect behavior.
 - Existing deterministic bridge and Meldwork composition tests: `harness/tests/test_agenticx_bridge.py` plus `harness/integration_tests/test_meldwork_agenticx_runtime.py`: **8 passed** using the pinned AgenticX environment. These use an injected fixed provider and no registered tools; they do not cover approval interruption or prohibited-action denial.
 - An attempted combined harness run including `test_ag2_agenticx.py` could not collect because the AgenticX venv does not contain AG2 (`ModuleNotFoundError: ag2`). This is an environment mismatch, not a test failure. The separate AG2 test bootstrap is documented in `spikes/ag2-collaboration/README.md`.
-- No server restart, route-by-route auth matrix, safe launcher, or side-effect replay test has been completed in this gate. No HA/cluster claim is supported by this evidence.
+- No whole-process restart/side-effect replay test, safe launcher, or capability tests (approval interruption and prohibited-action denial) have been completed in this gate. No HA/cluster claim is supported by this evidence.
 
 ## Interim decision
 
-**Retain only the narrow bounded AgenticX worker component behind the existing adapter; do not adopt AgenticX Studio as a control plane or expose its API.** The deterministic subprocess boundary is useful composition evidence, but it is not a hardened sandbox and does not establish model quality. Continue the gate before making a broader adoption decision. Issue #4 remains open pending the listed missing acceptance evidence.
+**Reject AgenticX Studio as a control plane for this project; retain only the narrow bounded AgenticX worker component behind the existing adapter.** The observed missing authentication on 65 route-method entries is a release-blocking security finding, and this evaluation does not patch upstream. The deterministic subprocess boundary is useful composition evidence, but it is not a hardened sandbox and does not establish model quality. The narrow worker choice is an interim composition decision, not a claim that all issue acceptance criteria passed. Issue #4 remains open pending the remaining evidence and formal resolution of its acceptance checklist.
