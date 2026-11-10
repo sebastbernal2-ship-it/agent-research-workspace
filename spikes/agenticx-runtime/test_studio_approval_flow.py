@@ -399,25 +399,31 @@ print(json.dumps({
                 fresh_app = create_studio_app()
                 fresh_manager = fresh_app.state.session_manager
                 fresh_store = CheckpointStore()
-                restored = {}
-
-                async def observe_recovery(sid, fresh_managed, resumed_checkpoint):
-                    restored["checkpoint"] = resumed_checkpoint
-                    restored["can_resolve"] = fresh_managed.get_confirm_gate("meta").resolve(
-                        request_id, True,
-                    )
-                    return False
-
                 restored_checkpoint = fresh_store.load(session_id)
                 assert restored_checkpoint is not None
-                asyncio.run(fresh_manager._resume_single_session(
+                from agenticx.llms.provider_resolver import ProviderResolver
+
+                class ResumeLLM:
+                    def invoke(self, _prompt, **_kwargs):
+                        return FakeResponse("Recovered without replaying the interrupted action.")
+
+                monkeypatch.setattr(
+                    ProviderResolver,
+                    "resolve",
+                    lambda **_kwargs: ResumeLLM(),
+                )
+                fresh_managed = fresh_manager.get(session_id, touch=False)
+                assert fresh_managed is not None
+                resumed = asyncio.run(fresh_manager._resume_single_session(
                     session_id,
                     restored_checkpoint,
                     fresh_store,
-                    runtime_runner=observe_recovery,
+                    runtime_runner=None,
                 ))
-                assert restored.get("checkpoint") is not None
-                assert restored["can_resolve"] is False
+                assert resumed is True
+                assert fresh_managed.execution_state == "idle"
+                assert fresh_store.load(session_id) is None
+                assert fresh_managed.get_confirm_gate("meta").resolve(request_id, True) is False
                 fresh_client = TestClient(build_app(TOKEN, fresh_app))
                 lost_response = fresh_client.post(
                     "/api/confirm",
