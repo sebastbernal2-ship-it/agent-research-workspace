@@ -64,6 +64,16 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertNotIn("innerHTML", self.js)
         self.assertIn("item.textContent", self.js)
 
+    def test_inbox_tabs_support_roving_focus_and_keyboard_navigation(self):
+        self.assertIn('role="tablist"', self.html)
+        self.assertIn('role="tab"', self.html)
+        self.assertIn('button.tabIndex = selected ? 0 : -1', self.js)
+        self.assertIn('event.key === "ArrowRight"', self.js)
+        self.assertIn('event.key === "ArrowLeft"', self.js)
+        self.assertIn('event.key === "Home"', self.js)
+        self.assertIn('event.key === "End"', self.js)
+        self.assertIn('tabs[nextIndex].focus()', self.js)
+
     def test_inbox_decision_controls_are_explicit_and_service_backed(self):
         for dialog_id in ("answer-dialog", "reject-dialog"):
             self.assertIn(f'id="{dialog_id}"', self.html)

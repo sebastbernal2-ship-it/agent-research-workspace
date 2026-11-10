@@ -323,6 +323,7 @@ function setInboxFilter(status) {
     const selected = button.dataset.inboxFilter === status;
     button.classList.toggle("active-tab", selected);
     button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
   });
 }
 
@@ -607,6 +608,22 @@ document.addEventListener("click", (event) => {
   }
   const toastControl = event.target.closest("[data-toast]");
   if (toastControl) showToast(toastControl.dataset.toast);
+});
+
+document.querySelectorAll("[data-inbox-filter]").forEach((button) => {
+  button.addEventListener("keydown", (event) => {
+    const tabs = [...document.querySelectorAll("[data-inbox-filter]")];
+    const index = tabs.indexOf(button);
+    let nextIndex;
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    tabs[nextIndex].focus();
+    void loadInbox(tabs[nextIndex].dataset.inboxFilter);
+  });
 });
 
 document.querySelector(".inbox-stat").addEventListener("keydown", (event) => {
