@@ -179,6 +179,42 @@ class ContractSchemaTests(unittest.TestCase):
         v2 = json.loads((ROOT / "v0.2" / "schema.json").read_text())
         Draft202012Validator.check_schema(v2)
 
+    def test_v02_project_scope_finding_and_adoption_provenance(self):
+        schema = json.loads((ROOT / "v0.2" / "schema.json").read_text())
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        project = {**valid_records()[0], "schemaVersion": "0.2", "visibility": "private", "policyScope": ["policy.research"]}
+        self.assertEqual([], list(validator.iter_errors(project)))
+        self.assertTrue(list(validator.iter_errors({**project, "visibility": "secret"})))
+        finding = {
+            "recordType": "finding", "schemaVersion": "0.2", "projectId": "project.alpha",
+            "findingId": "finding.one", "workId": "work.research", "runId": "run.first",
+            "title": "Synthetic finding", "statement": "A source supports a bounded claim.",
+            "sourceEvidenceIds": ["evidence.claim1"], "sourceHashes": [HASH],
+            "createdBy": ACTOR, "createdAt": NOW,
+        }
+        self.assertEqual([], list(validator.iter_errors(finding)))
+        adoption = {
+            "recordType": "adoption_decision", "schemaVersion": "0.2", "projectId": "project.alpha",
+            "adoptionId": "adoption.one", "workId": "work.research", "findingId": "finding.one",
+            "findingHash": HASH, "decision": "adopted", "rationale": "Accepted after review.",
+            "decidedBy": {"actorType": "human", "actorId": "user.owner", "role": "user"},
+            "decidedAt": NOW, "resultArtifactIds": ["artifact.report"],
+        }
+        self.assertEqual([], list(validator.iter_errors(adoption)))
+        self.assertTrue(list(validator.iter_errors({**adoption, "credential": "never canonical"})))
+        finding_event = {
+            **valid_records()[-1], "schemaVersion": "0.2", "eventId": "event.finding.recorded",
+            "eventType": "finding.recorded", "idempotencyKey": "idem.finding.recorded",
+            "payload": {"findingId": "finding.one", "workId": "work.research", "recordHash": HASH},
+        }
+        adoption_event = {
+            **finding_event, "eventId": "event.adoption.decided", "eventType": "adoption.decided",
+            "idempotencyKey": "idem.adoption.decided",
+            "payload": {"adoptionId": "adoption.one", "findingId": "finding.one", "workId": "work.research", "recordHash": HASH},
+        }
+        self.assertEqual([], list(validator.iter_errors(finding_event)))
+        self.assertEqual([], list(validator.iter_errors(adoption_event)))
+
     def test_v02_effect_intent_is_versioned_bounded_and_secret_free(self):
         schema = json.loads((ROOT / "v0.2" / "schema.json").read_text())
         validator = Draft202012Validator(schema, format_checker=FormatChecker())

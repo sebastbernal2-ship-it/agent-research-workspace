@@ -12,7 +12,7 @@ Current isolated evidence: AG2 Network provides message transport/turn coordinat
 
 ## Decision
 
-1. **The project/work control plane owns durable truth.** The local prototype stores validated event records, immutable record snapshots and content-addressed blobs in SQLite. Project/work/question/run/artifact/evidence projections are rebuilt from this history.
+1. **The project/work control plane owns durable truth.** The local prototype stores validated event records, immutable record snapshots and content-addressed blobs in SQLite. Project/work/question/run/artifact/evidence/finding/adoption/effect projections are rebuilt from this history. Canonical project bundles contain verified event chains and the project-scoped immutable record/blob closure; local queue leases and adapter journals remain replaceable operational metadata.
 2. **Candidate storage is adapter-local.** AG2 WAL and Meldwork workspaces may be replayed/imported, but cannot be authoritative. Candidate state can be discarded without losing already accepted canonical events.
 3. **Adapters normalize through closed contracts.** Each source has an explicit adapter and tests at its boundary. The complete AG2, Meldwork, and AgenticX source snapshots are vendored in `spikes/*/upstream/`; they remain separate upstream packages. Do not merge candidate databases or rely on undocumented internal tables.
 4. **Compose components by role, not winner-take-all.** Meldwork V4 supplies the collaboration engine for a work stage; AG2 supplies message transport/turn order for a separate DAG stage; AgenticX supplies bounded worker execution within both. `test_offline_organization_run` composes them under the canonical project DAG. The prototypes do not establish production suitability.
@@ -27,7 +27,7 @@ Synthetic project/work records
        │
        ├─ AG2 Hub/WAL ── CanonicalAG2Mirror ─────────┐
        ├─ Meldwork V4 LocalWorkspace                 │
-       │       └─ AgenticX deterministic workers      ├─> closed v0.1 event contract
+       │       └─ AgenticX deterministic workers      ├─> closed versioned v0.1/v0.2 event contract
        │              └─ V4 parser/sanitizer adapter ┘       │
        └─ Human question + capability commands              ▼
                                                     SQLite event/blob store
@@ -50,7 +50,7 @@ The combined Meldwork test runs the Node orchestration path and eight AgenticX `
 **Costs / open risks**
 
 - The prototype duplicates some state and needs reconciliation/outbox semantics for reliable dual writes.
-- The event vocabulary and v0.1 schema still need independent review and migration implementation.
+- The draft event vocabularies need independent review; version-to-version semantic migrations and production deployment compatibility remain unimplemented.
 - SQLite is single-host reference code; no network identity, multi-host transaction, backup/restore, retention, or production availability guarantee.
 - Capability checks are not authentication, sandboxing, or atomic side-effect authorization.
 - The UI, VP chat, background scheduler, notifications, worker leases, and genuine autonomous continuation remain unbuilt.

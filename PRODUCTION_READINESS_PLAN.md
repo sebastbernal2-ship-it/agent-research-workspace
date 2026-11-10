@@ -133,7 +133,7 @@ These prove deterministic behavior only. Separately record real-platform package
 
 ## Ordered execution sequence
 
-1. **Now, no external decisions needed:** finish #13 recovery/fault matrix, #15 durable effect-intent design and dispatch tests, #2 migration/failure contracts; keep tools disabled.
+1. **Now, no external decisions needed:** finish #13 recovery/fault matrix, #15 relay/effect failure tests, and #18 storage migration/restore compatibility; the #2 contract acceptance is verified, but production tools remain disabled.
 2. **Owner decisions:** complete Phase 0. Without identity/deployment/data/provider choices, keep hosted service, private data, and model pilot blocked.
 3. **Identity first:** implement #14 and connect #6/#16 surfaces; verify every operation before adding tools.
 4. **Isolation/effects:** complete #7/#15/#4 before any tool, external connector, or autonomous side effect.

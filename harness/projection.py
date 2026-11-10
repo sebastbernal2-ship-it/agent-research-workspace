@@ -126,6 +126,8 @@ class Projector:
             "artifacts": {},
             "evidence": {},
             "capabilityGrants": {},
+            "findings": {},
+            "adoptionDecisions": {},
             "effects": {},
             "messages": [],
         }
@@ -152,7 +154,7 @@ class Projector:
                     raise ProjectionError("charter revision is not the next revision")
                 if new["charter"]["revision"] != payload["charterRevision"] or self._charter_hash(new) != payload["charterHash"]:
                     raise ProjectionError("charter revision payload does not match its immutable record")
-                self._check_same_identity(old, new, ("projectId", "name", "status", "createdAt", "createdBy"))
+                self._check_same_identity(old, new, ("projectId", "name", "status", "createdAt", "createdBy", "visibility", "policyScope"))
                 if new["revision"] != old["revision"] + 1:
                     raise ProjectionError("project record revision is not monotonic")
                 state["project"] = new
@@ -541,6 +543,61 @@ class Projector:
                 if len(artifact_bytes) != artifact["byteSize"]:
                     raise ProjectionError("artifact byte size does not match its immutable metadata")
                 state["artifacts"][artifact_id] = artifact
+
+            elif event_type == "finding.recorded":
+                finding_id = payload["findingId"]
+                if finding_id in state["findings"]:
+                    raise ProjectionError(f"finding {finding_id!r} already exists")
+                finding = self._load_record(payload["recordHash"], "finding", project_id)
+                run = state["agentRuns"].get(finding["runId"])
+                if (
+                    finding["findingId"] != finding_id or finding["workId"] != payload["workId"]
+                    or finding["workId"] not in state["workItems"]
+                    or run is None or run["workId"] != finding["workId"]
+                    or run["agent"] != finding["createdBy"] or event["actor"] != finding["createdBy"]
+                ):
+                    raise ProjectionError("finding record does not match event, work, run, or actor provenance")
+                if any(evidence_id not in state["evidence"] for evidence_id in finding["sourceEvidenceIds"]):
+                    raise ProjectionError("finding references unknown source evidence")
+                linked_source_hashes = set()
+                for evidence_id in finding["sourceEvidenceIds"]:
+                    evidence = state["evidence"][evidence_id]
+                    if evidence["workId"] != finding["workId"]:
+                        allowed = self._work_dependency_scope(finding["workId"], state["workItems"])
+                        if evidence["workId"] not in allowed:
+                            raise ProjectionError("finding source evidence is outside its work dependency scope")
+                    linked_source_hashes.add(evidence["source"]["contentHash"])
+                if set(finding["sourceHashes"]) != linked_source_hashes:
+                    raise ProjectionError("finding source hashes do not match linked evidence snapshots")
+                if finding.get("contentRef") is not None:
+                    if not finding["contentRef"].startswith("blob.") or finding["contentRef"][5:] != finding["contentHash"]:
+                        raise ProjectionError("finding content reference does not match its hash")
+                    try:
+                        content = self.store.get_blob(finding["contentHash"])
+                    except KeyError as exc:
+                        raise ProjectionError("finding content blob is missing") from exc
+                    if hashlib.sha256(content).hexdigest() != finding["contentHash"]:
+                        raise ProjectionError("finding content does not match its hash")
+                state["findings"][finding_id] = {"record": finding, "recordHash": payload["recordHash"]}
+
+            elif event_type == "adoption.decided":
+                adoption_id = payload["adoptionId"]
+                if adoption_id in state["adoptionDecisions"]:
+                    raise ProjectionError(f"adoption decision {adoption_id!r} already exists")
+                decision = self._load_record(payload["recordHash"], "adoption_decision", project_id)
+                finding = state["findings"].get(decision["findingId"])
+                if (
+                    decision["adoptionId"] != adoption_id or decision["findingId"] != payload["findingId"]
+                    or decision["workId"] != payload["workId"] or finding is None
+                    or decision["workId"] != finding["record"]["workId"]
+                    or decision["findingHash"] != finding["recordHash"]
+                    or decision["decidedBy"] != event["actor"]
+                    or event["actor"].get("actorType") != "human" or event["actor"].get("role") != "user"
+                ):
+                    raise ProjectionError("adoption decision does not match finding hash, work, or human actor")
+                if any(artifact_id not in state["artifacts"] for artifact_id in decision.get("resultArtifactIds", [])):
+                    raise ProjectionError("adoption decision references unknown result artifact")
+                state["adoptionDecisions"][adoption_id] = {"record": decision, "recordHash": payload["recordHash"]}
 
             elif event_type == "effect.intent_created":
                 effect_id = payload["effectId"]

@@ -5,10 +5,12 @@ This is a reference implementation, not a multi-host production database.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -1136,6 +1138,233 @@ class SQLiteEventStore:
         finally:
             conn.close()
         return {row["project_id"] for row in rows}
+
+    def export_project_bundle(self, project_id: str) -> str:
+        """Export verified canonical events and the project-scoped immutable blob closure.
+
+        Runtime queue rows and adapter journals are intentionally excluded: they are
+        replaceable coordination metadata, not canonical project state.
+        """
+        events = self.verified_events(project_id)
+        if not events:
+            raise EventStoreError(f"cannot export unknown or empty project {project_id!r}")
+        from .projection import Projector
+        Projector(self).replay(project_id)
+        chain = [json.loads(line) for line in self.export_jsonl(project_id).splitlines()]
+        if [row["event"] for row in chain] != events:
+            raise ConcurrentWriteConflict("project changed during export; retry with a fresh snapshot")
+        record_hashes: set[str] = set()
+        for event in events:
+            self._collect_record_hashes(event.get("payload", {}), record_hashes)
+        records: dict[str, bytes] = {}
+        blobs: dict[str, bytes] = {}
+        pending = list(record_hashes)
+        while pending:
+            digest = pending.pop()
+            if digest in records:
+                continue
+            try:
+                raw = self.get_blob(digest)
+            except KeyError as exc:
+                raise IntegrityFailure(f"project event references missing immutable record {digest}") from exc
+            try:
+                record = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # A recordHash must always point at canonical JSON, never a raw blob.
+                raise IntegrityFailure(f"project record {digest} is not JSON")
+            if not isinstance(record, dict) or self._canonical_json(record).encode("utf-8") != raw:
+                raise IntegrityFailure(f"project record {digest} is not canonical JSON")
+            self.validate_record(record)
+            if record.get("projectId") != project_id:
+                raise IntegrityFailure(f"project record {digest} crosses project scope")
+            records[digest] = raw
+            referenced = self._collect_content_hashes(record)
+            for content_hash in referenced:
+                try:
+                    content = self.get_blob(content_hash)
+                except KeyError:
+                    continue
+                blobs[content_hash] = content
+        objects = [
+            {"sha256": digest, "kind": "record", "data": base64.b64encode(raw).decode("ascii")}
+            for digest, raw in sorted(records.items())
+        ] + [
+            {"sha256": digest, "kind": "blob", "data": base64.b64encode(raw).decode("ascii")}
+            for digest, raw in sorted(blobs.items()) if digest not in records
+        ]
+        bundle = {"formatVersion": 1, "projectId": project_id, "events": chain, "objects": objects}
+        return json.dumps(bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def import_project_bundle(self, encoded_bundle: str) -> list[AppendResult]:
+        """Import a canonical project bundle into an empty project, verifying all hashes."""
+        try:
+            bundle = json.loads(encoded_bundle)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise EventStoreError("project bundle is not valid JSON") from exc
+        if (
+            not isinstance(bundle, dict) or set(bundle) != {"formatVersion", "projectId", "events", "objects"}
+            or type(bundle.get("formatVersion")) is not int or bundle.get("formatVersion") != 1
+            or not isinstance(bundle.get("projectId"), str)
+            or not bundle["projectId"] or not isinstance(bundle.get("events"), list)
+            or not bundle["events"] or not isinstance(bundle.get("objects"), list)
+        ):
+            raise EventStoreError("project bundle has an unsupported or malformed envelope")
+        project_id = bundle["projectId"]
+        if self.events(project_id):
+            raise EventStoreError("project bundle import requires an empty destination project")
+        available: dict[str, tuple[str, bytes]] = {}
+        for item in bundle["objects"]:
+            if not isinstance(item, dict) or set(item) != {"sha256", "kind", "data"}:
+                raise EventStoreError("project bundle object has an invalid shape")
+            digest, kind = item["sha256"], item["kind"]
+            if (
+                not isinstance(digest, str) or len(digest) != 64
+                or not isinstance(kind, str) or kind not in {"record", "blob"}
+                or not isinstance(item["data"], str)
+            ):
+                raise EventStoreError("project bundle object hash, kind, or encoding is invalid")
+            try:
+                raw = base64.b64decode(item["data"], validate=True)
+            except (TypeError, ValueError) as exc:
+                raise EventStoreError("project bundle object data is not valid base64") from exc
+            if hashlib.sha256(raw).hexdigest() != digest or digest in available:
+                raise IntegrityFailure(f"project bundle object hash mismatch or duplicate: {digest}")
+            if kind == "record":
+                try:
+                    record = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise IntegrityFailure(f"project bundle record {digest} is not JSON") from exc
+                if not isinstance(record, dict) or self._canonical_json(record).encode("utf-8") != raw:
+                    raise IntegrityFailure(f"project bundle record {digest} is not canonical JSON")
+                self.validate_record(record)
+                if record.get("recordType") == "event" or record.get("projectId") != project_id:
+                    raise IntegrityFailure(f"project bundle record {digest} has wrong project scope/type")
+            available[digest] = (kind, raw)
+        events: list[dict[str, Any]] = []
+        expected_previous = ZERO_HASH
+        for sequence, item in enumerate(bundle["events"], start=1):
+            if not isinstance(item, dict) or set(item) != {"event", "previousHash", "recordHash"}:
+                raise EventStoreError("project bundle event has an invalid shape")
+            event = item["event"]
+            if not isinstance(event, dict) or event.get("projectId") != project_id or event.get("sequence") != sequence:
+                raise IntegrityFailure("project bundle events are not contiguous or project-scoped")
+            self._validate(event)
+            event_json = self._canonical_json(event)
+            expected_hash = self._record_hash(expected_previous, event_json)
+            if item["previousHash"] != expected_previous or item["recordHash"] != expected_hash:
+                raise IntegrityFailure(f"project bundle event hash chain fails at sequence {sequence}")
+            self._collect_record_hashes(event.get("payload", {}), required_records := set())
+            for record_hash in required_records:
+                if record_hash not in available or available[record_hash][0] != "record":
+                    raise IntegrityFailure(f"project bundle omits referenced record {record_hash}")
+            events.append(event)
+            expected_previous = expected_hash
+        # Validate semantic replay in an isolated staging store before committing
+        # anything to the destination project. Historical imports rebuild queued
+        # run-fence metadata from canonical starts but never restore live leases.
+        with tempfile.TemporaryDirectory(prefix="canonical-import-") as staging_dir:
+            staging = SQLiteEventStore(Path(staging_dir) / "staging.sqlite3")
+            for _digest, (_kind, raw) in available.items():
+                staging.put_blob(raw)
+            staging._append_imported_history(events)
+            from .projection import Projector
+            Projector(staging).replay(project_id)
+        for _digest, (_kind, raw) in available.items():
+            self.put_blob(raw)
+        try:
+            results = self._append_imported_history(events)
+            if any(result.record_hash != item["recordHash"] for result, item in zip(results, bundle["events"])):
+                raise IntegrityFailure("imported project event hashes differ from the exported chain")
+            self.verified_events(project_id)
+            return results
+        except Exception:
+            # Appended event batches are transactionally rolled back; immutable
+            # blobs may remain unattached and are safe to garbage-collect later.
+            raise
+
+    def _append_imported_history(self, events: list[dict[str, Any]]) -> list[AppendResult]:
+        """Append already hash-verified history, rebuilding historical run fences only.
+
+        This is private to the empty-project bundle importer: it is not a live
+        dispatch path and intentionally never recreates queue lease ownership.
+        """
+        conn = self._connect()
+        results: list[AppendResult] = []
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not events:
+                raise EventStoreError("cannot import an empty event history")
+            project_ids = {event.get("projectId") for event in events}
+            if len(project_ids) != 1 or not all(isinstance(value, str) for value in project_ids):
+                raise EventStoreError("imported history must belong to exactly one project")
+            project_id = next(iter(project_ids))
+            existing = conn.execute(
+                "SELECT 1 FROM canonical_events WHERE project_id=? LIMIT 1", (project_id,),
+            ).fetchone()
+            if existing is not None:
+                raise EventStoreError("historical import requires an empty project")
+            previous_hash = ZERO_HASH
+            for sequence, supplied in enumerate(events, start=1):
+                candidate = dict(supplied)
+                self._validate(candidate)
+                if candidate.get("sequence") != sequence:
+                    raise IntegrityFailure("historical import sequence is not contiguous")
+                event_json = self._canonical_json(candidate)
+                record_hash = self._record_hash(previous_hash, event_json)
+                conn.execute(
+                    "INSERT INTO canonical_events "
+                    "(project_id, sequence, event_id, idempotency_key, event_json, previous_hash, record_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (project_id, sequence, candidate["eventId"], candidate["idempotencyKey"],
+                     event_json, previous_hash, record_hash),
+                )
+                if candidate["eventType"] == "run.started" and "queueJobId" in candidate["payload"]:
+                    conn.execute(
+                        "INSERT INTO queued_run_fences "
+                        "(project_id, run_id, work_id, job_id, lease_generation) VALUES (?, ?, ?, ?, ?)",
+                        (project_id, candidate["payload"]["runId"], candidate["payload"]["workId"],
+                         candidate["payload"]["queueJobId"], candidate["payload"]["leaseGeneration"]),
+                    )
+                results.append(AppendResult(candidate, sequence, record_hash, False))
+                previous_hash = record_hash
+            conn.execute("COMMIT")
+            return results
+        except sqlite3.IntegrityError as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise EventStoreError(f"historical import uniqueness failure: {exc}") from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _collect_record_hashes(value: Any, found: set[str]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "recordHash" and isinstance(child, str):
+                    found.add(child)
+                else:
+                    SQLiteEventStore._collect_record_hashes(child, found)
+        elif isinstance(value, list):
+            for child in value:
+                SQLiteEventStore._collect_record_hashes(child, found)
+
+    @staticmethod
+    def _collect_content_hashes(value: Any) -> set[str]:
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if (key.endswith("Hash") or key == "sha256") and isinstance(child, str) and len(child) == 64:
+                    found.add(child)
+                else:
+                    found.update(SQLiteEventStore._collect_content_hashes(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.update(SQLiteEventStore._collect_content_hashes(child))
+        return found
 
     def export_jsonl(self, project_id: str) -> str:
         conn = self._connect()

@@ -2,10 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/sebastbernal2-ship-it/agent-research-workspace/contracts/v0.2/schema.json",
   "title": "Project-first AI workspace canonical contracts v0.2",
-  "description": "Language-neutral interchange records. Event records are authoritative; other records are projections or immutable references. No secrets or native runtime state belong here. v0.2 adds immutable external-effect intents and effect lifecycle events; v0.1 remains supported.",
+  "description": "Language-neutral interchange records. Event records are authoritative; other records are projections or immutable references. No secrets or native runtime state belong here. v0.2 adds explicit project visibility/policy scope, finding/adoption provenance, and external-effect intents/lifecycle events; v0.1 remains supported.",
   "oneOf": [
     {
       "$ref": "#/$defs/project"
+    },
+    {
+      "$ref": "#/$defs/projectV02"
     },
     {
       "$ref": "#/$defs/capabilityGrant"
@@ -30,6 +33,12 @@
     },
     {
       "$ref": "#/$defs/event"
+    },
+    {
+      "$ref": "#/$defs/finding"
+    },
+    {
+      "$ref": "#/$defs/adoptionDecision"
     }
   ],
   "$defs": {
@@ -1647,6 +1656,50 @@
               }
             }
           ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "findingId",
+            "workId",
+            "recordHash"
+          ],
+          "properties": {
+            "findingId": {
+              "$ref": "#/$defs/id"
+            },
+            "workId": {
+              "$ref": "#/$defs/id"
+            },
+            "recordHash": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "adoptionId",
+            "findingId",
+            "workId",
+            "recordHash"
+          ],
+          "properties": {
+            "adoptionId": {
+              "$ref": "#/$defs/id"
+            },
+            "findingId": {
+              "$ref": "#/$defs/id"
+            },
+            "workId": {
+              "$ref": "#/$defs/id"
+            },
+            "recordHash": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
         }
       ]
     },
@@ -1700,7 +1753,9 @@
             "artifact.registered",
             "evidence.registered",
             "effect.intent_created",
-            "effect.status_changed"
+            "effect.status_changed",
+            "finding.recorded",
+            "adoption.decided"
           ]
         },
         "actor": {
@@ -2140,6 +2195,53 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "finding.recorded"
+              }
+            },
+            "required": [
+              "eventType"
+            ]
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "required": [
+                  "findingId",
+                  "workId",
+                  "recordHash"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "adoption.decided"
+              }
+            },
+            "required": [
+              "eventType"
+            ]
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "required": [
+                  "adoptionId",
+                  "findingId",
+                  "workId",
+                  "recordHash"
+                ]
+              }
+            }
+          }
         }
       ]
     },
@@ -2277,6 +2379,282 @@
           "then": {
             "required": [
               "approvalRef"
+            ]
+          }
+        }
+      ]
+    },
+    "projectV02": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recordType",
+        "schemaVersion",
+        "projectId",
+        "revision",
+        "name",
+        "status",
+        "charter",
+        "createdAt",
+        "updatedAt",
+        "visibility",
+        "policyScope"
+      ],
+      "properties": {
+        "recordType": {
+          "const": "project"
+        },
+        "schemaVersion": {
+          "const": "0.2"
+        },
+        "projectId": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "status": {
+          "enum": [
+            "active",
+            "paused",
+            "archived"
+          ]
+        },
+        "charter": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "revision",
+            "goals",
+            "nonGoals",
+            "acceptanceCriteria"
+          ],
+          "properties": {
+            "revision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "goals": {
+              "$ref": "#/$defs/stringList"
+            },
+            "nonGoals": {
+              "$ref": "#/$defs/stringList"
+            },
+            "acceptanceCriteria": {
+              "$ref": "#/$defs/stringList"
+            },
+            "policyRef": {
+              "$ref": "#/$defs/id"
+            }
+          }
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "visibility": {
+          "enum": [
+            "private",
+            "project",
+            "public"
+          ]
+        },
+        "policyScope": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recordType",
+        "schemaVersion",
+        "projectId",
+        "findingId",
+        "workId",
+        "runId",
+        "title",
+        "statement",
+        "sourceEvidenceIds",
+        "sourceHashes",
+        "createdBy",
+        "createdAt"
+      ],
+      "properties": {
+        "recordType": {
+          "const": "finding"
+        },
+        "schemaVersion": {
+          "const": "0.2"
+        },
+        "projectId": {
+          "$ref": "#/$defs/id"
+        },
+        "findingId": {
+          "$ref": "#/$defs/id"
+        },
+        "workId": {
+          "$ref": "#/$defs/id"
+        },
+        "runId": {
+          "$ref": "#/$defs/id"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "sourceEvidenceIds": {
+          "$ref": "#/$defs/refList",
+          "minItems": 1
+        },
+        "sourceHashes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "contentRef": {
+          "$ref": "#/$defs/id"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "contentRef"
+            ]
+          },
+          "then": {
+            "required": [
+              "contentHash"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "contentHash"
+            ]
+          },
+          "then": {
+            "required": [
+              "contentRef"
+            ]
+          }
+        }
+      ]
+    },
+    "adoptionDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recordType",
+        "schemaVersion",
+        "projectId",
+        "adoptionId",
+        "workId",
+        "findingId",
+        "findingHash",
+        "decision",
+        "rationale",
+        "decidedBy",
+        "decidedAt"
+      ],
+      "properties": {
+        "recordType": {
+          "const": "adoption_decision"
+        },
+        "schemaVersion": {
+          "const": "0.2"
+        },
+        "projectId": {
+          "$ref": "#/$defs/id"
+        },
+        "adoptionId": {
+          "$ref": "#/$defs/id"
+        },
+        "workId": {
+          "$ref": "#/$defs/id"
+        },
+        "findingId": {
+          "$ref": "#/$defs/id"
+        },
+        "findingHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "decision": {
+          "enum": [
+            "adopted",
+            "rejected",
+            "deferred"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "decidedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "decidedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "resultArtifactIds": {
+          "$ref": "#/$defs/refList"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "adopted"
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "required": [
+              "resultArtifactIds"
             ]
           }
         }
