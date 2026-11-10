@@ -66,6 +66,37 @@ class FailClosedStudioWrapperTests(unittest.TestCase):
                     401,
                 )
 
+    def test_correct_token_passes_all_discovered_api_methods_to_a_safe_sink(self):
+        async def sink(scope, receive, send):
+            if scope["type"] == "http":
+                await send({"type": "http.response.start", "status": 204, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.accept"})
+                while (await receive())["type"] != "websocket.disconnect":
+                    pass
+
+        client = TestClient(FailClosedDesktopAuth(sink, TOKEN))
+        tested = 0
+        for route in self.upstream_app.routes:
+            if not getattr(route, "path", "").startswith("/api/"):
+                continue
+            for method in sorted(getattr(route, "methods", set()) or set()):
+                with self.subTest(method=method, path=route.path):
+                    response = client.request(
+                        method, concrete_path(route.path),
+                        headers={"x-agx-desktop-token": TOKEN},
+                    )
+                    self.assertEqual(response.status_code, 204)
+                    tested += 1
+        self.assertEqual(tested, 262)
+        for route in (item for item in self.upstream_app.routes if getattr(item, "path", "").startswith("/ws/")):
+            with client.websocket_connect(
+                concrete_path(route.path), headers={"x-agx-desktop-token": TOKEN},
+            ):
+                pass
+
     def test_all_discovered_api_methods_are_rejected_without_or_with_wrong_token(self):
         routes = [
             route for route in self.upstream_app.routes
