@@ -95,6 +95,15 @@ class SQLiteWorkQueueTests(unittest.TestCase):
         invalid["descriptorVersion"] = 2
         with self.assertRaisesRegex(QueueError, "unsupported job descriptor version"):
             self.queue.enqueue("job.v2", PROJECT_ID, WORK_ID, invalid, now=125)
+        for field in ("workerId", "placement", "machineCapabilities", "networkPolicy"):
+            with self.subTest(field=field):
+                agent_selected_policy = execution_descriptor()
+                agent_selected_policy[field] = "untrusted-choice"
+                with self.assertRaisesRegex(QueueError, "missing or unsupported fields"):
+                    self.queue.enqueue(
+                        f"job.untrusted.{field}", PROJECT_ID, WORK_ID,
+                        agent_selected_policy, now=125,
+                    )
 
     def test_claim_renew_release_and_reopen_are_durable(self):
         self.enqueue()
