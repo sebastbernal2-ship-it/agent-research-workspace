@@ -1593,6 +1593,7 @@
             "from": {
               "enum": [
                 "prepared",
+                "approved",
                 "dispatching",
                 "confirmed",
                 "recorded",
@@ -1604,6 +1605,7 @@
             },
             "to": {
               "enum": [
+                "approved",
                 "dispatching",
                 "confirmed",
                 "recorded",

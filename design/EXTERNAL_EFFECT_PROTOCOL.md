@@ -25,16 +25,17 @@ Changing payload, destination, resource, authorization scope, or approval revisi
 ## State machine
 
 ```text
-prepared -> dispatching -> confirmed -> recorded
-     |            |             |
-     |            +-> ambiguous  +-> reconciliation_required
-     +-> cancelled (only before dispatch)
+prepared -> approved -> dispatching -> confirmed -> recorded
+     |           |             |             |
+     |           +-> cancelled  +-> ambiguous  +-> reconciliation_required
+     +-> cancelled (only before approval)
 
 ambiguous -> confirmed | rejected | manual_review
 ```
 
-- `prepared`: durable, validated, and authorized intent; no dispatch has started.
-- `dispatching`: connector is about to call the provider. Persist this transition before the call. A crash immediately afterward is ambiguous, even if no bytes actually left the process.
+- `prepared`: durable, validated intent; no dispatch has started.
+- `approved`: an attributed human approval event binds to the immutable request hash and capability revision. It is not proof that a hosting identity service authenticated the actor.
+- `dispatching`: only an approved request with a still-active grant/run and unexpired intent may enter this state. Persist this transition before the provider call. A crash immediately afterward is ambiguous, even if no bytes actually left the process.
 - `confirmed`: provider response/receipt or authoritative read-back proves the outcome. Persist its immutable content-addressed receipt reference/hash and minimal redacted metadata; replay verifies the referenced bytes.
 - `recorded`: canonical project event/result is committed and verified; the effect is complete in the project view.
 - `ambiguous`: no authoritative outcome is available. Never automatically send again unless the provider's idempotency contract and reconciliation establish that retry is safe.
@@ -94,10 +95,10 @@ Connectors without safe idempotency/reconciliation stay disabled for unattended 
 
 ## Contract-version and implementation boundary
 
-Issue #2 now has a draft additive v0.2 schema with immutable `effect_intent` and `effect.intent_created` / `effect.status_changed` events. The v0.1 schema and event vocabulary remain intact; registry selection validates each record by its declared version, and the projector can replay mixed v0.1/v0.2 histories. `EffectLedger` validates active exact-scope grant revisions at intent creation and immediately before dispatch, active run/principal ownership, HTTPS endpoint hygiene, request/receipt content hashes, expiry bounds, compare-and-set transitions, and optional queue-lease fencing. The `effects` state is rebuilt solely from canonical events; there is no second mutable outbox table yet. These commands are local prototype code, not an authenticated application boundary. Approval references are representable but not verified against a canonical approval record, and CapabilityAuthority/RunLedger cannot yet bind this flow into real adapter/tool dispatch. Do not mutate v0.1 or encode effect state as an unrelated artifact/message.
+Issue #2 now has a draft additive v0.2 schema with immutable `effect_intent` and `effect.intent_created` / `effect.status_changed` events. The v0.1 schema and event vocabulary remain intact; registry selection validates each record by its declared version, and the projector can replay mixed v0.1/v0.2 histories. `EffectLedger` validates active exact-scope grant revisions at intent creation and immediately before dispatch, active run/principal ownership, HTTPS endpoint hygiene, request/receipt content hashes, expiry bounds, compare-and-set transitions, and optional queue-lease fencing. A persisted human approval transition binds to the exact request hash and grant revision before dispatch is allowed; hosting authentication is not supplied. The `effects` state is rebuilt solely from canonical events; there is no second mutable outbox table yet. These commands are local prototype code, not an authenticated application boundary. The human approval event is canonical and replayable, but no production identity/authentication boundary verifies its actor; CapabilityAuthority/RunLedger cannot yet bind this flow into real adapter/tool dispatch. Do not mutate v0.1 or encode effect state as an unrelated artifact/message.
 
 Before relay implementation under #15, #2 still needs independent contract review, golden v0.1 byte-identical export/replay fixtures, versioned migration/compatibility tests, and a canonical approval representation. If a durable relay projection is later added, it must be rebuildable from effect events and updated atomically with each canonical transition; it cannot be a competing state authority.
 
 ## Current boundary
 
-The v0.2 effect projection tracks `prepared`, `dispatching`, `confirmed`, `recorded`, `ambiguous`, `rejected`, `manual_review`, and pre-dispatch `cancelled`. Tests cover valid lifecycle replay, exact grant revision/resource, revocation denial, request blob hashes, stale/forbidden transitions, and the ambiguous no-redispatch rule. The existing Meldwork path separately has a stable invocation ID, queued job/generation binding, a lease-checked prepared→executing transition, staged receipt import, and ambiguous no-auto-replay behavior. Its regression test simulates a crash after the durable dispatch marker but before a provider call; restart marks it ambiguous, retry cannot start or stage a receipt, and canonical history stays unchanged. This still has no provider-facing idempotency reconciliation, immutable provider receipt authentication, canonical approval verification, general relay, authenticated recovery, or external-effect test double. It is not an external-effect guarantee.
+The v0.2 effect projection tracks `prepared`, `approved`, `dispatching`, `confirmed`, `recorded`, `ambiguous`, `rejected`, `manual_review`, and pre-dispatch `cancelled`. Tests cover approval binding, valid lifecycle replay, exact grant revision/resource, revocation denial, request blob hashes, stale/forbidden transitions, and the ambiguous no-redispatch rule. The existing Meldwork path separately has a stable invocation ID, queued job/generation binding, a lease-checked prepared→executing transition, staged receipt import, and ambiguous no-auto-replay behavior. Its regression test simulates a crash after the durable dispatch marker but before a provider call; restart marks it ambiguous, retry cannot start or stage a receipt, and canonical history stays unchanged. This still has no provider-facing idempotency reconciliation, immutable provider receipt authentication, canonical approval verification, general relay, authenticated recovery, or external-effect test double. It is not an external-effect guarantee.

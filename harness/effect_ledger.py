@@ -20,7 +20,8 @@ class EffectLedgerError(ValueError):
 
 
 _ALLOWED = {
-    "prepared": {"dispatching", "cancelled"},
+    "prepared": {"approved", "cancelled"},
+    "approved": {"dispatching", "cancelled"},
     "dispatching": {"confirmed", "ambiguous", "rejected", "manual_review"},
     "confirmed": {"recorded", "manual_review"},
     "ambiguous": {"confirmed", "rejected", "manual_review"},
@@ -128,8 +129,13 @@ class EffectLedger:
             return effect
         if target not in _ALLOWED.get(effect["status"], set()):
             raise EffectLedgerError(f"forbidden effect transition {effect['status']!r} -> {target!r}")
+        if target == "approved":
+            if actor.get("actorType") != "human" or actor.get("role") != "user":
+                raise EffectLedgerError("effect approval requires a human user principal")
         if target == "dispatching":
             intent = effect["intent"]
+            if effect.get("approval") is None:
+                raise EffectLedgerError("effect dispatch requires persisted approval bound to its immutable request")
             grant = state["capabilityGrants"].get(intent["capabilityGrantId"])
             run = state["agentRuns"].get(intent["runId"])
             now = datetime.fromisoformat(self.clock().replace("Z", "+00:00"))

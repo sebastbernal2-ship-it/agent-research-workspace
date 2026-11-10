@@ -603,7 +603,8 @@ class Projector:
                 if effect is None or effect["status"] != payload["from"]:
                     raise ProjectionError("effect status transition has unknown intent or stale prior state")
                 allowed = {
-                    "prepared": {"dispatching", "cancelled"},
+                    "prepared": {"approved", "cancelled"},
+                    "approved": {"dispatching", "cancelled"},
                     "dispatching": {"confirmed", "ambiguous", "rejected", "manual_review"},
                     "confirmed": {"recorded", "manual_review"},
                     "ambiguous": {"confirmed", "rejected", "manual_review"},
@@ -619,8 +620,12 @@ class Projector:
                     raise ProjectionError("effect transition work/run attribution differs from immutable intent")
                 target = payload["to"]
                 actor_type = event["actor"].get("actorType")
+                if target == "approved" and (actor_type != "human" or event["actor"].get("role") != "user"):
+                    raise ProjectionError("effect approval requires a human user actor")
                 if target == "dispatching":
                     intent = effect["intent"]
+                    if effect.get("approval") is None:
+                        raise ProjectionError("effect dispatch requires persisted approval for the immutable request")
                     run = state["agentRuns"].get(intent["runId"])
                     grant = state["capabilityGrants"].get(intent["capabilityGrantId"])
                     try:
@@ -647,8 +652,8 @@ class Projector:
                     raise ProjectionError("review/cancellation effect transitions require a human user actor")
                 if target not in allowed[effect["status"]]:
                     raise ProjectionError(f"forbidden effect transition {effect['status']!r} -> {target!r}")
-                if target == "dispatching" and effect["status"] != "prepared":
-                    raise ProjectionError("effect dispatch may begin only once")
+                if target == "dispatching" and effect["status"] != "approved":
+                    raise ProjectionError("effect dispatch may begin only after approval")
                 if target == "confirmed":
                     receipt_ref = payload.get("receiptRef")
                     receipt_hash = payload.get("receiptHash")
@@ -665,6 +670,13 @@ class Projector:
                 if target in {"ambiguous", "manual_review", "rejected", "cancelled"} and not payload.get("reason"):
                     raise ProjectionError("effect terminal/recovery transition requires a reason")
                 effect["status"] = target
+                if target == "approved":
+                    effect["approval"] = {
+                        "eventId": event["eventId"], "actor": event["actor"],
+                        "requestHash": effect["intent"]["requestHash"],
+                        "capabilityRevision": effect["intent"]["capabilityRevision"],
+                        "approvedAt": event["occurredAt"],
+                    }
                 if payload.get("receiptHash") is not None:
                     if effect.get("receiptHash") not in (None, payload["receiptHash"]):
                         raise ProjectionError("effect receipt hash is immutable once confirmed")

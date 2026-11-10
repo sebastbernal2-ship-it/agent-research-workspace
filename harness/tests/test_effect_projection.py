@@ -66,8 +66,15 @@ class EffectProjectionTests(unittest.TestCase):
             self.intent, actor=VP, event_id="event.effect.created",
         )
 
+    def approve(self):
+        return EffectLedger(self.store, clock=lambda: NOW).transition(
+            PROJECT, "effect.1", "approved", actor=USER,
+            event_id="event.effect.approved",
+        )
+
     def test_v02_effect_lifecycle_replays_without_mutating_intent(self):
         self.create_intent()
+        self.approve()
         receipt_ref, receipt_hash = self.store.put_blob(b"synthetic receipt")
         ledger = EffectLedger(self.store, clock=lambda: NOW)
         ledger.transition(PROJECT, "effect.1", "dispatching", actor=VP, event_id="event.effect.dispatching")
@@ -81,11 +88,23 @@ class EffectProjectionTests(unittest.TestCase):
         self.assertEqual(effect["receiptHash"], receipt_hash)
         self.assertEqual(effect["receiptRef"], receipt_ref)
         self.assertEqual(effect["intent"], self.intent)
-        self.assertEqual(len(effect["history"]), 4)
+        self.assertEqual(len(effect["history"]), 5)
+        self.assertEqual(effect["approval"]["actor"], USER)
+        self.assertEqual(effect["approval"]["requestHash"], self.request_hash)
         self.assertTrue(self.store.verify(PROJECT))
+
+    def test_effect_cannot_dispatch_before_human_approval(self):
+        self.create_intent()
+        with self.assertRaisesRegex(EffectLedgerError, "forbidden effect transition"):
+            EffectLedger(self.store, clock=lambda: NOW).transition(
+                PROJECT, "effect.1", "dispatching", actor=VP,
+                event_id="event.effect.dispatching",
+            )
+        self.assertEqual(Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"], "prepared")
 
     def test_ambiguous_effect_cannot_be_redispatched(self):
         self.create_intent()
+        self.approve()
         ledger = EffectLedger(self.store, clock=lambda: NOW)
         ledger.transition(PROJECT, "effect.1", "dispatching", actor=VP, event_id="event.effect.dispatching")
         system = {"actorType": "system", "actorId": "system.recovery", "role": "system"}
@@ -106,6 +125,7 @@ class EffectProjectionTests(unittest.TestCase):
 
     def test_grant_revoked_after_intent_prevents_dispatch(self):
         self.create_intent()
+        self.approve()
         self.authority.revoke(
             PROJECT, self.grant["grantId"], actor=USER, reason="revoke before dispatch",
             occurred_at="2026-04-16T12:01:00Z",
@@ -115,7 +135,7 @@ class EffectProjectionTests(unittest.TestCase):
                 PROJECT, "effect.1", "dispatching", actor=VP,
                 event_id="event.effect.dispatching",
             )
-        self.assertEqual(Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"], "prepared")
+        self.assertEqual(Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"], "approved")
 
     def test_v01_event_vocabulary_remains_accepted_in_mixed_history(self):
         self.create_intent()
