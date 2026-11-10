@@ -186,6 +186,7 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
             "Initial proposal: compare public astronomy sources.",
             "2026-04-16T12:00:00Z",
         )
+        leak_sentinel = "credential=should-be-redacted"
         challenge = request(
             "receipt.challenge.1",
             "challenge",
@@ -196,7 +197,7 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
                 "summary": "The distance-only claim is contradicted by opposite hemispheric seasons.",
                 "verdict": "contradict",
             },
-            "Public critique.\n\n## Private Reasoning\nnot for the project log\n\ncredential=should-be-redacted",
+            f"Public critique.\n\n## Private Reasoning\nnot for the project log\n\n{leak_sentinel}",
             "2026-04-16T12:01:00Z",
         )
         synthesis = request(
@@ -228,6 +229,18 @@ class MeldworkReceiptBridgeTests(unittest.TestCase):
         self.assertNotIn("not for the project log", challenge_content["visibleText"])
         self.assertNotIn("credential=", challenge_content["visibleText"])
         self.assertEqual(challenge_content["receipt"]["verdict"], "contradict")
+        persisted_material = [json.dumps(events, sort_keys=True)]
+        for event in events:
+            payload = event.get("payload", {})
+            for field in ("recordHash", "contentHash"):
+                digest = payload.get(field)
+                if not digest:
+                    continue
+                if field == "recordHash":
+                    persisted_material.append(json.dumps(self.store.get_record(digest), sort_keys=True))
+                else:
+                    persisted_material.append(self.store.get_blob(digest).decode("utf-8"))
+        self.assertNotIn(leak_sentinel, "\n".join(persisted_material))
         self.assertTrue(self.store.verify("project.meldwork"))
         self.assertEqual(len(Projector(self.store).replay("project.meldwork")["messages"]), 3)
 

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from harness.capabilities import CapabilityAuthority, CapabilityDenied, GuardedCapabilityExecutor
 from harness.control_plane import ControlPlaneError, ProjectControlPlane
-from harness.event_store import EventStoreError, SQLiteEventStore
+from harness.event_store import EventStoreError, IdempotencyConflict, SQLiteEventStore
 from harness.projection import Projector, ProjectionError
 from harness.testing import USER, seed_synthetic_project
 
@@ -245,6 +245,29 @@ class CapabilityAuthorityTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ProjectionError, "authority"):
             Projector(self.store).replay("project.capability")
+
+    def test_grant_replay_is_idempotent_and_mutated_replay_is_rejected(self):
+        grant = self.authority.grant(grant_record(), actor=USER)
+        initial_events = self.store.events("project.capability")
+        grant_event = next(event for event in initial_events if event["eventType"] == "capability.granted")
+        work_revision = Projector(self.store).replay("project.capability")["workItems"]["work.scoped"]["revision"]
+
+        # Repeating the command and replaying the identical canonical event must
+        # not mint a second grant or advance the work revision again.
+        self.assertEqual(self.authority.grant(grant_record(), actor=USER), grant)
+        replay = self.store.append(grant_event)
+        self.assertTrue(replay.duplicate)
+        self.assertEqual(self.store.events("project.capability"), initial_events)
+        self.assertEqual(
+            Projector(self.store).replay("project.capability")["workItems"]["work.scoped"]["revision"],
+            work_revision,
+        )
+
+        mutated = dict(grant_event)
+        mutated["payload"] = {**grant_event["payload"], "capability": "filesystem.write"}
+        with self.assertRaises(IdempotencyConflict):
+            self.store.append(mutated)
+        self.assertTrue(self.store.verify("project.capability"))
 
     def test_cross_project_grant_reference_is_rejected(self):
         with self.assertRaisesRegex(ControlPlaneError, "unknown work"):
