@@ -113,6 +113,68 @@ class EffectProjectionTests(unittest.TestCase):
             ledger.transition(PROJECT, "effect.1", "dispatching", actor=VP, event_id="event.effect.replay")
         self.assertEqual(Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"], "ambiguous")
 
+    def test_provider_without_authoritative_lookup_stops_at_manual_review(self):
+        class UnqueryableConnector:
+            def __init__(self):
+                self.dispatch_count = 0
+
+            def dispatch(self, _key):
+                self.dispatch_count += 1
+
+            def lookup(self, _key):
+                return None
+
+        self.create_intent()
+        self.approve()
+        system = {"actorType": "system", "actorId": "system.reconciler", "role": "system"}
+        ledger = EffectLedger(self.store, clock=lambda: NOW)
+        ledger.transition(
+            PROJECT, "effect.1", "dispatching", actor=VP,
+            event_id="event.effect.dispatching",
+        )
+        connector = UnqueryableConnector()
+        connector.dispatch(self.intent["idempotencyKey"])
+        ledger.transition(
+            PROJECT, "effect.1", "ambiguous", actor=system,
+            event_id="event.effect.ambiguous", reason="response lost; provider state unknown",
+        )
+        self.assertIsNone(connector.lookup(self.intent["idempotencyKey"]))
+        ledger.transition(
+            PROJECT, "effect.1", "manual_review", actor=USER,
+            event_id="event.effect.manual-review",
+            reason="provider has no authoritative operation lookup",
+        )
+        self.assertEqual(connector.dispatch_count, 1)
+        self.assertEqual(
+            Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"],
+            "manual_review",
+        )
+
+    def test_confirmation_requires_exact_content_addressed_receipt(self):
+        self.create_intent()
+        self.approve()
+        ledger = EffectLedger(self.store, clock=lambda: NOW)
+        ledger.transition(
+            PROJECT, "effect.1", "dispatching", actor=VP,
+            event_id="event.effect.dispatching",
+        )
+        system = {"actorType": "system", "actorId": "system.reconciler", "role": "system"}
+        receipt_ref, receipt_hash = self.store.put_blob(b"synthetic receipt")
+        with self.assertRaisesRegex(EffectLedgerError, "match its hash"):
+            ledger.transition(
+                PROJECT, "effect.1", "confirmed", actor=system,
+                event_id="event.effect.bad-reference", receipt_hash=receipt_hash,
+                receipt_ref="blob." + "0" * 64,
+            )
+        with self.assertRaisesRegex(EffectLedgerError, "blob is missing"):
+            ledger.transition(
+                PROJECT, "effect.1", "confirmed", actor=system,
+                event_id="event.effect.missing-receipt", receipt_hash="a" * 64,
+                receipt_ref="blob." + "a" * 64,
+            )
+        self.assertEqual(Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"], "dispatching")
+        self.assertTrue(self.store.get_blob(receipt_hash) == b"synthetic receipt")
+
     def test_intent_rejects_revoked_or_wrong_scope_grant_on_replay(self):
         revoked = self.authority.revoke(
             PROJECT, self.grant["grantId"], actor=USER, reason="synthetic revoke",
