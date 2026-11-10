@@ -23,6 +23,7 @@ from .runtime import PROJECT_ID, PrototypeRuntime
 STATIC_ROOT = Path(__file__).resolve().parent
 MAX_JSON_BODY_BYTES = 16 * 1024
 PROJECT_PATH = re.compile(r"^/api/v1/projects/([^/]+)$")
+PROJECT_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/(runs|evidence|artifacts)$")
 INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
 INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
 INBOX_COMMAND_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
@@ -165,6 +166,14 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if project_match:
             project_id = unquote(project_match.group(1))
             self._run(lambda: self._send_json(200, self.runtime.project_summary(project_id)))
+            return
+
+        collection_match = PROJECT_COLLECTION_PATH.fullmatch(path)
+        if collection_match:
+            project_id, collection = map(unquote, collection_match.groups())
+            self._run(lambda: self._send_json(
+                200, {"projectId": project_id, "items": self.runtime.project_collection(project_id, collection)},
+            ))
             return
 
         list_match = INBOX_LIST_PATH.fullmatch(path)

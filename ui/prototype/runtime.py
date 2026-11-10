@@ -41,7 +41,10 @@ class SingleProjectDemoAccess(ProjectAccessPolicy):
     def require_project_access(self, actor: dict[str, str], project_id: str, action: str) -> None:
         if actor != DEMO_USER or project_id != PROJECT_ID:
             raise InboxForbidden("project access denied")
-        if action not in {"project.read", "inbox.read", "inbox.answer", "inbox.close"}:
+        if action not in {
+            "project.read", "inbox.read", "inbox.answer", "inbox.close",
+            "run.read", "evidence.read", "artifact.read",
+        }:
             raise InboxForbidden("action is not available in the local demo")
 
 
@@ -258,6 +261,20 @@ class PrototypeRuntime:
                 "eventSequence": state["_eventSequence"],
             },
         }
+
+    def project_collection(self, project_id: str, collection: str) -> list[dict[str, Any]]:
+        readers = {
+            "runs": self.project_application.list_agent_runs,
+            "evidence": self.project_application.list_evidence,
+            "artifacts": self.project_application.list_artifacts,
+        }
+        reader = readers.get(collection)
+        if reader is None:
+            raise ValueError("unsupported project collection")
+        try:
+            return reader(project_id)
+        except KeyError as exc:
+            raise InboxNotFound("project was not found") from exc
 
     def list_questions(self, project_id: str, status: str = "open") -> dict[str, Any]:
         if status == "open":

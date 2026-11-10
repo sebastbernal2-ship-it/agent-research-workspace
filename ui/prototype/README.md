@@ -24,7 +24,7 @@ The SQLite database persists at `$XDG_STATE_HOME/northstar-ai-workspace-prototyp
 - Agent/model profiles illustrating local VP and potential remote orchestrator/specialist assignments. Codex terms and provider connections are intentionally marked unreviewed/unavailable.
 - Project charter from canonical records; evidence view accurately reports that no evidence/artifact records exist yet.
 
-The UI is plain HTML/CSS/JavaScript; a small Python standard-library HTTP adapter serves it and exposes only the local project/inbox endpoints under `/api/v1/`. This validates the workflow without selecting React, Svelte, or a production backend framework. It has keyboard-operable navigation and question controls, visible focus styles, semantic landmarks/headings, responsive layout, reduced-motion handling, and no external fonts or assets. This has not received a browser-matrix or independent accessibility review.
+The UI is plain HTML/CSS/JavaScript; a small Python standard-library HTTP adapter serves it and exposes local project/inbox plus read-only run, evidence, and artifact endpoints under `/api/v1/`. This validates the workflow without selecting React, Svelte, or a production backend framework. It has keyboard-operable navigation and question controls, visible focus styles, semantic landmarks/headings, responsive layout, reduced-motion handling, and no external fonts or assets. This has not received a browser-matrix or independent accessibility review.
 
 ## Checks
 

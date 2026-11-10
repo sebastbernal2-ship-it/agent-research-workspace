@@ -7,7 +7,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from ui.prototype.local_server import build_server
-from ui.prototype.runtime import PROJECT_ID, PrototypeRuntime
+from harness.evidence import EvidenceRegistrar
+from harness.run_ledger import RunLedger
+from ui.prototype.runtime import (
+    CREATED_AT, DEMO_RESEARCHER, PROJECT_ID, PrototypeRuntime,
+)
 
 
 class LocalPrototypeHTTPTests(unittest.TestCase):
@@ -229,6 +233,30 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 413)
         self.assertEqual(json.loads(raised.exception.read())["error"], "request_too_large")
 
+    def test_run_evidence_and_artifact_reads_use_project_scoped_application_facades(self):
+        RunLedger(self.runtime.store, clock=lambda: CREATED_AT).start(
+            PROJECT_ID, "work.ui-foundation", run_id="run.ui-api-read",
+            agent=DEMO_RESEARCHER, adapter={"name": "offline-test", "version": "1"},
+            context_hash="a" * 64, occurred_at=CREATED_AT,
+        )
+        source_bytes = b"synthetic-source-content-must-not-appear-in-api-response"
+        EvidenceRegistrar(self.runtime.store, clock=lambda: CREATED_AT).register(
+            PROJECT_ID, "work.ui-foundation", evidence_id="evidence.ui-api-read",
+            claim_text="Synthetic claim for a read-scope test.", stance="supports",
+            source_uri="https://example.test/source", source_title="Synthetic source",
+            source_content=source_bytes, actor=DEMO_RESEARCHER, run_id="run.ui-api-read",
+        )
+        status, runs, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/runs")
+        self.assertEqual(status, 200)
+        self.assertEqual([item["runId"] for item in runs["items"]], ["run.ui-api-read"])
+        status, evidence, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/evidence")
+        self.assertEqual(status, 200)
+        self.assertEqual(evidence["items"][0]["evidenceId"], "evidence.ui-api-read")
+        self.assertNotIn(source_bytes.decode(), json.dumps(evidence))
+        status, artifacts, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/artifacts")
+        self.assertEqual(status, 200)
+        self.assertEqual(artifacts["items"], [])
+
     def test_api_v1_is_explicit_and_unknown_api_versions_fail_closed(self):
         status, health, _ = self.request("/api/v1/health")
         self.assertEqual(status, 200)
@@ -238,6 +266,10 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(error["error"], "not_found")
 
     def test_cross_project_and_unknown_paths_do_not_disclose_project_data(self):
+        for collection in ("runs", "evidence", "artifacts"):
+            status, error, _ = self.request(f"/api/v1/projects/project.other/{collection}")
+            self.assertEqual(status, 403)
+            self.assertEqual(error["error"], "project_access_denied")
         status, error, _ = self.request("/api/projects/project.other/inbox")
         self.assertEqual(status, 403)
         self.assertEqual(error["error"], "project_access_denied")
