@@ -441,6 +441,21 @@ store.append_many(json.loads(sys.argv[3]))
         with self.assertRaises(IntegrityFailure):
             self.store.verify("project.alpha")
 
+    def test_backup_refuses_a_tampered_content_addressed_blob(self):
+        _reference, digest = self.store.put_blob(b"original synthetic backup blob")
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute("DROP TRIGGER canonical_blobs_no_update")
+            conn.execute(
+                "UPDATE canonical_blobs SET content=? WHERE content_hash=?",
+                (b"tampered bytes", digest),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(IntegrityFailure, "backup contains corrupt blob"):
+            self.store.backup_to(Path(self.temp.name) / "tampered-backup.sqlite3")
+
     def test_content_addressed_blobs_are_immutable_and_verified(self):
         ref, digest = self.store.put_blob("a discussion message")
         self.assertEqual(ref, f"blob.{digest}")
