@@ -100,7 +100,10 @@ def extract_sse(line: str):
 
 
 def create_client(monkeypatch, llm):
+    from agenticx.studio.storage.factory import reset_storage_backend_for_testing
     from agenticx.studio import server as server_module
+
+    reset_storage_backend_for_testing()
 
     async def skip_title_suggestion(*_args, **_kwargs):
         return None
@@ -165,6 +168,17 @@ def test_chat_waits_for_clarify_api_decision_then_resumes(monkeypatch, selected,
                 pending_ids = [request_id for request_id, future in clarify_gate._pending.items() if not future.done()]
                 assert len(pending_ids) == 1
                 confirmation_id = pending_ids[0]
+                from agenticx.runtime.checkpoint import CheckpointStore
+                from agenticx.runtime.clarify import AsyncClarifyGate
+
+                checkpoint = CheckpointStore().load(session_id)
+                assert checkpoint is not None
+                assert checkpoint.confirm_state["pending"] == []
+                assert not hasattr(checkpoint, "clarify_state")
+                fresh_clarify_gate = AsyncClarifyGate(timeout_seconds=1)
+                assert not fresh_clarify_gate.resolve(
+                    confirmation_id, {"selected_options": [selected], "answer_text": ""},
+                )
                 clarify = client.post(
                     "/api/clarify",
                     headers=headers,
@@ -195,7 +209,11 @@ def test_chat_tool_execution_waits_for_confirm_api_and_runs_only_if_approved(mon
     with tempfile.TemporaryDirectory(prefix="issue4-studio-command-") as temp_home:
         env = patch.dict(
             os.environ,
-            {"HOME": temp_home, "AGX_DESKTOP_TOKEN": TOKEN},
+            {
+                "HOME": temp_home,
+                "AGX_DESKTOP_TOKEN": TOKEN,
+                "AGX_CONFIRM_TIMEOUT_SEC": "10",
+            },
             clear=False,
         )
         env.start()
@@ -241,6 +259,23 @@ def test_chat_tool_execution_waits_for_confirm_api_and_runs_only_if_approved(mon
                 request_ids = [request_id for request_id, future in gate._pending.items() if not future.done()]
                 assert len(request_ids) == 1
                 assert launches == [], "command dispatch occurred before human approval"
+                from agenticx.runtime.checkpoint import CheckpointStore
+
+                checkpoint = CheckpointStore().load(session_id)
+                assert checkpoint is not None, "expected an AgenticX turn checkpoint before tool dispatch"
+                assert checkpoint.pending_tool_calls
+                # Current upstream saves the turn checkpoint before dispatch, but
+                # its gate snapshot has no pending request after the gate is opened.
+                assert checkpoint.status == "in_progress"
+                assert checkpoint.confirm_state["pending"] == []
+                from agenticx.runtime.confirm import AsyncConfirmGate
+
+                async def restore_and_resolve() -> bool:
+                    fresh_gate = AsyncConfirmGate(timeout_seconds=1)
+                    fresh_gate.restore_state(checkpoint.confirm_state)
+                    return fresh_gate.resolve(request_ids[0], approved)
+
+                assert asyncio.run(restore_and_resolve()) is False
                 # Patch only after the real confirmation gate is pending, so no
                 # test infrastructure can accidentally start a subprocess early.
                 monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", fake_process)
@@ -262,5 +297,87 @@ def test_chat_tool_execution_waits_for_confirm_api_and_runs_only_if_approved(mon
             assert "confirm_response" in types
             assert "final" in types
             assert not any(kind == "error" for kind in types)
+        finally:
+            env.stop()
+
+
+def test_pending_confirm_checkpoint_cannot_be_resolved_by_fresh_manager(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="issue4-studio-restart-") as temp_home:
+        env = patch.dict(
+            os.environ,
+            {
+                "HOME": temp_home,
+                "AGX_DESKTOP_TOKEN": TOKEN,
+                "AGX_CONFIRM_TIMEOUT_SEC": "5",
+                "AGX_RESUME_INTERRUPTED": "1",
+            },
+            clear=False,
+        )
+        env.start()
+        try:
+            import agenticx.cli.agent_tools as agent_tools
+            from agenticx.runtime.checkpoint import CheckpointStore
+            from agenticx.studio.server import create_studio_app
+            from agenticx.studio.storage.factory import reset_storage_backend_for_testing
+
+            async def fake_sandbox(argv, _session, cwd, **_kwargs):
+                return argv, None, "synthetic-test-sandbox"
+
+            monkeypatch.setattr(agent_tools, "_apply_command_sandbox", fake_sandbox)
+            llm = DeterministicCommandLLM()
+            client, headers, session_id, managed = create_client(monkeypatch, llm)
+            gate = managed.get_confirm_gate("meta")
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending_chat = pool.submit(run_chat, client, headers, session_id)
+                deadline = time.monotonic() + 10
+                while not gate._pending:
+                    if pending_chat.done():
+                        pending_chat.result()
+                        raise AssertionError("chat finished without a pending confirmation")
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("chat did not reach the confirmation gate")
+                    time.sleep(0.01)
+                request_id = next(iter(gate._pending))
+                checkpoint = CheckpointStore().load(session_id)
+                assert checkpoint is not None
+                assert checkpoint.confirm_state["pending"] == []
+
+                # Drop process-scoped storage and build a fresh Studio manager
+                # over the same isolated HOME, as a restart would.
+                reset_storage_backend_for_testing()
+                fresh_app = create_studio_app()
+                fresh_manager = fresh_app.state.session_manager
+                fresh_store = CheckpointStore()
+                restored = {}
+
+                async def observe_recovery(sid, fresh_managed, resumed_checkpoint):
+                    restored["checkpoint"] = resumed_checkpoint
+                    restored["can_resolve"] = fresh_managed.get_confirm_gate("meta").resolve(
+                        request_id, True,
+                    )
+                    return False
+
+                restored_checkpoint = fresh_store.load(session_id)
+                assert restored_checkpoint is not None
+                asyncio.run(fresh_manager._resume_single_session(
+                    session_id,
+                    restored_checkpoint,
+                    fresh_store,
+                    runtime_runner=observe_recovery,
+                ))
+                assert restored.get("checkpoint") is not None
+                assert restored["can_resolve"] is False
+                fresh_client = TestClient(build_app(TOKEN, fresh_app))
+                lost_response = fresh_client.post(
+                    "/api/confirm",
+                    headers=headers,
+                    json={"session_id": session_id, "request_id": request_id, "approved": True},
+                )
+                assert lost_response.status_code == 404
+                assert lost_response.json()["detail"] == "confirm request not found"
+                # The original request eventually times out fail-closed; no command
+                # is launched during this restart simulation.
+                assert pending_chat.result(timeout=10)
         finally:
             env.stop()
