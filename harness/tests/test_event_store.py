@@ -178,6 +178,46 @@ class SQLiteEventStoreTests(unittest.TestCase):
             reopened.commit_adapter_receipt("invocation.ambiguous")
         self.assertEqual(reopened.events("project.alpha"), [])
 
+    def test_process_crash_after_synthetic_side_effect_never_dispatches_it_twice(self):
+        side_effect_path = self.path.with_suffix(".synthetic-effect")
+        child = r'''
+import os
+import sys
+from harness.event_store import SQLiteEventStore
+
+store = SQLiteEventStore(sys.argv[1])
+invocation = store.prepare_adapter_invocation("invocation.effect-crash", "project.alpha", "f" * 64)
+if not store.start_adapter_invocation(invocation["invocationId"])["started"]:
+    raise SystemExit("dispatch was not claimed")
+with open(sys.argv[2], "a", encoding="utf-8") as marker:
+    marker.write("effect-attempt" + chr(10))
+    marker.flush()
+    os.fsync(marker.fileno())
+os._exit(71)  # effect occurred, process died before recording its receipt
+'''
+        child_process = subprocess.run(
+            [sys.executable, "-c", child, str(self.path), str(side_effect_path)],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(child_process.returncode, 71, child_process.stderr)
+        self.assertEqual(side_effect_path.read_text(encoding="utf-8").splitlines(), ["effect-attempt"])
+
+        restarted = SQLiteEventStore(self.path)
+        self.assertEqual(
+            restarted.mark_ambiguous_adapter_invocations("project.alpha"),
+            ["invocation.effect-crash"],
+        )
+        same = restarted.prepare_adapter_invocation(
+            "invocation.effect-crash", "project.alpha", "f" * 64,
+        )
+        self.assertEqual(same["state"], "ambiguous")
+        self.assertFalse(restarted.start_adapter_invocation("invocation.effect-crash")["started"])
+        self.assertEqual(side_effect_path.read_text(encoding="utf-8").splitlines(), ["effect-attempt"])
+        self.assertEqual(restarted.events("project.alpha"), [])
+
     def test_dispatch_marker_crash_is_ambiguous_and_never_replays(self):
         invocation_id = "invocation.crash-before-provider-call"
         request_hash = "e" * 64
