@@ -22,7 +22,7 @@ The SQLite database persists at `$XDG_STATE_HOME/northstar-ai-workspace-prototyp
 - User-initiated VP conversation, clearly marked as an unconnected local-Qwen profile.
 - Separate inbox with impact, explicit options, affected work, persisted answer/reject commands, and resolved history. Clarification is visibly unavailable because its command is not implemented.
 - Agent/model profiles illustrating local VP and potential remote orchestrator/specialist assignments. Codex terms and provider connections are intentionally marked unreviewed/unavailable.
-- Project charter from canonical records; evidence view accurately reports that no evidence/artifact records exist yet.
+- Project charter plus read-only run, evidence, and artifact metadata from scoped canonical endpoints; the seeded demo starts with no runs/evidence/artifacts, and source/artifact bytes are not served by these lists.
 
 The UI is plain HTML/CSS/JavaScript; a small Python standard-library HTTP adapter serves it and exposes local project/inbox plus read-only run, evidence, and artifact endpoints under `/api/v1/`. This validates the workflow without selecting React, Svelte, or a production backend framework. It has keyboard-operable navigation and question controls, visible focus styles, semantic landmarks/headings, responsive layout, reduced-motion handling, and no external fonts or assets. This has not received a browser-matrix or independent accessibility review.
 

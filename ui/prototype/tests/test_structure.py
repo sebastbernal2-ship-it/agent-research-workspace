@@ -55,6 +55,15 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertNotIn("XMLHttpRequest", self.js)
         self.assertNotRegex(self.css, r"url\(\s*['\"]?https?://")
 
+    def test_project_history_views_use_scoped_api_and_safe_text_rendering(self):
+        for collection in ("runs", "evidence", "artifacts"):
+            self.assertIn(f"${{PROJECT_API}}/{collection}", self.js)
+        self.assertIn('id="run-record-list"', self.html)
+        self.assertIn('id="evidence-record-list"', self.html)
+        self.assertIn('id="artifact-record-list"', self.html)
+        self.assertNotIn("innerHTML", self.js)
+        self.assertIn("item.textContent", self.js)
+
     def test_inbox_decision_controls_are_explicit_and_service_backed(self):
         for dialog_id in ("answer-dialog", "reject-dialog"):
             self.assertIn(f'id="{dialog_id}"', self.html)

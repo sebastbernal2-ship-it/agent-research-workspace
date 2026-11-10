@@ -66,6 +66,7 @@ function showView(name) {
   window.scrollTo({ top: 0, behavior: reduceMotion ? "instant" : "smooth" });
   if (name === "inbox" && serviceReady) void loadInbox(currentInboxFilter);
   if (name === "work" && serviceReady) void loadProject();
+  if (name === "evidence" && serviceReady) void loadProjectRecords();
 }
 
 function formatDate(value) {
@@ -377,6 +378,85 @@ async function loadProject() {
   } catch (error) {
     showToast(error.message);
     setServiceState(false, "Local project service unavailable · restart the demo server.");
+  }
+}
+
+function renderRecordCollection(containerId, items, renderItem, emptyMessage) {
+  const list = document.getElementById(containerId);
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "demo-caption";
+    empty.textContent = emptyMessage;
+    list.append(empty);
+    return;
+  }
+  for (const item of items) list.append(renderItem(item));
+}
+
+function renderEvidenceRecord(record) {
+  const card = document.createElement("article");
+  card.className = "record-card";
+  const claim = document.createElement("strong");
+  claim.textContent = record.claimText;
+  const source = document.createElement("p");
+  source.textContent = `${record.source.title} · ${record.source.uri}`;
+  const status = document.createElement("small");
+  status.textContent = `${record.reviewStatus || "unreviewed"} · ${record.stance} · SHA-256 ${record.source.contentHash}`;
+  card.append(claim, source, status);
+  return card;
+}
+
+function renderArtifactRecord(record) {
+  const card = document.createElement("article");
+  card.className = "record-card";
+  const title = document.createElement("strong");
+  title.textContent = record.name;
+  const meta = document.createElement("p");
+  meta.textContent = `${record.mediaType} · ${record.byteSize} bytes · ${record.reviewStatus || "unreviewed"}`;
+  const hash = document.createElement("small");
+  hash.textContent = `SHA-256 ${record.sha256}`;
+  card.append(title, meta, hash);
+  return card;
+}
+
+function renderRunRecord(record) {
+  const card = document.createElement("article");
+  card.className = "record-card";
+  const title = document.createElement("strong");
+  title.textContent = `${record.runId} · ${record.status}`;
+  const meta = document.createElement("p");
+  meta.textContent = `${record.agent.actorId} · ${record.adapter.name}@${record.adapter.version} · work ${record.workId}`;
+  const time = document.createElement("small");
+  time.textContent = `Started ${formatTimestamp(record.startedAt)}${record.finishedAt ? ` · finished ${formatTimestamp(record.finishedAt)}` : ""}`;
+  card.append(title, meta, time);
+  return card;
+}
+
+async function loadProjectRecords() {
+  if (!serviceReady) return;
+  try {
+    const [runs, evidence, artifacts] = await Promise.all([
+      apiRequest(`${PROJECT_API}/runs`),
+      apiRequest(`${PROJECT_API}/evidence`),
+      apiRequest(`${PROJECT_API}/artifacts`),
+    ]);
+    renderRecordCollection("run-record-list", runs.items, renderRunRecord, "No agent runs recorded yet.");
+    renderRecordCollection("evidence-record-list", evidence.items, renderEvidenceRecord, "No evidence snapshots registered yet.");
+    renderRecordCollection("artifact-record-list", artifacts.items, renderArtifactRecord, "No artifacts registered yet.");
+    document.getElementById("run-count-label").textContent = String(runs.items.length);
+    document.getElementById("evidence-count-label").textContent = String(evidence.items.length);
+    document.getElementById("artifact-count-label").textContent = String(artifacts.items.length);
+  } catch (error) {
+    showToast(error.message);
+    for (const id of ["run-record-list", "evidence-record-list", "artifact-record-list"]) {
+      const list = document.getElementById(id);
+      list.replaceChildren();
+      const failure = document.createElement("p");
+      failure.className = "demo-caption";
+      failure.textContent = "Project history could not be loaded.";
+      list.append(failure);
+    }
   }
 }
 
