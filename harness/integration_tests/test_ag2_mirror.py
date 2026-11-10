@@ -21,6 +21,7 @@ from ag2.testing import TestConfig
 from harness.ag2_mirror import CanonicalAG2Mirror
 from harness.event_store import EventStoreError, SQLiteEventStore
 from harness.projection import Projector
+from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
 
 
@@ -37,10 +38,15 @@ class AG2CanonicalMirrorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     proposer.agent_id: {"actorType": "agent", "actorId": "agent.repair-proposer", "role": "orchestrator"},
                     critic.agent_id: {"actorType": "agent", "actorId": "agent.repair-critic", "role": "reviewer"},
                 }
+                run_ledger = RunLedger(canonical, clock=lambda: "2026-04-16T12:00:00Z")
+                run_ledger.start("project.repair", "work.repair", run_id="run.repair.proposer", agent=actors[proposer.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="a" * 64, correlation_id="trace.repair", occurred_at="2026-04-16T12:00:00Z")
+                run_ledger.start("project.repair", "work.repair", run_id="run.repair.critic", agent=actors[critic.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="b" * 64, parent_run_id="run.repair.proposer", correlation_id="trace.repair", occurred_at="2026-04-16T12:00:00Z")
+                run_ids = {proposer.agent_id: "run.repair.proposer", critic.agent_id: "run.repair.critic"}
                 mirror = CanonicalAG2Mirror(
                     canonical, project_id="project.repair", work_id="work.repair",
                     actors_by_ag2_id=actors,
                     message_types_by_ag2_id={proposer.agent_id: "proposal", critic.agent_id: "challenge"},
+                    correlation_id="trace.repair", run_ids_by_ag2_id=run_ids,
                 )
                 hub.register_listener(mirror)
 
@@ -91,6 +97,7 @@ class AG2CanonicalMirrorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     canonical, project_id="project.repair", work_id="work.repair",
                     actors_by_ag2_id=actors,
                     message_types_by_ag2_id={proposer.agent_id: "proposal", critic.agent_id: "challenge"},
+                    correlation_id="trace.repair", run_ids_by_ag2_id=run_ids,
                 )
                 metadata = await hub.get_channel(channel.channel_id)
                 for envelope in wal:
@@ -122,6 +129,11 @@ class AG2CanonicalMirrorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     critic.agent_id: {"actorType": "agent", "actorId": "agent.critic", "role": "reviewer"},
                     reviser.agent_id: {"actorType": "agent", "actorId": "agent.reviser", "role": "specialist"},
                 }
+                run_ledger = RunLedger(canonical, clock=lambda: "2026-04-16T12:00:00Z")
+                run_ledger.start("project.demo", "work.demo", run_id="run.demo.proposer", agent=actors[proposer.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="a" * 64, correlation_id="trace.demo", occurred_at="2026-04-16T12:00:00Z")
+                run_ledger.start("project.demo", "work.demo", run_id="run.demo.critic", agent=actors[critic.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="b" * 64, parent_run_id="run.demo.proposer", correlation_id="trace.demo", occurred_at="2026-04-16T12:00:00Z")
+                run_ledger.start("project.demo", "work.demo", run_id="run.demo.reviser", agent=actors[reviser.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="c" * 64, parent_run_id="run.demo.proposer", correlation_id="trace.demo", occurred_at="2026-04-16T12:00:00Z")
+                run_ids = {proposer.agent_id: "run.demo.proposer", critic.agent_id: "run.demo.critic", reviser.agent_id: "run.demo.reviser"}
                 mirror = CanonicalAG2Mirror(
                     canonical,
                     project_id="project.demo",
@@ -132,6 +144,7 @@ class AG2CanonicalMirrorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         critic.agent_id: "challenge",
                         reviser.agent_id: "revision",
                     },
+                    correlation_id="trace.demo", run_ids_by_ag2_id=run_ids,
                 )
                 hub.register_listener(mirror)
 
@@ -192,10 +205,17 @@ class AG2CanonicalMirrorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 message_events = [event for event in canonical_events if event["eventType"] == "discussion.message_added"]
                 self.assertEqual(len(wal_text), 4)
                 self.assertEqual(len(message_events), 4)
-                self.assertEqual([e["sequence"] for e in message_events], [3, 4, 5, 6])
+                self.assertEqual([e["sequence"] for e in message_events], [7, 8, 9, 10])
                 self.assertEqual(
                     [e["payload"]["messageType"] for e in message_events],
                     ["proposal", "challenge", "revision", "decision"],
+                )
+                run_id_by_actor = {
+                    actors[ag2_id]["actorId"]: run_id for ag2_id, run_id in run_ids.items()
+                }
+                self.assertEqual(
+                    [e["payload"]["runId"] for e in message_events],
+                    [run_id_by_actor[e["actor"]["actorId"]] for e in message_events],
                 )
                 self.assertEqual(
                     [canonical.get_blob(e["payload"]["contentHash"]).decode("utf-8") for e in message_events],
@@ -225,21 +245,22 @@ class AG2CanonicalMirrorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         critic.agent_id: "challenge",
                         reviser.agent_id: "revision",
                     },
+                    correlation_id="trace.demo", run_ids_by_ag2_id=run_ids,
                 )
                 recovered_hub.register_listener(recovery_mirror)
                 metadata = await recovered_hub.get_channel(channel_id)
                 for envelope in recovered_text:
                     await recovery_mirror.on_envelope_posted(envelope, metadata)
                 recovery_mirror.raise_if_degraded()
-                self.assertEqual(len(canonical.events("project.demo")), 6)
+                self.assertEqual(len(canonical.events("project.demo")), 10)
                 self.assertTrue(canonical.verify("project.demo"))
                 self.assertEqual(len(Projector(canonical).replay("project.demo")["messages"]), 4)
 
                 # Canonical history remains readable independently of the
                 # candidate Hub's live in-memory state/session objects.
                 reopened = SQLiteEventStore(canonical_path)
-                self.assertEqual(len(reopened.events("project.demo")), 6)
-                self.assertEqual(len(reopened.export_jsonl("project.demo").splitlines()), 6)
+                self.assertEqual(len(reopened.events("project.demo")), 10)
+                self.assertEqual(len(reopened.export_jsonl("project.demo").splitlines()), 10)
                 await recovered_hub.close()
                 hub = None
                 shutil.rmtree(ag2_path)

@@ -16,10 +16,15 @@ This is a substantially better **message exchange primitive** for our needs than
 The v1.0.0 repo explicitly separates the new `ag2` API from the maintained `ag2-classic`/`autogen` namespace; this spike evaluates the new Network API. Python >=3.10.
 
 ```bash
-cd spikes/ag2-collaboration
-uv venv .venv --python 3.12
-uv pip install --python .venv/bin/python -e upstream
+spikes/ag2-collaboration/bootstrap_test_env.sh
+cd "$(git rev-parse --show-toplevel)"
+PYTHONPATH="$PWD:$PWD/spikes/ag2-collaboration/upstream" \
+  spikes/ag2-collaboration/.venv/bin/python -m unittest \
+  harness.integration_tests.test_ag2_mirror_contract \
+  harness.integration_tests.test_ag2_mirror -v
 ```
+
+The upstream snapshot intentionally omits license-related files, so pip's editable wheel build cannot satisfy its `license-files` glob. The bootstrap installs runtime dependencies and a version-only `dist-info` marker; imports resolve directly from the pinned `upstream/` source. It does not copy or modify upstream code.
 
 The core install is small (~37 MB at initial install) and does not install an LLM provider. For this upstream's full `test/network` suite, test-only dependencies were added to the ignored venv: pytest/asyncio/cov/timeout, `watchdog` (DiskKnowledgeStore), `websockets` (transport), OpenTelemetry (transport test instrumentation), and the Anthropic SDK (a few test fixtures instantiate `AnthropicConfig`; no credential or network call was made).
 
@@ -70,7 +75,7 @@ cd upstream
 - **Authentication is opt-in.** `Hub.open()` defaults to `AuthRegistry.default()` with `NoAuth`. The included `ApiKeyAuth` validates per-name keys with constant-time comparison. Every deployed Hub must choose an explicit strict auth registry; do not rely on the default.
 - `serve_ws` can receive an SSL context; `WsLinkClient` supports one. Use TLS/WSS for network traffic, secret-manager-backed key resolution, least-privilege identities, and per-agent `Rule`s. The transport performs one connection attempt—reconnect/backoff is the embedder's responsibility.
 - Delivery is at-least-once/replay-oriented, not an exactly-once side-effect guarantee. Workers and tool adapters need idempotency keys and deduplication.
-- No Internet-facing server was started by this spike. Upstream tests used only local ephemeral loopback sockets.
+- No Internet-facing server was started by this spike. Upstream tests used only local ephemeral loopback sockets. Our project-adapter tests use AG2's in-process Hub only; they do not call `serve_ws`, bind a port, configure a public listener, or supply credentials. The in-process Hub is not an authenticated boundary. Any future network transport must use a strict explicit auth registry, TLS, least-privilege identities, and no `NoAuth` before enabling it.
 
 ## Composition hypothesis
 
@@ -80,4 +85,4 @@ AG2 supplies the **agent-message transport and turn protocol** in the combined w
 
 ## Harness follow-up (2026-11-07)
 
-`harness.integration_tests.test_offline_organization_run` runs a human-gated project DAG with an AG2 proposal → AgenticX subprocess critique → AG2 specialist revision, then invokes Meldwork V4 for the dependent verification task with AgenticX workers. AG2 WAL messages and Meldwork phase receipts are both imported into the same canonical project history with run attribution and restart replay. This demonstrates adapter composition—not native Meldwork/AG2 shared transport, remote auth, provider quality, or production outbox guarantees. Upstream HubListener callbacks swallow errors, so the adapter exposes degradation and WAL replay remains the recovery path.
+`harness.integration_tests.test_offline_organization_run` runs a human-gated project DAG with an AG2 proposal → AgenticX subprocess critique → AG2 specialist revision, then invokes Meldwork V4 for the dependent verification task with AgenticX workers. The human's answer arrives through `InboxApplication` as a canonical question-answer event and is asserted absent from AG2/VP discussion messages. AG2 WAL messages and Meldwork phase receipts are imported into the same canonical project history with run attribution and restart replay. The focused adapter+composition run passed 8 tests after hardening. This is scripted protocol success, not real-model quality, native Meldwork/AG2 shared transport, remote auth, or production outbox evidence. Upstream HubListener callbacks swallow errors, so the adapter exposes degradation and WAL replay remains the recovery path. Project-adapter tests use an in-process Hub only; no network transport is exposed.

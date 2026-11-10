@@ -25,6 +25,7 @@ from harness.agenticx_bridge import AgenticXSubprocessWorker
 from harness.event_store import SQLiteEventStore
 from harness.meldwork_bridge import MeldworkReceiptBridge
 from harness.projection import Projector
+from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
 
 
@@ -104,6 +105,11 @@ class AG2AgenticXCompositionTests(unittest.IsolatedAsyncioTestCase):
                     critic.agent_id: {"actorType": "agent", "actorId": "agent.critic", "role": "reviewer"},
                     reviser.agent_id: {"actorType": "agent", "actorId": "agent.reviser", "role": "specialist"},
                 }
+                run_ledger = RunLedger(event_store, clock=lambda: "2026-04-16T12:00:00Z")
+                run_ledger.start("project.composed", "work.composed", run_id="run.composed.proposer", agent=actors[proposer.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="a" * 64, correlation_id="trace.composed", occurred_at="2026-04-16T12:00:00Z")
+                run_ledger.start("project.composed", "work.composed", run_id="run.composed.critic", agent=actors[critic.agent_id], adapter={"name": "ag2-agenticx", "version": "1"}, context_hash="b" * 64, parent_run_id="run.composed.proposer", correlation_id="trace.composed", occurred_at="2026-04-16T12:00:00Z")
+                run_ledger.start("project.composed", "work.composed", run_id="run.composed.reviser", agent=actors[reviser.agent_id], adapter={"name": "ag2", "version": "1"}, context_hash="c" * 64, parent_run_id="run.composed.proposer", correlation_id="trace.composed", occurred_at="2026-04-16T12:00:00Z")
+                run_ids = {proposer.agent_id: "run.composed.proposer", critic.agent_id: "run.composed.critic", reviser.agent_id: "run.composed.reviser"}
                 mirror = CanonicalAG2Mirror(
                     event_store,
                     project_id="project.composed",
@@ -114,6 +120,7 @@ class AG2AgenticXCompositionTests(unittest.IsolatedAsyncioTestCase):
                         critic.agent_id: "challenge",
                         reviser.agent_id: "revision",
                     },
+                    correlation_id="trace.composed", run_ids_by_ag2_id=run_ids,
                 )
                 hub.register_listener(mirror)
 
@@ -187,13 +194,14 @@ class AG2AgenticXCompositionTests(unittest.IsolatedAsyncioTestCase):
                         critic.agent_id: "challenge",
                         reviser.agent_id: "revision",
                     },
+                    correlation_id="trace.composed", run_ids_by_ag2_id=run_ids,
                 )
                 recovered_hub.register_listener(recovery_mirror)
                 metadata = await recovered_hub.get_channel(channel_id)
                 for envelope in recovered_messages:
                     await recovery_mirror.on_envelope_posted(envelope, metadata)
                 recovery_mirror.raise_if_degraded()
-                self.assertEqual(len(event_store.events("project.composed")), 6)
+                self.assertEqual(len(event_store.events("project.composed")), len(canonical_events))
                 self.assertTrue(event_store.verify("project.composed"))
                 self.assertEqual(len(Projector(event_store).replay("project.composed")["messages"]), 4)
                 await recovered_hub.close()

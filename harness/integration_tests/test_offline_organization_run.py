@@ -350,6 +350,18 @@ class OfflineOrganizationRunTests(unittest.IsolatedAsyncioTestCase):
                 selected_option_id="option.synthetic-only", occurred_at=now(),
             )
             self.assertEqual(answered["answer"]["resumedWorkIds"], [WORK_ID, DISCUSSION_WORK_ID, VERIFICATION_WORK_ID])
+            inbox_answer = next(
+                event for event in store.events(PROJECT_ID)
+                if event["eventType"] == "human.question_answered"
+                and event["payload"]["questionId"] == question_id
+            )
+            self.assertEqual(inbox_answer["actor"], USER)
+            human_answer_text = Projector(store).replay(PROJECT_ID)["questions"][question_id]["answer"]["text"]
+            self.assertNotIn(human_answer_text, [
+                store.get_blob(event["payload"]["contentHash"]).decode("utf-8")
+                for event in store.events(PROJECT_ID)
+                if event["eventType"] == "discussion.message_added"
+            ])
             outcome = await coordinator.run_work(project_task)
             self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
 
