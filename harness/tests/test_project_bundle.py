@@ -33,6 +33,18 @@ class ProjectBundleTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_v01_jsonl_export_remains_byte_identical_to_golden_fixture(self):
+        fixture = (
+            Path(__file__).resolve().parents[2]
+            / "contracts" / "tests" / "fixtures" / "v0.1-portable-project.jsonl"
+        )
+        exported = self.source.export_jsonl(PROJECT).encode("utf-8")
+        self.assertEqual(exported, fixture.read_bytes())
+        self.assertTrue(all(
+            event["schemaVersion"] == "0.1"
+            for event in self.source.verified_events(PROJECT)
+        ))
+
     def test_export_import_replays_identical_project_state_and_blob_closure(self):
         before = Projector(self.source).replay(PROJECT)
         bundle = self.source.export_project_bundle(PROJECT)
