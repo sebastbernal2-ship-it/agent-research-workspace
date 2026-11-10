@@ -137,6 +137,58 @@ class EffectProjectionTests(unittest.TestCase):
             )
         self.assertEqual(Projector(self.store).replay(PROJECT)["effects"]["effect.1"]["status"], "approved")
 
+    def test_synthetic_lost_response_reconciles_by_same_idempotency_key_after_restart(self):
+        class FakeConnector:
+            def __init__(self):
+                self.dispatch_keys = []
+                self.receipts = {}
+
+            def dispatch(self, key, _request):
+                self.dispatch_keys.append(key)
+                self.receipts[key] = b"synthetic provider operation receipt"
+                raise TimeoutError("response lost after synthetic provider accepted request")
+
+            def lookup(self, key):
+                return self.receipts.get(key)
+
+        self.create_intent()
+        self.approve()
+        connector = FakeConnector()
+        ledger = EffectLedger(self.store, clock=lambda: NOW)
+        ledger.transition(
+            PROJECT, "effect.1", "dispatching", actor=VP,
+            event_id="event.effect.dispatching",
+        )
+        with self.assertRaises(TimeoutError):
+            connector.dispatch("provider-key.effect.1", self.store.get_blob(self.request_hash))
+        system = {"actorType": "system", "actorId": "system.reconciler", "role": "system"}
+        ledger.transition(
+            PROJECT, "effect.1", "ambiguous", actor=system,
+            event_id="event.effect.ambiguous", reason="synthetic response lost",
+        )
+
+        # A fresh process/store can query the fake provider under the original key;
+        # it never redispatches the ambiguous operation.
+        reopened = SQLiteEventStore(self.path)
+        restarted = EffectLedger(reopened, clock=lambda: NOW)
+        receipt = connector.lookup("provider-key.effect.1")
+        self.assertEqual(receipt, b"synthetic provider operation receipt")
+        receipt_ref, receipt_hash = reopened.put_blob(receipt)
+        restarted.transition(
+            PROJECT, "effect.1", "confirmed", actor=system,
+            event_id="event.effect.confirmed", receipt_hash=receipt_hash,
+            receipt_ref=receipt_ref,
+        )
+        restarted.transition(
+            PROJECT, "effect.1", "recorded", actor=system,
+            event_id="event.effect.recorded",
+        )
+        state = Projector(reopened).replay(PROJECT)["effects"]["effect.1"]
+        self.assertEqual(state["status"], "recorded")
+        self.assertEqual(state["intent"]["idempotencyKey"], "provider-key.effect.1")
+        self.assertEqual(connector.dispatch_keys, ["provider-key.effect.1"])
+        self.assertTrue(reopened.verify(PROJECT))
+
     def test_v01_event_vocabulary_remains_accepted_in_mixed_history(self):
         self.create_intent()
         events = self.store.verified_events(PROJECT)
