@@ -1,16 +1,20 @@
-"""In-process Studio/AgentRuntime approval integration with a deterministic mock LLM.
+"""Studio/AgentRuntime approval integration with a deterministic mock LLM.
 
-The subprocess runner is replaced by an in-memory counter; no command, provider,
-lifespan, socket, or external service is used.
+The command runner is replaced by an in-memory counter. A separate Python
+reader process checks checkpoint recovery; no command, provider, server socket,
+or external service is used.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -323,7 +327,14 @@ def test_pending_confirm_checkpoint_cannot_be_resolved_by_fresh_manager(monkeypa
             async def fake_sandbox(argv, _session, cwd, **_kwargs):
                 return argv, None, "synthetic-test-sandbox"
 
+            launches = []
+
+            async def forbidden_process(*argv, **_kwargs):
+                launches.append(argv)
+                raise AssertionError("restart probe must never launch a process")
+
             monkeypatch.setattr(agent_tools, "_apply_command_sandbox", fake_sandbox)
+            monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", forbidden_process)
             llm = DeterministicCommandLLM()
             client, headers, session_id, managed = create_client(monkeypatch, llm)
             gate = managed.get_confirm_gate("meta")
@@ -342,6 +353,45 @@ def test_pending_confirm_checkpoint_cannot_be_resolved_by_fresh_manager(monkeypa
                 checkpoint = CheckpointStore().load(session_id)
                 assert checkpoint is not None
                 assert checkpoint.confirm_state["pending"] == []
+                child = r'''
+import asyncio, json, sys
+from agenticx.runtime.checkpoint import CheckpointStore
+from agenticx.runtime.confirm import AsyncConfirmGate
+checkpoint = CheckpointStore().load(sys.argv[1])
+async def probe():
+    gate = AsyncConfirmGate(timeout_seconds=1)
+    gate.restore_state(checkpoint.confirm_state or {})
+    return gate.resolve(sys.argv[2], True)
+print(json.dumps({
+    "status": checkpoint.status,
+    "pendingToolCount": len(checkpoint.pending_tool_calls),
+    "pendingConfirmCount": len((checkpoint.confirm_state or {}).get("pending", [])),
+    "canResolveOldRequest": asyncio.run(probe()),
+}))
+'''
+                child_env = {
+                    "HOME": temp_home,
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "AGX_STORAGE_BACKEND": "local",
+                }
+                child_result = subprocess.run(
+                    [sys.executable, "-c", child, session_id, request_id],
+                    cwd=Path(__file__).resolve().parents[2],
+                    env=child_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                restored_probe = json.loads(child_result.stdout)
+                assert restored_probe == {
+                    "status": "in_progress",
+                    "pendingToolCount": 1,
+                    "pendingConfirmCount": 0,
+                    "canResolveOldRequest": False,
+                }
 
                 # Drop process-scoped storage and build a fresh Studio manager
                 # over the same isolated HOME, as a restart would.
@@ -379,5 +429,6 @@ def test_pending_confirm_checkpoint_cannot_be_resolved_by_fresh_manager(monkeypa
                 # The original request eventually times out fail-closed; no command
                 # is launched during this restart simulation.
                 assert pending_chat.result(timeout=10)
+                assert launches == []
         finally:
             env.stop()
