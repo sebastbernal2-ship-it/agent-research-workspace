@@ -344,7 +344,7 @@ class SQLiteEventStore:
             question_ref = payload.get("questionRef")
             referenced_hash = record_hash if isinstance(record_hash, str) else question_ref
             if isinstance(referenced_hash, str) and event.get("eventType") in {
-                "artifact.registered", "evidence.registered", "human.question_opened",
+                "artifact.registered", "evidence.registered", "human.question_opened", "effect.intent_created",
             }:
                 blob = conn.execute(
                     "SELECT content FROM canonical_blobs WHERE content_hash=?", (referenced_hash,),

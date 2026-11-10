@@ -1,6 +1,6 @@
 # Canonical record and schema migration policy
 
-Status: design decision for draft v0.1; schema-version validation dispatch exists for v0.1, but no migration has been implemented.
+Status: migration policy for draft v0.1/v0.2; schema-version validation dispatch supports v0.1 and additive v0.2 effect records/events. No general projection migration has been implemented.
 
 ## Compatibility rules
 
@@ -16,8 +16,9 @@ Status: design decision for draft v0.1; schema-version validation dispatch exist
 ## v0.1 disposition
 
 - v0.1 is a draft and has no deployed user data. Its schema is closed (`additionalProperties: false`) and unknown sensitive fields are rejected.
-- The local SQLite prototype uses an explicit schema registry and currently validates v0.1 only. It does not yet implement version-to-version migration dispatch, compatibility readers, retention, or quarantine UX.
-- Before any production or private-data use, add a second schema version and migration/compatibility tests; do not mutate the current v0.1 schema to smuggle in changed semantics.
+- The local SQLite prototype uses an explicit schema registry for v0.1 and v0.2. v0.2 adds a closed `effect_intent` record and `effect.intent_created` / `effect.status_changed` event vocabulary; existing project/work/run/question/artifact/evidence records remain v0.1, and mixed-version event histories are supported by per-record validation. No records or v0.1 schemas are rewritten. `Projector` replays both event versions and exposes the v0.2 effect projection. This is an additive contract, not a migration of existing records.
+- Version-to-version projection migration, export compatibility matrix, retention, and quarantine UX remain unimplemented. Before another contract version, add golden v0.1 export/replay fixtures and prove their serialized bytes remain unchanged.
+- Before any production or private-data use, add a versioned compatibility/export test matrix and implement the required migration/restore lifecycle for the selected storage deployment; do not mutate v0.1 or v0.2 semantics in place.
 
 ## Required test matrix for the first migration
 

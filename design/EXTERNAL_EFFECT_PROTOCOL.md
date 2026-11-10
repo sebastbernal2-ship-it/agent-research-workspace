@@ -1,6 +1,6 @@
 # External-effect intent, dispatch, and recovery protocol
 
-**Status:** design contract for issue #15; not implemented as a general-purpose outbox. The adapter-specific dispatch-marker crash boundary has a new deterministic regression test in `harness/tests/test_event_store.py`; the Meldwork invocation journal still covers only its adapter receipt path. Do not enable real external effects on the strength of this document.
+**Status:** contract design and v0.2 canonical intent/status record plus deterministic projector/ledger are implemented. No general-purpose outbox, dispatch relay, provider call, or authenticated reconciler exists. The adapter-specific dispatch-marker crash boundary is also covered by `harness/tests/test_event_store.py`. Do not enable real external effects on the strength of this prototype.
 
 ## Goal and non-goal
 
@@ -35,7 +35,7 @@ ambiguous -> confirmed | rejected | manual_review
 
 - `prepared`: durable, validated, and authorized intent; no dispatch has started.
 - `dispatching`: connector is about to call the provider. Persist this transition before the call. A crash immediately afterward is ambiguous, even if no bytes actually left the process.
-- `confirmed`: provider response/receipt or authoritative read-back proves the outcome. Persist its immutable receipt hash and minimal redacted metadata.
+- `confirmed`: provider response/receipt or authoritative read-back proves the outcome. Persist its immutable content-addressed receipt reference/hash and minimal redacted metadata; replay verifies the referenced bytes.
 - `recorded`: canonical project event/result is committed and verified; the effect is complete in the project view.
 - `ambiguous`: no authoritative outcome is available. Never automatically send again unless the provider's idempotency contract and reconciliation establish that retry is safe.
 - `rejected`: provider definitively rejected before effect. Record reason class, not credentials or sensitive response bodies.
@@ -92,10 +92,12 @@ Connectors without safe idempotency/reconciliation stay disabled for unattended 
 - duplicated, reordered, late, oversized, malformed, and forged receipts fail closed;
 - budgets, deadlines, redaction, audit attribution, and retention limits are enforced.
 
-## Contract-version and implementation gate
+## Contract-version and implementation boundary
 
-Issue #2 remains open. The reader currently accepts only the closed v0.1 contract, and `Projector` rejects unknown event types. Do not mutate v0.1 or encode effect state as an unrelated artifact/message to avoid the versioning work. The first canonical implementation must land a new additive versioned effect record/event contract with a reader/projection path while preserving v0.1 fixtures byte-for-byte. The dispatchable outbox/relay row must be a rebuildable projection of those canonical events, updated atomically with the canonical append in the same SQLite transaction; it cannot be a competing state authority. Implement this contract/schema/version reader under #2 before general relay code under #15. Existing code provides neither that event projection nor a trusted identity source for grants, approvals, or recovery.
+Issue #2 now has a draft additive v0.2 schema with immutable `effect_intent` and `effect.intent_created` / `effect.status_changed` events. The v0.1 schema and event vocabulary remain intact; registry selection validates each record by its declared version, and the projector can replay mixed v0.1/v0.2 histories. `EffectLedger` validates active exact-scope grant revisions at intent creation and immediately before dispatch, active run/principal ownership, HTTPS endpoint hygiene, request/receipt content hashes, expiry bounds, compare-and-set transitions, and optional queue-lease fencing. The `effects` state is rebuilt solely from canonical events; there is no second mutable outbox table yet. These commands are local prototype code, not an authenticated application boundary. Approval references are representable but not verified against a canonical approval record, and CapabilityAuthority/RunLedger cannot yet bind this flow into real adapter/tool dispatch. Do not mutate v0.1 or encode effect state as an unrelated artifact/message.
+
+Before relay implementation under #15, #2 still needs independent contract review, golden v0.1 byte-identical export/replay fixtures, versioned migration/compatibility tests, and a canonical approval representation. If a durable relay projection is later added, it must be rebuildable from effect events and updated atomically with each canonical transition; it cannot be a competing state authority.
 
 ## Current boundary
 
-The existing Meldwork path has a stable invocation ID, queued job/generation binding, a lease-checked prepared→executing transition, staged receipt import, and ambiguous no-auto-replay behavior. The regression test simulates a crash after the durable dispatch marker but before a provider call; restart marks the call ambiguous, a retry cannot start or stage a receipt, and canonical history stays unchanged. This proves only the adapter-specific local state transition. It lacks general capability/approval binding, a provider idempotency contract, authenticated reconciliation, and remote-effect test doubles. It is not an external-effect guarantee.
+The v0.2 effect projection tracks `prepared`, `dispatching`, `confirmed`, `recorded`, `ambiguous`, `rejected`, `manual_review`, and pre-dispatch `cancelled`. Tests cover valid lifecycle replay, exact grant revision/resource, revocation denial, request blob hashes, stale/forbidden transitions, and the ambiguous no-redispatch rule. The existing Meldwork path separately has a stable invocation ID, queued job/generation binding, a lease-checked prepared→executing transition, staged receipt import, and ambiguous no-auto-replay behavior. Its regression test simulates a crash after the durable dispatch marker but before a provider call; restart marks it ambiguous, retry cannot start or stage a receipt, and canonical history stays unchanged. This still has no provider-facing idempotency reconciliation, immutable provider receipt authentication, canonical approval verification, general relay, authenticated recovery, or external-effect test double. It is not an external-effect guarantee.

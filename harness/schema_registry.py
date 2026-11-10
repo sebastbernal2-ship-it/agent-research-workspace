@@ -30,11 +30,11 @@ class SchemaRegistry:
             except (OSError, json.JSONDecodeError) as exc:
                 raise SchemaRegistryError(f"cannot load canonical schema {schema_path}") from exc
             versions = self._declared_versions(schema)
-            if len(versions) != 1:
+            version = schema_path.parent.name.removeprefix("v")
+            if version not in versions:
                 raise SchemaRegistryError(
-                    f"schema {schema_path} must use exactly one schemaVersion constant, found {sorted(versions)}"
+                    f"schema directory version {version!r} is not declared in {schema_path}"
                 )
-            version = next(iter(versions))
             if version in self.validators:
                 raise SchemaRegistryError(f"duplicate canonical schema version {version!r}")
             Draft202012Validator.check_schema(schema)

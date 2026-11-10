@@ -176,6 +176,50 @@ def valid_records():
 class ContractSchemaTests(unittest.TestCase):
     def test_schema_is_valid_draft_2020_12(self):
         Draft202012Validator.check_schema(SCHEMA)
+        v2 = json.loads((ROOT / "v0.2" / "schema.json").read_text())
+        Draft202012Validator.check_schema(v2)
+
+    def test_v02_effect_intent_is_versioned_bounded_and_secret_free(self):
+        schema = json.loads((ROOT / "v0.2" / "schema.json").read_text())
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        intent = {
+            "recordType": "effect_intent", "schemaVersion": "0.2",
+            "projectId": "project.alpha", "effectId": "effect.mail.1",
+            "workId": "work.research", "runId": "run.first",
+            "adapter": {"name": "mail-adapter", "version": "1.2.0"},
+            "principal": ACTOR, "capabilityGrantId": "grant.mail.send",
+            "capabilityRevision": 3, "action": "message.send",
+            "resourceId": "recipient.team", "requestRef": "blob.request",
+            "requestHash": HASH, "provider": "synthetic-mail", "endpoint": "https://mail.example.test/send",
+            "idempotencyKey": "effect-key-1", "dataClassification": "internal",
+            "createdAt": NOW, "expiresAt": "2026-04-16T13:00:00Z",
+            "correlationId": "trace.effect.1",
+        }
+        self.assertEqual([], list(validator.iter_errors(intent)))
+        with_secret = {**intent, "apiKey": "must-not-enter-canonical-history"}
+        self.assertTrue(list(validator.iter_errors(with_secret)))
+        missing_approval_revision = {**intent, "approvalRef": "approval.review.1"}
+        self.assertTrue(list(validator.iter_errors(missing_approval_revision)))
+        v1_event = valid_records()[-1]
+        self.assertEqual([], list(VALIDATOR.iter_errors(v1_event)))
+        effect_event = {
+            **v1_event, "schemaVersion": "0.2", "eventId": "event.effect-created",
+            "idempotencyKey": "idem.effect-created", "eventType": "effect.intent_created",
+            "payload": {"effectId": intent["effectId"], "recordHash": HASH},
+        }
+        self.assertEqual([], list(validator.iter_errors(effect_event)))
+        transition_event = {
+            **effect_event, "eventId": "event.effect-dispatching",
+            "idempotencyKey": "idem.effect-dispatching", "eventType": "effect.status_changed",
+            "payload": {"effectId": intent["effectId"], "workId": intent["workId"], "runId": intent["runId"], "from": "prepared", "to": "dispatching"},
+        }
+        self.assertEqual([], list(validator.iter_errors(transition_event)))
+        confirmed_event = {
+            **transition_event, "eventId": "event.effect-confirmed",
+            "idempotencyKey": "idem.effect-confirmed",
+            "payload": {"effectId": intent["effectId"], "workId": intent["workId"], "runId": intent["runId"], "from": "dispatching", "to": "confirmed", "receiptRef": "blob." + HASH, "receiptHash": HASH},
+        }
+        self.assertEqual([], list(validator.iter_errors(confirmed_event)))
 
     def test_synthetic_records_validate(self):
         for record in valid_records():

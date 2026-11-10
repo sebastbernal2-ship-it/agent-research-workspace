@@ -77,7 +77,7 @@ class SQLiteEventStoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_unknown_schema_version_fails_closed(self):
-        self.assertEqual(self.store._schema_registry.versions, ("0.1",))
+        self.assertEqual(self.store._schema_registry.versions, ("0.1", "0.2"))
         event = initial_events()[0]
         event["schemaVersion"] = "9.9"
         with self.assertRaisesRegex(EventStoreError, "unsupported canonical schema version"):

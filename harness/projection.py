@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from .event_store import IntegrityFailure, SQLiteEventStore
 
@@ -124,6 +126,7 @@ class Projector:
             "artifacts": {},
             "evidence": {},
             "capabilityGrants": {},
+            "effects": {},
             "messages": [],
         }
         for event in events:
@@ -538,6 +541,136 @@ class Projector:
                 if len(artifact_bytes) != artifact["byteSize"]:
                     raise ProjectionError("artifact byte size does not match its immutable metadata")
                 state["artifacts"][artifact_id] = artifact
+
+            elif event_type == "effect.intent_created":
+                effect_id = payload["effectId"]
+                if effect_id in state["effects"]:
+                    raise ProjectionError(f"effect intent {effect_id!r} already exists")
+                intent = self._load_record(payload["recordHash"], "effect_intent", project_id)
+                if intent["effectId"] != effect_id or intent["schemaVersion"] != "0.2":
+                    raise ProjectionError("effect intent event does not match its immutable v0.2 record")
+                work = state["workItems"].get(intent["workId"])
+                run = state["agentRuns"].get(intent["runId"])
+                if work is None or run is None or run["workId"] != intent["workId"]:
+                    raise ProjectionError("effect intent references unknown work or mismatched run")
+                if run["status"] != "running" or intent["principal"] != run["agent"] or event["actor"] != run["agent"]:
+                    raise ProjectionError("effect intent actor and principal must match the active run agent")
+                endpoint = urlsplit(intent["endpoint"])
+                try:
+                    created_at = datetime.fromisoformat(intent["createdAt"].replace("Z", "+00:00"))
+                    expires_at = datetime.fromisoformat(intent["expiresAt"].replace("Z", "+00:00"))
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise ProjectionError("effect intent timestamps are invalid") from exc
+                if (
+                    created_at.tzinfo is None or expires_at.tzinfo is None
+                    or expires_at <= created_at or expires_at - created_at > timedelta(days=7)
+                ):
+                    raise ProjectionError("effect intent expiry must be positive and no longer than seven days")
+                if endpoint.scheme != "https" or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.fragment:
+                    raise ProjectionError("effect endpoint must be credential-free HTTPS without a fragment")
+                if not intent["requestRef"].startswith("blob.") or intent["requestRef"][5:] != intent["requestHash"]:
+                    raise ProjectionError("effect request reference must match its content hash")
+                try:
+                    request_blob = self.store.get_blob(intent["requestHash"])
+                except KeyError as exc:
+                    raise ProjectionError("effect request content blob is missing") from exc
+                if hashlib.sha256(request_blob).hexdigest() != intent["requestHash"]:
+                    raise ProjectionError("effect request content does not match its hash")
+                grant = state["capabilityGrants"].get(intent["capabilityGrantId"])
+                if (
+                    grant is None or grant["status"] != "active"
+                    or grant["revision"] != intent["capabilityRevision"]
+                    or intent["workId"] not in grant["workIds"]
+                    or grant["subject"] != intent["principal"]
+                    or grant["resourceIds"].count(intent["resourceId"]) != 1
+                    or grant["capability"] != intent["action"]
+                ):
+                    raise ProjectionError("effect intent does not match an active exact-scope capability grant")
+                if intent.get("correlationId") not in (None, event["correlationId"]):
+                    raise ProjectionError("effect intent correlation differs from its event")
+                if intent.get("causationId") not in (None, event.get("causationId")):
+                    raise ProjectionError("effect intent causation differs from its event")
+                if any(existing["idempotencyKey"] == intent["idempotencyKey"] for existing in state["effects"].values()):
+                    raise ProjectionError("effect provider idempotency key is already in use")
+                state["effects"][effect_id] = {
+                    "intent": intent, "status": "prepared", "receiptHash": None,
+                    "correlationId": event["correlationId"], "history": [event["eventId"]],
+                }
+
+            elif event_type == "effect.status_changed":
+                effect_id = payload["effectId"]
+                effect = state["effects"].get(effect_id)
+                if effect is None or effect["status"] != payload["from"]:
+                    raise ProjectionError("effect status transition has unknown intent or stale prior state")
+                allowed = {
+                    "prepared": {"dispatching", "cancelled"},
+                    "dispatching": {"confirmed", "ambiguous", "rejected", "manual_review"},
+                    "confirmed": {"recorded", "manual_review"},
+                    "ambiguous": {"confirmed", "rejected", "manual_review"},
+                    "manual_review": {"confirmed", "rejected", "cancelled"},
+                    "recorded": set(), "rejected": set(), "cancelled": set(),
+                }
+                if event["correlationId"] != effect["correlationId"]:
+                    raise ProjectionError("effect transition correlation differs from immutable intent")
+                if (
+                    payload.get("workId") != effect["intent"]["workId"]
+                    or payload.get("runId") != effect["intent"]["runId"]
+                ):
+                    raise ProjectionError("effect transition work/run attribution differs from immutable intent")
+                target = payload["to"]
+                actor_type = event["actor"].get("actorType")
+                if target == "dispatching":
+                    intent = effect["intent"]
+                    run = state["agentRuns"].get(intent["runId"])
+                    grant = state["capabilityGrants"].get(intent["capabilityGrantId"])
+                    try:
+                        dispatch_at = datetime.fromisoformat(event["occurredAt"].replace("Z", "+00:00"))
+                        effect_expiry = datetime.fromisoformat(intent["expiresAt"].replace("Z", "+00:00"))
+                        grant_expiry = datetime.fromisoformat(grant["expiresAt"].replace("Z", "+00:00")) if grant else None
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        raise ProjectionError("effect dispatch or grant expiry time is invalid") from exc
+                    if (
+                        event["actor"] != intent["principal"] or run is None or run["status"] != "running"
+                        or grant is None or grant["status"] != "active"
+                        or grant["revision"] != intent["capabilityRevision"]
+                        or dispatch_at.tzinfo is None or effect_expiry <= dispatch_at
+                        or grant_expiry is None or grant_expiry <= dispatch_at
+                    ):
+                        raise ProjectionError("effect dispatch requires live run, unexpired intent, and current grant")
+                if target in {"confirmed", "ambiguous", "rejected", "recorded"} and (
+                    actor_type != "system" or event["actor"].get("role") != "system"
+                ):
+                    raise ProjectionError("provider/recovery effect transitions require a system actor")
+                if target in {"manual_review", "cancelled"} and (
+                    actor_type != "human" or event["actor"].get("role") != "user"
+                ):
+                    raise ProjectionError("review/cancellation effect transitions require a human user actor")
+                if target not in allowed[effect["status"]]:
+                    raise ProjectionError(f"forbidden effect transition {effect['status']!r} -> {target!r}")
+                if target == "dispatching" and effect["status"] != "prepared":
+                    raise ProjectionError("effect dispatch may begin only once")
+                if target == "confirmed":
+                    receipt_ref = payload.get("receiptRef")
+                    receipt_hash = payload.get("receiptHash")
+                    if not isinstance(receipt_hash, str) or not isinstance(receipt_ref, str) or not receipt_ref.startswith("blob.") or receipt_ref[5:] != receipt_hash:
+                        raise ProjectionError("confirmed effect requires a content-addressed receipt reference/hash pair")
+                    try:
+                        receipt_blob = self.store.get_blob(receipt_hash)
+                    except KeyError as exc:
+                        raise ProjectionError("effect receipt content blob is missing") from exc
+                    if hashlib.sha256(receipt_blob).hexdigest() != receipt_hash:
+                        raise ProjectionError("effect receipt content does not match its hash")
+                if target == "recorded" and not effect.get("receiptHash"):
+                    raise ProjectionError("effect cannot be recorded without a confirmed receipt")
+                if target in {"ambiguous", "manual_review", "rejected", "cancelled"} and not payload.get("reason"):
+                    raise ProjectionError("effect terminal/recovery transition requires a reason")
+                effect["status"] = target
+                if payload.get("receiptHash") is not None:
+                    if effect.get("receiptHash") not in (None, payload["receiptHash"]):
+                        raise ProjectionError("effect receipt hash is immutable once confirmed")
+                    effect["receiptHash"] = payload["receiptHash"]
+                    effect["receiptRef"] = payload["receiptRef"]
+                effect["history"].append(event["eventId"])
 
             elif event_type == "evidence.registered":
                 evidence_id = payload["evidenceId"]
