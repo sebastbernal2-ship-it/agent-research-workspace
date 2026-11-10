@@ -56,6 +56,7 @@ class ModelRoutingTests(unittest.TestCase):
             providers=[self.local, self.remote],
             role_defaults={"vp": "profile.local.qwen", "orchestrator": "profile.remote.deepseek"},
             project_role_overrides={("project.private", "orchestrator"): "profile.local.qwen"},
+            routing_revision=7,
             invocation_policy=AllowAllTestPolicy(),
         )
 
@@ -106,6 +107,40 @@ class ModelRoutingTests(unittest.TestCase):
             invocation_policy=AllowAllTestPolicy(),
         )
         with self.assertRaisesRegex(ModelRoutingError, "identity"):
+            router.complete(self.task())
+
+    def test_route_versions_are_reported_without_prompt_content(self):
+        result = self.router.complete(self.task(content="synthetic-private-prompt-marker"))
+        metadata = result.audit_metadata()
+        self.assertEqual(metadata["routingRevision"], 7)
+        self.assertEqual(metadata["profileId"], "profile.remote.deepseek")
+        self.assertEqual(metadata["profileVersion"], "1")
+        self.assertEqual(metadata["providerId"], "remote")
+        self.assertEqual(metadata["modelId"], "deepseek.synthetic-v1")
+        self.assertNotIn("synthetic-private-prompt-marker", repr(metadata))
+        self.assertNotIn("credential", repr(metadata).lower())
+
+    def test_reported_output_token_limit_is_enforced(self):
+        class OverTokenProvider:
+            provider_id = "remote"
+
+            def complete(self, profile, task):
+                return ProviderResponse(
+                    model_id=profile.model_id, text="short text", finish_reason="stop",
+                    output_tokens=profile.max_output_tokens + 1,
+                )
+
+        limited = ModelProfile(
+            profile_id="profile.token-limited", provider_id="remote",
+            model_id="deepseek.synthetic-v1", endpoint_class="remote",
+            allowed_roles=frozenset({"orchestrator"}), max_output_tokens=5,
+        )
+        router = ModelRouter(
+            profiles=[limited], providers=[OverTokenProvider()],
+            role_defaults={"orchestrator": "profile.token-limited"},
+            invocation_policy=AllowAllTestPolicy(),
+        )
+        with self.assertRaisesRegex(ModelRoutingError, "output-token limit"):
             router.complete(self.task())
 
     def test_provider_output_limit_is_enforced(self):

@@ -45,6 +45,7 @@ class ModelProfile:
     model_id: str
     endpoint_class: EndpointClass
     allowed_roles: frozenset[str]
+    profile_version: str = "1"
     max_input_chars: int = 100_000
     max_output_tokens: int = 2_000
     max_response_chars: int = 100_000
@@ -57,6 +58,8 @@ class ModelProfile:
             raise ValueError("endpoint_class must be local or remote")
         if not self.allowed_roles:
             raise ValueError("profile must allow at least one role")
+        if not isinstance(self.profile_version, str) or not self.profile_version.strip() or len(self.profile_version) > 32:
+            raise ValueError("profile_version must be a non-empty string of at most 32 characters")
         for name in ("max_input_chars", "max_output_tokens", "max_response_chars"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -96,11 +99,32 @@ class RoutedModelResult:
     run_id: str
     agent_id: str
     role: str
+    routing_revision: int
     profile_id: str
+    profile_version: str
     provider_id: str
     model_id: str
     endpoint_class: EndpointClass
     response: ProviderResponse
+
+    def audit_metadata(self) -> dict[str, object]:
+        """Return non-prompt, non-credential route and reported-usage metadata."""
+        metadata: dict[str, object] = {
+            "routingRevision": self.routing_revision,
+            "profileId": self.profile_id,
+            "profileVersion": self.profile_version,
+            "providerId": self.provider_id,
+            "modelId": self.model_id,
+            "endpointClass": self.endpoint_class,
+            "finishReason": self.response.finish_reason,
+        }
+        if self.response.input_tokens is not None:
+            metadata["inputTokens"] = self.response.input_tokens
+        if self.response.output_tokens is not None:
+            metadata["outputTokens"] = self.response.output_tokens
+        if self.response.cost_usd is not None:
+            metadata["costUsd"] = self.response.cost_usd
+        return metadata
 
 
 class ModelInvocationPolicy(Protocol):
@@ -131,6 +155,7 @@ class ModelRouter:
         providers: Sequence[ModelProvider],
         role_defaults: Mapping[str, str],
         project_role_overrides: Mapping[tuple[str, str], str] | None = None,
+        routing_revision: int = 1,
         invocation_policy: ModelInvocationPolicy,
     ):
         self.profiles = {profile.profile_id: profile for profile in profiles}
@@ -144,6 +169,9 @@ class ModelRouter:
         for profile in self.profiles.values():
             if profile.provider_id not in self.providers:
                 raise ValueError(f"profile {profile.profile_id!r} has no registered provider")
+        if isinstance(routing_revision, bool) or not isinstance(routing_revision, int) or routing_revision < 1:
+            raise ValueError("routing_revision must be a positive integer")
+        self.routing_revision = routing_revision
         self.invocation_policy = invocation_policy
         self.role_defaults = dict(role_defaults)
         self.project_role_overrides = dict(project_role_overrides or {})
@@ -183,13 +211,17 @@ class ModelRouter:
             raise ModelRoutingError("provider response model identity does not match selected profile")
         if len(response.text) > profile.max_response_chars:
             raise ModelRoutingError("provider response exceeds the selected profile's output limit")
+        if response.output_tokens is not None and response.output_tokens > profile.max_output_tokens:
+            raise ModelRoutingError("provider usage exceeds the selected profile's output-token limit")
         return RoutedModelResult(
             project_id=task.project_id,
             work_id=task.work_id,
             run_id=task.run_id,
             agent_id=task.agent_id,
             role=task.role,
+            routing_revision=self.routing_revision,
             profile_id=profile.profile_id,
+            profile_version=profile.profile_version,
             provider_id=profile.provider_id,
             model_id=profile.model_id,
             endpoint_class=profile.endpoint_class,
