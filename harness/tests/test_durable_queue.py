@@ -7,7 +7,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from harness.control_plane import ControlPlaneError
+from harness.control_plane import ControlPlaneError, ProjectControlPlane
 from harness.durable_queue import QueueError, SQLiteWorkQueue
 from harness.organization_runtime import (
     ExecutionSignal, OrganizationCoordinator, WorkflowStatus, WorkExecution,
@@ -43,6 +43,18 @@ def _start_invocation_in_process(database_path, invocation_id, result_queue):
         result_queue.put(None)
     except Exception as exc:
         result_queue.put(type(exc).__name__)
+
+
+def _inspect_pending_question_in_process(database_path, result_queue):
+    try:
+        store = SQLiteEventStore(database_path)
+        state = Projector(store).replay(PROJECT_ID)
+        question_status = state["questions"]["question.queued"]["status"]
+        work_status = state["workItems"][WORK_ID]["status"]
+        claim = SQLiteWorkQueue(store).claim_next("worker.after-restart", now=501, lease_seconds=10)
+        result_queue.put((question_status, work_status, claim))
+    except Exception as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
 
 
 PROJECT_ID = "project.queue"
@@ -439,19 +451,52 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(first.status, WorkflowStatus.WAITING_HUMAN)
         self.assertEqual(self.queue.get("job.runtime")["state"], "queued")
-        self.assertIsNone(self.queue.claim_next("worker.next", now=501, lease_seconds=10))
 
-        self.control.answer_question(
-            PROJECT_ID, "question.queued", "Proceed.", actor={
-                "actorType": "human", "actorId": "user.synthetic", "role": "user",
-            },
+        # A separate process must see the open question, paused work, and
+        # unclaimable job before the parent reconstructs its command objects.
+        context = multiprocessing.get_context("spawn")
+        reports = context.Queue()
+        child = context.Process(
+            target=_inspect_pending_question_in_process,
+            args=(str(self.path), reports),
         )
-        second = await coordinator.run_queued(
-            self.queue, "worker.next", resolve, lease_seconds=10, clock=lambda: 502,
+        child.start()
+        recovered_question = reports.get(timeout=15)
+        child.join(timeout=15)
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=5)
+        self.assertEqual(child.exitcode, 0)
+        self.assertEqual(recovered_question, ("open", "waiting_human", None))
+
+        # A cold queue/coordinator/control-plane reconstruction must retain the
+        # unanswered question and leave its dependent job unrunnable.
+        reopened = SQLiteEventStore(self.path)
+        resumed_control = ProjectControlPlane(reopened)
+        resumed_queue = SQLiteWorkQueue(reopened)
+        resumed_coordinator = OrganizationCoordinator(reopened)
+        self.assertIsNone(resumed_queue.claim_next("worker.next", now=501, lease_seconds=10))
+
+        actor = {"actorType": "human", "actorId": "user.synthetic", "role": "user"}
+        answer = resumed_control.answer_question(
+            PROJECT_ID, "question.queued", "Proceed.", actor=actor,
+        )
+        answered_event_count = len(reopened.events(PROJECT_ID))
+        self.assertEqual(
+            resumed_control.answer_question(
+                PROJECT_ID, "question.queued", "Proceed.", actor=actor,
+            ),
+            answer,
+        )
+        self.assertEqual(len(reopened.events(PROJECT_ID)), answered_event_count)
+
+        second = await resumed_coordinator.run_queued(
+            resumed_queue, "worker.next", resolve, lease_seconds=10, clock=lambda: 502,
         )
         self.assertEqual(second.status, WorkflowStatus.COMPLETED)
-        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
-        state = coordinator.projector.replay(PROJECT_ID)
+        self.assertEqual(resumed_queue.get("job.runtime")["state"], "completed")
+        self.assertIsNone(resumed_queue.claim_next("worker.third", now=503, lease_seconds=10))
+        state = resumed_coordinator.projector.replay(PROJECT_ID)
         self.assertEqual(state["agentRuns"]["run.queued.g1"]["status"], "succeeded")
         self.assertEqual(state["agentRuns"]["run.queued.g2"]["status"], "succeeded")
 

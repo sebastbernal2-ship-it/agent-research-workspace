@@ -88,6 +88,10 @@ class InboxReadModelTests(unittest.TestCase):
         self.assertEqual([row["eventType"] for row in after["history"]], [
             "human.question_opened", "human.question_answered",
         ])
+        self.assertEqual(after["history"][-1]["actor"], USER)
+        self.assertEqual(after["history"][-1]["occurredAt"], "2026-04-16T12:01:00Z")
+        self.assertEqual(after["record"]["answer"]["answeredBy"], USER)
+        self.assertEqual(after["record"]["answer"]["resumedWorkIds"], ["work.inbox"])
         self.assertEqual(
             [row["questionId"] for row in self.inbox.list_questions(
                 "project.inbox", statuses=("answered",),
