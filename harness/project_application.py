@@ -7,10 +7,12 @@ this module does not authenticate sessions or provide a production policy.
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from .capabilities import CapabilityAuthority
 from .control_plane import ProjectControlPlane
 from .event_store import ConcurrentWriteConflict
+from .effect_ledger import EffectLedger
 from .inbox import (
     InboxForbidden, PrincipalProvider, ProjectAccessPolicy, is_authenticated_human_actor,
 )
@@ -32,6 +34,7 @@ class ProjectApplication:
         self.principal_provider = principal_provider
         self.access_policy = access_policy
         self.capabilities = capability_authority or CapabilityAuthority(control_plane.store)
+        self.effects = EffectLedger(control_plane.store)
 
     def _authorize(self, project_id: str, action: str) -> dict[str, str]:
         actor = self.principal_provider.current_actor()
@@ -132,6 +135,29 @@ class ProjectApplication:
         actor = self._authorize(project_id, "capability.revoke")
         return self.capabilities.revoke(
             project_id, grant_id, actor=actor, reason=reason, occurred_at=occurred_at,
+        )
+
+    def approve_effect(
+        self,
+        project_id: str,
+        effect_id: str,
+        *,
+        expected_sequence: int,
+    ) -> dict[str, Any]:
+        """Record a human approval through the injected project membership boundary."""
+        actor = self._authorize(project_id, "effect.approve")
+        if type(expected_sequence) is not int or expected_sequence < 0:
+            raise ValueError("expected_sequence must be a nonnegative integer")
+        state = self.projector.replay(project_id)
+        effect = state["effects"].get(effect_id)
+        if effect is None:
+            raise KeyError(f"unknown effect {effect_id!r}")
+        if state["_eventSequence"] != expected_sequence:
+            raise ConcurrentWriteConflict("effect approval targets a stale project sequence")
+        return self.effects.transition(
+            project_id, effect_id, "approved", actor=actor,
+            event_id=f"event.effect.approved.{uuid4().hex}",
+            expected_sequence=expected_sequence,
         )
 
     def transition_work(

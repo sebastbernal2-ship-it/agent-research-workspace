@@ -8,6 +8,7 @@ from harness.control_plane import ProjectControlPlane
 from harness.event_store import ConcurrentWriteConflict, SQLiteEventStore
 from harness.inbox import InboxForbidden
 from harness.project_application import ProjectApplication
+from harness.run_ledger import RunLedger
 from harness.testing import seed_synthetic_project
 
 
@@ -76,6 +77,60 @@ class ProjectApplicationTests(unittest.TestCase):
         self.membership.allowed_projects.clear()
         with self.assertRaisesRegex(InboxForbidden, "membership"):
             self.app.list_evidence(PROJECT_ID)
+
+    def create_effect(self):
+        self.app.effects.clock = lambda: NOW
+        grant = self.app.capabilities.grant({
+            "recordType": "capability_grant", "schemaVersion": "0.1",
+            "projectId": PROJECT_ID, "grantId": "grant.effect.application", "revision": 1,
+            "subject": AGENT, "workIds": [WORK_ID], "capability": "tool.execute",
+            "resourceIds": ["resource.application"], "grantedBy": USER,
+            "createdAt": NOW, "expiresAt": "2026-04-17T12:00:00Z", "status": "active",
+        }, actor=USER)
+        run = RunLedger(self.store, clock=lambda: NOW).start(
+            PROJECT_ID, WORK_ID, run_id="run.effect.application", agent=AGENT,
+            adapter={"name": "test", "version": "1"}, context_hash="b" * 64,
+            occurred_at=NOW,
+        )
+        request_ref, request_hash = self.store.put_blob(b"approved payload")
+        intent = {
+            "recordType": "effect_intent", "schemaVersion": "0.2",
+            "projectId": PROJECT_ID, "effectId": "effect.application", "workId": WORK_ID,
+            "runId": run["runId"], "adapter": {"name": "test", "version": "1"},
+            "principal": AGENT, "capabilityGrantId": grant["grantId"],
+            "capabilityRevision": 1, "action": "tool.execute", "resourceId": "resource.application",
+            "requestRef": request_ref, "requestHash": request_hash,
+            "provider": "synthetic", "endpoint": "https://provider.example.test/effect",
+            "idempotencyKey": "provider-key.application", "dataClassification": "internal",
+            "createdAt": NOW, "expiresAt": "2026-04-16T13:00:00Z",
+            "correlationId": run["runId"],
+        }
+        self.app.effects.create_intent(intent, actor=AGENT, event_id="event.effect.application.created")
+
+    def test_effect_approval_is_authorized_server_side_and_sequence_fenced(self):
+        self.create_effect()
+        sequence = self.app.projector.replay(PROJECT_ID)["_eventSequence"]
+        self.membership.allowed_projects.clear()
+        before = len(self.store.events(PROJECT_ID))
+        with self.assertRaisesRegex(InboxForbidden, "membership"):
+            self.app.approve_effect(PROJECT_ID, "effect.application", expected_sequence=sequence)
+        self.assertEqual(len(self.store.events(PROJECT_ID)), before)
+        with self.assertRaises(TypeError):
+            self.app.approve_effect(
+                PROJECT_ID, "effect.application", expected_sequence=sequence,
+                actor=AGENT,
+            )
+        self.assertEqual(len(self.store.events(PROJECT_ID)), before)
+
+        self.membership.allowed_projects.add(PROJECT_ID)
+        with self.assertRaisesRegex(ConcurrentWriteConflict, "stale project sequence"):
+            self.app.approve_effect(PROJECT_ID, "effect.application", expected_sequence=sequence - 1)
+        approved = self.app.approve_effect(
+            PROJECT_ID, "effect.application", expected_sequence=sequence,
+        )
+        self.assertEqual(approved["approval"]["actor"], USER)
+        self.assertEqual(approved["approval"]["requestHash"], approved["intent"]["requestHash"])
+        self.assertEqual(self.membership.calls[-1][2], "effect.approve")
 
     def test_work_approval_binds_to_current_revision_and_rejects_replay(self):
         record = deepcopy(self.control.projector.replay(PROJECT_ID)["workItems"][WORK_ID])
