@@ -45,6 +45,29 @@ def _start_invocation_in_process(database_path, invocation_id, result_queue):
         result_queue.put(type(exc).__name__)
 
 
+def _start_queued_run_then_wait(database_path, ready_queue, stop_event):
+    try:
+        store = SQLiteEventStore(database_path)
+        queue = SQLiteWorkQueue(store)
+        lease = queue.claim_next("worker.crash-process", now=1_000, lease_seconds=5)
+        if lease is None:
+            raise RuntimeError("expected queued job claim")
+        RunLedger(store).start(
+            PROJECT_ID, WORK_ID, run_id="run.crash-process.g1", agent=SPECIALIST,
+            adapter=ADAPTER, context_hash=CONTEXT_HASH, correlation_id="queue.integration",
+            occurred_at=NOW,
+            queue_lease={
+                "jobId": lease["jobId"], "workerId": "worker.crash-process",
+                "leaseToken": lease["leaseToken"], "leaseGeneration": lease["leaseGeneration"],
+                "now": 1_001,
+            },
+        )
+        ready_queue.put((lease["leaseGeneration"], None))
+        stop_event.wait()
+    except Exception as exc:
+        ready_queue.put((None, repr(exc)))
+
+
 def _inspect_pending_question_in_process(database_path, result_queue):
     try:
         store = SQLiteEventStore(database_path)
@@ -299,7 +322,7 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         coordinator = OrganizationCoordinator(self.store)
 
         async def execute(_context):
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(3.6)
             return ExecutionSignal.COMPLETED
 
         def resolve(job):
@@ -314,7 +337,7 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         outcome = await coordinator.run_queued(
-            self.queue, "worker.heartbeat", resolve, lease_seconds=1,
+            self.queue, "worker.heartbeat", resolve, lease_seconds=3,
         )
         self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
         self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
@@ -814,6 +837,61 @@ class QueuedOrganizationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         state = coordinator.projector.replay(PROJECT_ID)
         self.assertEqual(state["agentRuns"]["run.crashed.g1"]["status"], "interrupted")
         self.assertEqual(state["agentRuns"]["run.crashed.g2"]["status"], "succeeded")
+
+    async def test_killed_worker_process_requires_explicit_run_and_lease_recovery(self):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        stop_event = context.Event()
+        process = context.Process(
+            target=_start_queued_run_then_wait,
+            args=(str(self.path), ready, stop_event),
+        )
+        process.start()
+        generation, error = ready.get(timeout=20)
+        self.assertIsNone(error, error)
+        self.assertEqual(generation, 1)
+        process.terminate()
+        process.join(timeout=20)
+        self.assertFalse(process.is_alive())
+        self.assertNotEqual(process.exitcode, 0)
+
+        # Lease expiry is observed, but neither lease nor canonical run is silently replayed.
+        self.assertIsNone(self.queue.claim_next("worker.replacement", now=1_006, lease_seconds=10))
+        self.assertEqual(self.queue.get("job.runtime")["state"], "recovery_required")
+        self.assertEqual(Projector(self.store).replay(PROJECT_ID)["agentRuns"]["run.crash-process.g1"]["status"], "running")
+        self.queue.recover_expired(
+            "job.runtime", now=1_007, attest_no_live_worker=True,
+        )
+        coordinator = OrganizationCoordinator(self.store)
+        self.assertEqual(coordinator.recover_project(PROJECT_ID, occurred_at=NOW), ("run.crash-process.g1",))
+        coordinator.retry_work(
+            PROJECT_ID, WORK_ID, actor=USER, reason="Reviewed the killed worker attempt.", occurred_at=NOW,
+        )
+        self.queue.recover_expired(
+            "job.runtime", now=1_008, attest_no_live_worker=True,
+        )
+
+        def resolve(job):
+            descriptor = job["payload"]
+            return WorkExecution(
+                project_id=PROJECT_ID, work_id=WORK_ID,
+                run_id=f"run.crash-process.g{job['leaseGeneration']}",
+                correlation_id=descriptor["correlationId"], actor=descriptor["actor"],
+                adapter=descriptor["adapter"], context_hash=descriptor["contextHash"],
+                verification_actor=descriptor["verificationActor"],
+                execute=lambda _: ExecutionSignal.COMPLETED, verify=lambda _: True,
+            )
+
+        outcome = await coordinator.run_queued(
+            self.queue, "worker.replacement", resolve,
+            lease_seconds=10, clock=lambda: 1_009,
+        )
+        self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
+        runs = Projector(self.store).replay(PROJECT_ID)["agentRuns"]
+        self.assertEqual(runs["run.crash-process.g1"]["status"], "interrupted")
+        self.assertEqual(runs["run.crash-process.g2"]["status"], "succeeded")
+        self.assertEqual(self.queue.get("job.runtime")["state"], "completed")
+        self.assertTrue(self.store.verify(PROJECT_ID))
 
     async def test_missing_trusted_execution_factory_enters_recovery_not_replay(self):
         coordinator = OrganizationCoordinator(self.store)
