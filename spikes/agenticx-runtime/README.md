@@ -86,11 +86,11 @@ Using FastAPI's in-process `TestClient` (no socket/server, no lifespan integrati
 
 ### Fail-closed wrapper probe
 
-`safe_studio.py` is a spike-only outer ASGI authentication wrapper. It requires the desktop-token header on every non-health/readiness HTTP route and every WebSocket route, and its optional launcher refuses non-loopback binds, requires the pinned venv, generates a 256-bit token, uses a temporary private HOME, removes inherited environment credentials, and disables the gateway. Its in-process tests cover all 260 non-exempt API method entries for missing/wrong tokens, and forward valid-token requests for all 262 API method entries plus both WebSockets to an inert ASGI sink; actual route handlers have representative valid-token tests. **The launcher itself has not been run; no socket or port was opened.** This wrapper is neither a hardened sandbox nor product adoption, and does not cure the upstream source defects. Deterministic worker/capability probes are in `test_mock_policy.py`; `restart_probe.py` checks SQLite session metadata across fresh processes. Reproduce the offline tests with:
+`safe_studio.py` is a spike-only outer ASGI authentication wrapper. It requires the desktop-token header on every non-health/readiness HTTP route and every WebSocket route, and its optional launcher refuses non-loopback binds, requires the pinned venv, generates a 256-bit token, uses a temporary private HOME, removes inherited environment credentials, and disables the gateway. Its in-process tests cover all 260 non-exempt API method entries for missing/wrong tokens, and forward valid-token requests for all 262 API method entries plus both WebSockets to an inert ASGI sink; actual route handlers have representative valid-token tests. **The launcher itself has not been run; no socket or port was opened.** This wrapper is neither a hardened sandbox nor product adoption, and does not cure the upstream source defects. Deterministic worker/capability probes are in `test_mock_policy.py`; `test_studio_approval_flow.py` drives the real in-process Studio chat/approval routes with a deterministic LLM and an intercepted subprocess; `restart_probe.py` checks SQLite session metadata across fresh processes. Reproduce the offline tests with:
 
 ```bash
 cd spikes/agenticx-runtime
-.venv/bin/python -m pytest -q test_safe_studio.py test_mock_policy.py
+.venv/bin/python -m pytest -q test_safe_studio.py test_mock_policy.py test_studio_approval_flow.py
 .venv/bin/python restart_probe.py
 ```
 
