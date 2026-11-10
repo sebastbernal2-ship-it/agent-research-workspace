@@ -269,6 +269,61 @@ class CapabilityAuthorityTests(unittest.TestCase):
             self.store.append(mutated)
         self.assertTrue(self.store.verify("project.capability"))
 
+    def test_forged_revocation_event_is_rejected_during_replay(self):
+        self.authority.grant(grant_record(), actor=USER)
+        revoked = grant_record(
+            revision=2, status="revoked", revokedBy=NON_USER,
+            revokedAt=LATER, revokeReason="forged agent revocation",
+        )
+        record_hash = self.store.put_record(revoked)
+        self.store.append({
+            "recordType": "event", "schemaVersion": "0.1",
+            "eventId": "event.forged-revocation", "projectId": "project.capability",
+            "eventType": "capability.revoked", "actor": NON_USER,
+            "occurredAt": LATER, "causationId": None,
+            "correlationId": "project.capability", "idempotencyKey": "idem.forged-revocation",
+            "payload": {
+                "grantId": revoked["grantId"], "recordHash": record_hash,
+                "revokeReason": revoked["revokeReason"],
+            },
+        })
+        with self.assertRaisesRegex(ProjectionError, "does not match its record"):
+            Projector(self.store).replay("project.capability")
+
+    def test_revocation_replay_is_idempotent_and_mutation_is_rejected(self):
+        self.authority.grant(grant_record(), actor=USER)
+        self.authority.revoke(
+            "project.capability", "grant.read-corpus", actor=USER,
+            reason="Revoked after synthetic review.", occurred_at=LATER,
+        )
+        revoke_event = next(
+            event for event in self.store.events("project.capability")
+            if event["eventType"] == "capability.revoked"
+        )
+        self.assertTrue(self.store.append(revoke_event).duplicate)
+        mutated = {**revoke_event, "payload": {**revoke_event["payload"], "revokeReason": "forged"}}
+        with self.assertRaises(IdempotencyConflict):
+            self.store.append(mutated)
+        self.assertEqual(
+            Projector(self.store).replay("project.capability")["capabilityGrants"]["grant.read-corpus"]["status"],
+            "revoked",
+        )
+        self.assertTrue(self.store.verify("project.capability"))
+
+    def test_malformed_capability_event_is_rejected_before_append(self):
+        before = self.store.events("project.capability")
+        malformed = {
+            "recordType": "event", "schemaVersion": "0.1",
+            "eventId": "event.malformed-capability", "projectId": "project.capability",
+            "eventType": "capability.granted", "actor": USER, "occurredAt": NOW,
+            "causationId": None, "correlationId": "project.capability",
+            "idempotencyKey": "idem.malformed-capability",
+            "payload": {"grantId": "grant.bad"},
+        }
+        with self.assertRaises(EventStoreError):
+            self.store.append(malformed)
+        self.assertEqual(self.store.events("project.capability"), before)
+
     def test_cross_project_grant_reference_is_rejected(self):
         with self.assertRaisesRegex(ControlPlaneError, "unknown work"):
             self.authority.grant(grant_record(workIds=["work.other"]), actor=USER)
