@@ -95,6 +95,17 @@ class EvidenceRegistrarTests(unittest.TestCase):
             small_registrar.register(**self.base)
         self.assertFalse(any(event["eventType"] == "evidence.registered" for event in self.store.events(PROJECT_ID)))
 
+    def test_source_registration_cannot_self_assert_review_status(self):
+        for status in ("corroborated", "contested", "human_verified"):
+            with self.subTest(status=status), self.assertRaisesRegex(
+                EvidenceRegistrationError, "must start unreviewed",
+            ):
+                self.registrar.register(**self.base, review_status=status)
+        self.assertFalse(any(
+            event["eventType"] == "evidence.registered"
+            for event in self.store.events(PROJECT_ID)
+        ))
+
     def test_evidence_identity_cannot_be_reused_for_changed_source_or_claim(self):
         self.registrar.register(**self.base)
         with self.assertRaisesRegex(EvidenceRegistrationError, "different immutable content"):

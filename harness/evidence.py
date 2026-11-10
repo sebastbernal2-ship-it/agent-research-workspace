@@ -93,6 +93,10 @@ class EvidenceRegistrar:
                 raise EvidenceRegistrationError(f"{label} must be a non-empty string")
         if run_id is not None and (not isinstance(run_id, str) or not run_id):
             raise EvidenceRegistrationError("run_id must be a non-empty string when supplied")
+        if review_status != "unreviewed":
+            raise EvidenceRegistrationError(
+                "source registration cannot assert review; evidence must start unreviewed"
+            )
         self._validate_source_uri(source_uri)
         if isinstance(source_content, str):
             raw_content = source_content.encode("utf-8")
