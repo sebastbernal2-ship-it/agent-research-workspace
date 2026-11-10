@@ -8,7 +8,7 @@ This workstream (#10) is deliberately separate from project truth and from candi
 - Scope is exactly `user`, `project`, or `task`; scope IDs are compared literally. Project/task rules do not leak to a different project/task. A correction must point to an included prior record with the same scope and topic.
 - A project charter remains the revisioned canonical project artifact under `contracts/v0.1`; it is not silently imported into or overwritten by global preference memory. A memory entry may cite a charter location as provenance, but cannot replace that charter.
 - Agent-local memory is noncanonical and outside this schema. It must be disableable/exportable/deletable without changing project events.
-- User correction is represented as a new immutable record superseding an earlier ID. The evaluator never edits an old record or silently chooses between contradictory confirmed rules.
+- User correction/retraction is represented as a new immutable record superseding an earlier ID. The evaluator never edits an old record or silently chooses between contradictory confirmed rules. `prepare_memory_candidate` returns no persistence candidate without explicit opt-in or when the user says “do not remember”; it is a pure pre-persistence helper, not an enforced storage boundary or deletion mechanism.
 
 ## Evaluator contract
 
@@ -26,4 +26,4 @@ Conflicting confirmed requirements cause `needsUserClarification`; stale/observe
 python3 -m unittest alignment.tests.test_conformance -v
 ```
 
-Tests cover confirmation, contradiction, expiry, scope isolation, correction/supersession, unknown fields and the strict separation between alignment and authorization. Private profile import still requires a separate privacy review and explicit opt-in.
+Tests cover confirmation, contradiction, expiry, scope isolation, correction/retraction, explicit opt-in and “do not remember” suppression, unknown fields and the strict separation between alignment and authorization. Private profile import still requires a separate privacy review and explicit opt-in; no private profile data is included.

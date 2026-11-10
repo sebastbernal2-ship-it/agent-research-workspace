@@ -1,6 +1,6 @@
 import unittest
 
-from alignment.conformance import AlignmentMemoryError, ConformanceEngine
+from alignment.conformance import AlignmentMemoryError, ConformanceEngine, prepare_memory_candidate
 
 
 USER = {"actorType": "human", "actorId": "user.synthetic", "role": "user"}
@@ -92,6 +92,32 @@ class AlignmentConformanceTests(unittest.TestCase):
         self.assertEqual(advisory["alignmentStatus"], "unknown")
         self.assertEqual(advisory["advisoryMemoryIds"], ["memory.inferred"])
         self.assertEqual(advisory["bindingMemoryIds"], [])
+
+    def test_retraction_removes_binding_rule_without_rewriting_history(self):
+        old = memory("memory.retracted-old")
+        retraction = memory(
+            "memory.retraction", status="retracted", supersedes="memory.retracted-old",
+        )
+        result = self.evaluate([old, retraction])
+        self.assertEqual(result["alignmentStatus"], "unknown")
+        self.assertEqual(result["bindingMemoryIds"], [])
+        self.assertEqual(old["status"], "confirmed")
+        self.assertEqual(retraction["status"], "retracted")
+
+    def test_no_opt_in_or_do_not_remember_never_yields_persistable_candidate(self):
+        candidate = memory("memory.sensitive-candidate")
+        candidate["statement"] = "synthetic private preference marker"
+        self.assertIsNone(prepare_memory_candidate(candidate, explicitly_opted_in=False))
+        self.assertIsNone(prepare_memory_candidate(
+            candidate, explicitly_opted_in=True, do_not_remember=True,
+        ))
+        prepared = prepare_memory_candidate(candidate, explicitly_opted_in=True)
+        self.assertEqual(prepared, candidate)
+        self.assertIsNot(prepared, candidate)
+
+    def test_memory_consent_flags_must_be_explicit_booleans(self):
+        with self.assertRaisesRegex(AlignmentMemoryError, "explicit booleans"):
+            prepare_memory_candidate(memory("memory.consent"), explicitly_opted_in=1)
 
     def test_explicit_correction_supersedes_old_preference(self):
         old = memory("memory.old", value="external-write", polarity="forbid")

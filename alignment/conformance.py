@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,24 @@ VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 
 class AlignmentMemoryError(ValueError):
     """Invalid or ambiguous alignment memory input."""
+
+
+def prepare_memory_candidate(
+    candidate: dict[str, Any], *, explicitly_opted_in: bool, do_not_remember: bool = False,
+) -> dict[str, Any] | None:
+    """Fail closed before handing a candidate to any persistence adapter.
+
+    This helper is not a store and cannot prevent callers from retaining their
+    own input. A do-not-remember directive always suppresses the candidate.
+    """
+    if type(explicitly_opted_in) is not bool or type(do_not_remember) is not bool:
+        raise AlignmentMemoryError("memory consent flags must be explicit booleans")
+    if do_not_remember or not explicitly_opted_in:
+        return None
+    errors = list(VALIDATOR.iter_errors(candidate))
+    if errors:
+        raise AlignmentMemoryError("invalid memory candidate: " + errors[0].message)
+    return deepcopy(candidate)
 
 
 def _time(value: str) -> datetime:
