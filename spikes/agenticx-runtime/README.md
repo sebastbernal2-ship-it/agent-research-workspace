@@ -82,7 +82,11 @@ Using FastAPI's in-process `TestClient` (no socket/server, no lifespan integrati
 
 - `/api/session`: no token → **401**; correct `x-agx-desktop-token` → **200**.
 - `/api/session/messages`: no token → **401**; correct token → **200**.
-- The auth behavior is conditional: `_check_token` permits requests when `AGX_DESKTOP_TOKEN` is empty. The CLI defaults to `--host 0.0.0.0` and empty token, warning that the API is unauthenticated. Therefore, **never use those defaults**. Static inspection of `server.py` found only `/api/health` and `/api/ready` without direct token checks; the many remaining inline routes call the checker, while several registered routers accept it as a callback. This was not a full audit of every registered router, HTTP method, or downstream effect, and does not establish a remotely acceptable product security model. We did not start a socket server.
+- The auth behavior is conditional: `_check_token` permits requests when `AGX_DESKTOP_TOKEN` is empty. The CLI defaults to `--host 0.0.0.0` and empty token, warning that the API is unauthenticated. Therefore, **never use those defaults**. The later full route inventory found **65 API handlers with no auth check visible in the endpoint**, beyond health/readiness; representative KB, Brain, code-index, and web-search routes returned 200 regardless of token. Details and limits are in [`ISSUE-4-REVIEW.md`](ISSUE-4-REVIEW.md). The upstream Studio server remains unsuitable for direct exposure. We did not start a socket server.
+
+### Fail-closed wrapper probe
+
+`safe_studio.py` is a spike-only outer ASGI authentication wrapper. It requires the desktop-token header on every non-health/readiness HTTP route and every WebSocket route, and its optional launcher refuses non-loopback binds, requires the pinned venv, generates a 256-bit token, uses a temporary private HOME, removes inherited environment credentials, and disables the gateway. Its in-process tests cover all 260 non-exempt API method entries for missing/wrong tokens and representative valid-token access. **The launcher itself has not been run; no socket or port was opened.** This wrapper is neither a hardened sandbox nor product adoption, and does not cure the upstream source defects.
 
 ### Revised decision
 
