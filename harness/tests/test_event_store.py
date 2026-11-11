@@ -441,6 +441,19 @@ store.append_many(json.loads(sys.argv[3]))
         with self.assertRaises(IntegrityFailure):
             self.store.verify("project.alpha")
 
+    def test_verified_backup_restores_event_chain_and_content_addressed_blobs(self):
+        for event in initial_events():
+            self.store.append(event)
+        blob_ref, blob_hash = self.store.put_blob(b"restore drill synthetic source")
+        backup_path = self.store.backup_to(Path(self.temp.name) / "restore-drill.sqlite3")
+
+        restored = SQLiteEventStore(backup_path)
+        self.assertTrue(restored.verify("project.alpha"))
+        self.assertEqual(restored.events("project.alpha"), self.store.events("project.alpha"))
+        self.assertEqual(restored.get_blob(blob_hash), b"restore drill synthetic source")
+        self.assertEqual(blob_ref, f"blob.{blob_hash}")
+        self.assertEqual(restored.export_jsonl("project.alpha"), self.store.export_jsonl("project.alpha"))
+
     def test_backup_refuses_a_tampered_content_addressed_blob(self):
         _reference, digest = self.store.put_blob(b"original synthetic backup blob")
         conn = sqlite3.connect(self.path)
