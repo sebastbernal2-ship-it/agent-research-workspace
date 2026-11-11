@@ -282,7 +282,7 @@ class PrototypeRuntime:
     def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
-            "mode": "local-synthetic-demo",
+            "mode": "local-project-prototype",
             "projectId": PROJECT_ID,
             "modelProvidersConnected": False,
         }

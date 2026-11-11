@@ -594,7 +594,7 @@ async function runQuestionCommand(dialogId, command) {
 async function bootstrap() {
   try {
     const health = await apiRequest("/api/v1/health");
-    if (health.mode !== "local-synthetic-demo") throw new Error("Unexpected service mode.");
+    if (health.mode !== "local-project-prototype") throw new Error("Unexpected service mode.");
     setServiceState(true, "Local WSL prototype · test data only · no agents/models connected");
     projects = (await apiRequest("/api/v1/projects")).items;
     renderProjectList();

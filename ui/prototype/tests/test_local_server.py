@@ -292,7 +292,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
     def test_api_v1_is_explicit_and_unknown_api_versions_fail_closed(self):
         status, health, _ = self.request("/api/v1/health")
         self.assertEqual(status, 200)
-        self.assertEqual(health["mode"], "local-synthetic-demo")
+        self.assertEqual(health["mode"], "local-project-prototype")
         status, error, _ = self.request("/api/v2/health")
         self.assertEqual(status, 404)
         self.assertEqual(error["error"], "not_found")
