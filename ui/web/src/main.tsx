@@ -1,11 +1,11 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import {
-  Activity, ChevronDown, Files, Folder, FolderKanban, GitBranch, Inbox,
-  Layers3, MessageSquare, MoreHorizontal, Paperclip, Plus, Search, Send,
-  ShieldAlert, Sparkles, Terminal, X,
+  Check, ChevronDown, CircleHelp, Folder, FolderKanban, Inbox,
+  Layers3, Plus, Search, ShieldAlert, Sparkles, X,
 } from "lucide-react";
 import "./style.css";
+import "./goal.css";
 
 type Project = { projectId: string; name: string; status: string; charter: { revision: number; goals: string[]; nonGoals: string[]; acceptanceCriteria: string[] } };
 type Work = { workId: string; title: string; objective: string; workType: string; status: string; dependsOn: string[]; revision: number };
@@ -13,8 +13,7 @@ type ProjectEvent = { eventId: string; title: string; description: string; actor
 type Summary = { project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number> };
 type Question = { questionId: string; questionText: string; priority: string; blocking: boolean; workIds: string[]; etag: string };
 type QuestionDetail = Question & { record: { options: { optionId: string; label: string; consequence?: string }[]; impact: string; status: string; questionText: string }; affectedWork: { workId: string; title: string; status: string }[] };
-type View = "thread" | "inbox";
-type InspectorTab = "Changes" | "Files" | "Terminal";
+type View = "overview" | "inbox";
 
 const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
@@ -31,10 +30,8 @@ function App() {
   const [projects, setProjects] = React.useState<Project[]>([]);
   const [projectId, setProjectId] = React.useState("project.northstar");
   const [summary, setSummary] = React.useState<Summary | null>(null);
-  const [view, setView] = React.useState<View>("thread");
-  const [inspector, setInspector] = React.useState<InspectorTab>("Changes");
+  const [view, setView] = React.useState<View>("overview");
   const [projectsOpen, setProjectsOpen] = React.useState(false);
-  const [selectedWorkId, setSelectedWorkId] = React.useState("");
   const [questions, setQuestions] = React.useState<Question[]>([]);
   const [selectedQuestion, setSelectedQuestion] = React.useState<QuestionDetail | null>(null);
   const [selectedOption, setSelectedOption] = React.useState("");
@@ -65,7 +62,6 @@ function App() {
     const result = await request<Summary>(`/api/v1/projects/${encodeURIComponent(id)}`);
     setProjectId(id);
     setSummary(result);
-    setSelectedWorkId((current) => result.workItems.some((item) => item.workId === current) ? current : result.workItems[0]?.workId || "");
     setError("");
   }, [projectId]);
 
@@ -82,8 +78,9 @@ function App() {
 
   const project = summary?.project;
   const workItems = summary?.workItems || [];
-  const selectedWork = workItems.find((item) => item.workId === selectedWorkId) || null;
   const openQuestionCount = summary?.counts.openQuestions || 0;
+  const blockingQuestionCount = questions.filter((question) => question.blocking).length;
+  const pulse = projectPulse(workItems.length, openQuestionCount, blockingQuestionCount);
 
   async function createProject(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true);
@@ -91,7 +88,7 @@ function App() {
     try {
       const result = await request<{project: Project}>('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name: data.get('name'), goal: data.get('goal') }) });
       await loadProjects(); await loadProject(result.project.projectId); await loadInbox(result.project.projectId);
-      setView("thread"); setProjectDialog(false); form.reset();
+      setView("overview"); setProjectDialog(false); form.reset();
     } catch (e) { setError(e instanceof Error ? e.message : "Could not create project."); }
     finally { setBusy(false); }
   }
@@ -100,9 +97,9 @@ function App() {
     event.preventDefault(); if (!project) return; setBusy(true);
     const form = event.currentTarget; const data = new FormData(form);
     try {
-      const result = await request<{workItem: Work}>(`/api/v1/projects/${encodeURIComponent(project.projectId)}/work`, { method: 'POST', body: JSON.stringify({ title: data.get('title'), objective: data.get('objective'), workType: data.get('workType') }) });
-      setSelectedWorkId(result.workItem.workId); await loadProject(project.projectId); setView("thread"); setWorkDialog(false); form.reset();
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not add work."); }
+      await request(`/api/v1/projects/${encodeURIComponent(project.projectId)}/work`, { method: 'POST', body: JSON.stringify({ title: data.get('title'), objective: data.get('objective'), workType: data.get('workType') }) });
+      await loadProject(project.projectId); setView("overview"); setWorkDialog(false); form.reset();
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not add planned work."); }
     finally { setBusy(false); }
   }
 
@@ -112,6 +109,11 @@ function App() {
       const detail = await request<QuestionDetail>(`/api/v1/projects/${encodeURIComponent(project.projectId)}/inbox/${encodeURIComponent(questionId)}`);
       setSelectedQuestion(detail); setSelectedOption(detail.record.options[0]?.optionId || ""); setAnswerNote("");
     } catch (e) { setError(e instanceof Error ? e.message : "Could not load question."); }
+  }
+
+  async function openQuestion(questionId: string) {
+    await chooseQuestion(questionId);
+    setView("inbox");
   }
 
   async function submitDecision(reject = false) {
@@ -133,7 +135,7 @@ function App() {
   }
 
   async function switchProject(id: string) {
-    try { await loadProject(id); await loadInbox(id); setView("thread"); }
+    try { await loadProject(id); await loadInbox(id); setView("overview"); }
     catch (e) { setError(e instanceof Error ? e.message : "Could not open the project."); }
   }
 
@@ -142,39 +144,43 @@ function App() {
       <div className="amp-brand-row"><button className="panel-toggle" aria-label="Sidebar collapse unavailable" title="Sidebar collapse is not implemented" disabled><span/></button><a className="amp-brand" href="#workspace"><span className="amp-logo"><Layers3 size={16}/></span><b>Northstar</b></a><button className="icon-button" aria-label="Search unavailable" title="Search is not connected" disabled><Search size={15}/></button><button className="new-thread" aria-label="New project" title="New project" onClick={() => setProjectDialog(true)}><Plus size={16}/></button></div>
       <button className="amp-project-picker" onClick={() => setProjectsOpen((open) => !open)}><Folder size={15}/><span>{project?.name || "Projects"}</span><ChevronDown size={13}/></button>
       {projectsOpen && <div className="project-menu">{projects.map((item)=><button key={item.projectId} className={item.projectId===projectId?"current":""} onClick={()=>{void switchProject(item.projectId);setProjectsOpen(false);}}>{item.name}</button>)}<button onClick={()=>{setProjectDialog(true);setProjectsOpen(false);}}><Plus size={13}/>New project</button></div>}
-      <div className="sidebar-section-head"><span>WORK ITEMS</span><button onClick={() => setWorkDialog(true)} aria-label="Add work item"><Plus size={14}/></button></div>
-      <div className="thread-list">{workItems.map((item) => <button key={item.workId} className={`thread-row ${selectedWorkId === item.workId && view === "thread" ? "thread-selected" : ""}`} onClick={() => { setSelectedWorkId(item.workId); setView("thread"); }}><span className={`thread-status-dot ${item.status}`}/><span className="thread-title">{item.title}</span><span className="thread-menu"><MoreHorizontal size={14}/></span></button>)}</div>
+      <div className="sidebar-section-head"><span>PROJECT</span></div>
+      <nav className="amp-sidebar-links" aria-label="Project navigation"><button onClick={() => setView("overview")} className={view === "overview" ? "current" : ""}><Layers3 size={15}/>Overview</button><button onClick={() => setView("inbox")} className={view === "inbox" ? "current" : ""}><Inbox size={15}/>Your input <span>{openQuestionCount || ""}</span></button></nav>
       <div className="sidebar-spacer"/>
-      <div className="amp-sidebar-links"><button onClick={() => setView("inbox")} className={view === "inbox" ? "current" : ""}><Inbox size={15}/>Inbox <span>{openQuestionCount || ""}</span></button><button disabled title="Activity view is not connected"><Activity size={15}/>Activity</button><button onClick={() => setProjectDialog(true)}><FolderKanban size={15}/>Projects</button></div>
-      <div className="amp-user"><span className="amp-avatar">V</span><span><b>Local user</b><small>Prototype · not authenticated</small></span><MoreHorizontal size={15}/></div>
+      <div className="amp-sidebar-links"><button onClick={() => setProjectDialog(true)}><FolderKanban size={15}/>New project</button></div>
+      <div className="amp-user"><span className="amp-avatar">V</span><span><b>Local user</b><small>Prototype · not authenticated</small></span><CircleHelp size={15}/></div>
     </aside>
-    <main className="amp-main">
-      <header className="thread-header"><div className="thread-heading"><span className="project-dot"/><div><h1>{view === "inbox" ? "Project inbox" : selectedWork?.title || project?.name || "Workspace"}</h1><small>{project?.name || "Local project"}{selectedWork ? ` · ${selectedWork.workType} · ${selectedWork.status.replaceAll("_", " ")}` : " · canonical project history"}</small></div><button className="icon-button" title="Thread actions are unavailable" aria-label="Thread actions unavailable" disabled><MoreHorizontal size={17}/></button></div><div className="thread-actions"><button className="icon-button" title="Sharing is unavailable" aria-label="Share unavailable" disabled><MessageSquare size={15}/></button><span className="branch-pill"><GitBranch size={13}/>{project?.projectId || "local"}</span><span className="thread-size">Local</span></div></header>
-      <div className="amp-workspace">
-        <section className="conversation-pane">
-          {error && <div className="error-banner" role="alert">{error}</div>}
-          {view === "inbox" ? <InboxView questions={questions} selected={selectedQuestion} selectedOption={selectedOption} setSelectedOption={setSelectedOption} note={answerNote} setNote={setAnswerNote} busy={decisionBusy} choose={chooseQuestion} answer={() => void submitDecision(false)} reject={() => void submitDecision(true)}/> : <>
-            <div className="thread-scroll">
-              <div className="thread-intro"><div className="intro-icon"><Sparkles size={16}/></div><div><span className="eyebrow">PROJECT THREAD</span><h2>{selectedWork?.title || project?.name || "Welcome"}</h2><p>{selectedWork?.objective || project?.charter.goals.join(" ") || "Create a project to get started."}</p></div></div>
-              {selectedWork && <div className="user-turn"><div className="user-turn-label"><span className="amp-avatar small-avatar">V</span><b>Project owner</b><time>Work request</time></div><p>{selectedWork.objective}</p></div>}
-              <div className="agent-placeholder"><div className="placeholder-line"/><div className="agent-placeholder-body"><Sparkles size={15}/><div><b>No agent response yet</b><p>This project has durable work history, but no model or worker is connected. Starting an agent is intentionally unavailable in this prototype.</p></div></div></div>
-              {summary?.recentEvents?.length ? <div className="thread-events"><div className="events-heading"><span>PROJECT ACTIVITY</span><span>{summary.recentEvents.length} events</span></div>{summary.recentEvents.slice(0,5).map((event)=><div className="event-row" key={event.eventId}><span className="event-bullet"/><span><b>{event.title}</b><small>{event.description}</small></span><time>{new Date(event.occurredAt).toLocaleDateString()}</time></div>)}</div> : null}
-            </div>
-            <div className="composer-wrap"><div className="composer-disabled"><textarea aria-label="Message agent" disabled placeholder="Connect an agent to start this thread…"/><div className="composer-tools"><button disabled aria-label="Attach file"><Paperclip size={16}/></button><span>Agent execution is not connected</span><button disabled aria-label="Send message"><Send size={15}/></button></div></div><div className="composer-caption">Project context stays in canonical history · no model calls are made</div></div>
-          </>}
-        </section>
-        <aside className="review-pane"><div className="review-tabs" role="tablist" aria-label="Workspace tools">{([['Changes',GitBranch],['Files',Files],['Terminal',Terminal]] as const).map(([tab,Icon])=><button role="tab" aria-selected={inspector===tab} className={inspector===tab?"review-tab active":"review-tab"} key={tab} onClick={()=>setInspector(tab)}><Icon size={14}/>{tab}</button>)}</div><div className="review-toolbar"><span>{inspector === "Changes" ? "PROJECT CHANGES" : inspector.toUpperCase()}</span><button className="icon-button" title="Panel options are unavailable" aria-label="Panel options unavailable" disabled><MoreHorizontal size={15}/></button></div>{inspector === "Changes" ? <><div className="change-summary"><span className="change-count">0</span><span><b>No file changes</b><small>Nothing has been edited in this project.</small></span></div><div className="review-divider"/><div className="review-section-title">PROJECT WORK <span>{workItems.length}</span></div><div className="review-work-list">{workItems.map((item)=><button key={item.workId} className={item.workId===selectedWorkId?"review-work selected":"review-work"} onClick={()=>{setSelectedWorkId(item.workId);setView("thread");}}><span className={`thread-status-dot ${item.status}`}/><span><b>{item.title}</b><small>{item.status.replaceAll("_"," ")} · rev {item.revision}</small></span></button>)}</div></> : inspector === "Files" ? <div className="inspector-empty"><Files size={18}/><b>Project files</b><p>File browsing is not connected. The workspace folder is not exposed to this UI.</p></div> : <div className="inspector-empty"><Terminal size={18}/><b>Terminal unavailable</b><p>No worker or project shell is running.</p></div>}
-          <div className="review-footer"><ShieldAlert size={14}/><span>Local prototype · test data only</span></div>
-        </aside>
+    <main className="goal-main">
+      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? "Your input" : project?.name || "Project"}</h1><small>{view === "inbox" ? "Decisions that need your attention" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{view === "overview" && <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add to plan</button>}</div></header>
+      <div className="goal-stage">
+        {error && <div className="error-banner" role="alert">{error}</div>}
+        {view === "inbox" ? <InboxView questions={questions} selected={selectedQuestion} selectedOption={selectedOption} setSelectedOption={setSelectedOption} note={answerNote} setNote={setAnswerNote} busy={decisionBusy} choose={chooseQuestion} answer={() => void submitDecision(false)} reject={() => void submitDecision(true)}/> : project ? <div className="goal-scroll">
+          <section className="goal-hero"><div className="eyebrow"><Sparkles size={13}/> WHAT YOU WANT TO ACHIEVE</div><h2>{project.charter.goals.join(" ") || "No project goal defined"}</h2><div className="goal-project-meta"><span>{project.name}</span><span>Charter revision {project.charter.revision}</span></div></section>
+          <section className={`project-pulse ${openQuestionCount ? "needs-input" : ""}`} aria-labelledby="pulse-title"><div className="pulse-icon"><Sparkles size={17}/></div><div className="pulse-copy"><div className="eyebrow">PROJECT UPDATE</div><h3 id="pulse-title">{pulse.title}</h3><p>{pulse.description}</p></div>{openQuestionCount > 0 && <button className="button secondary" onClick={() => setView("inbox")}>Review {openQuestionCount === 1 ? "decision" : `${openQuestionCount} decisions`} <span aria-hidden="true">→</span></button>}</section>
+          <div className="goal-columns">
+            <section className="goal-card criteria-card"><div className="goal-card-heading"><div><div className="eyebrow">THE FINISH LINE</div><h3>How you’ll know it worked</h3></div><Check size={17}/></div>{project.charter.acceptanceCriteria.length ? <><ul className="criteria-list">{project.charter.acceptanceCriteria.map((criterion,index)=><li key={`${index}-${criterion}`}><span className="criteria-marker"/>{criterion}</li>)}</ul><p className="subtle-note">These are the project’s stated criteria; this prototype does not verify outcomes against them.</p></> : <p className="empty-copy">No success criteria are recorded in this project charter yet.</p>}</section>
+            <section className="goal-card attention-card"><div className="goal-card-heading"><div><div className="eyebrow">YOUR INPUT</div><h3>{openQuestionCount ? `${openQuestionCount} ${openQuestionCount === 1 ? "decision" : "decisions"} to review` : "Nothing needs your attention"}</h3></div><Inbox size={17}/></div>{questions.length ? <div className="attention-list">{questions.slice(0,3).map((question)=><button key={question.questionId} className="attention-item" onClick={()=>void openQuestion(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking ? "Your answer is needed before affected work can continue" : "Your answer may shape the project direction"}</small></span><span aria-hidden="true">→</span></button>)}</div> : <p className="empty-copy">Open project decisions will appear here. You won’t need to follow the agents’ internal discussion.</p>}</section>
+          </div>
+          <details className="detail-disclosure"><summary><span><b>Work plan details</b><small>Implementation-level items are here when you want them</small></span><span className="detail-count">{workItems.length}</span></summary>{workItems.length ? <div className="plan-list">{workItems.map((item)=><article className="plan-item" key={item.workId}><div className="plan-item-title"><span className={`thread-status-dot ${item.status}`}/><b>{item.title}</b><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div><p>{item.objective}</p><small>{item.workType} · revision {item.revision}</small></article>)}</div> : <p className="empty-copy">No work has been planned yet.</p>}</details>
+          <details className="detail-disclosure history-disclosure"><summary><span><b>Project history</b><small>Event-by-event detail, kept out of the main progress view</small></span><span className="detail-count">{summary?.recentEvents.length || 0}</span></summary>{summary?.recentEvents.length ? <ol className="history-list">{summary.recentEvents.map((event)=><li key={event.eventId}><span><b>{event.title}</b><small>{event.description}</small><time>{event.actorLabel} · {new Date(event.occurredAt).toLocaleString()}</time></span></li>)}</ol> : <p className="empty-copy">No project events have been recorded yet.</p>}</details>
+          <div className="goal-footnote"><ShieldAlert size={13}/>No model or worker is connected. This demo cannot report agent progress or verified outcomes.</div>
+        </div> : <div className="loading">Loading your project…</div>}
       </div>
     </main>
-    {projectDialog && <Modal title="Create a project" onClose={() => setProjectDialog(false)}><form onSubmit={createProject}><label>Project name<input name="name" required maxLength={100} autoFocus placeholder="e.g. Reading list"/></label><label>Project goal<textarea name="goal" required maxLength={1000} rows={3} placeholder="What are you trying to accomplish?"/></label><div className="form-actions"><button type="button" className="button secondary" onClick={() => setProjectDialog(false)}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating…" : "Create project"}</button></div></form></Modal>}
-    {workDialog && <Modal title="Add a work item" onClose={() => setWorkDialog(false)}><form onSubmit={createWork}><label>Title<input name="title" required maxLength={160} autoFocus placeholder="What needs to be done?"/></label><label>Objective<textarea name="objective" required maxLength={2000} rows={3} placeholder="Describe the intended outcome."/></label><label>Type<select name="workType"><option value="research">Research</option><option value="planning">Planning</option><option value="implementation">Implementation</option><option value="review">Review</option></select></label><p className="form-hint">Work is recorded in canonical history; no agent will execute it yet.</p><div className="form-actions"><button type="button" className="button secondary" onClick={() => setWorkDialog(false)}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Saving…" : "Add work"}</button></div></form></Modal>}
+    {projectDialog && <Modal title="Create a project" onClose={() => setProjectDialog(false)}><form onSubmit={createProject}><label>Project name<input name="name" required maxLength={100} autoFocus placeholder="e.g. Reading list"/></label><label>What do you want to accomplish?<textarea name="goal" required maxLength={1000} rows={3} placeholder="What do you want to be true when this succeeds?"/></label><div className="form-actions"><button type="button" className="button secondary" onClick={() => setProjectDialog(false)}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating…" : "Create project"}</button></div></form></Modal>}
+    {workDialog && <Modal title="Add to the project plan" onClose={() => setWorkDialog(false)}><form onSubmit={createWork}><label>Outcome or milestone<input name="title" required maxLength={160} autoFocus placeholder="What meaningful result should this produce?"/></label><label>What will be different when this is done?<textarea name="objective" required maxLength={2000} rows={3} placeholder="Describe the result and how it contributes to the project goal."/></label><label>Category<select name="workType"><option value="research">Research</option><option value="planning">Planning</option><option value="implementation">Implementation</option><option value="review">Review</option></select></label><p className="form-hint">This records a proposal in project history; it does not start an agent.</p><div className="form-actions"><button type="button" className="button secondary" onClick={() => setWorkDialog(false)}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Saving…" : "Add to plan"}</button></div></form></Modal>}
   </div>;
 }
 
+function projectPulse(workCount:number,questionCount:number,blockingCount:number) {
+  if (blockingCount > 0) return { title: "Your input is needed", description: `${blockingCount} open decision${blockingCount === 1 ? " is" : "s are"} blocking the affected work. Review the question and its impact before deciding.` };
+  if (questionCount > 0) return { title: "A decision is available", description: "There are open project questions that may shape the direction. Review them when convenient." };
+  if (workCount > 0) return { title: "The project plan is recorded", description: "The plan is available below. This prototype has no connected agent, so it cannot report active progress or verified results." };
+  return { title: "Your goal is captured", description: "No project work has been planned yet, and no agent is connected. Add an outcome or milestone when you’re ready." };
+}
+
 function InboxView({questions,selected,selectedOption,setSelectedOption,note,setNote,busy,choose,answer,reject}:{questions:Question[];selected:QuestionDetail|null;selectedOption:string;setSelectedOption:(value:string)=>void;note:string;setNote:(value:string)=>void;busy:boolean;choose:(id:string)=>void;answer:()=>void;reject:()=>void}) {
-  return <div className="inbox-layout"><section className="inbox-questions"><div className="inbox-heading"><span>OPEN QUESTIONS</span><span>{questions.length}</span></div>{questions.length ? questions.map((question)=><button key={question.questionId} className={`question-link ${selected?.questionId===question.questionId?"chosen":""}`} onClick={()=>choose(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking?"Blocks "+question.workIds.length+" work item(s)":"Non-blocking"}</small></span></button>) : <div className="inbox-empty"><Inbox size={19}/><b>Inbox clear</b><small>No open project questions.</small></div>}</section><section className="inbox-detail">{selected ? <><div className="eyebrow">{selected.blocking?"BLOCKING DECISION":"PROJECT QUESTION"}</div><h2>{selected.questionText}</h2><p>{selected.record.impact}</p><div className="affected-list"><b>AFFECTED WORK</b>{selected.affectedWork.map((item)=><span key={item.workId}>{item.title}<small>{item.status.replaceAll("_"," ")}</small></span>)}</div>{selected.record.options.length>0&&<fieldset className="decision-options"><legend>Choose an option</legend>{selected.record.options.map((option)=><label key={option.optionId}><input type="radio" name="decision" value={option.optionId} checked={selectedOption===option.optionId} onChange={()=>setSelectedOption(option.optionId)}/><span><b>{option.label}</b>{option.consequence&&<small>{option.consequence}</small>}</span></label>)}</fieldset>}<label className="note-label">{selected.record.options.length?"NOTE (OPTIONAL)":"YOUR RESPONSE"}<textarea value={note} onChange={(event)=>setNote(event.target.value)} rows={3} placeholder="Add context or a written response…"/></label><div className="decision-actions"><button className="button secondary" disabled={busy} onClick={reject}>Reject</button><button className="button primary" disabled={busy} onClick={answer}>{busy?"Saving…":"Record decision"}</button></div><p className="form-hint">Decision is checked against the current question and work revision.</p></> : <div className="inbox-empty"><Inbox size={19}/><b>Select a question</b><small>Choose an open item to review and decide.</small></div>}</section></div>;
+  return <div className="inbox-layout"><section className="inbox-questions"><div className="inbox-heading"><span>OPEN DECISIONS</span><span>{questions.length}</span></div>{questions.length ? questions.map((question)=><button key={question.questionId} className={`question-link ${selected?.questionId===question.questionId?"chosen":""}`} onClick={()=>choose(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking?"Your answer is needed to continue":"May affect project direction"}</small></span></button>) : <div className="inbox-empty"><Inbox size={19}/><b>Nothing needs your attention</b><small>No open project decisions.</small></div>}</section><section className="inbox-detail">{selected ? <><div className="eyebrow">{selected.blocking?"YOUR INPUT IS NEEDED":"PROJECT DECISION"}</div><h2>{selected.questionText}</h2><p>{selected.record.impact}</p>{selected.affectedWork.length>0&&<details className="affected-details"><summary>Why this matters <span>{selected.affectedWork.length} affected planned item{selected.affectedWork.length===1?"":"s"}</span></summary><div>{selected.affectedWork.map((item)=><span key={item.workId}>{item.title}</span>)}</div></details>}{selected.record.options.length>0&&<fieldset className="decision-options"><legend>Choose an option</legend>{selected.record.options.map((option)=><label key={option.optionId}><input type="radio" name="decision" value={option.optionId} checked={selectedOption===option.optionId} onChange={()=>setSelectedOption(option.optionId)}/><span><b>{option.label}</b>{option.consequence&&<small>{option.consequence}</small>}</span></label>)}</fieldset>}<label className="note-label">{selected.record.options.length?"ADDITIONAL CONTEXT (OPTIONAL)":"YOUR RESPONSE"}<textarea value={note} onChange={(event)=>setNote(event.target.value)} rows={3} placeholder="Add context for this decision…"/></label><div className="decision-actions"><button className="button secondary" disabled={busy} onClick={reject}>Reject question</button><button className="button primary" disabled={busy} onClick={answer}>{busy?"Saving…":"Record decision"}</button></div><p className="form-hint">Your decision is checked against the current project state.</p></> : <div className="inbox-empty"><Inbox size={19}/><b>Select a decision</b><small>Review its impact and record your direction.</small></div>}</section></div>;
 }
 
 function Modal({title,onClose,children}:{title:string;onClose:()=>void;children:React.ReactNode}) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-head"><h2 id="modal-title">{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={17}/></button></div>{children}</section></div>; }

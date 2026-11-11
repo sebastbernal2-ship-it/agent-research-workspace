@@ -1,6 +1,6 @@
 # Local project UI prototype
 
-This is a loopback-only project/inbox demo for issue #11. The front end now uses a React implementation adapted from the shadcn `dashboard-01` visual/layout base (source pin and MIT attribution: [`../web/README.md`](../web/README.md)); it preserves the Python project API and canonical SQLite event history. The current interface creates and switches projects, adds proposed work, displays project history, and records inbox answers/rejections. No agent execution, model calls, browser worker, or external tools are connected. Use test data only; do not enter private or sensitive data.
+This is a loopback-only project/inbox demo for issue #11. The React front end uses the shadcn `dashboard-01` visual baseline (source pin and MIT attribution: [`../web/README.md`](../web/README.md)) but now leads with the project goal, a concise project-state update, success criteria, and decisions needing the user's input. Work-plan details and event-by-event history are collapsed by default; there is no agent chat or Changes pane in the primary view. The UI preserves the Python project API and canonical SQLite event history, creates/switches projects, records proposed outcomes, and handles inbox answers/rejections. No agent execution, model calls, browser worker, or external tools are connected, so it cannot report genuine agent progress or verified outcomes. Use test data only; do not enter private or sensitive data.
 
 ## Run locally
 
