@@ -1,8 +1,8 @@
 # Project UI
 
-The visual/layout base is adapted from shadcn's `dashboard-01` registry block, pinned at upstream commit [`dd41d19e2f80ff6891951f7ced74c2c9a650b065`](https://github.com/shadcn-ui/ui/tree/dd41d19e2f80ff6891951f7ced74c2c9a650b065/apps/v4/registry/new-york-v4/blocks/dashboard-01). The upstream MIT license is included as `SHADCN-LICENSE.md`. React/Vite and Lucide are pinned in `package-lock.json`.
+The frontend dependencies and initial component baseline use shadcn's `dashboard-01` registry block, pinned at upstream commit [`dd41d19e2f80ff6891951f7ced74c2c9a650b065`](https://github.com/shadcn-ui/ui/tree/dd41d19e2f80ff6891951f7ced74c2c9a650b065/apps/v4/registry/new-york-v4/blocks/dashboard-01). The current thread-workspace layout is an original adaptation informed by Amp's public [thread documentation](https://ampcode.com/docs/threads): project-scoped work list, conversation area, and a right-hand review/tools pane. It does not use Amp source code, assets, or branding. The shadcn upstream MIT license is included as `SHADCN-LICENSE.md`; React/Vite and Lucide are pinned in `package-lock.json`.
 
-This implementation replaces only the presentation layer. Project state and commands continue to use the project-owned local API and canonical SQLite history. No project-store or agent runtime from the template is adopted. The UI uses no remote fonts or external assets.
+This is a presentation-layer change only. Project state and commands continue to use the project-owned local API and canonical SQLite history. No project-store or agent runtime from either visual reference is adopted. The UI uses no remote fonts or external assets. The conversation and Changes/Files/Terminal surfaces are visual affordances; they do not imply an agent, file editor, or terminal is connected.
 
 ## Build and serve
 

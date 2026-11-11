@@ -14,11 +14,14 @@ class PrototypeStructureTests(unittest.TestCase):
         cls.css = (WEB_ROOT / "src" / "style.css").read_text(encoding="utf-8")
         cls.readme = (WEB_ROOT / "README.md").read_text(encoding="utf-8")
 
-    def test_shadcn_dashboard_base_is_pinned_and_licensed(self):
+    def test_shadcn_base_is_pinned_and_licensed_with_amp_inspired_thread_layout(self):
         for dependency, version in self.package["dependencies"].items():
             self.assertFalse(version.startswith(("^", "~")), dependency)
         self.assertIn("dashboard-01", self.readme)
         self.assertIn("dd41d19e2f80ff6891951f7ced74c2c9a650b065", self.readme)
+        self.assertIn("Amp's public", self.readme)
+        for surface in ('thread-list', 'conversation-pane', 'review-pane', 'No agent response yet', 'No file changes'):
+            self.assertIn(surface, self.tsx)
         self.assertTrue((WEB_ROOT / "SHADCN-LICENSE.md").is_file())
         self.assertTrue((WEB_ROOT / "package-lock.json").is_file())
 
@@ -31,8 +34,8 @@ class PrototypeStructureTests(unittest.TestCase):
 
     def test_core_project_work_inbox_and_limitations_are_visible(self):
         for text in (
-            "Create a project", "Add proposed work", "Open questions",
-            "no model, browser, or agent execution connected", "not authenticated",
+            "Create a project", "Add a work item", "OPEN QUESTIONS",
+            "no model or worker is connected", "not authenticated",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)
