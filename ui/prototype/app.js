@@ -465,6 +465,7 @@ async function loadProjectRecords() {
 function renderProjectList() {
   const list = document.getElementById("project-list");
   list.replaceChildren();
+  document.getElementById("workspace-project-count").textContent = `${projects.length} project${projects.length === 1 ? "" : "s"}`;
   for (const project of projects) {
     const button = document.createElement("button");
     button.type = "button";
@@ -492,6 +493,7 @@ function renderProject(data) {
   const counts = data.counts;
   document.getElementById("overview-title").textContent = project.name;
   document.getElementById("project-breadcrumb").textContent = project.name;
+  document.querySelector(".project-nav").setAttribute("aria-label", project.name);
   document.getElementById("project-inbox-name").textContent = project.name;
   document.querySelector(".chat-context strong").textContent = `${project.name} project context`;
   document.querySelector(".context-panel h2").textContent = project.name;
