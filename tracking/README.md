@@ -1,5 +1,7 @@
 # GitHub issue register
 
+- [Hackathon Agent Board pattern review](HACKATHON_AGENT_BOARD_REVIEW.md) — evaluation of a single pinned GitHub issue for agent handoffs; recommends keeping it separate from this issue register and canonical project history.
+
 Canonical live tracking is in the [GitHub issues](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues), the [roadmap parent issue #1](https://github.com/sebastbernal2-ship-it/agent-research-workspace/issues/1), and the [First validated collaboration adapter milestone](https://github.com/sebastbernal2-ship-it/agent-research-workspace/milestone/1). The detailed phased completion/acceptance plan is [`../PRODUCTION_READINESS_PLAN.md`](../PRODUCTION_READINESS_PLAN.md). The repository is private.
 
 ## Ownership and status convention
