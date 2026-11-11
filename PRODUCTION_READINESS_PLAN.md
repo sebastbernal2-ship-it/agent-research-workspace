@@ -79,6 +79,8 @@ Bounded child processes are not sandboxes. Current workers have no production to
 
 ## Phase 5 — project UI, service, and user workflow (issues #6, #11, #16)
 
+The loopback UI presentation was replaced with a React/Vite adaptation of shadcn's MIT `dashboard-01` block, pinned and attributed in `ui/web/README.md`; the project service and canonical SQLite history remain authoritative. The shell now supports multi-project switching, proposed-work creation, and project inbox answers. This is a test-data-only prototype, not the authenticated multi-project workflow below.
+
 - [ ] Replace the fixed-principal loopback server with the authenticated service from Phase 2; add multi-project navigation and enforce authorization on every data fetch and mutation.
 - [ ] Implement durable plan submission/review, role assignment, approval and rejection, run progress, pause/recovery, evidence review, and project-scoped VP conversation backed by canonical events.
 - [ ] Keep inbox decisions distinct from chat; show exact affected work, revisions, consequences, approval identity, and stale-state conflicts.

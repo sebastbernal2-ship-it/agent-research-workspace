@@ -289,6 +289,21 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(artifacts["items"], [])
 
+    def test_built_react_ui_is_served_from_loopback_static_root(self):
+        build_dir = Path(__file__).resolve().parents[1] / "build"
+        if not (build_dir / "index.html").is_file():
+            self.skipTest("build frontend with `cd ui/web && npm run build`")
+        response = urlopen(f"{self.base_url}/", timeout=3)
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/html", response.headers["Content-Type"])
+        html = response.read().decode("utf-8")
+        self.assertIn("Northstar · Projects", html)
+        asset = html.split('src="', 1)[1].split('"', 1)[0]
+        asset_response = urlopen(f"{self.base_url}{asset}", timeout=3)
+        self.assertEqual(asset_response.status, 200)
+        self.assertIn("javascript", asset_response.headers["Content-Type"])
+        self.assertEqual(self.request("/assets/../../../../etc/passwd")[0], 404)
+
     def test_api_v1_is_explicit_and_unknown_api_versions_fail_closed(self):
         status, health, _ = self.request("/api/v1/health")
         self.assertEqual(status, 200)

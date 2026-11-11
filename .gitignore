@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+ui/prototype/build/
 coverage/
 htmlcov/
 .coverage*

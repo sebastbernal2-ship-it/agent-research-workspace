@@ -7,6 +7,7 @@ synthetic project and never binds to a non-loopback interface.
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +22,7 @@ from .runtime import PROJECT_ID, PrototypeRuntime
 
 
 STATIC_ROOT = Path(__file__).resolve().parent
+BUILT_UI_ROOT = STATIC_ROOT / "build"
 MAX_JSON_BODY_BYTES = 16 * 1024
 PROJECT_PATH = re.compile(r"^/api/v1/projects/([^/]+)$")
 WORK_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/work$")
@@ -28,14 +30,6 @@ PROJECT_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/(runs|evidence|
 INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
 INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
 INBOX_COMMAND_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
-STATIC_FILES = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/index.html": ("index.html", "text/html; charset=utf-8"),
-    "/app.css": ("app.css", "text/css; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-}
-
-
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -91,7 +85,11 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # Browsers may close a request during navigation/shutdown.
+                pass
 
     def _send_json(
         self,
@@ -149,8 +147,9 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._error(422, "invalid_request", "The command is invalid or missing required fields.")
         except EventStoreError:
             self._error(500, "canonical_store_error", "The local project store rejected the operation.")
-        except Exception:
-            self.log_error("Unhandled local demo error", exc_info=True)
+        except Exception as exc:
+            # Log only the exception class; request data may contain project text.
+            self.log_error("Unhandled local demo error: %s", type(exc).__name__)
             self._error(500, "internal_error", "The local demo could not complete the request.")
 
     def do_GET(self) -> None:
@@ -197,15 +196,23 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._run(lambda: self._send_question_detail(project_id, question_id))
             return
 
-        asset = STATIC_FILES.get(path)
-        if asset is not None:
-            file_name, content_type = asset
+        if BUILT_UI_ROOT.is_dir() and (BUILT_UI_ROOT / "index.html").is_file():
+            relative = "index.html" if path == "/" else unquote(path).lstrip("/")
+            candidate = (BUILT_UI_ROOT / relative).resolve()
             try:
-                body = (STATIC_ROOT / file_name).read_bytes()
-            except OSError:
-                self._error(500, "asset_unavailable", "A local UI asset could not be read.")
+                candidate.relative_to(BUILT_UI_ROOT.resolve())
+            except ValueError:
+                self._error(404, "not_found", "The requested local demo resource was not found.")
                 return
-            self._send_headers(200, content_type, body)
+            if candidate.is_file():
+                content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+                if content_type not in {"text/html", "text/css", "text/javascript", "application/javascript", "image/svg+xml", "image/png", "image/x-icon"}:
+                    self._error(404, "not_found", "The requested local demo resource was not found.")
+                    return
+                self._send_headers(200, content_type + ("; charset=utf-8" if content_type.startswith("text/") or "javascript" in content_type else ""), candidate.read_bytes())
+                return
+        if path in {"/", "/index.html"}:
+            self._error(503, "ui_not_built", "Build the local React UI with `cd ui/web && npm ci && npm run build`.")
             return
         self._error(404, "not_found", "The requested local demo resource was not found.")
 
