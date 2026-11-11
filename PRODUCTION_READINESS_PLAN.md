@@ -13,9 +13,9 @@ A release candidate is ready only when every **release gate** below has a named 
 Record decisions in `decisions/` and link them from the relevant GitHub issue. Do not silently choose on the project owner’s behalf.
 
 - [ ] Name implementation, security-review, operations, and product-decision owners; currently unassigned.
-- [ ] Select deployment target and threat boundary: single-user local application, authenticated hosted service, or both as separate products.
+- [x] Select initial deployment target: single-user local WSL2 Ubuntu on the owner's machine; hosted multi-user service is deferred to Step 2. Decision: [`ADR-0002`](decisions/ADR-0002-wsl-local-first-v1.md). WSL is the chosen target, not yet a supported/reviewed deployment; loopback-only and no exposed ports remain required.
 - [ ] Select identity/session provider and account lifecycle: enrollment, authentication, MFA/session expiry, revocation, project membership, service identities, and recovery authority.
-- [ ] Define data classification, allowed retention, deletion, backup location, encryption/key management, and which data may leave the machine.
+- [ ] Define data classification, allowed retention, deletion, backup location, encryption/key management, and which data may leave the machine. The owner expects all data categories, including sensitive/confidential; the current prototype is not approved for them. Codex data transfer, provider terms/retention, credentials, and spend limits must be decided before enabling the connector. See ADR-0002.
 - [ ] For any model pilot, explicitly select provider/model, credential method, spend cap, permitted data scope, logging/retention behavior, and reviewed terms. No model call is implied by this plan.
 - [ ] Decide whether multi-laptop workers are in scope. HiperGator remains separately blocked pending policy review and case-specific authorization.
 - [ ] Define support/SLO, incident response, operator access, and maintenance/update policy.
