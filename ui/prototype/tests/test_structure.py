@@ -64,6 +64,14 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertNotIn("innerHTML", self.js)
         self.assertIn("item.textContent", self.js)
 
+    def test_project_and_work_creation_are_connected_to_local_api(self):
+        self.assertIn('id="project-form"', self.html)
+        self.assertIn('id="work-form"', self.html)
+        self.assertIn('apiRequest("/api/v1/projects"', self.js)
+        self.assertIn('`${PROJECT_API}/work`', self.js)
+        self.assertIn("No agent is connected yet", self.js)
+        self.assertIn("It has not been executed.", self.js)
+
     def test_inbox_tabs_support_roving_focus_and_keyboard_navigation(self):
         self.assertIn('role="tablist"', self.html)
         self.assertIn('role="tab"', self.html)

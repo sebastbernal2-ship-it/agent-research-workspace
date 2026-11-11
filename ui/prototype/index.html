@@ -29,10 +29,8 @@
         </button>
 
         <div class="sidebar-section-label">YOUR PROJECTS</div>
-        <button class="project-switcher active-project" type="button" data-view="overview">
-          <span class="project-icon" aria-hidden="true">✳</span>
-          <span class="switcher-copy"><strong id="sidebar-project-name">Northstar research</strong><small>Local synthetic project</small></span>
-        </button>
+        <div id="project-list" aria-label="Projects"></div>
+        <button class="text-button project-create-button" type="button" data-dialog="project-dialog">＋ New project</button>
 
         <nav class="project-nav" aria-label="Northstar research">
           <button class="nav-item selected" type="button" data-view="overview" aria-current="page"><span aria-hidden="true">▦</span>Overview</button>
@@ -102,7 +100,7 @@
           </section>
 
           <section class="view" id="view-work" aria-labelledby="work-view-title" hidden>
-            <div class="page-heading"><div><div class="eyebrow">PROJECT PLAN</div><h1 id="work-view-title">Work</h1><p class="subheading">A dependency-aware plan. Blocked work stays paused until its prerequisites are met.</p></div><button class="button button-primary" type="button" data-toast="Creating work items is not connected in this prototype.">＋ New work item</button></div>
+            <div class="page-heading"><div><div class="eyebrow">PROJECT PLAN</div><h1 id="work-view-title">Work</h1><p class="subheading">A dependency-aware plan. Blocked work stays paused until its prerequisites are met.</p></div><button class="button button-primary" type="button" data-dialog="work-dialog">＋ New work item</button></div>
             <div class="work-toolbar"><span class="filter-chip active-filter">All <span id="work-filter-all">4</span></span><span class="filter-chip">In progress <span id="work-filter-running">0</span></span><span class="filter-chip">Waiting/blocked <span id="work-filter-blocked">2</span></span><span class="toolbar-spacer"></span><span class="muted">Canonical project work · read-only</span></div>
             <section class="panel full-panel"><div class="work-list expanded-work-list" id="work-view-list" aria-live="polite"></div></section>
           </section>
@@ -168,6 +166,8 @@
       </main>
     </div>
 
+    <dialog class="action-dialog" id="project-dialog" aria-labelledby="project-dialog-title"><form id="project-form"><h2 id="project-dialog-title">Create a project</h2><label class="detail-label" for="new-project-name">PROJECT NAME</label><input id="new-project-name" name="name" maxlength="100" required><label class="detail-label" for="new-project-goal">GOAL</label><textarea id="new-project-goal" name="goal" rows="3" maxlength="1000" required></textarea><div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Create project</button></div></form></dialog>
+    <dialog class="action-dialog" id="work-dialog" aria-labelledby="work-dialog-title"><form id="work-form"><h2 id="work-dialog-title">Add project work</h2><label class="detail-label" for="new-work-title">TITLE</label><input id="new-work-title" name="title" maxlength="160" required><label class="detail-label" for="new-work-objective">OBJECTIVE</label><textarea id="new-work-objective" name="objective" rows="3" maxlength="2000" required></textarea><label class="detail-label" for="new-work-type">TYPE</label><select id="new-work-type" name="workType"><option>research</option><option>planning</option><option>implementation</option><option>review</option></select><p class="demo-caption">New work is proposed only. No agent or model runs from this prototype.</p><div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Add proposed work</button></div></form></dialog>
     <dialog class="action-dialog" id="answer-dialog" aria-labelledby="answer-dialog-title"><form method="dialog"><div class="dialog-icon success-icon" aria-hidden="true">✓</div><h2 id="answer-dialog-title">Confirm this decision?</h2><p>This will be recorded in the local canonical project history and may resume the exact work listed. This is a synthetic, loopback-only prototype.</p><div class="dialog-actions"><button class="button button-secondary" value="cancel">Go back</button><button class="button button-primary" value="confirm">Confirm decision</button></div></form></dialog>
     <dialog class="action-dialog" id="reject-dialog" aria-labelledby="reject-dialog-title"><form method="dialog"><div class="dialog-icon warning-icon" aria-hidden="true">!</div><h2 id="reject-dialog-title">Reject this proposal?</h2><p>Rejecting a blocking question will leave its affected work blocked. This decision will be recorded in local canonical history.</p><label class="detail-label" for="reject-reason">REASON</label><textarea id="reject-reason" class="answer-note" rows="2" required placeholder="Why are you rejecting this proposal?"></textarea><div class="dialog-actions"><button class="button button-secondary" value="cancel">Go back</button><button class="button button-danger" value="confirm">Reject proposal</button></div></form></dialog>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

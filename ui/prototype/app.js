@@ -1,7 +1,8 @@
 "use strict";
 
-const PROJECT_ID = "project.northstar";
-const PROJECT_API = `/api/v1/projects/${encodeURIComponent(PROJECT_ID)}`;
+let PROJECT_ID = "project.northstar";
+let PROJECT_API = `/api/v1/projects/${encodeURIComponent(PROJECT_ID)}`;
+let projects = [];
 const views = ["overview", "work", "conversation", "inbox", "agents", "evidence"];
 let projectData = null;
 let openQuestions = [];
@@ -42,7 +43,7 @@ function setServiceState(ready, message) {
   serviceReady = ready;
   document.getElementById("service-status").textContent = message;
   document.getElementById("service-status").parentElement.classList.toggle("service-offline", !ready);
-  document.querySelectorAll("[data-dialog='answer-dialog'], [data-dialog='reject-dialog']")
+  document.querySelectorAll("[data-dialog]")
     .forEach((button) => { button.disabled = !ready; });
 }
 
@@ -461,13 +462,36 @@ async function loadProjectRecords() {
   }
 }
 
+function renderProjectList() {
+  const list = document.getElementById("project-list");
+  list.replaceChildren();
+  for (const project of projects) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `project-switcher${project.projectId === PROJECT_ID ? " active-project" : ""}`;
+    button.dataset.projectId = project.projectId;
+    const icon = document.createElement("span");
+    icon.className = "project-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "✳";
+    const copy = document.createElement("span");
+    copy.className = "switcher-copy";
+    const name = document.createElement("strong");
+    name.textContent = project.name;
+    const label = document.createElement("small");
+    label.textContent = project.projectId === "project.northstar" ? "Synthetic example" : "Local project";
+    copy.append(name, label);
+    button.append(icon, copy);
+    list.append(button);
+  }
+}
+
 function renderProject(data) {
   projectData = data;
   const project = data.project;
   const counts = data.counts;
   document.getElementById("overview-title").textContent = project.name;
   document.getElementById("project-breadcrumb").textContent = project.name;
-  document.getElementById("sidebar-project-name").textContent = project.name;
   document.getElementById("project-inbox-name").textContent = project.name;
   document.querySelector(".chat-context strong").textContent = `${project.name} project context`;
   document.querySelector(".context-panel h2").textContent = project.name;
@@ -569,7 +593,9 @@ async function bootstrap() {
   try {
     const health = await apiRequest("/api/v1/health");
     if (health.mode !== "local-synthetic-demo") throw new Error("Unexpected service mode.");
-    setServiceState(true, "Local synthetic project · inbox persists to SQLite · model providers disconnected");
+    setServiceState(true, "Local WSL prototype · test data only · no agents/models connected");
+    projects = (await apiRequest("/api/v1/projects")).items;
+    renderProjectList();
     await loadProject();
     await loadInbox("open");
   } catch (_error) {
@@ -580,6 +606,20 @@ async function bootstrap() {
 }
 
 document.addEventListener("click", (event) => {
+  const projectControl = event.target.closest("[data-project-id]");
+  if (projectControl) {
+    PROJECT_ID = projectControl.dataset.projectId;
+    PROJECT_API = `/api/v1/projects/${encodeURIComponent(PROJECT_ID)}`;
+    renderProjectList();
+    selectedQuestion = null;
+    void loadProject().then(() => loadInbox("open"));
+    return;
+  }
+  const closeDialog = event.target.closest("[data-close-dialog]");
+  if (closeDialog) {
+    closeDialog.closest("dialog").close();
+    return;
+  }
   const viewControl = event.target.closest("[data-view]");
   if (viewControl) {
     event.preventDefault();
@@ -631,6 +671,51 @@ document.querySelector(".inbox-stat").addEventListener("keydown", (event) => {
     event.preventDefault();
     showView("inbox");
   }
+});
+
+document.getElementById("project-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button[type='submit']");
+  button.disabled = true;
+  try {
+    const created = await apiRequest("/api/v1/projects", {
+      method: "POST",
+      body: { name: form.elements.name.value, goal: form.elements.goal.value },
+    });
+    PROJECT_ID = created.project.projectId;
+    PROJECT_API = `/api/v1/projects/${encodeURIComponent(PROJECT_ID)}`;
+    projects = (await apiRequest("/api/v1/projects")).items;
+    renderProjectList();
+    form.closest("dialog").close();
+    form.reset();
+    await loadProject();
+    await loadInbox("open");
+    showToast("Project created in local canonical history. No agent is connected yet.");
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; }
+});
+
+document.getElementById("work-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button[type='submit']");
+  button.disabled = true;
+  try {
+    await apiRequest(`${PROJECT_API}/work`, {
+      method: "POST",
+      body: {
+        title: form.elements.title.value,
+        objective: form.elements.objective.value,
+        workType: form.elements.workType.value,
+      },
+    });
+    form.closest("dialog").close();
+    form.reset();
+    await loadProject();
+    showToast("Proposed work added to canonical project history. It has not been executed.");
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; }
 });
 
 document.querySelectorAll("#answer-dialog form, #reject-dialog form").forEach((form) => {

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +40,14 @@ class LocalDemoPrincipal(PrincipalProvider):
 class SingleProjectDemoAccess(ProjectAccessPolicy):
     """Demo-only allowlist. It is not suitable as a production access policy."""
 
+    def __init__(self, store: SQLiteEventStore):
+        self.store = store
+
     def require_project_access(self, actor: dict[str, str], project_id: str, action: str) -> None:
-        if actor != DEMO_USER or project_id != PROJECT_ID:
+        if actor != DEMO_USER or not self.store.verified_events(project_id):
             raise InboxForbidden("project access denied")
         if action not in {
-            "project.read", "inbox.read", "inbox.answer", "inbox.close",
+            "project.read", "work.read", "work.create", "inbox.read", "inbox.answer", "inbox.close",
             "run.read", "evidence.read", "artifact.read",
         }:
             raise InboxForbidden("action is not available in the local demo")
@@ -58,20 +63,37 @@ def _validated_etag(request: dict[str, Any]) -> str:
 class PrototypeRuntime:
     """Own one canonical store and the demo-only project/inbox facade."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, workspace_root: str | Path | None = None):
+        self.workspace_root = Path(workspace_root or Path.home() / "AI-Projects").expanduser()
+        self.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.workspace_root.is_symlink():
+            raise RuntimeError("project workspace root must not be a symlink")
+        self.workspace_root = self.workspace_root.resolve()
         self.store = SQLiteEventStore(db_path)
         self.control = ProjectControlPlane(self.store)
         self._seed_if_empty()
         self.projector = Projector(self.store)
         self.inbox = InboxReadModel(self.store)
         principal = LocalDemoPrincipal()
-        access_policy = SingleProjectDemoAccess()
+        access_policy = SingleProjectDemoAccess(self.store)
         self.application = InboxApplication(
             self.inbox, self.control, principal, access_policy,
         )
         self.project_application = ProjectApplication(
             self.control, principal, access_policy,
         )
+        self._ensure_workspace_directories()
+
+    def _ensure_workspace_directories(self) -> None:
+        for project_id in self.store._project_ids():
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", project_id) is None:
+                raise RuntimeError("canonical project ID cannot safely map to a workspace directory")
+            directory = self.workspace_root / project_id
+            if directory.is_symlink():
+                raise RuntimeError("project workspace directory must not be a symlink")
+            directory.mkdir(mode=0o700, exist_ok=True)
+            if directory.resolve().parent != self.workspace_root:
+                raise RuntimeError("project workspace escaped its configured root")
 
     def _seed_if_empty(self) -> None:
         existing = self.store.verified_events(PROJECT_ID)
@@ -193,6 +215,66 @@ class PrototypeRuntime:
             "createdAt": CREATED_AT,
             "dueAt": "2026-11-11T17:00:00Z",
         })
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        projects = []
+        for project_id in sorted(self.store._project_ids()):
+            try:
+                projects.append(self.project_application.get_project(project_id))
+            except (InboxForbidden, KeyError):
+                continue
+        return projects
+
+    def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"name", "goal"}:
+            raise ValueError("project creation requires only name and goal")
+        name, goal = request["name"], request["goal"]
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+            raise ValueError("name must contain 1 to 100 characters")
+        if not isinstance(goal, str) or not goal.strip() or len(goal.strip()) > 1000:
+            raise ValueError("goal must contain 1 to 1000 characters")
+        project_id = f"project.local-{secrets.token_hex(8)}"
+        project_directory = self.workspace_root / project_id
+        project_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            project = self.control.create_project({
+                "recordType": "project", "schemaVersion": "0.1", "projectId": project_id,
+                "revision": 1, "name": name.strip(), "status": "active",
+                "charter": {
+                    "revision": 1, "goals": [goal.strip()],
+                    "nonGoals": ["No model or network access is enabled in this prototype."],
+                    "acceptanceCriteria": ["Record project decisions and work in canonical history."],
+                },
+                "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
+            })
+        except Exception:
+            project_directory.rmdir()
+            raise
+        return project
+
+    def create_work(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "work.create")
+        if set(request) - {"title", "objective", "workType"}:
+            raise ValueError("unsupported work fields")
+        title, objective = request.get("title"), request.get("objective")
+        work_type = request.get("workType", "research")
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 160:
+            raise ValueError("title must contain 1 to 160 characters")
+        if not isinstance(objective, str) or not objective.strip() or len(objective.strip()) > 2000:
+            raise ValueError("objective must contain 1 to 2000 characters")
+        if work_type not in {"research", "planning", "implementation", "review"}:
+            raise ValueError("unsupported work type")
+        work_id = f"work.local-{secrets.token_hex(8)}"
+        now = datetime.now(timezone.utc).isoformat()
+        return self.control.create_work({
+            "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id,
+            "workId": work_id, "revision": 1, "parentWorkId": None,
+            "title": title.strip(), "objective": objective.strip(), "workType": work_type,
+            "status": "proposed", "owner": DEMO_RESEARCHER, "dependsOn": [],
+            "capabilityGrantIds": [], "acceptanceCriteria": ["Review the result with the project owner."],
+            "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
+        }, actor=DEMO_USER)
 
     def projector_project(self) -> dict[str, Any]:
         return self.control.projector.replay(PROJECT_ID)["project"]

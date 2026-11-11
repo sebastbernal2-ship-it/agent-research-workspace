@@ -18,7 +18,8 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "canonical.sqlite3"
-        self.runtime = PrototypeRuntime(self.db_path)
+        self.workspace_root = Path(self.temp.name) / "AI-Projects"
+        self.runtime = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
         self.server = build_server(self.runtime, 0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -53,6 +54,37 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             "Origin": self.base_url,
             "X-Local-Prototype": "1",
         }
+
+    def test_user_can_create_a_project_and_add_proposed_work(self):
+        status, created, _ = self.request(
+            "/api/v1/projects", method="POST",
+            payload={"name": "My WSL project", "goal": "Build a first useful project."},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 201)
+        project_id = created["project"]["projectId"]
+        self.assertEqual(created["project"]["name"], "My WSL project")
+        project_directory = self.workspace_root / project_id
+        self.assertTrue(project_directory.is_dir())
+        self.assertEqual(project_directory.stat().st_mode & 0o777, 0o700)
+        status, collection, _ = self.request("/api/v1/projects")
+        self.assertEqual(status, 200)
+        self.assertIn(project_id, {project["projectId"] for project in collection["items"]})
+
+        status, work, _ = self.request(
+            f"/api/v1/projects/{project_id}/work", method="POST",
+            payload={"title": "Explore the question", "objective": "Write down the first research steps.", "workType": "research"},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(work["workItem"]["status"], "proposed")
+        summary_status, summary, _ = self.request(f"/api/v1/projects/{project_id}")
+        self.assertEqual(summary_status, 200)
+        self.assertEqual(summary["workItems"][0]["title"], "Explore the question")
+        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        self.assertEqual(restarted.project_application.get_project(project_id)["name"], "My WSL project")
+        self.assertEqual(restarted.project_application.list_work(project_id)[0]["title"], "Explore the question")
+        self.assertTrue(restarted.store.verify(project_id))
 
     def test_local_answer_and_rejection_persist_across_runtime_restart(self):
         status, project, _ = self.request(f"/api/projects/{PROJECT_ID}")
@@ -131,7 +163,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(retried_rejection["record"]["status"], "rejected")
         self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
 
-        restarted = PrototypeRuntime(self.db_path)
+        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
         self.assertEqual(restarted.get_question(PROJECT_ID, "question.source-policy")["record"]["status"], "answered")
         self.assertEqual(restarted.get_question(PROJECT_ID, "question.ui-global-view")["record"]["status"], "rejected")
         counts = restarted.project_summary(PROJECT_ID)["counts"]

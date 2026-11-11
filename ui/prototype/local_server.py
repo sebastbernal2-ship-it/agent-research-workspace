@@ -23,6 +23,7 @@ from .runtime import PROJECT_ID, PrototypeRuntime
 STATIC_ROOT = Path(__file__).resolve().parent
 MAX_JSON_BODY_BYTES = 16 * 1024
 PROJECT_PATH = re.compile(r"^/api/v1/projects/([^/]+)$")
+WORK_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/work$")
 PROJECT_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/(runs|evidence|artifacts)$")
 INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
 INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
@@ -161,6 +162,9 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/health":
             self._run(lambda: self._send_json(200, self.runtime.health()))
             return
+        if path == "/api/v1/projects":
+            self._run(lambda: self._send_json(200, {"items": self.runtime.list_projects()}))
+            return
 
         project_match = PROJECT_PATH.fullmatch(path)
         if project_match:
@@ -215,7 +219,18 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
-        match = INBOX_COMMAND_PATH.fullmatch(urlsplit(self.path).path)
+        path = urlsplit(self.path).path
+        if path == "/api/v1/projects":
+            self._run(lambda: self._send_json(201, {"project": self.runtime.create_project(body)}))
+            return
+        work_match = WORK_COLLECTION_PATH.fullmatch(path)
+        if work_match:
+            project_id = unquote(work_match.group(1))
+            self._run(lambda: self._send_json(
+                201, {"workItem": self.runtime.create_work(project_id, body)},
+            ))
+            return
+        match = INBOX_COMMAND_PATH.fullmatch(path)
         if not match:
             self._error(404, "not_found", "The requested local demo command was not found.")
             return
