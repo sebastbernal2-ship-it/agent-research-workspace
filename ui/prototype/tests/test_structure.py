@@ -31,6 +31,7 @@ class PrototypeStructureTests(unittest.TestCase):
 
     def test_frontend_uses_same_origin_api_and_no_remote_assets_or_storage(self):
         self.assertIn("fetch(path", self.tsx)
+        self.assertIn("URLSearchParams(window.location.search)", self.tsx)
         self.assertNotRegex(self.tsx, r"https?://")
         self.assertNotRegex(self.css, r"https?://")
         for forbidden in ("localStorage", "sessionStorage", "dangerouslySetInnerHTML"):

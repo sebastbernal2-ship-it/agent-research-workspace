@@ -28,7 +28,7 @@ const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
 
 function App() {
   const [projects, setProjects] = React.useState<Project[]>([]);
-  const [projectId, setProjectId] = React.useState("project.northstar");
+  const [projectId, setProjectId] = React.useState(() => new URLSearchParams(window.location.search).get("project") || "project.northstar");
   const [summary, setSummary] = React.useState<Summary | null>(null);
   const [view, setView] = React.useState<View>("overview");
   const [projectsOpen, setProjectsOpen] = React.useState(false);
@@ -61,6 +61,7 @@ function App() {
   const loadProject = React.useCallback(async (id = projectId) => {
     const result = await request<Summary>(`/api/v1/projects/${encodeURIComponent(id)}`);
     setProjectId(id);
+    window.history.replaceState(window.history.state, "", `${window.location.pathname}?project=${encodeURIComponent(id)}`);
     setSummary(result);
     setError("");
   }, [projectId]);
