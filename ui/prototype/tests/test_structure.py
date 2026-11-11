@@ -22,6 +22,8 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertIn("Amp's public", self.readme)
         for surface in ('thread-list', 'conversation-pane', 'review-pane', 'No agent response yet', 'No file changes'):
             self.assertIn(surface, self.tsx)
+        for color in ('#f9fdf6', '#f2f6ef', '#edf1ea', '#2f8052', '#bb8e00'):
+            self.assertIn(color, self.css)
         self.assertTrue((WEB_ROOT / "SHADCN-LICENSE.md").is_file())
         self.assertTrue((WEB_ROOT / "package-lock.json").is_file())
 
