@@ -64,6 +64,8 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(status, 201)
         project_id = created["project"]["projectId"]
         self.assertEqual(created["project"]["name"], "My WSL project")
+        self.assertEqual(created["project"]["charter"]["acceptanceCriteria"], [])
+        self.assertEqual(created["project"]["charter"]["nonGoals"], [])
         project_directory = self.workspace_root / project_id
         self.assertTrue(project_directory.is_dir())
         self.assertEqual(project_directory.stat().st_mode & 0o777, 0o700)
@@ -73,17 +75,33 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
 
         status, work, _ = self.request(
             f"/api/v1/projects/{project_id}/work", method="POST",
-            payload={"title": "Explore the question", "objective": "Write down the first research steps.", "workType": "research"},
+            payload={"title": "Explore the question", "objective": "Agree the research outcome before choosing implementation steps.", "workType": "research"},
             headers=self.write_headers(),
         )
         self.assertEqual(status, 201)
         self.assertEqual(work["workItem"]["status"], "proposed")
+        parent_id = work["workItem"]["workId"]
+        status, child, _ = self.request(
+            f"/api/v1/projects/{project_id}/work", method="POST",
+            payload={
+                "title": "Audit current evidence", "objective": "Separate verified facts from unsupported claims.",
+                "workType": "analysis", "parentWorkId": parent_id,
+                "acceptanceCriteria": ["Every finding links to a repository artifact."],
+            },
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(child["workItem"]["parentWorkId"], parent_id)
+        self.assertEqual(child["workItem"]["acceptanceCriteria"], ["Every finding links to a repository artifact."])
         summary_status, summary, _ = self.request(f"/api/v1/projects/{project_id}")
         self.assertEqual(summary_status, 200)
-        self.assertEqual(summary["workItems"][0]["title"], "Explore the question")
+        self.assertEqual(len(summary["workItems"]), 2)
+        self.assertEqual(summary["workItems"][1]["parentWorkId"], parent_id)
         restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
         self.assertEqual(restarted.project_application.get_project(project_id)["name"], "My WSL project")
-        self.assertEqual(restarted.project_application.list_work(project_id)[0]["title"], "Explore the question")
+        reopened_work = restarted.project_application.list_work(project_id)
+        self.assertEqual(reopened_work[0]["title"], "Explore the question")
+        self.assertEqual(reopened_work[1]["parentWorkId"], parent_id)
         self.assertTrue(restarted.store.verify(project_id))
 
     def test_local_answer_and_rejection_persist_across_runtime_restart(self):

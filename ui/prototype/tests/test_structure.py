@@ -20,8 +20,14 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertIn("dashboard-01", self.readme)
         self.assertIn("dd41d19e2f80ff6891951f7ced74c2c9a650b065", self.readme)
         self.assertIn("Amp's public", self.readme)
-        for surface in ('PROJECT UPDATE', 'THE FINISH LINE', 'Work plan details', 'Project history', 'Your input'):
+        for surface in ('PROJECT STATE', 'PROJECT BREAKDOWN', 'Goal → outcomes → workstreams → steps', 'Your input'):
             self.assertIn(surface, self.tsx)
+        self.assertNotIn('THE FINISH LINE', self.tsx)
+        self.assertNotIn('How you’ll know it worked', self.tsx)
+        self.assertIn('WorkTree', self.tsx)
+        self.assertIn('parentWorkId', self.tsx)
+        self.assertIn('Record response', self.tsx)
+        self.assertIn('No outcome or implementation breakdown has been agreed', self.tsx)
         self.assertNotIn('No agent response yet', self.tsx)
         self.assertNotIn('PROJECT CHANGES', self.tsx)
         for color in ('#f9fdf6', '#f2f6ef', '#edf1ea', '#2f8052', '#bb8e00'):
@@ -39,8 +45,8 @@ class PrototypeStructureTests(unittest.TestCase):
 
     def test_core_project_work_inbox_and_limitations_are_visible(self):
         for text in (
-            "Create a project", "Add to the project plan", "OPEN DECISIONS",
-            "No model or worker is connected", "not authenticated",
+            "Create a project", "Add an outcome or nested step", "OPEN DECISIONS",
+            "No project-scoped model or worker is connected", "not authenticated",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)

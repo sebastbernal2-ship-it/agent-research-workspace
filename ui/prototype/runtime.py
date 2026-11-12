@@ -243,8 +243,8 @@ class PrototypeRuntime:
                 "revision": 1, "name": name.strip(), "status": "active",
                 "charter": {
                     "revision": 1, "goals": [goal.strip()],
-                    "nonGoals": ["No model or network access is enabled in this prototype."],
-                    "acceptanceCriteria": ["Record project decisions and work in canonical history."],
+                    "nonGoals": [],
+                    "acceptanceCriteria": [],
                 },
                 "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
             })
@@ -255,24 +255,40 @@ class PrototypeRuntime:
 
     def create_work(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         self.project_application._authorize(project_id, "work.create")
-        if set(request) - {"title", "objective", "workType"}:
+        if set(request) - {"title", "objective", "workType", "parentWorkId", "acceptanceCriteria"}:
             raise ValueError("unsupported work fields")
         title, objective = request.get("title"), request.get("objective")
         work_type = request.get("workType", "research")
+        parent_work_id = request.get("parentWorkId")
+        acceptance_criteria = request.get("acceptanceCriteria", [])
+        if parent_work_id is not None and (
+            not isinstance(parent_work_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", parent_work_id) is None
+        ):
+            raise ValueError("parentWorkId must be a project work ID or null")
+        if (
+            not isinstance(acceptance_criteria, list)
+            or len(acceptance_criteria) > 128
+            or any(not isinstance(item, str) or not item.strip() or len(item.strip()) > 1000 for item in acceptance_criteria)
+        ):
+            raise ValueError("acceptanceCriteria must be a list of nonempty strings up to 1000 characters")
+        acceptance_criteria = [item.strip() for item in acceptance_criteria]
+        if len(set(acceptance_criteria)) != len(acceptance_criteria):
+            raise ValueError("acceptanceCriteria must not contain duplicates")
         if not isinstance(title, str) or not title.strip() or len(title.strip()) > 160:
             raise ValueError("title must contain 1 to 160 characters")
         if not isinstance(objective, str) or not objective.strip() or len(objective.strip()) > 2000:
             raise ValueError("objective must contain 1 to 2000 characters")
-        if work_type not in {"research", "planning", "implementation", "review"}:
+        if work_type not in {"research", "analysis", "planning", "writing", "review", "implementation", "operations", "other"}:
             raise ValueError("unsupported work type")
         work_id = f"work.local-{secrets.token_hex(8)}"
         now = datetime.now(timezone.utc).isoformat()
         return self.control.create_work({
             "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id,
-            "workId": work_id, "revision": 1, "parentWorkId": None,
+            "workId": work_id, "revision": 1, "parentWorkId": parent_work_id,
             "title": title.strip(), "objective": objective.strip(), "workType": work_type,
             "status": "proposed", "owner": DEMO_RESEARCHER, "dependsOn": [],
-            "capabilityGrantIds": [], "acceptanceCriteria": ["Review the result with the project owner."],
+            "capabilityGrantIds": [], "acceptanceCriteria": acceptance_criteria,
             "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
         }, actor=DEMO_USER)
 
