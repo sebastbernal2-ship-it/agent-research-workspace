@@ -7,6 +7,7 @@ not permission to run that worker or grant it tools.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -18,6 +19,8 @@ WORK_TYPES = frozenset({
 })
 ROUTE_STATES = frozenset({"matched", "ambiguous", "unknown"})
 ENDPOINT_CLASSES = frozenset({"local", "remote"})
+AGENT_ROLES = frozenset({"vp", "orchestrator", "specialist", "reviewer", "worker"})
+_CANONICAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
 
 class AgentRoutingError(ValueError):
@@ -40,6 +43,13 @@ class AgentRouteProfile:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise AgentRoutingError(f"{name} must be a non-empty string")
+        for name in ("profile_id", "agent_id"):
+            if _CANONICAL_ID.fullmatch(getattr(self, name)) is None:
+                raise AgentRoutingError(f"{name} must be a canonical identifier")
+        if len(self.adapter_name) > 100 or len(self.adapter_version) > 100:
+            raise AgentRoutingError("adapter name/version must be at most 100 characters")
+        if self.role not in AGENT_ROLES:
+            raise AgentRoutingError("role must be a canonical agent role")
         if not isinstance(self.endpoint_class, str) or self.endpoint_class not in ENDPOINT_CLASSES:
             raise AgentRoutingError("endpoint_class must be local or remote")
         if not isinstance(self.work_types, frozenset) or not self.work_types or not self.work_types <= WORK_TYPES:

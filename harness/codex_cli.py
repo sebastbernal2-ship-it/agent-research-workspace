@@ -32,7 +32,7 @@ class CodexInvocationError(RuntimeError):
 
 
 class CodexInvocationPolicy(Protocol):
-    """Trusted host policy; production identity/data/budget policy is not supplied here."""
+    """Repeatable trusted host policy; production identity/data/budget policy is absent."""
 
     def authorize(self, invocation: "CodexInvocation", *, codex_home: Path, workspace: Path) -> None: ...
 
@@ -128,7 +128,8 @@ class CodexCliWorker:
         self.codex_home = codex_home
         self.policy = policy
 
-    def invoke(self, invocation: CodexInvocation) -> CodexInvocationResult:
+    def authorize(self, invocation: CodexInvocation) -> tuple[Path, Path, Path]:
+        """Validate paths and run the repeatable policy check without starting a process."""
         if not isinstance(invocation, CodexInvocation):
             raise TypeError("invocation must be a CodexInvocation")
         executable = self.executable.resolve(strict=True)
@@ -144,6 +145,10 @@ class CodexCliWorker:
         # No process starts until policy has checked the explicit project/work,
         # workspace, model, authorization, data, terms, and budget references.
         self.policy.authorize(invocation, codex_home=codex_home, workspace=workspace)
+        return executable, codex_home, workspace
+
+    def invoke(self, invocation: CodexInvocation) -> CodexInvocationResult:
+        executable, codex_home, workspace = self.authorize(invocation)
         with tempfile.TemporaryDirectory(prefix="northstar-codex-") as temp_dir:
             output_path = Path(temp_dir) / "last-message.txt"
             args = [
