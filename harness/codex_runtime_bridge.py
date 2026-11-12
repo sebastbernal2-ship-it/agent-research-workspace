@@ -55,6 +55,8 @@ class CodexRuntimeBridge:
             "agentId": invocation.agent_id,
             "modelId": invocation.model_id,
             "sandboxMode": invocation.sandbox_mode,
+            "skipGitRepoCheck": invocation.skip_git_repo_check,
+            "workspaceManifestHash": invocation.workspace_manifest_hash,
             "workspacePathHash": hashlib.sha256(str(workspace).encode("utf-8")).hexdigest(),
             "promptHash": hashlib.sha256(invocation.prompt.encode("utf-8")).hexdigest(),
             "approvalRef": invocation.approval_ref,

@@ -51,6 +51,8 @@ class CodexInvocation:
     provider_terms_ref: str
     budget_ref: str
     sandbox_mode: str = "read-only"
+    skip_git_repo_check: bool = False
+    workspace_manifest_hash: str | None = None
     timeout_seconds: float = 120
     max_prompt_bytes: int = 100_000
     max_response_bytes: int = 200_000
@@ -73,6 +75,15 @@ class CodexInvocation:
             raise ValueError("workspace must be an explicit absolute Path")
         if self.sandbox_mode not in _ALLOWED_SANDBOXES:
             raise ValueError("sandbox_mode must be read-only or workspace-write")
+        if type(self.skip_git_repo_check) is not bool:
+            raise ValueError("skip_git_repo_check must be a boolean")
+        if self.workspace_manifest_hash is not None and (
+            not isinstance(self.workspace_manifest_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.workspace_manifest_hash) is None
+        ):
+            raise ValueError("workspace_manifest_hash must be a lowercase SHA-256 hex digest")
+        if self.skip_git_repo_check and self.workspace_manifest_hash is None:
+            raise ValueError("non-Git workspaces require a source snapshot manifest hash")
         if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, (int, float)) or not 1 <= self.timeout_seconds <= 600:
             raise ValueError("timeout_seconds must be between 1 and 600")
         for name in ("max_prompt_bytes", "max_response_bytes", "max_stdout_bytes", "max_stderr_bytes"):
@@ -88,6 +99,8 @@ class CodexInvocationResult:
     text: str
     model_id: str
     sandbox_mode: str
+    skip_git_repo_check: bool
+    workspace_manifest_hash: str | None
     stdout_bytes: int
     stderr_bytes: int
 
@@ -97,6 +110,8 @@ class CodexInvocationResult:
             "adapter": "codex-cli",
             "modelId": self.model_id,
             "sandboxMode": self.sandbox_mode,
+            "skipGitRepoCheck": self.skip_git_repo_check,
+            "workspaceManifestHash": self.workspace_manifest_hash,
             "stdoutBytes": self.stdout_bytes,
             "stderrBytes": self.stderr_bytes,
         }
@@ -156,8 +171,11 @@ class CodexCliWorker:
                 "--sandbox", invocation.sandbox_mode,
                 "--model", invocation.model_id,
                 "--cd", str(workspace),
-                "--output-last-message", str(output_path), "-",
+                "--output-last-message", str(output_path),
             ]
+            if invocation.skip_git_repo_check:
+                args.append("--skip-git-repo-check")
+            args.append("-")
             # Never inherit provider API keys, proxy credentials, or arbitrary
             # project env. Codex auth is read only from the explicitly selected
             # CODEX_HOME; official account/terms review is still a prerequisite.
@@ -203,6 +221,8 @@ class CodexCliWorker:
                 text=text,
                 model_id=invocation.model_id,
                 sandbox_mode=invocation.sandbox_mode,
+                skip_git_repo_check=invocation.skip_git_repo_check,
+                workspace_manifest_hash=invocation.workspace_manifest_hash,
                 stdout_bytes=len(completed.stdout),
                 stderr_bytes=len(completed.stderr),
             )

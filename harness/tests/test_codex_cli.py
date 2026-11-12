@@ -80,7 +80,10 @@ sys.exit({exit_code})
         previous = os.environ.get("OPENAI_API_KEY")
         os.environ["OPENAI_API_KEY"] = "must-not-reach-child"
         try:
-            invocation = self.invocation()
+            invocation = self.invocation(
+                skip_git_repo_check=True,
+                workspace_manifest_hash="a" * 64,
+            )
             result = self.worker.invoke(invocation)
         finally:
             if previous is None:
@@ -96,6 +99,7 @@ sys.exit({exit_code})
         self.assertIn("--json", args)
         self.assertIn("--ephemeral", args)
         self.assertIn("--ignore-user-config", args)
+        self.assertIn("--skip-git-repo-check", args)
         self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
         self.assertEqual(args[args.index("--model") + 1], "gpt-synthetic-test-v1")
         self.assertEqual(args[args.index("--cd") + 1], str(self.workspace.resolve()))
@@ -105,6 +109,7 @@ sys.exit({exit_code})
         self.assertEqual(observed["env"], [], "ambient API keys/tokens must not be inherited")
         self.assertTrue(Path(args[args.index("--output-last-message") + 1]).is_relative_to(Path(tempfile.gettempdir())))
         self.assertEqual(result.audit_metadata()["modelId"], invocation.model_id)
+        self.assertEqual(result.audit_metadata()["workspaceManifestHash"], invocation.workspace_manifest_hash)
         self.assertEqual(len(self.policy.calls), 1)
         self.assertEqual(self.policy.calls[0][0], invocation)
 
@@ -142,6 +147,8 @@ sys.exit({exit_code})
             self.invocation(sandbox_mode="danger-full-access")
         with self.assertRaisesRegex(ValueError, "budget_ref"):
             self.invocation(budget_ref="")
+        with self.assertRaisesRegex(ValueError, "manifest hash"):
+            self.invocation(skip_git_repo_check=True)
 
 
 if __name__ == "__main__":
