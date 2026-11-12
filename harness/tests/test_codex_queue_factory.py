@@ -1,6 +1,9 @@
 import asyncio
 import hashlib
+import os
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -129,6 +132,81 @@ print("{{}}")
         self.assertEqual(self.queue.get("job.codex.queue")["state"], "completed")
         self.assertTrue(self.marker.is_file())
         self.assertEqual(len(self.store.list_adapter_invocations(PROJECT)), 1)
+
+    def test_async_codex_keeps_queue_lease_renewals_running(self):
+        self.executable.write_text(
+            f'''#!/usr/bin/env python3
+import pathlib, sys, time
+args = sys.argv[1:]
+pathlib.Path({str(self.marker)!r}).write_text("started")
+time.sleep(1.2)
+out = pathlib.Path(args[args.index("--output-last-message") + 1])
+out.write_text("Synthetic queued Codex output.", encoding="utf-8")
+print("{{}}")
+''',
+            encoding="utf-8",
+        )
+        self.executable.chmod(0o700)
+        self.enqueue()
+        outcome = asyncio.run(self.coordinator.run_queued(
+            self.queue, "worker.codex.synthetic", self.factory(), lease_seconds=1,
+        ))
+        self.assertEqual(outcome.status, WorkflowStatus.COMPLETED)
+        self.assertEqual(self.queue.get("job.codex.queue")["state"], "completed")
+        self.assertEqual(Projector(self.store).replay(PROJECT)["workItems"][WORK]["status"], "completed")
+
+    @unittest.skipUnless(os.name == "posix", "process-group cancellation is POSIX-specific")
+    def test_cancelling_codex_kills_process_group_and_records_canonical_cancellation(self):
+        child_pid_file = self.root / "child.pid"
+        self.executable.write_text(
+            f'''#!/usr/bin/env python3
+import pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))
+while True:
+    time.sleep(1)
+''',
+            encoding="utf-8",
+        )
+        self.executable.chmod(0o700)
+        self.enqueue()
+
+        async def cancel_running_job():
+            task = asyncio.create_task(self.coordinator.run_queued(
+                self.queue, "worker.codex.synthetic", self.factory(), lease_seconds=5,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5
+            while not child_pid_file.exists() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            if not child_pid_file.exists():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self.fail("Codex child process did not start")
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return child_pid
+
+        child_pid = asyncio.run(cancel_running_job())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            stat_path = Path(f"/proc/{child_pid}/stat")
+            if stat_path.exists() and stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("Codex process group child remained alive after cancellation")
+        state = Projector(self.store).replay(PROJECT)
+        self.assertEqual(state["agentRuns"]["run.codex.queue.g1"]["status"], "cancelled")
+        self.assertEqual(state["workItems"][WORK]["status"], "cancelled")
+        self.assertEqual(self.queue.get("job.codex.queue")["state"], "failed")
+        invocations = self.store.list_adapter_invocations(PROJECT)
+        self.assertEqual(invocations[0]["state"], "executing", "dispatched remote work remains ambiguous")
 
     def test_mismatched_execution_key_fails_before_cli_dispatch(self):
         self.enqueue(payload=self.descriptor(execution_key="route.other"))

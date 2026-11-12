@@ -20,6 +20,7 @@ from .bounded_process import (
     BoundedProcessOutputLimit,
     BoundedProcessTimeout,
     run_bounded_subprocess,
+    run_bounded_subprocess_async,
 )
 
 
@@ -162,67 +163,89 @@ class CodexCliWorker:
         self.policy.authorize(invocation, codex_home=codex_home, workspace=workspace)
         return executable, codex_home, workspace
 
+    @staticmethod
+    def _process_spec(invocation: CodexInvocation, executable: Path, codex_home: Path, workspace: Path, output_path: Path):
+        args = [
+            str(executable), "exec", "--json", "--ephemeral", "--ignore-user-config",
+            "--sandbox", invocation.sandbox_mode,
+            "--model", invocation.model_id,
+            "--cd", str(workspace),
+            "--output-last-message", str(output_path),
+        ]
+        if invocation.skip_git_repo_check:
+            args.append("--skip-git-repo-check")
+        args.append("-")
+        # Never inherit provider API keys, proxy credentials, or arbitrary
+        # project env. Codex auth is read only from the explicitly selected
+        # CODEX_HOME; official account/terms review is still a prerequisite.
+        env = {
+            "PATH": os.environ.get("PATH", os.defpath),
+            "HOME": str(Path.home()),
+            "CODEX_HOME": str(codex_home),
+            "LANG": "C.UTF-8",
+        }
+        return args, env
+
+    @staticmethod
+    def _result(invocation: CodexInvocation, completed, output_path: Path) -> CodexInvocationResult:
+        if completed.returncode != 0:
+            raise CodexInvocationError(f"Codex CLI exited with status {completed.returncode}")
+        try:
+            output_stat = output_path.lstat()
+        except FileNotFoundError as exc:
+            raise CodexInvocationError("Codex CLI produced no final-message file") from exc
+        if not output_path.is_file() or output_path.is_symlink() or output_stat.st_size > invocation.max_response_bytes:
+            raise CodexInvocationError("Codex CLI final-message file is invalid or oversized")
+        try:
+            text = output_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise CodexInvocationError("Codex CLI final-message file is unreadable") from exc
+        if not text.strip():
+            raise CodexInvocationError("Codex CLI returned an empty final message")
+        return CodexInvocationResult(
+            text=text,
+            model_id=invocation.model_id,
+            sandbox_mode=invocation.sandbox_mode,
+            skip_git_repo_check=invocation.skip_git_repo_check,
+            workspace_manifest_hash=invocation.workspace_manifest_hash,
+            stdout_bytes=len(completed.stdout),
+            stderr_bytes=len(completed.stderr),
+        )
+
+    @staticmethod
+    def _process_error(exc: Exception) -> CodexInvocationError:
+        if isinstance(exc, BoundedProcessTimeout):
+            return CodexInvocationError("Codex CLI exceeded its wall-clock limit")
+        if isinstance(exc, BoundedProcessOutputLimit):
+            return CodexInvocationError("Codex CLI exceeded a captured-output limit")
+        return CodexInvocationError("Codex CLI process could not be safely collected")
+
     def invoke(self, invocation: CodexInvocation) -> CodexInvocationResult:
         executable, codex_home, workspace = self.authorize(invocation)
         with tempfile.TemporaryDirectory(prefix="northstar-codex-") as temp_dir:
             output_path = Path(temp_dir) / "last-message.txt"
-            args = [
-                str(executable), "exec", "--json", "--ephemeral", "--ignore-user-config",
-                "--sandbox", invocation.sandbox_mode,
-                "--model", invocation.model_id,
-                "--cd", str(workspace),
-                "--output-last-message", str(output_path),
-            ]
-            if invocation.skip_git_repo_check:
-                args.append("--skip-git-repo-check")
-            args.append("-")
-            # Never inherit provider API keys, proxy credentials, or arbitrary
-            # project env. Codex auth is read only from the explicitly selected
-            # CODEX_HOME; official account/terms review is still a prerequisite.
-            env = {
-                "PATH": os.environ.get("PATH", os.defpath),
-                "HOME": str(Path.home()),
-                "CODEX_HOME": str(codex_home),
-                "LANG": "C.UTF-8",
-            }
+            args, env = self._process_spec(invocation, executable, codex_home, workspace, output_path)
             try:
                 completed = run_bounded_subprocess(
-                    args,
-                    input_bytes=invocation.prompt.encode("utf-8"),
-                    cwd=workspace,
-                    env=env,
-                    timeout=float(invocation.timeout_seconds),
-                    stdout_limit=invocation.max_stdout_bytes,
+                    args, input_bytes=invocation.prompt.encode("utf-8"), cwd=workspace, env=env,
+                    timeout=float(invocation.timeout_seconds), stdout_limit=invocation.max_stdout_bytes,
                     stderr_limit=invocation.max_stderr_bytes,
                 )
-            except BoundedProcessTimeout as exc:
-                raise CodexInvocationError("Codex CLI exceeded its wall-clock limit") from exc
-            except BoundedProcessOutputLimit as exc:
-                raise CodexInvocationError("Codex CLI exceeded a captured-output limit") from exc
             except BoundedProcessError as exc:
-                raise CodexInvocationError("Codex CLI process could not be safely collected") from exc
-            if completed.returncode != 0:
-                # Do not surface arbitrary child stderr: it may contain prompts,
-                # workspace data, or provider diagnostics.
-                raise CodexInvocationError(f"Codex CLI exited with status {completed.returncode}")
+                raise self._process_error(exc) from exc
+            return self._result(invocation, completed, output_path)
+
+    async def invoke_async(self, invocation: CodexInvocation) -> CodexInvocationResult:
+        executable, codex_home, workspace = self.authorize(invocation)
+        with tempfile.TemporaryDirectory(prefix="northstar-codex-") as temp_dir:
+            output_path = Path(temp_dir) / "last-message.txt"
+            args, env = self._process_spec(invocation, executable, codex_home, workspace, output_path)
             try:
-                output_stat = output_path.lstat()
-            except FileNotFoundError as exc:
-                raise CodexInvocationError("Codex CLI produced no final-message file") from exc
-            if not output_path.is_file() or output_path.is_symlink() or output_stat.st_size > invocation.max_response_bytes:
-                raise CodexInvocationError("Codex CLI final-message file is invalid or oversized")
-            try:
-                text = output_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError) as exc:
-                raise CodexInvocationError("Codex CLI final-message file is unreadable") from exc
-            if not text.strip():
-                raise CodexInvocationError("Codex CLI returned an empty final message")
-            return CodexInvocationResult(
-                text=text,
-                model_id=invocation.model_id,
-                sandbox_mode=invocation.sandbox_mode,
-                skip_git_repo_check=invocation.skip_git_repo_check,
-                workspace_manifest_hash=invocation.workspace_manifest_hash,
-                stdout_bytes=len(completed.stdout),
-                stderr_bytes=len(completed.stderr),
-            )
+                completed = await run_bounded_subprocess_async(
+                    args, input_bytes=invocation.prompt.encode("utf-8"), cwd=workspace, env=env,
+                    timeout=float(invocation.timeout_seconds), stdout_limit=invocation.max_stdout_bytes,
+                    stderr_limit=invocation.max_stderr_bytes,
+                )
+            except BoundedProcessError as exc:
+                raise self._process_error(exc) from exc
+            return self._result(invocation, completed, output_path)

@@ -65,7 +65,7 @@ class CodexExecutionFactory:
         }
         adapter = {"name": profile.adapter_name, "version": profile.adapter_version}
 
-        def execute(context: ExecutionContext) -> ExecutionSignal:
+        async def execute(context: ExecutionContext) -> ExecutionSignal:
             invocation = invocation_factory(context)
             if not isinstance(invocation, CodexInvocation):
                 raise CodexExecutionFactoryError("invocation_factory must return a CodexInvocation")
@@ -76,7 +76,7 @@ class CodexExecutionFactory:
                 or invocation.agent_id != profile.agent_id
             ):
                 raise CodexExecutionFactoryError("Codex invocation does not match its routed canonical run")
-            self.bridge.run(invocation)
+            await self.bridge.run_async(invocation)
             return ExecutionSignal.COMPLETED
 
         return WorkExecution(
