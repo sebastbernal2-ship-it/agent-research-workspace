@@ -14,6 +14,6 @@ Authorization: user explicitly granted full approval in this conversation.
 
 ## Limits
 
-This verifies a local CLI call and one synthetic library-level harness path. It is not a quality evaluation, project-data authorization, production security review, durable queue integration, or production Codex service. No per-run monetary amount was reported or enforced; the calls used the existing ChatGPT sign-in and remained subject to that account's usage limits. The project still needs a production policy, queue/service registration, worktree lifecycle and restart/cancellation handling before Codex can execute user-project work.
+This verifies a local CLI call and one synthetic library-level harness path. It is not a quality evaluation, project-data authorization, production security review, durable queue integration, or production Codex service. No per-run monetary amount was reported or enforced; the calls used the existing ChatGPT sign-in and remained subject to that account's usage limits. A separate synthetic queue-to-verifier path now passes with a fake Codex executable, but the live call was not made through the queue. The project still needs a production policy, a supervised worker service, worktree lifecycle and restart/cancellation handling before Codex can execute user-project work.
 
-The checked-in offline tests use a fake executable and cover fixed arguments, ambient credential stripping, approval denial, output bounds, canonical receipt/replay, ambiguous no-replay, and verifier-gated completion.
+The checked-in offline tests use a fake executable and cover fixed arguments, ambient credential stripping, approval denial, output bounds, canonical receipt/replay, ambiguous no-replay, queue descriptor matching, and verifier-gated completion.
