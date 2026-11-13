@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import os
 import sys
 import tempfile
@@ -8,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from harness.agent_router import AgentRouteProfile, AgentRouter
+from harness.control_plane import ProjectControlPlane
 from harness.codex_cli import CodexCliWorker, CodexInvocation
 from harness.codex_execution import CodexExecutionFactory
 from harness.codex_queue_factory import (
@@ -26,9 +26,6 @@ WORK = "work.codex.queue"
 AGENT = {"actorType": "agent", "actorId": "agent.codex", "role": "specialist"}
 VERIFIER = USER
 ADAPTER = {"name": "codex-cli", "version": "0.1"}
-CONTEXT_HASH = hashlib.sha256(b"synthetic codex queue context").hexdigest()
-
-
 class SyntheticPolicy:
     def authorize(self, invocation, *, codex_home, workspace):
         if invocation.data_scope_ref != "scope.synthetic-only":
@@ -81,22 +78,23 @@ print("{{}}")
         self.temp.cleanup()
 
     def descriptor(self, *, execution_key=None, actor=None):
-        return {
-            "descriptorVersion": 1,
-            "executionKey": execution_key or self.profile.profile_id,
-            "actor": actor or AGENT,
-            "verificationActor": VERIFIER,
-            "adapter": ADAPTER,
-            "contextHash": CONTEXT_HASH,
-            "correlationId": "correlation.codex.queue",
-        }
+        descriptor = self.factory().build_descriptor(
+            PROJECT, WORK, correlation_id="correlation.codex.queue",
+        )
+        if execution_key is not None:
+            descriptor["executionKey"] = execution_key
+        if actor is not None:
+            descriptor["actor"] = actor
+        return descriptor
 
     def enqueue(self, *, payload=None):
-        return self.queue.enqueue(
-            "job.codex.queue", PROJECT, WORK,
-            self.descriptor() if payload is None else payload,
-            now=100,
-        )
+        if payload is None:
+            return self.factory().enqueue(
+                self.queue, "job.codex.queue", PROJECT, WORK,
+                correlation_id="correlation.codex.queue",
+                now=100,
+            )
+        return self.queue.enqueue("job.codex.queue", PROJECT, WORK, payload, now=100)
 
     def factory(self):
         return CodexQueueExecutionFactory(
@@ -110,6 +108,7 @@ print("{{}}")
                 provider_terms_ref="terms.fixture", budget_ref="budget.fixture",
                 sandbox_mode="read-only",
             ),
+            verification_actor_factory=lambda work: dict(VERIFIER),
             verify=lambda context: any(
                 message.get("runId") == context.run_id
                 and message["content"] == "Synthetic queued Codex output."
@@ -217,6 +216,64 @@ while True:
         self.assertFalse(self.marker.exists())
         self.assertEqual(Projector(self.store).replay(PROJECT)["agentRuns"], {})
         self.assertEqual(self.store.list_adapter_invocations(PROJECT), [])
+
+    def test_untrusted_verification_actor_fails_before_cli_dispatch(self):
+        descriptor = self.descriptor()
+        descriptor["verificationActor"] = AGENT
+        self.enqueue(payload=descriptor)
+        with self.assertRaisesRegex(CodexQueueExecutionFactoryError, "verificationActor"):
+            asyncio.run(self.coordinator.run_queued(
+                self.queue, "worker.codex.synthetic", self.factory(), lease_seconds=10,
+            ))
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(Projector(self.store).replay(PROJECT)["agentRuns"], {})
+
+    def test_stale_canonical_context_fails_before_cli_dispatch(self):
+        descriptor = self.descriptor()
+        ProjectControlPlane(self.store).revise_work(
+            PROJECT, WORK, {"objective": "Changed after queue planning."}, actor=VERIFIER,
+        )
+        self.enqueue(payload=descriptor)
+        with self.assertRaisesRegex(CodexQueueExecutionFactoryError, "contextHash"):
+            asyncio.run(self.coordinator.run_queued(
+                self.queue, "worker.codex.synthetic", self.factory(), lease_seconds=10,
+            ))
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(Projector(self.store).replay(PROJECT)["agentRuns"], {})
+
+    def test_descriptor_construction_uses_the_exact_current_route_and_context(self):
+        descriptor = self.descriptor()
+        self.assertEqual(descriptor["executionKey"], self.profile.profile_id)
+        self.assertEqual(descriptor["actor"], AGENT)
+        self.assertEqual(descriptor["adapter"], ADAPTER)
+        self.assertEqual(len(descriptor["contextHash"]), 64)
+        self.assertEqual(descriptor["descriptorVersion"], 1)
+
+    def test_project_charter_changes_invalidate_the_prepared_context_hash(self):
+        before = self.descriptor()["contextHash"]
+        state = Projector(self.store).replay(PROJECT)
+        charter = dict(state["project"]["charter"])
+        charter["goals"] = ["A revised synthetic goal."]
+        ProjectControlPlane(self.store).revise_project_charter(
+            PROJECT, charter, actor=VERIFIER,
+        )
+        after = self.descriptor()["contextHash"]
+        self.assertNotEqual(before, after)
+
+    def test_descriptor_preflight_rejects_incomplete_dependencies(self):
+        ProjectControlPlane(self.store).create_work({
+            "recordType": "work_item", "schemaVersion": "0.1", "projectId": PROJECT,
+            "workId": "work.codex.downstream", "revision": 1, "parentWorkId": None,
+            "title": "Dependent synthetic work", "objective": "Wait for its dependency.",
+            "workType": "research", "status": "ready", "owner": AGENT,
+            "dependsOn": [WORK], "capabilityGrantIds": [], "acceptanceCriteria": [],
+            "createdBy": VERIFIER, "createdAt": "2026-04-16T12:00:00Z",
+            "updatedAt": "2026-04-16T12:00:00Z",
+        }, actor=VERIFIER)
+        with self.assertRaisesRegex(CodexQueueExecutionFactoryError, "incomplete dependency"):
+            self.factory().build_descriptor(
+                PROJECT, "work.codex.downstream", correlation_id="correlation.downstream",
+            )
 
     def test_mismatched_actor_fails_before_cli_dispatch(self):
         wrong_actor = {"actorType": "agent", "actorId": "agent.other", "role": "specialist"}

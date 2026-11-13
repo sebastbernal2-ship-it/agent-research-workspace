@@ -161,6 +161,38 @@ class ModelRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(ModelRoutingError, "output limit"):
             router.complete(self.task(role="vp"))
 
+    def test_router_route_tables_and_task_inputs_are_immutable_and_validated(self):
+        with self.assertRaises(TypeError):
+            self.router.role_defaults["vp"] = "profile.remote.deepseek"
+        with self.assertRaises(TypeError):
+            self.router.project_role_overrides[("project.other", "vp")] = "profile.local.qwen"
+        with self.assertRaises(ValueError):
+            ModelProfile(
+                profile_id="profile.mutable", provider_id="local", model_id="qwen.synthetic-v1",
+                endpoint_class="local", allowed_roles={"vp"},
+            )
+        with self.assertRaises(ValueError):
+            ModelTask("project.x", "work.x", "run.x", "agent.x", "unknown", (ChatMessage("user", "x"),))
+        with self.assertRaises(ValueError):
+            ModelTask("project.x", "work.x", "run.x", "agent.x", "vp", [ChatMessage("user", "x")])
+        with self.assertRaises(ValueError):
+            ChatMessage("tool", "untrusted role")
+
+    def test_provider_must_return_the_normalized_contract(self):
+        class MalformedProvider:
+            provider_id = "remote"
+
+            def complete(self, profile, task):
+                return {"model_id": profile.model_id, "text": "not normalized"}
+
+        router = ModelRouter(
+            profiles=[self.remote_profile], providers=[MalformedProvider()],
+            role_defaults={"orchestrator": "profile.remote.deepseek"},
+            invocation_policy=AllowAllTestPolicy(),
+        )
+        with self.assertRaisesRegex(ModelRoutingError, "normalized response contract"):
+            router.complete(self.task())
+
     def test_profile_role_mismatch_is_rejected_at_configuration(self):
         with self.assertRaisesRegex(ValueError, "not allowed"):
             ModelRouter(
