@@ -12,6 +12,7 @@ class PrototypeStructureTests(unittest.TestCase):
         cls.package = json.loads((WEB_ROOT / "package.json").read_text(encoding="utf-8"))
         cls.tsx = (WEB_ROOT / "src" / "main.tsx").read_text(encoding="utf-8")
         cls.css = (WEB_ROOT / "src" / "style.css").read_text(encoding="utf-8") + (WEB_ROOT / "src" / "goal.css").read_text(encoding="utf-8")
+        cls.board_css = (WEB_ROOT / "src" / "kanban-board.css").read_text(encoding="utf-8")
         cls.readme = (WEB_ROOT / "README.md").read_text(encoding="utf-8")
 
     def test_shadcn_base_is_pinned_and_licensed_with_goal_centered_workspace(self):
@@ -50,7 +51,7 @@ class PrototypeStructureTests(unittest.TestCase):
             "Alignment interview", "Add an outcome or nested step", "OPEN DECISIONS",
             "No project-scoped model or worker is connected", "not authenticated",
             "Task board", "Project chat", "Nothing is running right now", "Approve task",
-            "Project auto-run", "Project chat is not connected yet", "KanbanBoard", "ProjectChat",
+            "Auto-run", "Project chat is not connected yet", "KanbanBoard", "ProjectChat",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)
@@ -59,6 +60,10 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertIn("/api/v1/repositories/inspect", self.tsx)
         self.assertIn("/alignment/resume", self.tsx)
         self.assertIn("/approval", self.tsx)
+        self.assertIn('aria-label={`Open ${item.title} details`}', self.tsx)
+        self.assertIn('className="work-detail-modal"', self.tsx)
+        self.assertIn('grid-template-columns:repeat(5', self.board_css)
+        self.assertNotIn('board-status-banner', self.tsx)
 
 
 if __name__ == "__main__":

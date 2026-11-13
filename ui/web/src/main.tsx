@@ -7,6 +7,7 @@ import {
 import "./style.css";
 import "./goal.css";
 import "./work-views.css";
+import "./kanban-board.css";
 
 type Project = { projectId: string; name: string; status: string; charter: { revision: number; goals: string[]; nonGoals: string[]; acceptanceCriteria: string[] } };
 type Work = { workId: string; title: string; objective: string; workType: string; status: string; parentWorkId?: string | null; dependsOn: string[]; acceptanceCriteria: string[]; revision: number };
@@ -130,13 +131,14 @@ function App() {
     finally { setBusy(false); }
   }
 
-  async function decideWork(workId: string, revision: number, decision: "approve" | "reject") {
-    if (!project) return;
+  async function decideWork(workId: string, revision: number, decision: "approve" | "reject"): Promise<boolean> {
+    if (!project) return false;
     setBusy(true);
     try {
       await request(`/api/v1/projects/${encodeURIComponent(project.projectId)}/work/${encodeURIComponent(workId)}/approval`, { method: "POST", body: JSON.stringify({ expectedRevision: revision, decision }) });
       await loadProject(project.projectId);
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not record the work approval."); }
+      return true;
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not record the work approval."); return false; }
     finally { setBusy(false); }
   }
 
@@ -201,7 +203,7 @@ function App() {
       <div className="amp-user"><span className="amp-avatar">V</span><span><b>Local user</b><small>Prototype · not authenticated</small></span><CircleHelp size={15}/></div>
     </aside>
     <main className="goal-main">
-      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Your input" : view === "board" ? "Task board" : view === "chat" ? "Project chat" : project?.name || "Project"}</h1><small>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Repo-grounded alignment · one segment at a time" : "Decisions that need your attention" : view === "board" ? "Proposed, ready, active, and completed work" : view === "chat" ? "Conversation with the project assistant" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{(view === "overview" || view === "board") && (openQuestionCount > 0 ? <button className="button secondary" onClick={() => setView("inbox")}><Inbox size={14}/>Review decisions</button> : breakdownItems.length > 0 && view === "overview" ? <button className="button primary" onClick={() => setView("board")}><FolderKanban size={14}/>See task status</button> : <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add outcome or step</button>)}</div></header>
+      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Your input" : view === "board" ? "Task board" : view === "chat" ? "Project chat" : project?.name || "Project"}</h1><small>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Repo-grounded alignment · one segment at a time" : "Decisions that need your attention" : view === "board" ? "Work at a glance · click cards for details" : view === "chat" ? "Conversation with the project assistant" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{(view === "overview" || view === "board") && (openQuestionCount > 0 ? <button className="button secondary" onClick={() => setView("inbox")}><Inbox size={14}/>Review decisions</button> : breakdownItems.length > 0 && view === "overview" ? <button className="button primary" onClick={() => setView("board")}><FolderKanban size={14}/>See task status</button> : <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add outcome or step</button>)}</div></header>
       <div className="goal-stage">
         {error && <div className="error-banner" role="alert">{error}</div>}
         {view === "inbox" ? <InboxView questions={questions} selected={selectedQuestion} selectedOption={selectedOption} setSelectedOption={setSelectedOption} note={answerNote} setNote={setAnswerNote} busy={decisionBusy} choose={chooseQuestion} answer={() => void submitDecision(false)} reject={() => void submitDecision(true)}/> : view === "board" && project ? <KanbanBoard items={workItems} busy={busy} decide={decideWork}/> : view === "chat" && project ? <ProjectChat projectName={project.name}/> : project ? <div className="goal-scroll">
@@ -267,27 +269,28 @@ function WorkTree({items,showObjectives=false}:{items:Work[];showObjectives?:boo
   return <ol className={`outcome-tree ${showObjectives?"detailed":""}`}>{roots.map((root)=>render(root,0))}</ol>;
 }
 
-function KanbanBoard({items,busy,decide}:{items:Work[];busy:boolean;decide:(workId:string,revision:number,decision:"approve"|"reject")=>void}) {
+function KanbanBoard({items,busy,decide}:{items:Work[];busy:boolean;decide:(workId:string,revision:number,decision:"approve"|"reject")=>Promise<boolean>}) {
+  const [selectedWork,setSelectedWork]=React.useState<Work|null>(null);
   const columns = [
     { id: "proposed", title: "Proposed", statuses: ["proposed"] },
     { id: "ready", title: "Ready", statuses: ["ready"] },
     { id: "active", title: "In progress", statuses: ["running", "verifying"] },
     { id: "waiting", title: "Waiting", statuses: ["waiting_human", "blocked"] },
     { id: "done", title: "Done", statuses: ["completed"] },
-    { id: "stopped", title: "Stopped", statuses: ["failed", "cancelled"] },
   ];
   const byId = new Map(items.map((item)=>[item.workId,item]));
-  const activeCount = items.filter((item)=>["running","verifying"].includes(item.status)).length;
+  const stopped = items.filter((item)=>["failed","cancelled"].includes(item.status));
   return <div className="board-page">
-    <section className="board-status-banner"><div><div className="eyebrow">CANONICAL WORK STATUS</div><h2>{activeCount ? `${activeCount} item${activeCount===1?"":"s"} in progress` : "Nothing is running right now"}</h2><p>Proposed items are plans, not activity. This prototype has no connected project agent; a card moves only when its canonical status changes.</p></div><div className="board-banner-actions"><span className="board-total">{items.length}<small>items</small></span><div className="auto-run-status"><span>Project auto-run</span><button role="switch" aria-checked="false" disabled title="Automatic execution is unavailable until a scoped provider, enforceable budget, and isolated worker are configured."><i/>Off</button></div></div></section>
+    <header className="board-toolbar"><div><div className="eyebrow">PROJECT BOARD</div><h2>Work items</h2><p>Click a card to see its details and approval controls.</p></div><div className="board-toolbar-actions"><span className="board-item-total">{items.length} items</span><span className="auto-run-status"><span>Auto-run</span><button role="switch" aria-checked="false" disabled title="Unavailable until provider/data policy, spend limits, and worker isolation are configured."><i/>Off</button></span></div></header>
     <section className="kanban-board" aria-label="Project work kanban board">{columns.map((column)=>{
       const cards=items.filter((item)=>column.statuses.includes(item.status));
       return <div className="kanban-column" key={column.id}><header><h3>{column.title}</h3><span>{cards.length}</span></header>{cards.length ? <div className="kanban-cards">{cards.map((item)=>{
         const parent=item.parentWorkId?byId.get(item.parentWorkId):undefined;
-        return <article className="kanban-card" key={item.workId}><div className="kanban-card-meta"><span className={`thread-status-dot ${item.status}`}/><span>{item.workType}</span><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div><h4>{item.title}</h4><p>{item.objective}</p>{parent&&<small>Under: {parent.title}</small>}{item.status === "proposed" && <div className="work-approval-actions"><button className="approve-work" disabled={busy} onClick={()=>decide(item.workId,item.revision,"approve")}>Approve task</button><button className="reject-work" disabled={busy} onClick={()=>decide(item.workId,item.revision,"reject")}>Decline</button><small>Approval moves it to Ready; it does not start work.</small></div>}</article>;
-      })}</div> : <p className="kanban-empty">No items in this column.</p>}</div>;
+        return <button className="kanban-card" key={item.workId} onClick={()=>setSelectedWork(item)} aria-label={`Open ${item.title} details`}><div className="kanban-card-meta"><span className={`thread-status-dot ${item.status}`}/><span>{item.workType}</span><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div><h4>{item.title}</h4>{parent&&<small>Under: {parent.title}</small>}</button>;
+      })}</div> : <p className="kanban-empty">Empty</p>}</div>;
     })}</section>
-    <p className="board-footnote"><ShieldAlert size={13}/>Per-task approval is recorded canonically. Project auto-run is off and unavailable without provider/data policy, enforceable spend limits, and hardened worker isolation.</p>
+    {stopped.length>0&&<details className="stopped-items"><summary>Stopped · {stopped.length}</summary><div>{stopped.map((item)=><button key={item.workId} onClick={()=>setSelectedWork(item)}>{item.title}<span>{item.status}</span></button>)}</div></details>}
+    {selectedWork&&<Modal title={selectedWork.title} onClose={()=>setSelectedWork(null)}><div className="work-detail-modal"><div className="work-detail-meta"><span className={`work-status ${selectedWork.status}`}><i/>{selectedWork.status.replaceAll("_"," ")}</span><span>{selectedWork.workType}</span>{selectedWork.parentWorkId&&<span>Under {byId.get(selectedWork.parentWorkId)?.title||selectedWork.parentWorkId}</span>}</div><p>{selectedWork.objective}</p>{selectedWork.acceptanceCriteria.length>0&&<div><b>Acceptance criteria</b><ul>{selectedWork.acceptanceCriteria.map((criterion,index)=><li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{selectedWork.status==="proposed"?<><p className="form-hint">Approval moves this item to Ready; it does not start execution.</p><div className="form-actions"><button className="button secondary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"reject"))setSelectedWork(null);}}>Decline</button><button className="button primary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"approve"))setSelectedWork(null);}}>Approve task</button></div></>:selectedWork.status==="ready"?<p className="form-hint">Approved and Ready. No agent is connected to execute it.</p>:null}</div></Modal>}
   </div>;
 }
 
