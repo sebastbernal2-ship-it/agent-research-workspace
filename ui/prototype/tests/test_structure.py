@@ -27,7 +27,8 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertIn('WorkTree', self.tsx)
         self.assertIn('parentWorkId', self.tsx)
         self.assertIn('Record response', self.tsx)
-        self.assertIn('No outcome or implementation breakdown has been agreed', self.tsx)
+        self.assertIn('breakdownItems.length ? <WorkTree', self.tsx)
+        self.assertNotIn('No outcome or implementation breakdown has been agreed', self.tsx)
         self.assertNotIn('No agent response yet', self.tsx)
         self.assertNotIn('PROJECT CHANGES', self.tsx)
         for color in ('#f9fdf6', '#f2f6ef', '#edf1ea', '#2f8052', '#bb8e00'):
@@ -47,6 +48,8 @@ class PrototypeStructureTests(unittest.TestCase):
         for text in (
             "Create a project", "Add an outcome or nested step", "OPEN DECISIONS",
             "No project-scoped model or worker is connected", "not authenticated",
+            "Task board", "Project chat", "Nothing is running right now",
+            "Project chat is not connected yet", "KanbanBoard", "ProjectChat",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)

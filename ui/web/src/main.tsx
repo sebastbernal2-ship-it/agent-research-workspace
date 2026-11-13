@@ -2,10 +2,11 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import {
   ChevronDown, CircleHelp, Folder, FolderKanban, Inbox,
-  Layers3, Plus, Search, ShieldAlert, Sparkles, X,
+  Layers3, MessageSquare, Plus, Search, ShieldAlert, Sparkles, X,
 } from "lucide-react";
 import "./style.css";
 import "./goal.css";
+import "./work-views.css";
 
 type Project = { projectId: string; name: string; status: string; charter: { revision: number; goals: string[]; nonGoals: string[]; acceptanceCriteria: string[] } };
 type Work = { workId: string; title: string; objective: string; workType: string; status: string; parentWorkId?: string | null; dependsOn: string[]; acceptanceCriteria: string[]; revision: number };
@@ -13,7 +14,7 @@ type ProjectEvent = { eventId: string; title: string; description: string; actor
 type Summary = { project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number> };
 type Question = { questionId: string; questionType: string; questionText: string; priority: string; blocking: boolean; workIds: string[]; etag: string };
 type QuestionDetail = Question & { record: { questionType: string; options: { optionId: string; label: string; consequence?: string }[]; impact: string; status: string; questionText: string }; affectedWork: { workId: string; title: string; status: string }[] };
-type View = "overview" | "inbox";
+type View = "overview" | "board" | "chat" | "inbox";
 
 const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
@@ -84,7 +85,9 @@ function App() {
   const alignmentQuestionCount = questions.filter((question) => question.questionType === "clarification").length;
   const alignmentWork = workItems.find((item) => item.workId === "work.alignment-intake");
   const alignmentPending = alignmentQuestionCount > 0 || Boolean(alignmentWork && !["completed", "cancelled"].includes(alignmentWork.status));
-  const pulse = projectPulse(workItems.length, openQuestionCount, blockingQuestionCount, alignmentQuestionCount, alignmentWork);
+  const breakdownItems = workItems.filter((item) => item.workId !== "work.alignment-intake" && item.status !== "cancelled");
+  const runningWorkCount = workItems.filter((item) => ["running", "verifying"].includes(item.status)).length;
+  const pulse = projectPulse(workItems.length, openQuestionCount, blockingQuestionCount, alignmentQuestionCount, alignmentWork, breakdownItems.length, runningWorkCount);
 
   async function createProject(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true);
@@ -150,21 +153,21 @@ function App() {
       <button className="amp-project-picker" onClick={() => setProjectsOpen((open) => !open)}><Folder size={15}/><span>{project?.name || "Projects"}</span><ChevronDown size={13}/></button>
       {projectsOpen && <div className="project-menu">{projects.map((item)=><button key={item.projectId} className={item.projectId===projectId?"current":""} onClick={()=>{void switchProject(item.projectId);setProjectsOpen(false);}}>{item.name}</button>)}<button onClick={()=>{setProjectDialog(true);setProjectsOpen(false);}}><Plus size={13}/>New project</button></div>}
       <div className="sidebar-section-head"><span>PROJECT</span></div>
-      <nav className="amp-sidebar-links" aria-label="Project navigation"><button onClick={() => setView("overview")} className={view === "overview" ? "current" : ""}><Layers3 size={15}/>Overview</button><button onClick={() => setView("inbox")} className={view === "inbox" ? "current" : ""}><Inbox size={15}/>Your input <span>{openQuestionCount || ""}</span></button></nav>
+      <nav className="amp-sidebar-links" aria-label="Project navigation"><button onClick={() => setView("overview")} className={view === "overview" ? "current" : ""}><Layers3 size={15}/>Overview</button><button onClick={() => setView("board")} className={view === "board" ? "current" : ""}><FolderKanban size={15}/>Task board <span>{workItems.length || ""}</span></button><button onClick={() => setView("chat")} className={view === "chat" ? "current" : ""}><MessageSquare size={15}/>Chat <span className="nav-status">not connected</span></button><button onClick={() => setView("inbox")} className={view === "inbox" ? "current" : ""}><Inbox size={15}/>Your input <span>{openQuestionCount || ""}</span></button></nav>
       <div className="sidebar-spacer"/>
       <div className="amp-sidebar-links"><button onClick={() => setProjectDialog(true)}><FolderKanban size={15}/>New project</button></div>
       <div className="amp-user"><span className="amp-avatar">V</span><span><b>Local user</b><small>Prototype · not authenticated</small></span><CircleHelp size={15}/></div>
     </aside>
     <main className="goal-main">
-      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? "Your input" : project?.name || "Project"}</h1><small>{view === "inbox" ? "Decisions that need your attention" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{view === "overview" && (alignmentPending ? <button className="button secondary" onClick={() => setView("inbox")}><Inbox size={14}/>Review alignment</button> : <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add outcome or step</button>)}</div></header>
+      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? "Your input" : view === "board" ? "Task board" : view === "chat" ? "Project chat" : project?.name || "Project"}</h1><small>{view === "inbox" ? "Decisions that need your attention" : view === "board" ? "Proposed, ready, active, and completed work" : view === "chat" ? "Conversation with the project assistant" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{(view === "overview" || view === "board") && (openQuestionCount > 0 ? <button className="button secondary" onClick={() => setView("inbox")}><Inbox size={14}/>Review decisions</button> : breakdownItems.length > 0 && view === "overview" ? <button className="button primary" onClick={() => setView("board")}><FolderKanban size={14}/>See task status</button> : <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add outcome or step</button>)}</div></header>
       <div className="goal-stage">
         {error && <div className="error-banner" role="alert">{error}</div>}
-        {view === "inbox" ? <InboxView questions={questions} selected={selectedQuestion} selectedOption={selectedOption} setSelectedOption={setSelectedOption} note={answerNote} setNote={setAnswerNote} busy={decisionBusy} choose={chooseQuestion} answer={() => void submitDecision(false)} reject={() => void submitDecision(true)}/> : project ? <div className="goal-scroll">
+        {view === "inbox" ? <InboxView questions={questions} selected={selectedQuestion} selectedOption={selectedOption} setSelectedOption={setSelectedOption} note={answerNote} setNote={setAnswerNote} busy={decisionBusy} choose={chooseQuestion} answer={() => void submitDecision(false)} reject={() => void submitDecision(true)}/> : view === "board" && project ? <KanbanBoard items={workItems}/> : view === "chat" && project ? <ProjectChat projectName={project.name}/> : project ? <div className="goal-scroll">
           <section className="goal-hero"><div className="eyebrow"><Sparkles size={13}/> {alignmentPending ? "PROVISIONAL REPOSITORY HYPOTHESIS" : "PROJECT DIRECTION"}</div><h2>{project.charter.goals.join(" ") || "No project goal defined"}</h2>{alignmentPending && <p className="goal-context-note">This wording comes from the repository, not from a confirmed conversation with you. It is not yet the agreed overarching vision.</p>}<div className="goal-project-meta"><span>{project.name}</span><span>Charter revision {project.charter.revision}</span></div></section>
           <section className={`project-pulse ${openQuestionCount ? "needs-input" : ""}`} aria-labelledby="pulse-title"><div className="pulse-icon"><Sparkles size={17}/></div><div className="pulse-copy"><div className="eyebrow">PROJECT STATE</div><h3 id="pulse-title">{pulse.title}</h3><p>{pulse.description}</p></div>{openQuestionCount > 0 && <button className="button secondary" onClick={() => setView("inbox")}>Your input <span aria-hidden="true">→</span></button>}</section>
           <div className="goal-columns">
-            <section className="goal-card outcome-card"><div className="goal-card-heading"><div><div className="eyebrow">PROJECT BREAKDOWN</div><h3>Goal → outcomes → workstreams → steps</h3></div><Layers3 size={17}/></div>{alignmentPending ? <p className="empty-copy">No outcome or implementation breakdown has been agreed. First align on the real vision and how you want the work handled; then I’ll propose a hierarchy for your review before anything starts.</p> : <WorkTree items={workItems.filter((item) => item.workId !== "work.alignment-intake")} />}</section>
-            <section className="goal-card attention-card"><div className="goal-card-heading"><div><div className="eyebrow">YOUR INPUT</div><h3>{openQuestionCount ? `${openQuestionCount} ${openQuestionCount === 1 ? "question" : "questions"} to answer` : "No open project questions"}</h3></div><Inbox size={17}/></div>{questions.length ? <div className="attention-list">{questions.slice(0,3).map((question)=><button key={question.questionId} className="attention-item" onClick={()=>void openQuestion(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking ? "Needed before the alignment phase can continue" : "May shape the project direction"}</small></span><span aria-hidden="true">→</span></button>)}</div> : <p className="empty-copy">Project tasks and decisions will appear here when they are actually agreed or need your input.</p>}</section>
+            <section className="goal-card outcome-card"><div className="goal-card-heading"><div><div className="eyebrow">PROJECT BREAKDOWN</div><h3>Goal → outcomes → workstreams → steps</h3></div><Layers3 size={17}/></div>{breakdownItems.length ? <WorkTree items={breakdownItems}/> : alignmentPending ? <p className="empty-copy">Alignment is still in progress. The current approved scope will appear here as outcome proposals; nothing starts automatically.</p> : <p className="empty-copy">No outcome hierarchy is recorded yet. Add a meaningful outcome when you are ready.</p>}</section>
+            <section className="goal-card attention-card"><div className="goal-card-heading"><div><div className="eyebrow">YOUR INPUT</div><h3>{openQuestionCount ? `${openQuestionCount} ${openQuestionCount === 1 ? "question" : "questions"} to answer` : "No open project questions"}</h3></div><Inbox size={17}/></div>{questions.length ? <div className="attention-list">{questions.slice(0,3).map((question)=><button key={question.questionId} className="attention-item" onClick={()=>void openQuestion(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking ? "Needed before the alignment phase can continue" : "May shape the project direction"}</small></span><span aria-hidden="true">→</span></button>)}</div> : <p className="empty-copy">No decision is waiting on you. {breakdownItems.length ? "The task board shows the proposed work; no agent work is running." : "The project breakdown will appear here when proposals are recorded."}</p>}</section>
           </div>
           <details className="detail-disclosure"><summary><span><b>Process and work-item details</b><small>Proposals, statuses, and implementation detail</small></span><span className="detail-count">{workItems.length}</span></summary>{workItems.length ? <div className="plan-list">{workItems.map((item)=><article className="plan-item" key={item.workId}><div className="plan-item-title"><span className={`thread-status-dot ${item.status}`}/><b>{item.title}</b><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div><p>{item.objective}</p><small>{item.workType} · revision {item.revision}{item.parentWorkId ? ` · parent ${workItems.find((parent)=>parent.workId===item.parentWorkId)?.title || item.parentWorkId}` : ""}</small></article>)}</div> : <p className="empty-copy">No work items have been agreed.</p>}</details>
           {project.charter.acceptanceCriteria.length > 0 && <details className="detail-disclosure"><summary><span><b>Recorded acceptance criteria</b><small>Stored wording only; nothing is automatically verified</small></span><span className="detail-count">{project.charter.acceptanceCriteria.length}</span></summary><ul className="criteria-list">{project.charter.acceptanceCriteria.map((criterion,index)=><li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></details>}
@@ -178,12 +181,14 @@ function App() {
   </div>;
 }
 
-function projectPulse(workCount:number,questionCount:number,blockingCount:number,alignmentQuestionCount:number,alignmentWork?:Work) {
-  if (alignmentQuestionCount > 0) return { title: "Your project direction needs alignment", description: "The repository supplied a hypothesis, not your confirmed vision. No research or implementation breakdown is agreed; answer the alignment question and I’ll propose an outcome hierarchy for your review." };
-  if (alignmentWork && !["completed", "cancelled"].includes(alignmentWork.status)) return { title: "Alignment is not complete yet", description: "Your response is recorded. The repo needs to be reconciled with your direction, then a proposed goal-to-outcome breakdown must be reviewed before delivery work is added." };
+function projectPulse(workCount:number,questionCount:number,blockingCount:number,alignmentQuestionCount:number,alignmentWork?:Work,breakdownCount=0,runningCount=0) {
   if (blockingCount > 0) return { title: "Your input is needed", description: `${blockingCount} open question${blockingCount === 1 ? " is" : "s are"} blocking affected work. Review the impact before deciding.` };
+  if (alignmentQuestionCount > 0) return { title: "Your project direction needs alignment", description: "Some project scope is still unresolved. The current proposal is visible on the task board; unresolved choices are not being guessed." };
+  if (runningCount > 0) return { title: `${runningCount} work item${runningCount === 1 ? " is" : "s are"} in progress`, description: "This count comes from canonical work statuses. Open the task board for the exact items; no unrecorded progress is inferred." };
+  if (breakdownCount > 0) return { title: "Nothing is running right now", description: `${breakdownCount} work items are visible on the task board; proposed and ready statuses are not active execution. This prototype has no connected project agent.` };
+  if (alignmentWork && !["completed", "cancelled"].includes(alignmentWork.status)) return { title: "Planning is underway", description: "No task breakdown is recorded yet. The project will show proposed outcomes here before claiming any work has started." };
   if (questionCount > 0) return { title: "A decision may shape the project", description: "There are open project questions to review; no progress is inferred from the plan." };
-  if (workCount > 0) return { title: "Outcomes and work are recorded", description: "The hierarchy shows the current proposals and status. This prototype has no connected agent, so it cannot report active progress or verified results." };
+  if (workCount > 0) return { title: "Work is recorded · nothing running", description: "The task board shows canonical item statuses. This prototype has no connected agent and does not infer progress from a proposal." };
   return { title: "Project direction is recorded", description: "No outcome hierarchy is recorded yet. Add a meaningful outcome when you are ready; this prototype will not invent a finish line." };
 }
 
@@ -208,6 +213,34 @@ function WorkTree({items,showObjectives=false}:{items:Work[];showObjectives?:boo
     {(children.get(item.workId)||[]).length>0 && <ol>{(children.get(item.workId)||[]).map((child)=>render(child,depth+1))}</ol>}
   </li>;
   return <ol className={`outcome-tree ${showObjectives?"detailed":""}`}>{roots.map((root)=>render(root,0))}</ol>;
+}
+
+function KanbanBoard({items}:{items:Work[]}) {
+  const columns = [
+    { id: "proposed", title: "Proposed", statuses: ["proposed"] },
+    { id: "ready", title: "Ready", statuses: ["ready"] },
+    { id: "active", title: "In progress", statuses: ["running", "verifying"] },
+    { id: "waiting", title: "Waiting", statuses: ["waiting_human", "blocked"] },
+    { id: "done", title: "Done", statuses: ["completed"] },
+    { id: "stopped", title: "Stopped", statuses: ["failed", "cancelled"] },
+  ];
+  const byId = new Map(items.map((item)=>[item.workId,item]));
+  const activeCount = items.filter((item)=>["running","verifying"].includes(item.status)).length;
+  return <div className="board-page">
+    <section className="board-status-banner"><div><div className="eyebrow">CANONICAL WORK STATUS</div><h2>{activeCount ? `${activeCount} item${activeCount===1?"":"s"} in progress` : "Nothing is running right now"}</h2><p>Proposed items are plans, not activity. This prototype has no connected project agent; a card moves only when its canonical status changes.</p></div><span className="board-total">{items.length}<small>items</small></span></section>
+    <section className="kanban-board" aria-label="Project work kanban board">{columns.map((column)=>{
+      const cards=items.filter((item)=>column.statuses.includes(item.status));
+      return <div className="kanban-column" key={column.id}><header><h3>{column.title}</h3><span>{cards.length}</span></header>{cards.length ? <div className="kanban-cards">{cards.map((item)=>{
+        const parent=item.parentWorkId?byId.get(item.parentWorkId):undefined;
+        return <article className="kanban-card" key={item.workId}><div className="kanban-card-meta"><span className={`thread-status-dot ${item.status}`}/><span>{item.workType}</span><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div><h4>{item.title}</h4><p>{item.objective}</p>{parent&&<small>Under: {parent.title}</small>}</article>;
+      })}</div> : <p className="kanban-empty">No items in this column.</p>}</div>;
+    })}</section>
+    <p className="board-footnote"><ShieldAlert size={13}/>Statuses are canonical records, not estimates. No agent run is active; proposed work has not started.</p>
+  </div>;
+}
+
+function ProjectChat({projectName}:{projectName:string}) {
+  return <div className="chat-page"><section className="chat-heading"><div className="eyebrow">PROJECT CONVERSATION</div><h2>Talk through {projectName}</h2><p>Chat is meant to help discuss the goal and the work—not replace the outcome hierarchy or task board.</p></section><section className="chat-unavailable"><div className="chat-agent-mark"><MessageSquare size={18}/></div><div><div className="eyebrow">AI CONNECTION STATUS</div><h3>Project chat is not connected yet</h3><p>This screen currently has no project-scoped AI service. Messages typed here would not reach an AI, so the composer is intentionally disabled rather than pretending to send them. You can still talk with me in this coding conversation.</p><p>Connecting chat requires a project-specific provider/data policy and enforceable usage controls; it must also read the same canonical goal and work tree shown here.</p></div></section><div className="chat-composer disabled"><textarea aria-label="Chat message" disabled placeholder="AI chat is unavailable in this prototype"/><button className="button primary" disabled>Send</button><small>No text is saved or sent from this disabled composer.</small></div></div>;
 }
 
 function InboxView({questions,selected,selectedOption,setSelectedOption,note,setNote,busy,choose,answer,reject}:{questions:Question[];selected:QuestionDetail|null;selectedOption:string;setSelectedOption:(value:string)=>void;note:string;setNote:(value:string)=>void;busy:boolean;choose:(id:string)=>void;answer:()=>void;reject:()=>void}) {

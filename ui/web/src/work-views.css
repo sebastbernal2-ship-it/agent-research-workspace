@@ -1,0 +1,36 @@
+.nav-status{color:#98886b!important;font-size:8px!important;font-weight:500}
+.board-page,.chat-page{width:100%;max-width:1500px;margin:0 auto;padding:24px 28px 32px;overflow:auto}
+.board-status-banner{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:17px 19px;border:1px solid #e1e8de;border-radius:8px;background:#f2f6ef}
+.board-status-banner h2{margin:5px 0;color:#242a23;font-size:17px;font-weight:570;letter-spacing:-.025em}
+.board-status-banner p{max-width:700px;margin:0;color:#6d756a;font-size:10px;line-height:1.55}
+.board-total{width:42px;height:42px;display:grid;place-items:center;align-content:center;flex:0 0 auto;border:1px solid #dce5d8;border-radius:8px;color:#445144;background:#f9fdf6;font-size:15px;font-weight:600}
+.board-total small{color:#7d8579;font-size:7px;font-weight:450;text-transform:uppercase;letter-spacing:.06em}
+.kanban-board{display:grid;grid-template-columns:repeat(6,minmax(205px,1fr));gap:10px;margin-top:17px;overflow-x:auto;padding-bottom:8px;align-items:start}
+.kanban-column{min-height:210px;padding:10px;border:1px solid #e5eae2;border-radius:7px;background:#f4f7f2}
+.kanban-column>header{display:flex;align-items:center;gap:8px;padding:2px 1px 10px;border-bottom:1px solid #e1e6de}
+.kanban-column>header h3{min-width:0;flex:1;margin:0;color:#4a5248;font-size:10px;font-weight:600}
+.kanban-column>header span{min-width:20px;height:18px;display:grid;place-items:center;border:1px solid #e0e5dd;border-radius:10px;color:#747c71;background:#fbfcfa;font-size:8px}
+.kanban-cards{display:grid;gap:8px;padding-top:8px}
+.kanban-card{padding:10px;border:1px solid #e4e9e1;border-radius:6px;background:#fff;box-shadow:0 1px 2px #14210b08}
+.kanban-card-meta{display:flex;align-items:center;gap:6px;color:#858c82;font-size:8px;text-transform:capitalize}
+.kanban-card-meta .work-status{margin-left:auto}
+.kanban-card h4{margin:8px 0 5px;color:#343c32;font-size:10px;font-weight:600;line-height:1.4}
+.kanban-card p{margin:0;color:#6f776c;font-size:9px;line-height:1.5;white-space:pre-line}
+.kanban-card>small{display:block;margin-top:8px;padding-top:7px;border-top:1px solid #edf0ea;color:#8b9288;font-size:8px;line-height:1.4}
+.kanban-empty{margin:13px 2px;color:#92998f;font-size:9px;line-height:1.5}
+.board-footnote{display:flex;align-items:flex-start;gap:6px;margin:12px 1px;color:#868d83;font-size:8px;line-height:1.5}
+.board-footnote svg{flex:0 0 auto;color:#a1792a}
+.chat-page{max-width:900px}
+.chat-heading{padding:10px 2px 19px;border-bottom:1px solid #e8ece5}
+.chat-heading h2{margin:7px 0;color:#252b24;font-size:22px;font-weight:560;letter-spacing:-.035em}
+.chat-heading p{margin:0;color:#70786d;font-size:10px;line-height:1.55}
+.chat-unavailable{display:flex;align-items:flex-start;gap:13px;margin:22px 0;padding:18px;border:1px solid #e8dfc5;border-radius:8px;background:#f8f5ec}
+.chat-agent-mark{width:31px;height:31px;display:grid;place-items:center;flex:0 0 auto;border:1px solid #e6dbbc;border-radius:7px;color:#987522;background:#fcfaf5}
+.chat-unavailable h3{margin:5px 0 8px;color:#403b2d;font-size:13px;font-weight:600}
+.chat-unavailable p{max-width:680px;margin:6px 0;color:#6d6654;font-size:10px;line-height:1.6}
+.chat-composer{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:10px;border:1px solid #e1e5dd;border-radius:8px;background:#f7f9f5}
+.chat-composer textarea{min-height:48px;resize:vertical;padding:8px;border:1px solid #e1e5dd;border-radius:5px;color:#6d756a;background:#f1f3ef;font:inherit;font-size:10px}
+.chat-composer .button{align-self:start}
+.chat-composer small{grid-column:1/-1;color:#8a9087;font-size:8px}
+@media(max-width:1100px){.kanban-board{grid-template-columns:repeat(6,minmax(190px,1fr))}.board-page,.chat-page{padding-right:20px;padding-left:20px}}
+@media(max-width:700px){.nav-status{display:none}.board-page,.chat-page{padding:16px 12px 22px}.board-status-banner{padding:13px}.board-status-banner h2{font-size:14px}.kanban-board{grid-template-columns:repeat(6,minmax(170px,78vw));gap:8px}.chat-unavailable{padding:13px;gap:9px}.chat-heading h2{font-size:19px}}
