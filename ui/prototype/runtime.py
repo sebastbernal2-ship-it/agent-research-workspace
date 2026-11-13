@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from harness.control_plane import ProjectControlPlane
+from harness.control_plane import ControlPlaneError, ProjectControlPlane
 from harness.event_store import SQLiteEventStore
 from harness.inbox import (
     InboxApplication,
@@ -20,6 +21,7 @@ from harness.inbox import (
 )
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
+from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
 PROJECT_ID = "project.northstar"
@@ -37,8 +39,8 @@ class LocalDemoPrincipal(PrincipalProvider):
         return dict(DEMO_USER)
 
 
-class SingleProjectDemoAccess(ProjectAccessPolicy):
-    """Demo-only allowlist. It is not suitable as a production access policy."""
+class LocalDemoProjectAccess(ProjectAccessPolicy):
+    """Single-user demo access to existing local projects; not production authorization."""
 
     def __init__(self, store: SQLiteEventStore):
         self.store = store
@@ -47,8 +49,8 @@ class SingleProjectDemoAccess(ProjectAccessPolicy):
         if actor != DEMO_USER or not self.store.verified_events(project_id):
             raise InboxForbidden("project access denied")
         if action not in {
-            "project.read", "work.read", "work.create", "inbox.read", "inbox.answer", "inbox.close",
-            "run.read", "evidence.read", "artifact.read",
+            "project.read", "project.charter.revise", "work.read", "work.create", "inbox.read", "inbox.answer", "inbox.close",
+            "run.read", "evidence.read", "artifact.read", "work.approve", "discussion.read",
         }:
             raise InboxForbidden("action is not available in the local demo")
 
@@ -75,7 +77,7 @@ class PrototypeRuntime:
         self.projector = Projector(self.store)
         self.inbox = InboxReadModel(self.store)
         principal = LocalDemoPrincipal()
-        access_policy = SingleProjectDemoAccess(self.store)
+        access_policy = LocalDemoProjectAccess(self.store)
         self.application = InboxApplication(
             self.inbox, self.control, principal, access_policy,
         )
@@ -226,13 +228,24 @@ class PrototypeRuntime:
         return projects
 
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
-        if set(request) != {"name", "goal"}:
-            raise ValueError("project creation requires only name and goal")
+        if not isinstance(request, dict):
+            raise ValueError("project creation body must be an object")
+        mode = request.get("mode", "new")
+        allowed_fields = {"name", "goal"} if mode == "new" else {"name", "goal", "repositoryPath", "inspectionFingerprint"}
+        if mode not in {"new", "existing"} or set(request) - allowed_fields - {"mode"} or not {"name", "goal"}.issubset(request):
+            raise ValueError("project creation fields do not match the selected project type")
         name, goal = request["name"], request["goal"]
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
             raise ValueError("name must contain 1 to 100 characters")
         if not isinstance(goal, str) or not goal.strip() or len(goal.strip()) > 1000:
             raise ValueError("goal must contain 1 to 1000 characters")
+        report = None
+        if mode == "existing":
+            if not isinstance(request.get("repositoryPath"), str) or not isinstance(request.get("inspectionFingerprint"), str):
+                raise ValueError("existing projects require an inspected local Git repository")
+            report = self.inspect_repository(request["repositoryPath"])
+            if report["fingerprint"] != request["inspectionFingerprint"]:
+                raise ControlPlaneError("the repository changed since inspection; inspect it again before creating the project")
         project_id = f"project.local-{secrets.token_hex(8)}"
         project_directory = self.workspace_root / project_id
         project_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -248,10 +261,126 @@ class PrototypeRuntime:
                 },
                 "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
             })
+            if report is not None:
+                self._start_alignment_interview(project_id, report)
         except Exception:
-            project_directory.rmdir()
+            if self.control.projector.replay(project_id)["project"] is None:
+                project_directory.rmdir()
             raise
         return project
+
+    def inspect_repository(self, repository_path: str) -> dict[str, Any]:
+        try:
+            allowed_root = self.workspace_root.parent
+            return inspect_repository(repository_path, allowed_root=allowed_root)
+        except RepositoryInspectionError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _start_alignment_interview(self, project_id: str, report: dict[str, Any]) -> None:
+        work_id = "work.alignment-intake"
+        now = datetime.now(timezone.utc).isoformat()
+        self.control.create_work({
+            "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id,
+            "workId": work_id, "revision": 1, "parentWorkId": None,
+            "title": "Guided repository alignment", "objective": "Review repository-derived hypotheses with the project owner before proposing delivery work.",
+            "workType": "planning", "status": "ready", "owner": DEMO_VP,
+            "dependsOn": [], "capabilityGrantIds": [],
+            "acceptanceCriteria": ["Record the owner's vision, current-state corrections, scope boundaries, unresolved choices, and approval preferences."],
+            "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
+        }, actor=DEMO_USER)
+        segments = alignment_segments(report)
+        plan = {"kind": "repo_alignment_plan.v1", "repository": report, "segments": segments}
+        self.control.add_discussion_message(
+            project_id, work_id, thread_id="thread.alignment-intake", message_type="proposal",
+            content=json.dumps(plan, ensure_ascii=False, separators=(",", ":")),
+            actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]],
+        )
+        self._open_alignment_question(project_id, 0, segments[0], work_id, now)
+
+    def _open_alignment_question(self, project_id: str, index: int, segment: dict[str, str], work_id: str, now: str | None = None) -> None:
+        created_at = now or datetime.now(timezone.utc).isoformat()
+        question_id = f"question.alignment.{index + 1:02d}"
+        self.control.open_question({
+            "recordType": "human_question", "schemaVersion": "0.1", "projectId": project_id,
+            "questionId": question_id, "questionType": "clarification", "priority": "high",
+            "blocking": True, "requestedBy": DEMO_VP, "workIds": [work_id], "runId": None,
+            "questionText": f"{index + 1} of 5 · {segment['title']}\n\n{segment['prompt']}",
+            "impact": segment["evidence"][:3500],
+            "options": ([
+                {"optionId": "option.alignment.keep-goal", "label": "Keep the initial goal text", "consequence": "The goal you reviewed before creating the project remains canonical."},
+                {"optionId": "option.alignment.replace-goal", "label": "Replace it with my response", "consequence": "Enter the complete replacement goal in the response box."},
+            ] if index == 0 else []),
+            "status": "open", "createdAt": created_at,
+        })
+
+    def _advance_alignment_interview(self, project_id: str, question_id: str) -> None:
+        match = re.fullmatch(r"question\.alignment\.(\d{2})", question_id)
+        if not match:
+            return
+        state = self.control.projector.replay(project_id)
+        plan_message = next((message for message in state["messages"] if message["threadId"] == "thread.alignment-intake"), None)
+        if plan_message is None:
+            raise RuntimeError("canonical alignment plan is missing")
+        plan = json.loads(plan_message["content"])
+        index = int(match.group(1))
+        segments = plan["segments"]
+        work_id = "work.alignment-intake"
+        if index < len(segments):
+            next_id = f"question.alignment.{index + 1:02d}"
+            if next_id not in state["questions"]:
+                self._open_alignment_question(project_id, index, segments[index], work_id)
+            return
+        work = state["workItems"][work_id]
+        if work["status"] == "ready":
+            self.control.transition_work(
+                project_id, work_id, "completed", actor=DEMO_USER,
+                reason="All repository-alignment interview segments were answered by the project owner.",
+                expected_revision=work["revision"],
+            )
+        completion_text = "Repository alignment interview completed. The recorded answers are project input; no delivery task was automatically approved or started."
+        state = self.control.projector.replay(project_id)
+        if not any(message["content"] == completion_text for message in state["messages"]):
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id="thread.alignment-intake", message_type="decision",
+                content=completion_text, actor=DEMO_USER,
+                visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]],
+            )
+
+    def resume_alignment(self, project_id: str) -> None:
+        self.project_application._authorize(project_id, "inbox.read")
+        state = self.control.projector.replay(project_id)
+        plan_message = next((message for message in state["messages"] if message["threadId"] == "thread.alignment-intake"), None)
+        if plan_message is None:
+            return
+        if any(question["status"] == "open" for question in state["questions"].values() if question["questionId"].startswith("question.alignment.")):
+            return
+        plan = json.loads(plan_message["content"])
+        answered = [
+            question for question in state["questions"].values()
+            if question["questionId"].startswith("question.alignment.") and question["status"] == "answered"
+        ]
+        if answered:
+            latest = max(answered, key=lambda question: question["questionId"])
+            self._advance_alignment_interview(project_id, latest["questionId"])
+        elif plan.get("segments"):
+            self._open_alignment_question(project_id, 0, plan["segments"][0], "work.alignment-intake")
+
+    def approve_work(self, project_id: str, work_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"expectedRevision", "decision"} or type(request["expectedRevision"]) is not int:
+            raise ValueError("approval requires expectedRevision and decision")
+        if request["decision"] not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        actor = self.project_application._authorize(project_id, "work.approve")
+        state = self.control.projector.replay(project_id)
+        work = state["workItems"].get(work_id)
+        if work is None or work["status"] != "proposed":
+            raise ControlPlaneError("only a proposed work item may be approved or declined")
+        next_status = "ready" if request["decision"] == "approve" else "cancelled"
+        reason = "Human approved this proposed item; approval makes it ready but does not start execution." if next_status == "ready" else "Human declined this proposed item."
+        return self.control.transition_work(
+            project_id, work_id, next_status, actor=actor, reason=reason,
+            expected_revision=request["expectedRevision"],
+        )
 
     def create_work(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         self.project_application._authorize(project_id, "work.create")
@@ -343,10 +472,33 @@ class PrototypeRuntime:
                 "actorLabel": actor_label,
                 "occurredAt": event["occurredAt"],
             })
+        alignment = None
+        plan_message = next((message for message in state["messages"] if message["threadId"] == "thread.alignment-intake"), None)
+        if plan_message is not None:
+            plan = json.loads(plan_message["content"])
+            segments = []
+            for index, segment in enumerate(plan.get("segments", []), start=1):
+                question = state["questions"].get(f"question.alignment.{index:02d}")
+                segments.append({
+                    "index": index, "title": segment["title"], "prompt": segment["prompt"],
+                    "evidence": segment["evidence"],
+                    "status": question["status"] if question else "pending",
+                    "answer": question.get("answer") if question else None,
+                })
+            repository = plan.get("repository", {})
+            intake = state["workItems"].get("work.alignment-intake", {})
+            alignment = {
+                "status": "completed" if intake.get("status") == "completed" else "in_progress",
+                "repositoryName": repository.get("repositoryName"),
+                "branch": repository.get("branch"),
+                "head": repository.get("head"),
+                "segments": segments,
+            }
         return {
             "project": project,
             "workItems": list(state["workItems"].values()),
             "recentEvents": recent_events,
+            "alignment": alignment,
             "counts": {
                 "workItems": len(state["workItems"]),
                 "runningWorkItems": sum(item["status"] == "running" for item in state["workItems"].values()),
@@ -400,15 +552,30 @@ class PrototypeRuntime:
         option_id = request.get("selectedOptionId")
         if option_id is not None and not isinstance(option_id, str):
             raise ValueError("selectedOptionId must be a string")
-        return self.application.answer_question(
+        goal_replacement = None
+        if question_id == "question.alignment.01" and option_id == "option.alignment.replace-goal":
+            marker = "\n\nNote: "
+            goal_replacement = text.split(marker, 1)[1].strip() if marker in text else ""
+            if not goal_replacement or len(goal_replacement) > 1000:
+                raise ValueError("enter a complete replacement goal of at most 1000 characters")
+        answered = self.application.answer_question(
             project_id,
             question_id,
             expected_etag=expected_etag,
             text=text,
             selected_option_id=option_id,
         )
+        if goal_replacement is not None:
+            project = self.control.projector.replay(project_id)["project"]
+            if project["charter"]["goals"] != [goal_replacement]:
+                charter = {**project["charter"], "goals": [goal_replacement]}
+                self.project_application.revise_project_charter(project_id, charter)
+        self._advance_alignment_interview(project_id, question_id)
+        return answered
 
     def close_question(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        if question_id.startswith("question.alignment."):
+            raise ValueError("alignment interview segments must be answered, not rejected")
         if set(request) - {"expectedEtag", "newStatus", "reason"}:
             raise ValueError("request contains unsupported fields")
         expected_etag = _validated_etag(request)

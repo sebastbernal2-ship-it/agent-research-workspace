@@ -1,7 +1,7 @@
-"""Loopback-only HTTP adapter for the synthetic inbox demo.
+"""Loopback-only HTTP adapter for the local project prototype.
 
-This is a development prototype, not an authenticated service. It serves one
-synthetic project and never binds to a non-loopback interface.
+This is a development prototype, not an authenticated service, and never
+binds to a non-loopback interface.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from harness.control_plane import ControlPlaneError, StaleQuestionRevision
-from harness.event_store import EventStoreError
+from harness.event_store import ConcurrentWriteConflict, EventStoreError
 from harness.inbox import InboxForbidden, InboxNotFound
 
 from .runtime import PROJECT_ID, PrototypeRuntime
@@ -26,6 +26,9 @@ BUILT_UI_ROOT = STATIC_ROOT / "build"
 MAX_JSON_BODY_BYTES = 16 * 1024
 PROJECT_PATH = re.compile(r"^/api/v1/projects/([^/]+)$")
 WORK_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/work$")
+WORK_APPROVAL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/work/([^/]+)/approval$")
+ALIGNMENT_RESUME_PATH = re.compile(r"^/api/v1/projects/([^/]+)/alignment/resume$")
+REPOSITORY_INSPECTION_PATH = "/api/v1/repositories/inspect"
 PROJECT_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/(runs|evidence|artifacts)$")
 INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
 INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
@@ -139,8 +142,8 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._error(403, "project_access_denied", "This project is not available in the local demo.")
         except InboxNotFound:
             self._error(404, "not_found", "The requested project or inbox item was not found.")
-        except StaleQuestionRevision:
-            self._error(409, "stale_revision", "This inbox item changed. Refresh it before deciding.")
+        except (StaleQuestionRevision, ConcurrentWriteConflict):
+            self._error(409, "stale_revision", "The project state changed. Refresh it before deciding.")
         except ControlPlaneError:
             self._error(409, "command_conflict", "The command conflicts with the current project state.")
         except ValueError:
@@ -227,8 +230,30 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         path = urlsplit(self.path).path
+        if path == REPOSITORY_INSPECTION_PATH:
+            def inspect() -> None:
+                if set(body) != {"repositoryPath"}:
+                    raise ValueError("repository inspection requires only repositoryPath")
+                self._send_json(200, {"report": self.runtime.inspect_repository(body["repositoryPath"])})
+            self._run(inspect)
+            return
         if path == "/api/v1/projects":
             self._run(lambda: self._send_json(201, {"project": self.runtime.create_project(body)}))
+            return
+        alignment_match = ALIGNMENT_RESUME_PATH.fullmatch(path)
+        if alignment_match:
+            project_id = unquote(alignment_match.group(1))
+            def resume_alignment() -> None:
+                if body:
+                    raise ValueError("alignment resume accepts an empty object")
+                self.runtime.resume_alignment(project_id)
+                self._send_json(200, {"status": "resumed"})
+            self._run(resume_alignment)
+            return
+        approval_match = WORK_APPROVAL_PATH.fullmatch(path)
+        if approval_match:
+            project_id, work_id = map(unquote, approval_match.groups())
+            self._run(lambda: self._send_json(200, {"workItem": self.runtime.approve_work(project_id, work_id, body)}))
             return
         work_match = WORK_COLLECTION_PATH.fullmatch(path)
         if work_match:

@@ -46,15 +46,19 @@ class PrototypeStructureTests(unittest.TestCase):
 
     def test_core_project_work_inbox_and_limitations_are_visible(self):
         for text in (
-            "Create a project", "Add an outcome or nested step", "OPEN DECISIONS",
+            "New project", "Existing project", "Inspect repository", "five-part alignment interview",
+            "Alignment interview", "Add an outcome or nested step", "OPEN DECISIONS",
             "No project-scoped model or worker is connected", "not authenticated",
-            "Task board", "Project chat", "Nothing is running right now",
-            "Project chat is not connected yet", "KanbanBoard", "ProjectChat",
+            "Task board", "Project chat", "Nothing is running right now", "Approve task",
+            "Project auto-run", "Project chat is not connected yet", "KanbanBoard", "ProjectChat",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)
         self.assertIn("/answers", self.tsx)
         self.assertIn("/closure", self.tsx)
+        self.assertIn("/api/v1/repositories/inspect", self.tsx)
+        self.assertIn("/alignment/resume", self.tsx)
+        self.assertIn("/approval", self.tsx)
 
 
 if __name__ == "__main__":

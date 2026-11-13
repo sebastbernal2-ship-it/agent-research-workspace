@@ -6,6 +6,7 @@ from copy import deepcopy
 from hashlib import sha256
 from datetime import datetime, timezone
 from typing import Any, Callable
+from uuid import uuid4
 
 from .event_store import ConcurrentWriteConflict, EventStoreError, SQLiteEventStore
 from .inbox import InboxReadModel
@@ -143,6 +144,46 @@ class ProjectControlPlane:
         )
         self.store.append(event, expected_sequence=state["_eventSequence"])
         return self.projector.replay(project_id)["workItems"][work_id]
+
+    def add_discussion_message(
+        self,
+        project_id: str,
+        work_id: str,
+        *,
+        thread_id: str,
+        message_type: str,
+        content: str,
+        actor: dict[str, str],
+        visible_to: list[str],
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable project discussion message and its content blob."""
+        if message_type not in {"proposal", "question", "challenge", "evidence", "revision", "decision", "status"}:
+            raise ControlPlaneError("unsupported discussion message type")
+        if not isinstance(content, str) or not content.strip() or len(content.encode("utf-8")) > 128_000:
+            raise ControlPlaneError("discussion content must be nonempty and at most 128 KiB")
+        if not isinstance(visible_to, list) or not visible_to or any(not isinstance(item, str) or not item for item in visible_to):
+            raise ControlPlaneError("discussion visibility must list at least one actor")
+        if len(set(visible_to)) != len(visible_to):
+            raise ControlPlaneError("discussion visibility must not contain duplicate actors")
+        state = self.projector.replay(project_id)
+        if state["project"] is None or work_id not in state["workItems"]:
+            raise ControlPlaneError("discussion message must reference existing project work")
+        content_ref, content_hash = self.store.put_blob(content)
+        event_id = f"event.discussion.message.{uuid4().hex}"
+        event = self._event(
+            project_id,
+            "discussion.message_added",
+            actor,
+            {
+                "workId": work_id, "threadId": thread_id, "messageType": message_type,
+                "contentRef": content_ref, "contentHash": content_hash, "visibleTo": visible_to,
+            },
+            event_id=event_id,
+            occurred_at=occurred_at,
+        )
+        self.store.append(event, expected_sequence=state["_eventSequence"])
+        return next(message for message in self.projector.replay(project_id)["messages"] if message["eventId"] == event_id)
 
     def revise_project_charter(
         self,

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -103,6 +104,107 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(reopened_work[0]["title"], "Explore the question")
         self.assertEqual(reopened_work[1]["parentWorkId"], parent_id)
         self.assertTrue(restarted.store.verify(project_id))
+
+    def test_existing_project_inspection_starts_a_durable_sequential_alignment_interview(self):
+        repo = self.workspace_root.parent / "trump-speech-predictor-fixture"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+        (repo / "README.md").write_text("# Speech predictor\n\nForecast future speech topics from reviewed historical evidence.\n", encoding="utf-8")
+        (repo / "docs").mkdir()
+        (repo / "docs" / "scope.md").write_text("# Scope\n\nRetrospective research is supported; live markets are undecided.\n", encoding="utf-8")
+        (repo / ".env").write_text("API_KEY=do-not-read-sentinel\n", encoding="utf-8")
+        (repo / "data").mkdir()
+        (repo / "data" / "bulk.csv").write_text("do not read bulk sentinel\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md", "docs", ".env"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "fixture"], check=True, capture_output=True)
+
+        status, inspected, _ = self.request(
+            "/api/v1/repositories/inspect", method="POST",
+            payload={"repositoryPath": str(repo)}, headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200)
+        report = inspected["report"]
+        self.assertNotIn("do-not-read-sentinel", json.dumps(report))
+        self.assertNotIn("do not read bulk sentinel", json.dumps(report))
+        self.assertEqual(len(report["documents"]), 2)
+
+        status, created, _ = self.request(
+            "/api/v1/projects", method="POST",
+            payload={
+                "mode": "existing", "name": "My predictor", "goal": "Forecast future speech topics.",
+                "repositoryPath": str(repo), "inspectionFingerprint": report["fingerprint"],
+            }, headers=self.write_headers(),
+        )
+        self.assertEqual(status, 201, created)
+        project_id = created["project"]["projectId"]
+        summary_status, summary, _ = self.request(f"/api/v1/projects/{project_id}")
+        self.assertEqual(summary_status, 200)
+        self.assertEqual([item["workId"] for item in summary["workItems"]], ["work.alignment-intake"])
+        self.assertEqual(summary["counts"]["openQuestions"], 1)
+
+        for index in range(1, 6):
+            status, question, _ = self.request(f"/api/v1/projects/{project_id}/inbox/question.alignment.{index:02d}")
+            self.assertEqual(status, 200)
+            self.assertIn(f"{index} of 5", question["questionText"])
+            answer_payload = {"expectedEtag": question["etag"], "text": f"Owner's answer for segment {index}."}
+            if index == 1:
+                answer_payload.update({
+                    "selectedOptionId": "option.alignment.replace-goal",
+                    "text": "Replace it with my response\n\nNote: The confirmed goal is to produce reviewed forecasts from speech transcripts.",
+                })
+            status, _, _ = self.request(
+                f"/api/v1/projects/{project_id}/inbox/question.alignment.{index:02d}/answers",
+                method="POST", payload=answer_payload, headers=self.write_headers(),
+            )
+            self.assertEqual(status, 200)
+            if index == 1:
+                restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+                sequence_before_resume = restarted.projector.replay(project_id)["_eventSequence"]
+                restarted.resume_alignment(project_id)
+                self.assertEqual(restarted.projector.replay(project_id)["_eventSequence"], sequence_before_resume)
+            if index < 5:
+                next_status, next_questions, _ = self.request(f"/api/v1/projects/{project_id}/inbox?status=open")
+                self.assertEqual(next_status, 200)
+                self.assertEqual([item["questionId"] for item in next_questions["questions"]], [f"question.alignment.{index + 1:02d}"])
+
+        final_status, final_summary, _ = self.request(f"/api/v1/projects/{project_id}")
+        self.assertEqual(final_status, 200)
+        self.assertEqual(final_summary["counts"]["openQuestions"], 0)
+        self.assertEqual(final_summary["workItems"][0]["status"], "completed")
+        self.assertEqual(final_summary["project"]["charter"]["goals"], ["The confirmed goal is to produce reviewed forecasts from speech transcripts."])
+        self.assertEqual(final_summary["alignment"]["status"], "completed")
+        self.assertIn("Owner's answer for segment 2", final_summary["alignment"]["segments"][1]["answer"]["text"])
+        self.assertTrue(self.runtime.store.verify(project_id))
+        messages = self.runtime.project_application.list_messages(project_id)
+        self.assertIn("interview completed", messages[-1]["content"])
+
+    def test_proposed_work_requires_per_item_approval_to_become_ready(self):
+        status, created, _ = self.request(
+            "/api/v1/projects", method="POST",
+            payload={"name": "Approval test", "goal": "Review work before starting."}, headers=self.write_headers(),
+        )
+        self.assertEqual(status, 201)
+        project_id = created["project"]["projectId"]
+        status, work, _ = self.request(
+            f"/api/v1/projects/{project_id}/work", method="POST",
+            payload={"title": "Proposed step", "objective": "A test proposal."}, headers=self.write_headers(),
+        )
+        item = work["workItem"]
+        self.assertEqual(item["status"], "proposed")
+        status, approved, _ = self.request(
+            f"/api/v1/projects/{project_id}/work/{item['workId']}/approval", method="POST",
+            payload={"expectedRevision": item["revision"], "decision": "approve"}, headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(approved["workItem"]["status"], "ready")
+        self.assertIsNone(approved["workItem"].get("finishedAt"))
+        stale_status, _, _ = self.request(
+            f"/api/v1/projects/{project_id}/work/{item['workId']}/approval", method="POST",
+            payload={"expectedRevision": item["revision"], "decision": "approve"}, headers=self.write_headers(),
+        )
+        self.assertEqual(stale_status, 409)
 
     def test_local_answer_and_rejection_persist_across_runtime_restart(self):
         status, project, _ = self.request(f"/api/projects/{PROJECT_ID}")

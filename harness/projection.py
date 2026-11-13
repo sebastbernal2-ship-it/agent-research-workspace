@@ -16,7 +16,7 @@ class ProjectionError(IntegrityFailure):
 
 WORK_STATUS_TRANSITIONS = {
     "proposed": {"ready", "cancelled"},
-    "ready": {"running", "blocked", "waiting_human", "cancelled"},
+    "ready": {"running", "blocked", "waiting_human", "completed", "cancelled"},
     "running": {"blocked", "waiting_human", "verifying", "completed", "failed", "cancelled"},
     "blocked": {"ready", "waiting_human", "failed", "cancelled"},
     "waiting_human": {"ready", "blocked", "cancelled"},
