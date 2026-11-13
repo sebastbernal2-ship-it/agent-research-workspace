@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from harness.agent_router import AgentRouteProfile, AgentRouter
-from harness.control_plane import ProjectControlPlane
+from harness.control_plane import ControlPlaneError, ProjectControlPlane
 from harness.codex_cli import CodexCliWorker, CodexInvocation
 from harness.codex_execution import CodexExecutionFactory
 from harness.codex_queue_factory import (
@@ -19,7 +19,7 @@ from harness.durable_queue import SQLiteWorkQueue
 from harness.event_store import SQLiteEventStore
 from harness.organization_runtime import OrganizationCoordinator, WorkflowStatus
 from harness.projection import Projector
-from harness.testing import USER, seed_synthetic_project
+from harness.testing import USER, VP, seed_synthetic_project
 
 PROJECT = "project.codex.queue"
 WORK = "work.codex.queue"
@@ -37,7 +37,7 @@ class CodexQueueFactoryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="codex-queue-factory-")
         self.root = Path(self.temp.name)
         self.store = SQLiteEventStore(self.root / "canonical.sqlite3")
-        seed_synthetic_project(self.store, project_id=PROJECT, work_id=WORK)
+        self.control = seed_synthetic_project(self.store, project_id=PROJECT, work_id=WORK)
         self.queue = SQLiteWorkQueue(self.store)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
@@ -247,7 +247,48 @@ while True:
         self.assertEqual(descriptor["actor"], AGENT)
         self.assertEqual(descriptor["adapter"], ADAPTER)
         self.assertEqual(len(descriptor["contextHash"]), 64)
+        self.assertEqual(descriptor["canonicalSequence"], Projector(self.store).replay(PROJECT)["_eventSequence"])
         self.assertEqual(descriptor["descriptorVersion"], 1)
+
+    def test_unrelated_canonical_change_invalidates_prepared_sequence(self):
+        descriptor = self.descriptor()
+        self.control.create_work({
+            "recordType": "work_item", "schemaVersion": "0.1", "projectId": PROJECT,
+            "workId": "work.unrelated", "revision": 1, "parentWorkId": None,
+            "title": "Unrelated proposed work", "objective": "Does not change this task context.",
+            "workType": "research", "status": "proposed", "owner": VP,
+            "dependsOn": [], "capabilityGrantIds": [],
+            "acceptanceCriteria": ["Remain outside the dispatch context."],
+            "createdBy": USER, "createdAt": "2026-04-16T12:00:00Z",
+            "updatedAt": "2026-04-16T12:00:00Z",
+        }, actor=USER)
+        self.enqueue(payload=descriptor)
+        with self.assertRaisesRegex(CodexQueueExecutionFactoryError, "canonical project state changed"):
+            asyncio.run(self.coordinator.run_queued(
+                self.queue, "worker.codex.synthetic", self.factory(), lease_seconds=10,
+            ))
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(Projector(self.store).replay(PROJECT)["agentRuns"], {})
+
+    def test_canonical_change_after_factory_resolution_is_fenced_before_run_start(self):
+        self.enqueue()
+        trusted_factory = self.factory()
+
+        def mutate_after_resolution(job):
+            execution = trusted_factory(job)
+            charter = Projector(self.store).replay(PROJECT)["project"]["charter"]
+            charter["goals"] = ["Changed after execution resolution."]
+            self.control.revise_project_charter(PROJECT, charter, actor=USER)
+            return execution
+
+        with self.assertRaisesRegex(ControlPlaneError, "canonical project state changed"):
+            asyncio.run(self.coordinator.run_queued(
+                self.queue, "worker.codex.synthetic", mutate_after_resolution, lease_seconds=10,
+            ))
+        self.assertFalse(self.marker.exists())
+        state = Projector(self.store).replay(PROJECT)
+        self.assertEqual(state["agentRuns"], {})
+        self.assertEqual(state["workItems"][WORK]["status"], "ready")
 
     def test_project_charter_changes_invalidate_the_prepared_context_hash(self):
         before = self.descriptor()["contextHash"]

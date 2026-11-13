@@ -93,6 +93,7 @@ class CodexQueueExecutionFactory:
             "verificationActor": dict(verification_actor),
             "adapter": {"name": profile.adapter_name, "version": profile.adapter_version},
             "contextHash": context_hash,
+            "canonicalSequence": state["_eventSequence"],
             "correlationId": correlation_id,
         }
         if parent_run_id is not None:
@@ -135,6 +136,9 @@ class CodexQueueExecutionFactory:
         ):
             raise CodexQueueExecutionFactoryError("claimed queue job identity/generation is invalid")
         state = self.projector.replay(project_id)
+        canonical_sequence = descriptor.get("canonicalSequence")
+        if type(canonical_sequence) is not int or canonical_sequence < 0:
+            raise CodexQueueExecutionFactoryError("queue descriptor has no valid canonical sequence")
         work = state["workItems"].get(work_id)
         if work is None:
             raise CodexQueueExecutionFactoryError("queued canonical work does not exist")
@@ -161,6 +165,8 @@ class CodexQueueExecutionFactory:
             raise CodexQueueExecutionFactoryError(str(exc)) from exc
         if descriptor.get("contextHash") != expected_context_hash:
             raise CodexQueueExecutionFactoryError("queued contextHash does not match current canonical project/work inputs")
+        if canonical_sequence != state["_eventSequence"]:
+            raise CodexQueueExecutionFactoryError("canonical project state changed after queued dispatch was prepared")
 
         run_id = self.run_id_factory(job)
         try:
@@ -173,6 +179,7 @@ class CodexQueueExecutionFactory:
                 invocation_factory=self.invocation_factory,
                 verify=self.verify,
                 parent_run_id=descriptor.get("parentRunId"),
+                expected_project_sequence=canonical_sequence,
             )
         except Exception as exc:
             raise CodexQueueExecutionFactoryError("trusted Codex execution could not be built") from exc
@@ -183,6 +190,7 @@ class CodexQueueExecutionFactory:
             or execution.context_hash != descriptor["contextHash"]
             or execution.correlation_id != descriptor["correlationId"]
             or execution.parent_run_id != descriptor.get("parentRunId")
+            or execution.expected_project_sequence != canonical_sequence
         ):
             raise CodexQueueExecutionFactoryError("resolved Codex execution differs from its durable queue descriptor")
         return execution

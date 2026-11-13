@@ -139,6 +139,10 @@ class SQLiteWorkQueueTests(unittest.TestCase):
         invalid["descriptorVersion"] = 2
         with self.assertRaisesRegex(QueueError, "unsupported job descriptor version"):
             self.queue.enqueue("job.v2", PROJECT_ID, WORK_ID, invalid, now=125)
+        invalid_sequence = execution_descriptor()
+        invalid_sequence["canonicalSequence"] = True
+        with self.assertRaisesRegex(QueueError, "canonicalSequence"):
+            self.queue.enqueue("job.invalid-sequence", PROJECT_ID, WORK_ID, invalid_sequence, now=125)
         for field in ("workerId", "placement", "machineCapabilities", "networkPolicy"):
             with self.subTest(field=field):
                 agent_selected_policy = execution_descriptor()

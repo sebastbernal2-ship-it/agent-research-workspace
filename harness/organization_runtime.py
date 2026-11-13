@@ -59,6 +59,7 @@ class WorkExecution:
     execute: Callable[[ExecutionContext], Any]
     verify: Callable[[ExecutionContext], Any]
     parent_run_id: str | None = None
+    expected_project_sequence: int | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class OrganizationCoordinator:
                 or task.context_hash != descriptor["contextHash"]
                 or task.correlation_id != descriptor["correlationId"]
                 or task.parent_run_id != descriptor.get("parentRunId")
+                or task.expected_project_sequence != descriptor.get("canonicalSequence")
             ):
                 raise QueueError("resolved execution does not match its persisted run descriptor")
             state = self.projector.replay(task.project_id)
@@ -430,6 +432,7 @@ class OrganizationCoordinator:
                 context_hash=task.context_hash,
                 correlation_id=task.correlation_id,
                 parent_run_id=task.parent_run_id,
+                expected_project_sequence=task.expected_project_sequence,
                 queue_lease=None if queue_lease is None else {
                     **queue_lease, "now": lease_clock(),
                 },

@@ -70,7 +70,7 @@ class SQLiteWorkQueue:
             "descriptorVersion", "executionKey", "actor", "verificationActor", "adapter",
             "contextHash", "correlationId",
         }
-        if not required.issubset(descriptor) or set(descriptor) - required - {"parentRunId"}:
+        if not required.issubset(descriptor) or set(descriptor) - required - {"parentRunId", "canonicalSequence"}:
             raise QueueError("job descriptor has missing or unsupported fields")
         if type(descriptor["descriptorVersion"]) is not int or descriptor["descriptorVersion"] != 1:
             raise QueueError("unsupported job descriptor version")
@@ -92,6 +92,10 @@ class SQLiteWorkQueue:
             raise QueueError("contextHash must be a lowercase SHA-256 digest")
         if "parentRunId" in descriptor and descriptor["parentRunId"] is not None:
             cls._required_text(descriptor["parentRunId"], "parentRunId")
+        if "canonicalSequence" in descriptor and (
+            type(descriptor["canonicalSequence"]) is not int or descriptor["canonicalSequence"] < 0
+        ):
+            raise QueueError("canonicalSequence must be a non-negative integer")
 
     def enqueue(
         self,

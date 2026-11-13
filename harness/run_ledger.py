@@ -46,6 +46,7 @@ class RunLedger:
         correlation_id: str | None = None,
         parent_run_id: str | None = None,
         occurred_at: str | None = None,
+        expected_project_sequence: int | None = None,
         queue_lease: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(agent, dict) or agent.get("actorType") != "agent":
@@ -55,12 +56,19 @@ class RunLedger:
             raise ControlPlaneError("run ledger does not authorize capability-bearing execution")
         if not isinstance(context_hash, str) or re.fullmatch(r"[a-f0-9]{64}", context_hash) is None:
             raise ValueError("context_hash must be a SHA-256 digest")
+        if expected_project_sequence is not None and (
+            type(expected_project_sequence) is not int or expected_project_sequence < 0
+        ):
+            raise ValueError("expected_project_sequence must be a non-negative integer")
 
         state = self.control.projector.replay(project_id)
         work = state["workItems"].get(work_id)
         if work is None:
             raise ControlPlaneError(f"unknown work item {work_id!r}")
         existing = state["agentRuns"].get(run_id)
+        if existing is None and expected_project_sequence is not None:
+            if state["_eventSequence"] != expected_project_sequence:
+                raise ControlPlaneError("canonical project state changed after queued dispatch was prepared")
         lease_identity = {} if queue_lease is None else {
             "queueJobId": queue_lease.get("jobId"),
             "leaseGeneration": queue_lease.get("leaseGeneration"),
