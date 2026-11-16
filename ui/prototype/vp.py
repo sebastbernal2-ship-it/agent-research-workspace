@@ -388,17 +388,34 @@ class ProjectVP:
         return worktree
 
     # ---- execution -----------------------------------------------------
-    def _eligible(self, state: dict[str, Any], auto: bool) -> dict[str, Any] | None:
+    def _slots(self, state: dict[str, Any]) -> int:
+        """Parallel orchestrators. Repo projects share one worktree, so they stay sequential."""
+        plan = next((m for m in state["messages"] if m["threadId"] == "thread.alignment-intake"), None)
+        try:
+            if plan is not None and (json.loads(plan["content"]).get("repository") or {}).get("repositoryPath"):
+                return 1
+        except ValueError:
+            pass
+        try:
+            return max(1, min(4, int(os.environ.get("NORTHSTAR_PARALLEL", "2"))))
+        except ValueError:
+            return 2
+
+    def _eligible(self, state: dict[str, Any], auto: bool) -> list[dict[str, Any]]:
+        """Up to the free number of slots of tasks whose dependencies are all complete."""
         items = state["workItems"]
-        if any(w["status"] in {"running", "verifying"} for w in items.values()):
-            return None
+        running = sum(1 for w in items.values() if w["status"] in {"running", "verifying"} and not w.get("parentWorkId"))
+        free = self._slots(state) - running
+        picked: list[dict[str, Any]] = []
         for work in sorted(items.values(), key=lambda w: w["createdAt"]):
+            if len(picked) >= free:
+                break
             if work["workId"] in SKIP_WORK or work.get("parentWorkId") and items.get(work["parentWorkId"], {}).get("status") == "running":
                 continue
             ok_status = work["status"] == "ready" or (auto and work["status"] == "proposed")
             if ok_status and all(items[d]["status"] == "completed" for d in work["dependsOn"]):
-                return work
-        return None
+                picked.append(work)
+        return picked
 
     def recover(self, project_id: str) -> int:
         """At startup nothing can still be running: fail interrupted work so it can be retried."""
@@ -418,10 +435,17 @@ class ProjectVP:
         try:
             self._settle_parents(project_id)
             state = self._state(project_id)
-            work = self._eligible(state, self.settings.auto_run(project_id))
-            if work is None:
+            batch = self._eligible(state, self.settings.auto_run(project_id))
+            if not batch:
                 return None
-            return self._run_task(project_id, work)
+            if len(batch) == 1:
+                return self._run_task(project_id, batch[0])
+            threads = [threading.Thread(target=self._run_task, args=(project_id, w), name=f"orchestrator-{w['workId']}") for w in batch]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            return batch[0]["workId"]
         finally:
             self._lock(project_id).release()
 

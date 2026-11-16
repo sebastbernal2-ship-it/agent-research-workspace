@@ -67,6 +67,26 @@ def _validated_etag(request: dict[str, Any]) -> str:
     return etag
 
 
+class _SerializedControl:
+    """Every control-plane write runs under one lock so parallel agents never race on event sequence numbers.
+
+    Each call replays and appends atomically; slow model calls happen outside it.
+    """
+
+    def __init__(self, inner: ProjectControlPlane):
+        self._inner, self._lock = inner, threading.RLock()
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def locked(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return attr(*args, **kwargs)
+        return locked
+
+
 class PrototypeRuntime:
     """Own one canonical store and the demo-only project/inbox facade."""
 
@@ -80,7 +100,7 @@ class PrototypeRuntime:
             raise RuntimeError("project workspace root must not be a symlink")
         self.workspace_root = self.workspace_root.resolve()
         self.store = SQLiteEventStore(db_path)
-        self.control = ProjectControlPlane(self.store)
+        self.control = _SerializedControl(ProjectControlPlane(self.store))
         self._seed_if_empty()
         self.projector = Projector(self.store)
         self.inbox = InboxReadModel(self.store)

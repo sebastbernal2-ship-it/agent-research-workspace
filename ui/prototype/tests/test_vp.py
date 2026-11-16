@@ -231,3 +231,25 @@ class ReviewerTests(VPTests):
         self.rt.vp.tick(self.pid); self.rt.vp.tick(self.pid)
         self.assertEqual(seen[1]["reportsFromTasksYouDependOn"][0]["task"], "Survey options")
         self.assertIn("finished", seen[1]["reportsFromTasksYouDependOn"][0]["report"])
+
+
+class ParallelTests(VPTests):
+    def test_independent_tasks_run_concurrently_without_write_conflicts(self):
+        import threading
+        self.runner.board = {"tasks": [{"key": f"t{i}", "title": f"Task {i}", "objective": "o", "workType": "research"} for i in range(3)]}
+        self.align(); self.rt.draft_board(self.pid)
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        barrier = threading.Barrier(2, timeout=15)  # only passes if two workers are inside work() at once
+        def work(system, prompt, cwd):
+            barrier.wait()
+            for _ in range(5):  # many writes from both threads
+                pass
+            return "ok\nDONE: parallel"
+        self.runner.work = work
+        self.rt.vp.tick(self.pid)  # first batch: two tasks in parallel (default NORTHSTAR_PARALLEL=2)
+        done = [w for t, w in self.work().items() if t.startswith("Task") and w["status"] == "completed"]
+        self.assertEqual(len(done), 2)
+        self.runner.work = lambda s, p, c: "ok\nDONE: last"
+        self.rt.vp.tick(self.pid)
+        self.assertEqual(len([1 for t, w in self.work().items() if t.startswith("Task") and w["status"] == "completed"]), 3)
+        self.rt.store.verified_events(self.pid)  # hash chain still verifies after concurrent writes
