@@ -56,6 +56,84 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             "X-Local-Prototype": "1",
         }
 
+    def test_chat_always_includes_selected_project_context_without_mutating_canonical_history(self):
+        class FakeChat:
+            def __init__(self):
+                self.calls = []
+
+            def status(self):
+                return {"available": True, "model": "offline-fake", "accountLabel": "fake"}
+
+            def send(self, message, history, project_context=None, question_context=None):
+                self.calls.append((message, history, project_context, question_context))
+                return "Synthetic offline response"
+
+        fake = FakeChat()
+        self.runtime.chat_provider = fake
+        event_count = len(self.runtime.store.verified_events(PROJECT_ID))
+        status, connection, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/chat/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(connection["available"])
+
+        status, result, _ = self.request(
+            f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
+            payload={
+                "message": "Discuss this idea.",
+                "history": [{"role": "user", "content": "Earlier message."}],
+            }, headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["response"], "Synthetic offline response")
+        self.assertEqual(len(fake.calls), 1)
+        message, history, context, question_context = fake.calls[0]
+        self.assertEqual((message, history), (
+            "Discuss this idea.", [{"role": "user", "content": "Earlier message."}],
+        ))
+        self.assertEqual(context["project"]["name"], "Northstar research")
+        self.assertEqual(context["project"]["goals"], [
+            "Coordinate research and other project work across agent roles.",
+            "Keep project decisions, evidence, and permissions transparent.",
+        ])
+        self.assertEqual(context["workItemCount"], 4)
+        self.assertEqual(len(context["workItems"]), 4)
+        self.assertEqual(context["openQuestionCount"], 2)
+        self.assertEqual(context["automation"]["projectAutoRun"], "off")
+        self.assertFalse(context["automation"]["chatCanExecuteWork"])
+        self.assertFalse(context["repositoryFilesIncluded"])
+        self.assertIsNone(question_context)
+
+        status, result, _ = self.request(
+            f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
+            payload={"message": "What are the tradeoffs here?", "history": [], "questionId": "question.source-policy"},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200, result)
+        question_context = fake.calls[1][3]
+        self.assertEqual(question_context["questionId"], "question.source-policy")
+        self.assertIn("changes what evidence", question_context["impact"])
+        self.assertEqual(len(question_context["options"]), 2)
+        self.assertEqual(len(question_context["affectedWork"]), 2)
+        self.assertTrue(all("status" in item and "objective" in item for item in question_context["affectedWork"]))
+        self.assertIn("changes what evidence", question_context["impact"])
+        self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
+
+        status, error, _ = self.request(
+            f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
+            payload={"message": "Try to disable context", "history": [], "includeProjectGoal": False},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
+
+        status, error, _ = self.request(
+            "/api/v1/projects/project.other/chat", method="POST",
+            payload={"message": "No project access", "history": []},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["error"], "project_access_denied")
+
     def test_user_can_create_a_project_and_add_proposed_work(self):
         status, created, _ = self.request(
             "/api/v1/projects", method="POST",

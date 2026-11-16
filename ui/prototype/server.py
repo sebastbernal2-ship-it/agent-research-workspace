@@ -40,7 +40,7 @@ def main() -> None:
     print("Northstar local prototype (synthetic data only)")
     print(f"URL: http://127.0.0.1:{args.port}")
     print(f"Canonical SQLite store: {database_path}")
-    print("Bound to 127.0.0.1 only. No real authentication, remote access, model providers, or tools.")
+    print("Bound to 127.0.0.1 only. No real authentication or remote access. A server-side Codex chat bridge is configured for explicit sends only; no project-worker tools or task execution.")
     print("Press Ctrl-C to stop.", flush=True)
     try:
         server.serve_forever(poll_interval=0.25)

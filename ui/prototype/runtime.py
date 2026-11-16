@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ from harness.inbox import (
 )
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
+from .pi_chat import PiChatError, PiCodexChat
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -65,7 +68,10 @@ def _validated_etag(request: dict[str, Any]) -> str:
 class PrototypeRuntime:
     """Own one canonical store and the demo-only project/inbox facade."""
 
-    def __init__(self, db_path: str | Path, *, workspace_root: str | Path | None = None):
+    def __init__(
+        self, db_path: str | Path, *, workspace_root: str | Path | None = None,
+        chat_provider: Any | None = None,
+    ):
         self.workspace_root = Path(workspace_root or Path.home() / "AI-Projects").expanduser()
         self.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.workspace_root.is_symlink():
@@ -85,6 +91,9 @@ class PrototypeRuntime:
             self.control, principal, access_policy,
         )
         self._ensure_workspace_directories()
+        self.chat_provider = chat_provider or PiCodexChat()
+        self._chat_lock = threading.Lock()
+        self._chat_timestamps: list[float] = []
 
     def _ensure_workspace_directories(self) -> None:
         for project_id in self.store._project_ids():
@@ -423,6 +432,116 @@ class PrototypeRuntime:
 
     def projector_project(self) -> dict[str, Any]:
         return self.control.projector.replay(PROJECT_ID)["project"]
+
+    def chat_status(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "project.read")
+        return self.chat_provider.status()
+
+    def send_project_chat(self, project_id: str, request: dict[str, Any]) -> dict[str, str]:
+        if (
+            not isinstance(request, dict)
+            or set(request) - {"message", "history", "questionId"}
+            or not {"message", "history"}.issubset(request)
+        ):
+            raise ValueError("chat requires message, history, and optionally questionId")
+        question_id = request.get("questionId")
+        if question_id is not None and (
+            not isinstance(question_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", question_id) is None
+        ):
+            raise ValueError("questionId must identify an inbox question")
+        PiCodexChat._conversation(request["message"], request["history"])
+        state, _events = self.project_application.get_project_snapshot(project_id)
+        project = state["project"]
+        work_items = list(state["workItems"].values())
+        open_questions = [question for question in state["questions"].values() if question["status"] == "open"]
+        recorded_decisions = [question for question in state["questions"].values() if question["status"] == "answered"]
+        project_context = {
+            "project": {
+                "name": project["name"],
+                "goals": project["charter"].get("goals", [])[:4],
+                "nonGoals": project["charter"].get("nonGoals", [])[:6],
+                "acceptanceCriteria": project["charter"].get("acceptanceCriteria", [])[:6],
+            },
+            "workItems": [
+                {
+                    "workId": item["workId"], "parentWorkId": item.get("parentWorkId"),
+                    "title": item["title"][:160], "objective": item["objective"][:600],
+                    "workType": item["workType"], "status": item["status"],
+                    "dependsOn": item.get("dependsOn", [])[:10],
+                    "acceptanceCriteria": [criterion[:200] for criterion in item.get("acceptanceCriteria", [])[:3]],
+                }
+                for item in work_items[:20]
+            ],
+            "workItemCount": len(work_items),
+            "openQuestions": [
+                {
+                    "questionId": question["questionId"],
+                    "question": question["questionText"][:500],
+                    "blocking": question["blocking"],
+                    "workIds": question.get("workIds", [])[:10],
+                }
+                for question in open_questions[:10]
+            ],
+            "openQuestionCount": len(open_questions),
+            "recordedDecisions": [
+                {
+                    "question": question["questionText"][:400],
+                    "answer": question.get("answer", {}).get("text", "")[:600],
+                }
+                for question in recorded_decisions[-8:]
+            ],
+            "recordedDecisionCount": len(recorded_decisions),
+            "automation": {
+                "projectAutoRun": "off",
+                "chatCanExecuteWork": False,
+                "note": "No project worker is connected; chat cannot start or change work.",
+            },
+            "repositoryFilesIncluded": False,
+            "omittedWorkItems": max(0, len(work_items) - 20),
+            "omittedOpenQuestions": max(0, len(open_questions) - 10),
+        }
+        question_context = None
+        if question_id is not None:
+            question = state["questions"].get(question_id)
+            if question is None:
+                raise InboxNotFound("question was not found")
+            if question["status"] != "open":
+                raise ControlPlaneError("only open questions can be discussed in context")
+            question_context = {
+                "questionId": question["questionId"],
+                "question": question["questionText"][:1000],
+                "questionType": question["questionType"],
+                "priority": question["priority"],
+                "blocking": question["blocking"],
+                **({"impact": question.get("impact", "")[:600]} if not question_id.startswith("question.alignment.") else {}),
+                "options": [
+                    {"label": option["label"][:300], "consequence": option.get("consequence", "")[:500]}
+                    for option in question.get("options", [])[:8]
+                ],
+                "affectedWork": [
+                    {
+                        "title": state["workItems"][work_id]["title"][:160],
+                        "objective": state["workItems"][work_id]["objective"][:500],
+                        "status": state["workItems"][work_id]["status"],
+                    }
+                    for work_id in question.get("workIds", [])[:8]
+                    if work_id in state["workItems"]
+                ],
+            }
+        if not self._chat_lock.acquire(blocking=False):
+            raise PiChatError("A Codex chat request is already in progress.")
+        try:
+            now = time.monotonic()
+            self._chat_timestamps = [stamp for stamp in self._chat_timestamps if now - stamp < 3600]
+            if len(self._chat_timestamps) >= 20:
+                raise PiChatError("The local chat limit is 20 requests per hour. Try again later.")
+            self._chat_timestamps.append(now)
+            return {"response": self.chat_provider.send(
+                request["message"], request["history"], project_context, question_context,
+            )}
+        finally:
+            self._chat_lock.release()
 
     def health(self) -> dict[str, Any]:
         return {

@@ -18,6 +18,7 @@ from harness.control_plane import ControlPlaneError, StaleQuestionRevision
 from harness.event_store import ConcurrentWriteConflict, EventStoreError
 from harness.inbox import InboxForbidden, InboxNotFound
 
+from .pi_chat import PiChatError
 from .runtime import PROJECT_ID, PrototypeRuntime
 
 
@@ -33,6 +34,8 @@ PROJECT_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/(runs|evidence|
 INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
 INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
 INBOX_COMMAND_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
+CHAT_STATUS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/status$")
+CHAT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -146,6 +149,8 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._error(409, "stale_revision", "The project state changed. Refresh it before deciding.")
         except ControlPlaneError:
             self._error(409, "command_conflict", "The command conflicts with the current project state.")
+        except PiChatError as exc:
+            self._error(503, "chat_unavailable", str(exc))
         except ValueError:
             self._error(422, "invalid_request", "The command is invalid or missing required fields.")
         except EventStoreError:
@@ -166,6 +171,12 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/projects":
             self._run(lambda: self._send_json(200, {"items": self.runtime.list_projects()}))
+            return
+
+        chat_status_match = CHAT_STATUS_PATH.fullmatch(path)
+        if chat_status_match:
+            project_id = unquote(chat_status_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
             return
 
         project_match = PROJECT_PATH.fullmatch(path)
@@ -230,6 +241,11 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         path = urlsplit(self.path).path
+        chat_match = CHAT_PATH.fullmatch(path)
+        if chat_match:
+            project_id = unquote(chat_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.send_project_chat(project_id, body)))
+            return
         if path == REPOSITORY_INSPECTION_PATH:
             def inspect() -> None:
                 if set(body) != {"repositoryPath"}:

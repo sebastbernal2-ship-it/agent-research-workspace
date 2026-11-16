@@ -49,9 +49,9 @@ class PrototypeStructureTests(unittest.TestCase):
         for text in (
             "New project", "Existing project", "Inspect repository", "five-part alignment interview",
             "Alignment interview", "Add an outcome or nested step", "OPEN DECISIONS",
-            "No project-scoped model or worker is connected", "not authenticated",
+            "no project worker is connected", "not authenticated",
             "Task board", "Project chat", "Nothing is running right now", "Approve task",
-            "Auto-run", "Project chat is not connected yet", "KanbanBoard", "ProjectChat",
+            "Auto-run", "SERVER-SIDE CODEX CONNECTION", "bounded snapshot of the selected project's charter, work items", "KanbanBoard", "ProjectChat", "QuestionDiscussion", "Discuss this question with Codex",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)
