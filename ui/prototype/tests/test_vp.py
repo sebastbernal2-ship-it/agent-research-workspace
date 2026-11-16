@@ -272,3 +272,41 @@ class RepoChatTests(VPTests):
         self.assertEqual(Path(seen["cwd"]).resolve(), repo.resolve())
         self.assertIn("READ and SEARCH", seen["system"])
         self.assertTrue(self.rt.chat_status(pid)["available"])
+
+
+class DurableChatTests(VPTests):
+    def test_thread_survives_restart_stays_bounded_and_drafts_an_answer(self):
+        self.align()
+        self.runner.explore = lambda system, prompt, cwd: "VP reply"
+        self.runner.summarized = 0
+        orig = self.runner.think
+        def think(system, payload):
+            if "Summarize an owner-and-VP conversation" in system:
+                self.runner.summarized += 1
+                return "Owner wants a small guide; no photos."
+            if "Write the owner's answer" in system:
+                return "I decided: small guide. Open: sources."
+            return orig(system, payload)
+        self.runner.think = think
+        q = self.rt.list_questions(self.pid)["questions"]
+        for i in range(12):  # 24 persisted turns: forces a summary, never an unbounded prompt
+            self.rt.chat_provider.fallback  # RepoChat in use
+            self.rt.send_project_chat(self.pid, {"message": f"turn {i}", "history": []})
+        sizes = []
+        restarted = PrototypeRuntime(Path(self.temp.name) / "c.sqlite3", workspace_root=Path(self.temp.name) / "ws", runner=self.runner)
+        turns = restarted.chat_history(self.pid)["turns"]
+        self.assertEqual(len(turns), 24)  # every turn is still there after a restart
+        summary, recent = restarted._chat_context(self.pid, "thread.chat.project")
+        self.assertGreaterEqual(self.runner.summarized, 1)
+        self.assertIn("small guide", summary)
+        self.assertLessEqual(len(recent), 8)
+
+    def test_draft_answer_comes_from_the_saved_discussion(self):
+        self.runner.explore = lambda s, p, c: "ok"
+        self.runner.think_orig = self.runner.think
+        self.runner.think = lambda system, payload: "I decided: X." if "Write the owner's answer" in system else self.runner.think_orig(system, payload)
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        with self.assertRaises(ValueError):
+            self.rt.draft_answer(self.pid, q)  # nothing discussed yet
+        self.rt.send_project_chat(self.pid, {"message": "what do you think?", "history": [], "questionId": q})
+        self.assertEqual(self.rt.draft_answer(self.pid, q)["draft"], "I decided: X.")

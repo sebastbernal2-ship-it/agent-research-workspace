@@ -39,6 +39,8 @@ CHAT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat$")
 AUTOMATION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/automation$")
 BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
+CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
+CHAT_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/draft$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -182,6 +184,12 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
             return
 
+        history_match = CHAT_HISTORY_PATH.fullmatch(path)
+        if history_match:
+            project_id = unquote(history_match.group(1))
+            question_id = (parse_qs(parsed.query).get("questionId") or [None])[0]
+            self._run(lambda: self._send_json(200, self.runtime.chat_history(project_id, question_id)))
+            return
         activity_match = ACTIVITY_PATH.fullmatch(path)
         if activity_match:
             project_id = unquote(activity_match.group(1))
@@ -263,6 +271,15 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        draft_answer_match = CHAT_DRAFT_PATH.fullmatch(path)
+        if draft_answer_match:
+            project_id = unquote(draft_answer_match.group(1))
+            def draft_answer() -> None:
+                if set(body) != {"questionId"} or not isinstance(body["questionId"], str):
+                    raise ValueError("drafting requires only questionId")
+                self._send_json(200, self.runtime.draft_answer(project_id, body["questionId"]))
+            self._run(draft_answer)
             return
         chat_match = CHAT_PATH.fullmatch(path)
         if chat_match:

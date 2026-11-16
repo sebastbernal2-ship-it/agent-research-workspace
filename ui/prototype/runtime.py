@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import AutomationSettings, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import CHAT_WORK, DRAFT_ANSWER_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -585,7 +585,7 @@ class PrototypeRuntime:
         PiCodexChat._conversation(request["message"], request["history"])
         state, _events = self.project_application.get_project_snapshot(project_id)
         project = state["project"]
-        work_items = list(state["workItems"].values())
+        work_items = [w for w in state["workItems"].values() if w["workId"] != CHAT_WORK]
         open_questions = [question for question in state["questions"].values() if question["status"] == "open"]
         recorded_decisions = [question for question in state["questions"].values() if question["status"] == "answered"]
         project_context = {
@@ -673,13 +673,103 @@ class PrototypeRuntime:
             if len(self._chat_timestamps) >= 20:
                 raise PiChatError("The local chat limit is 20 requests per hour. Try again later.")
             self._chat_timestamps.append(now)
+            # The project record is the single source of truth for the conversation: the browser's copy is ignored.
+            work_id, thread_id = self._chat_target(project_id, question_id)
+            summary, history = self._chat_context(project_id, thread_id)
+            project_context["earlierConversationSummary"] = summary
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id=thread_id, message_type="question", content=request["message"].strip(),
+                actor=DEMO_USER, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            request = {**request, "history": history}
             provider = self.red_provider if mode == "red" else self.chat_provider
             extra = {"project_id": project_id} if getattr(provider, "needs_project_id", False) else {}
-            return {"response": provider.send(
-                request["message"], request["history"], project_context, question_context, **extra,
-            )}
+            reply = provider.send(request["message"], request["history"], project_context, question_context, **extra)
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id=thread_id, message_type="status", content=reply,
+                actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            return {"response": reply}
         finally:
             self._chat_lock.release()
+
+    # ---- durable chat ----------------------------------------------------
+    def _chat_target(self, project_id: str, question_id: str | None) -> tuple[str, str]:
+        state = self.control.projector.replay(project_id)
+        work_id = None
+        if question_id is not None:
+            question = state["questions"].get(question_id)
+            work_id = next((w for w in (question or {}).get("workIds", []) if w in state["workItems"]), None)
+        if work_id is None:
+            work_id = CHAT_WORK
+            if CHAT_WORK not in state["workItems"]:
+                now = datetime.now(timezone.utc).isoformat()
+                self.control.create_work({
+                    "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id, "workId": CHAT_WORK,
+                    "revision": 1, "parentWorkId": None, "title": "Project chat log",
+                    "objective": "Holds the durable owner-and-VP conversation; not a task.", "workType": "other",
+                    "status": "ready", "owner": DEMO_VP, "dependsOn": [], "capabilityGrantIds": [],
+                    "acceptanceCriteria": [], "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
+                }, actor=DEMO_USER)
+        return work_id, f"thread.chat.{question_id}" if question_id else "thread.chat.project"
+
+    def _thread(self, project_id: str, thread_id: str) -> list[dict[str, Any]]:
+        messages = [m for m in self.control.projector.replay(project_id)["messages"] if m["threadId"] == thread_id]
+        return sorted(messages, key=lambda m: m["sequence"])
+
+    @staticmethod
+    def _is_summary(message: dict[str, Any]) -> bool:
+        return message["messageType"] == "revision" and message["content"].startswith("SUMMARY: ")
+
+    def _chat_context(self, project_id: str, thread_id: str) -> tuple[str, list[dict[str, str]]]:
+        """Bounded model context from the durable thread: latest saved summary plus the most recent turns."""
+        messages = self._thread(project_id, thread_id)
+        last = max((i for i, m in enumerate(messages) if self._is_summary(m)), default=-1)
+        summary = messages[last]["content"][len("SUMMARY: "):] if last >= 0 else ""
+        turns = [m for m in messages[last + 1:] if not self._is_summary(m)]
+        if len(turns) > 16 and self.vp.runner.available():
+            older = turns[:-6]
+            try:
+                folded = self.vp.runner.think(SUMMARY_SYSTEM, json.dumps({
+                    "previousSummary": summary,
+                    "turns": [{"by": "owner" if t["actor"]["role"] == "user" else "vp", "text": t["content"][:2000]} for t in older]}))
+                self.control.add_discussion_message(
+                    project_id, messages[0]["workId"], thread_id=thread_id, message_type="revision",
+                    content="SUMMARY: " + folded.strip()[:6000], actor=DEMO_VP,
+                    visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+                summary, turns = folded.strip()[:6000], turns[-6:]
+            except Exception:
+                pass  # summarizing is an optimization; the full thread stays safe in the record
+        recent = turns[-8:]
+        return summary, [
+            {"role": "user" if t["actor"]["role"] == "user" else "assistant", "content": t["content"][:2000]}
+            for t in recent if t["content"].strip()]
+
+    def chat_history(self, project_id: str, question_id: str | None = None) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "project.read")
+        thread_id = f"thread.chat.{question_id}" if question_id else "thread.chat.project"
+        return {"turns": [
+            {"role": "user" if m["actor"]["role"] == "user" else "assistant", "content": m["content"], "at": m["occurredAt"]}
+            for m in self._thread(project_id, thread_id) if not self._is_summary(m)]}
+
+    def draft_answer(self, project_id: str, question_id: str) -> dict[str, str]:
+        """Turn the saved discussion into a proposed answer; the owner edits and records it explicitly."""
+        self.project_application._authorize(project_id, "inbox.read")
+        state = self.control.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None or question["status"] != "open":
+            raise ControlPlaneError("only an open question can have an answer drafted")
+        if not self.vp.runner.available():
+            raise PiChatError("No model runner is available to draft an answer.")
+        summary, turns = self._chat_context(project_id, f"thread.chat.{question_id}")
+        if not turns:
+            raise ValueError("discuss the question first; there is nothing to draft from yet")
+        payload = {"question": question["questionText"][:1500], "options": [o["label"] for o in question.get("options", [])],
+                   "earlierSummary": summary, "discussion": turns,
+                   "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
+                                      for q in state["questions"].values() if q["status"] == "answered"][-12:]}
+        try:
+            return {"draft": self.vp.runner.think(DRAFT_ANSWER_SYSTEM, json.dumps(payload)).strip()}
+        except VPError as exc:
+            raise PiChatError(str(exc)) from exc
 
     def health(self) -> dict[str, Any]:
         return {
@@ -753,7 +843,7 @@ class PrototypeRuntime:
             }
         return {
             "project": project,
-            "workItems": list(state["workItems"].values()),
+            "workItems": [w for w in state["workItems"].values() if w["workId"] != CHAT_WORK],
             "recentEvents": recent_events,
             "alignment": alignment,
             "automation": self.automation(project_id),

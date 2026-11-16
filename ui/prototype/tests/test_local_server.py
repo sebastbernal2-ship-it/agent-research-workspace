@@ -57,7 +57,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             "X-Local-Prototype": "1",
         }
 
-    def test_chat_always_includes_selected_project_context_without_mutating_canonical_history(self):
+    def test_chat_is_persisted_in_project_history_and_always_includes_project_context(self):
         class FakeChat:
             def __init__(self):
                 self.calls = []
@@ -87,9 +87,8 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(result["response"], "Synthetic offline response")
         self.assertEqual(len(fake.calls), 1)
         message, history, context, question_context = fake.calls[0]
-        self.assertEqual((message, history), (
-            "Discuss this idea.", [{"role": "user", "content": "Earlier message."}],
-        ))
+        # The durable thread is the source of truth; a browser-supplied history is ignored.
+        self.assertEqual((message, history), ("Discuss this idea.", []))
         self.assertEqual(context["project"]["name"], "Northstar research")
         self.assertEqual(context["project"]["goals"], [
             "Coordinate research and other project work across agent roles.",
@@ -116,7 +115,14 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(len(question_context["affectedWork"]), 2)
         self.assertTrue(all("status" in item and "objective" in item for item in question_context["affectedWork"]))
         self.assertIn("changes what evidence", question_context["impact"])
-        self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
+        # chat log work item + 2 turns, then 2 more turns on the question thread: all durable, none lost
+        self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count + 5)
+        status, hist, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/chat/history")
+        self.assertEqual([t["role"] for t in hist["turns"]], ["user", "assistant"])
+        status, hist, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/chat/history?questionId=question.source-policy")
+        self.assertEqual(hist["turns"][0]["content"], "What are the tradeoffs here?")
+        self.assertEqual(self.request(f"/api/v1/projects/{PROJECT_ID}")[1]["workItems"].__len__(), 4)  # chat log is hidden
+        event_count += 5
 
         status, error, _ = self.request(
             f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
