@@ -299,7 +299,7 @@ class DurableChatTests(VPTests):
         summary, recent = restarted._chat_context(self.pid, "thread.chat.project")
         self.assertGreaterEqual(self.runner.summarized, 1)
         self.assertIn("small guide", summary)
-        self.assertLessEqual(len(recent), 8)
+        self.assertLessEqual(len(recent), 14)  # bounded window, however long the thread
 
     def _converse_with(self, data, message="hello"):
         self.runner.explore = lambda system, prompt, cwd: json.dumps(data) if isinstance(data, dict) else data
@@ -338,3 +338,22 @@ class ConversationTests(VPTests):
         self.runner.explore = lambda s, p, c: json.dumps({"intent": "answer", "reply": "ok", "answer": {"selectedOptionId": "bogus", "text": "mine"}})
         out = self.rt.converse(self.pid, q, {"message": "mine"})
         self.assertEqual(out["proposedAnswer"], {"text": "mine", "selectedOptionId": None})
+
+
+class OwnerWordsTests(VPTests):
+    def test_recorded_answer_always_keeps_the_owners_own_messages_verbatim(self):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "answer", "reply": "ok", "answer": {"selectedOptionId": None, "text": "Consolidated summary."}})
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        self.rt.converse(self.pid, q, {"message": "First I said this long important plan about extraction."})
+        out = self.rt.converse(self.pid, q, {"message": "NONE. models later."})
+        full = self.rt.get_question(self.pid, q)
+        self.rt.answer_question(self.pid, q, {"expectedEtag": full["etag"], **out["proposedAnswer"]})
+        recorded = self.rt.control.projector.replay(self.pid)["questions"][q]["answer"]["text"]
+        self.assertTrue(recorded.startswith("Consolidated summary."))
+        self.assertIn("First I said this long important plan about extraction.", recorded)  # not lost behind the last message
+        self.assertIn("NONE. models later.", recorded)
+
+    def test_many_notes_per_message_are_kept(self):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "ok", "learned": [f"point {i}" for i in range(12)]})
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        self.assertEqual(self.rt.converse(self.pid, q, {"message": "long plan"})["notesSaved"], 8)

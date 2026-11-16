@@ -743,10 +743,27 @@ class PrototypeRuntime:
                 summary, turns = folded.strip()[:6000], turns[-6:]
             except Exception:
                 pass  # summarizing is an optimization; the full thread stays safe in the record
-        recent = turns[-8:]
+        recent = turns[-14:]
         return summary, [
             {"role": "user" if t["actor"]["role"] == "user" else "assistant", "content": t["content"][:2000]}
             for t in recent if t["content"].strip()]
+
+    def _with_owner_words(self, project_id: str, question_id: str, text: str) -> str:
+        """Safety net: whatever the VP consolidated, the owner's own messages from the discussion are kept verbatim."""
+        try:
+            said = [m["content"].strip() for m in self._thread(project_id, f"thread.chat.{question_id}")
+                    if m["actor"]["role"] == "user" and m["messageType"] == "question" and m["content"].strip()]
+        except Exception:
+            return text
+        if not said:
+            return text
+        block, room = [], 10_000 - len(text) - 80
+        for message in said:
+            if room - len(message) - 4 < 0:
+                break
+            block.append("- " + message)
+            room -= len(message) + 4
+        return text if not block else text + "\n\n— Your own words in this discussion —\n" + "\n".join(block)
 
     def chat_history(self, project_id: str, question_id: str | None = None) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
@@ -811,7 +828,7 @@ class PrototypeRuntime:
             reply = data.get("reply") if isinstance(data.get("reply"), str) and data["reply"].strip() else "Understood."
             self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="status",
                                                 content=reply[:8000], actor=DEMO_VP, visible_to=both)
-            learned = [n.strip()[:500] for n in (data.get("learned") or []) if isinstance(n, str) and n.strip()][:5]
+            learned = [n.strip()[:500] for n in (data.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
             for note in learned:  # route anything useful back into project memory
                 self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="evidence",
                                                     content="NOTE: " + note, actor=DEMO_VP, visible_to=both)
@@ -966,6 +983,7 @@ class PrototypeRuntime:
             goal_replacement = text.split(marker, 1)[1].strip() if marker in text else ""
             if not goal_replacement or len(goal_replacement) > 1000:
                 raise ValueError("enter a complete replacement goal of at most 1000 characters")
+        text = self._with_owner_words(project_id, question_id, text)
         answered = self.application.answer_question(
             project_id,
             question_id,
