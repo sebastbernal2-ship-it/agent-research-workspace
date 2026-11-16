@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from ui.prototype.vp import NullRunner
 from ui.prototype.local_server import build_server
 from harness.evidence import EvidenceRegistrar
 from harness.run_ledger import RunLedger
@@ -20,7 +21,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "canonical.sqlite3"
         self.workspace_root = Path(self.temp.name) / "AI-Projects"
-        self.runtime = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        self.runtime = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
         self.server = build_server(self.runtime, 0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -174,13 +175,15 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(child["workItem"]["acceptanceCriteria"], ["Every finding links to a repository artifact."])
         summary_status, summary, _ = self.request(f"/api/v1/projects/{project_id}")
         self.assertEqual(summary_status, 200)
-        self.assertEqual(len(summary["workItems"]), 2)
-        self.assertEqual(summary["workItems"][1]["parentWorkId"], parent_id)
-        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        # New projects now start with the VP's alignment-intake item plus the two proposals.
+        self.assertEqual(len(summary["workItems"]), 3)
+        self.assertEqual(summary["workItems"][0]["workId"], "work.alignment-intake")
+        self.assertEqual(summary["workItems"][2]["parentWorkId"], parent_id)
+        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
         self.assertEqual(restarted.project_application.get_project(project_id)["name"], "My WSL project")
         reopened_work = restarted.project_application.list_work(project_id)
-        self.assertEqual(reopened_work[0]["title"], "Explore the question")
-        self.assertEqual(reopened_work[1]["parentWorkId"], parent_id)
+        self.assertEqual(reopened_work[1]["title"], "Explore the question")
+        self.assertEqual(reopened_work[2]["parentWorkId"], parent_id)
         self.assertTrue(restarted.store.verify(project_id))
 
     def test_existing_project_inspection_starts_a_durable_sequential_alignment_interview(self):
@@ -238,7 +241,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             if index == 1:
-                restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+                restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
                 sequence_before_resume = restarted.projector.replay(project_id)["_eventSequence"]
                 restarted.resume_alignment(project_id)
                 self.assertEqual(restarted.projector.replay(project_id)["_eventSequence"], sequence_before_resume)
@@ -361,7 +364,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(retried_rejection["record"]["status"], "rejected")
         self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
 
-        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
         self.assertEqual(restarted.get_question(PROJECT_ID, "question.source-policy")["record"]["status"], "answered")
         self.assertEqual(restarted.get_question(PROJECT_ID, "question.ui-global-view")["record"]["status"], "rejected")
         counts = restarted.project_summary(PROJECT_ID)["counts"]

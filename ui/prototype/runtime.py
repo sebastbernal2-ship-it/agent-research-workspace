@@ -23,7 +23,8 @@ from harness.inbox import (
 )
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
-from .pi_chat import PiChatError, PiCodexChat
+from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
+from .vp import AutomationSettings, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -54,6 +55,7 @@ class LocalDemoProjectAccess(ProjectAccessPolicy):
         if action not in {
             "project.read", "project.charter.revise", "work.read", "work.create", "inbox.read", "inbox.answer", "inbox.close",
             "run.read", "evidence.read", "artifact.read", "work.approve", "discussion.read",
+            "board.draft", "automation.manage",
         }:
             raise InboxForbidden("action is not available in the local demo")
 
@@ -70,7 +72,7 @@ class PrototypeRuntime:
 
     def __init__(
         self, db_path: str | Path, *, workspace_root: str | Path | None = None,
-        chat_provider: Any | None = None,
+        chat_provider: Any | None = None, runner: Any | None = None,
     ):
         self.workspace_root = Path(workspace_root or Path.home() / "AI-Projects").expanduser()
         self.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -92,8 +94,95 @@ class PrototypeRuntime:
         )
         self._ensure_workspace_directories()
         self.chat_provider = chat_provider or PiCodexChat()
+        self.red_provider = LocalModelChat()
         self._chat_lock = threading.Lock()
         self._chat_timestamps: list[float] = []
+        self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
+        self.vp = ProjectVP(self, runner or default_runner(), self.settings)
+        self._autopilot_stop = threading.Event()
+        self._autopilot: threading.Thread | None = None
+        self._drafting: set[str] = set()
+
+    # ---- autopilot -----------------------------------------------------
+    def start_autopilot(self, interval: float = 5.0) -> None:
+        """Run approved work in the background. Never touches the synthetic demo project."""
+        if self._autopilot is not None:
+            return
+
+        for project_id in sorted(self.store._project_ids()):
+            if project_id != PROJECT_ID:
+                try:
+                    self.vp.recover(project_id)
+                except Exception:
+                    pass
+
+        def loop() -> None:
+            while not self._autopilot_stop.wait(interval):
+                for project_id in sorted(self.store._project_ids()):
+                    if project_id == PROJECT_ID:
+                        continue
+                    try:
+                        self.vp.tick(project_id)
+                    except Exception:
+                        pass  # one project's failure must not stop the others
+
+        self._autopilot = threading.Thread(target=loop, name="northstar-autopilot", daemon=True)
+        self._autopilot.start()
+
+    def stop_autopilot(self) -> None:
+        self._autopilot_stop.set()
+
+    def _draft_in_background(self, project_id: str) -> None:
+        if self._autopilot is None or project_id in self._drafting:
+            return
+        self._drafting.add(project_id)
+
+        def draft() -> None:
+            try:
+                self.vp.draft_board(project_id)
+            except Exception:
+                pass  # the owner can retry with "Draft board"
+            finally:
+                self._drafting.discard(project_id)
+
+        threading.Thread(target=draft, name="northstar-draft", daemon=True).start()
+
+    def draft_board(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "board.draft")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project does not use the VP")
+        try:
+            return {"workItems": self.vp.draft_board(project_id)}
+        except VPError as exc:
+            raise ControlPlaneError(str(exc)) from exc
+
+    def automation(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "project.read")
+        return {
+            "autoRun": self.settings.auto_run(project_id),
+            "workerAvailable": self.vp.runner.available() and project_id != PROJECT_ID,
+            "demoProject": project_id == PROJECT_ID,
+        }
+
+    def set_automation(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "automation.manage")
+        if set(request) != {"autoRun"} or type(request["autoRun"]) is not bool:
+            raise ValueError("automation requires only a boolean autoRun")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project cannot run agents")
+        self.settings.set_auto_run(project_id, request["autoRun"])
+        return self.automation(project_id)
+
+    def activity(self, project_id: str, limit: int = 40) -> list[dict[str, Any]]:
+        state, _events = self.project_application.get_project_snapshot(project_id)
+        titles = {w["workId"]: w["title"] for w in state["workItems"].values()}
+        labels = {"vp": "Project VP", "orchestrator": "Orchestrator", "worker": "Subagent", "user": "You"}
+        feed = [
+            {"id": m["eventId"], "kind": "report", "workId": m["workId"], "workTitle": titles.get(m["workId"], m["workId"]),
+             "actor": labels.get(m["actor"].get("role", ""), "Agent"), "text": m["content"][:4000], "at": m["occurredAt"]}
+            for m in state["messages"] if m["threadId"].startswith("thread.work.")
+        ]
+        return sorted(feed, key=lambda e: e["at"], reverse=True)[:limit]
 
     def _ensure_workspace_directories(self) -> None:
         for project_id in self.store._project_ids():
@@ -270,8 +359,7 @@ class PrototypeRuntime:
                 },
                 "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
             })
-            if report is not None:
-                self._start_alignment_interview(project_id, report)
+            self._start_alignment_interview(project_id, report, goal.strip())
         except Exception:
             if self.control.projector.replay(project_id)["project"] is None:
                 project_directory.rmdir()
@@ -285,19 +373,19 @@ class PrototypeRuntime:
         except RepositoryInspectionError as exc:
             raise ValueError(str(exc)) from exc
 
-    def _start_alignment_interview(self, project_id: str, report: dict[str, Any]) -> None:
+    def _start_alignment_interview(self, project_id: str, report: dict[str, Any] | None, goal: str = "") -> None:
         work_id = "work.alignment-intake"
         now = datetime.now(timezone.utc).isoformat()
         self.control.create_work({
             "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id,
             "workId": work_id, "revision": 1, "parentWorkId": None,
-            "title": "Guided repository alignment", "objective": "Review repository-derived hypotheses with the project owner before proposing delivery work.",
+            "title": "Guided repository alignment", "objective": "Interview the project owner to align on vision, scope, and constraints before any delivery work is proposed.",
             "workType": "planning", "status": "ready", "owner": DEMO_VP,
             "dependsOn": [], "capabilityGrantIds": [],
             "acceptanceCriteria": ["Record the owner's vision, current-state corrections, scope boundaries, unresolved choices, and approval preferences."],
             "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
         }, actor=DEMO_USER)
-        segments = alignment_segments(report)
+        segments = alignment_segments(report) if report is not None else new_project_segments(goal)
         plan = {"kind": "repo_alignment_plan.v1", "repository": report, "segments": segments}
         self.control.add_discussion_message(
             project_id, work_id, thread_id="thread.alignment-intake", message_type="proposal",
@@ -313,7 +401,7 @@ class PrototypeRuntime:
             "recordType": "human_question", "schemaVersion": "0.1", "projectId": project_id,
             "questionId": question_id, "questionType": "clarification", "priority": "high",
             "blocking": True, "requestedBy": DEMO_VP, "workIds": [work_id], "runId": None,
-            "questionText": f"{index + 1} of 5 · {segment['title']}\n\n{segment['prompt']}",
+            "questionText": (f"{index + 1} of 5 · " if index < 5 else "Follow-up · ") + f"{segment['title']}\n\n{segment['prompt']}",
             "impact": segment["evidence"][:3500],
             "options": ([
                 {"optionId": "option.alignment.keep-goal", "label": "Keep the initial goal text", "consequence": "The goal you reviewed before creating the project remains canonical."},
@@ -339,6 +427,16 @@ class PrototypeRuntime:
             if next_id not in state["questions"]:
                 self._open_alignment_question(project_id, index, segments[index], work_id)
             return
+        extra = sum(1 for qid in state["questions"] if qid.startswith("question.alignment.") and int(qid.rsplit(".", 1)[1]) > len(segments))
+        if index >= len(segments) and extra < 3:
+            # One blocking question per work item: ask a single follow-up, then re-evaluate after the answer.
+            followups = self.vp.followup_questions(project_id)
+            if followups:
+                self._open_alignment_question(project_id, len(segments) + extra, {**followups[0], "evidence": "Asked by the VP because earlier answers left this unclear."}, work_id)
+                return
+        if any(q["status"] == "open" for q in self.control.projector.replay(project_id)["questions"].values()
+               if q["questionId"].startswith("question.alignment.")):
+            return
         work = state["workItems"][work_id]
         if work["status"] == "ready":
             self.control.transition_work(
@@ -346,7 +444,7 @@ class PrototypeRuntime:
                 reason="All repository-alignment interview segments were answered by the project owner.",
                 expected_revision=work["revision"],
             )
-        completion_text = "Repository alignment interview completed. The recorded answers are project input; no delivery task was automatically approved or started."
+        completion_text = "Alignment interview completed. The VP will draft a task board from your answers; nothing starts until you approve a task or turn on auto-run."
         state = self.control.projector.replay(project_id)
         if not any(message["content"] == completion_text for message in state["messages"]):
             self.control.add_discussion_message(
@@ -354,6 +452,7 @@ class PrototypeRuntime:
                 content=completion_text, actor=DEMO_USER,
                 visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]],
             )
+            self._draft_in_background(project_id)
 
     def resume_alignment(self, project_id: str) -> None:
         self.project_application._authorize(project_id, "inbox.read")
@@ -377,11 +476,18 @@ class PrototypeRuntime:
     def approve_work(self, project_id: str, work_id: str, request: dict[str, Any]) -> dict[str, Any]:
         if set(request) != {"expectedRevision", "decision"} or type(request["expectedRevision"]) is not int:
             raise ValueError("approval requires expectedRevision and decision")
-        if request["decision"] not in {"approve", "reject"}:
-            raise ValueError("decision must be approve or reject")
+        if request["decision"] not in {"approve", "reject", "retry"}:
+            raise ValueError("decision must be approve, reject or retry")
         actor = self.project_application._authorize(project_id, "work.approve")
         state = self.control.projector.replay(project_id)
         work = state["workItems"].get(work_id)
+        if request["decision"] == "retry":
+            if work is None or work["status"] != "failed":
+                raise ControlPlaneError("only a failed work item can be retried")
+            return self.control.transition_work(
+                project_id, work_id, "ready", actor=actor, reason="Owner retried this failed task.",
+                expected_revision=request["expectedRevision"],
+            )
         if work is None or work["status"] != "proposed":
             raise ControlPlaneError("only a proposed work item may be approved or declined")
         next_status = "ready" if request["decision"] == "approve" else "cancelled"
@@ -435,15 +541,18 @@ class PrototypeRuntime:
 
     def chat_status(self, project_id: str) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
-        return self.chat_provider.status()
+        return {**self.chat_provider.status(), "red": self.red_provider.status()}
 
     def send_project_chat(self, project_id: str, request: dict[str, Any]) -> dict[str, str]:
         if (
             not isinstance(request, dict)
-            or set(request) - {"message", "history", "questionId"}
+            or set(request) - {"message", "history", "questionId", "mode"}
             or not {"message", "history"}.issubset(request)
         ):
             raise ValueError("chat requires message, history, and optionally questionId")
+        mode = request.get("mode", "blue")
+        if mode not in {"blue", "red"}:
+            raise ValueError("mode must be blue or red")
         question_id = request.get("questionId")
         if question_id is not None and (
             not isinstance(question_id, str)
@@ -489,14 +598,18 @@ class PrototypeRuntime:
                     "question": question["questionText"][:400],
                     "answer": question.get("answer", {}).get("text", "")[:600],
                 }
-                for question in recorded_decisions[-8:]
+                for question in recorded_decisions[-20:]
             ],
             "recordedDecisionCount": len(recorded_decisions),
             "automation": {
-                "projectAutoRun": "off",
+                "projectAutoRun": "on" if self.settings.auto_run(project_id) else "off",
                 "chatCanExecuteWork": False,
-                "note": "No project worker is connected; chat cannot start or change work.",
+                "note": "Approved tasks are run by background agents; chat only discusses and cannot start or change work.",
             },
+            "recentAgentReports": [
+                {"task": entry["workTitle"][:120], "by": entry["actor"], "report": entry["text"][:500]}
+                for entry in self.activity(project_id, 6)
+            ],
             "repositoryFilesIncluded": False,
             "omittedWorkItems": max(0, len(work_items) - 20),
             "omittedOpenQuestions": max(0, len(open_questions) - 10),
@@ -537,7 +650,8 @@ class PrototypeRuntime:
             if len(self._chat_timestamps) >= 20:
                 raise PiChatError("The local chat limit is 20 requests per hour. Try again later.")
             self._chat_timestamps.append(now)
-            return {"response": self.chat_provider.send(
+            provider = self.red_provider if mode == "red" else self.chat_provider
+            return {"response": provider.send(
                 request["message"], request["history"], project_context, question_context,
             )}
         finally:
@@ -604,7 +718,7 @@ class PrototypeRuntime:
                     "status": question["status"] if question else "pending",
                     "answer": question.get("answer") if question else None,
                 })
-            repository = plan.get("repository", {})
+            repository = plan.get("repository") or {}
             intake = state["workItems"].get("work.alignment-intake", {})
             alignment = {
                 "status": "completed" if intake.get("status") == "completed" else "in_progress",
@@ -618,6 +732,9 @@ class PrototypeRuntime:
             "workItems": list(state["workItems"].values()),
             "recentEvents": recent_events,
             "alignment": alignment,
+            "automation": self.automation(project_id),
+            "activity": self.activity(project_id, 15),
+            "drafting": project_id in self._drafting,
             "counts": {
                 "workItems": len(state["workItems"]),
                 "runningWorkItems": sum(item["status"] == "running" for item in state["workItems"].values()),

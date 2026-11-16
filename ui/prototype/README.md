@@ -29,3 +29,10 @@ cd ui/web && npm ci && npm run build
 ```
 
 The Python HTTP tests cover create/list/reopen persistence, bounded repository inspection, sequential canonical alignment questions and restart recovery, per-item approval, nested work, inbox decisions, cross-project denial, loopback host/origin/write-header restrictions, request bounds, and built-asset serving/traversal rejection. A previous headless Chromium smoke exercised basic project switching and work creation. There is no broad browser/accessibility review, real authentication, production isolation, model-led interviewing, or agent execution. Do not treat this prototype as safe for sensitive data.
+
+
+## VP, workers, and auto-run
+
+After the alignment interview (new projects get the same five-part interview as existing ones), the project VP drafts a proposed task board from the goal and your recorded answers (`Draft board with VP` retries it). Approving a task makes it ready; a background loop then runs ready tasks one at a time in dependency order: an orchestrator decides whether to split the task, and workers do the work with their own tool loops in the project workspace (existing repos get an isolated `northstar/<project>` git worktree; your checkout is never edited). A worker that needs you opens an inbox question and the task waits. The per-project **Auto-run** switch lets the VP approve and run every proposed task. The synthetic demo project never runs agents.
+
+Workers are headless Claude Code or Codex CLIs using their own sign-ins: `NORTHSTAR_RUNNER=claude|codex|pi` (default: Claude, then Codex). `NORTHSTAR_WORKERS=off` disables the background loop. These CLIs are not an OS sandbox; use test or non-sensitive projects. **Red mode** (VP chat on a local model) needs a loopback OpenAI-compatible server: set `NORTHSTAR_RED_ENDPOINT` (e.g. `http://127.0.0.1:8080/v1`) and `NORTHSTAR_RED_MODEL`.

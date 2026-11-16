@@ -49,7 +49,7 @@ class PrototypeStructureTests(unittest.TestCase):
         for text in (
             "New project", "Existing project", "Inspect repository", "five-part alignment interview",
             "Alignment interview", "Add an outcome or nested step", "OPEN DECISIONS",
-            "no project worker is connected", "not authenticated",
+            "Chat only discusses", "not authenticated",
             "Task board", "Project chat", "Nothing is running right now", "Approve task",
             "Auto-run", "SERVER-SIDE CODEX CONNECTION", "bounded snapshot of the selected project's charter, work items", "KanbanBoard", "ProjectChat", "QuestionDiscussion", "Discuss this question with Codex",
         ):

@@ -36,6 +36,9 @@ INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
 INBOX_COMMAND_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
 CHAT_STATUS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/status$")
 CHAT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat$")
+AUTOMATION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/automation$")
+BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
+ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -179,6 +182,12 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
             return
 
+        activity_match = ACTIVITY_PATH.fullmatch(path)
+        if activity_match:
+            project_id = unquote(activity_match.group(1))
+            self._run(lambda: self._send_json(200, {"items": self.runtime.activity(project_id, 100)}))
+            return
+
         project_match = PROJECT_PATH.fullmatch(path)
         if project_match:
             project_id = unquote(project_match.group(1))
@@ -241,6 +250,20 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         path = urlsplit(self.path).path
+        automation_match = AUTOMATION_PATH.fullmatch(path)
+        if automation_match:
+            project_id = unquote(automation_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.set_automation(project_id, body)))
+            return
+        draft_match = BOARD_DRAFT_PATH.fullmatch(path)
+        if draft_match:
+            project_id = unquote(draft_match.group(1))
+            def draft() -> None:
+                if body:
+                    raise ValueError("board drafting accepts an empty object")
+                self._send_json(201, self.runtime.draft_board(project_id))
+            self._run(draft)
+            return
         chat_match = CHAT_PATH.fullmatch(path)
         if chat_match:
             project_id = unquote(chat_match.group(1))

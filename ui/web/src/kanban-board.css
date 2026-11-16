@@ -35,3 +35,6 @@
 .work-detail-modal .form-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:0}
 @media(max-width:1050px){.kanban-board{grid-template-columns:repeat(5,minmax(175px,1fr))}.board-page{padding-right:14px;padding-left:14px}}
 @media(max-width:700px){.board-page{padding:12px 10px 20px}.board-toolbar{align-items:flex-start}.board-toolbar h2{font-size:15px}.board-toolbar-actions{gap:8px}.board-item-total{display:none}.kanban-board{grid-template-columns:repeat(5,minmax(72vw,1fr));gap:8px}.work-detail-modal{padding-right:14px;padding-left:14px}}
+
+.kanban-approve{margin-top:8px;font-size:12px;padding:4px 10px;display:inline-block;cursor:pointer}
+.kanban-card .kanban-approve{font-size:12px;padding:3px 10px;min-height:0;line-height:1.4}

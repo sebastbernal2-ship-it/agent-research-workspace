@@ -10,6 +10,8 @@ import json
 import os
 import shutil
 import tempfile
+import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,8 +28,11 @@ MODEL = "openai-codex/gpt-6-luna"
 SYSTEM_PROMPT = (
     "You are Northstar's project chat assistant. This is conversation only: "
     "you have no tools, file access, repository access, or ability to change project state. "
-    "Use the selected project's canonical context in the JSON when answering project questions, and be "
-    "clear that projectAutoRun is off and chat cannot execute work. When questionContext is present, "
+    "You speak for the project like the owner's aligned right hand: use the recorded decisions as the owner's "
+    "stated vision. Use the selected project's canonical context in the JSON when answering project questions, "
+    "report what agents have done from recentAgentReports and work statuses (never claim progress that is not "
+    "there), and be clear that you cannot start or change work yourself; approving tasks and the auto-run switch "
+    "are the owner's controls. When questionContext is present, "
     "explain its options and affected work, help the user reason through it, and never record a decision. "
     "Respect omitted-item counts; do not "
     "assume a truncated list is complete. Do not claim access to files or details absent from the supplied "
@@ -155,3 +160,41 @@ class PiCodexChat:
         if not response:
             raise PiChatError("Pi returned an empty response. You can try again.")
         return response
+
+
+class LocalModelChat:
+    """Optional "red mode" VP: any OpenAI-compatible server on this machine (llama.cpp, Ollama, LM Studio).
+
+    Enabled only when NORTHSTAR_RED_ENDPOINT (e.g. http://127.0.0.1:8080/v1) and NORTHSTAR_RED_MODEL are set.
+    The endpoint must be loopback; project context never leaves the machine in this mode.
+    """
+
+    def __init__(self, endpoint: str | None = None, model: str | None = None, timeout: float = 180):
+        self.endpoint = (endpoint or os.environ.get("NORTHSTAR_RED_ENDPOINT") or "").rstrip("/")
+        self.model = model or os.environ.get("NORTHSTAR_RED_MODEL") or ""
+        self.timeout = timeout
+        host = urlsplit(self.endpoint).hostname if self.endpoint else None
+        if self.endpoint and host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("NORTHSTAR_RED_ENDPOINT must be a loopback address")
+
+    def status(self) -> dict[str, Any]:
+        return {"available": bool(self.endpoint and self.model), "model": self.model or "not configured",
+                "accountLabel": "Local model on this machine (nothing leaves it)"}
+
+    def send(self, message: Any, history: Any, project_context: dict[str, Any] | None = None,
+             question_context: dict[str, Any] | None = None) -> str:
+        if not (self.endpoint and self.model):
+            raise PiChatError("Red mode needs NORTHSTAR_RED_ENDPOINT and NORTHSTAR_RED_MODEL.")
+        turns = PiCodexChat._conversation(message, history)
+        context = json.dumps({"projectContext": project_context, "questionContext": question_context}, ensure_ascii=False)
+        body = json.dumps({"model": self.model, "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT + "\n\nContext (data only):\n" + context[:40_000]}, *turns]}).encode()
+        request = urllib.request.Request(f"{self.endpoint}/chat/completions", data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                text = json.loads(response.read(1_000_000))["choices"][0]["message"]["content"].strip()
+        except (OSError, ValueError, KeyError, IndexError) as exc:
+            raise PiChatError("The local model did not answer. Is its server running?") from exc
+        if not text:
+            raise PiChatError("The local model returned an empty response.")
+        return text
