@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import AutomationSettings, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import AutomationSettings, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -113,12 +113,15 @@ class PrototypeRuntime:
             self.control, principal, access_policy,
         )
         self._ensure_workspace_directories()
-        self.chat_provider = chat_provider or PiCodexChat()
+        self._plain_chat = chat_provider or PiCodexChat()
+        self.chat_provider = chat_provider
         self.red_provider = LocalModelChat()
         self._chat_lock = threading.Lock()
         self._chat_timestamps: list[float] = []
         self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
         self.vp = ProjectVP(self, runner or default_runner(), self.settings)
+        if self.chat_provider is None:
+            self.chat_provider = RepoChat(self.vp, self._plain_chat)
         self._autopilot_stop = threading.Event()
         self._autopilot: threading.Thread | None = None
         self._drafting: set[str] = set()
@@ -671,8 +674,9 @@ class PrototypeRuntime:
                 raise PiChatError("The local chat limit is 20 requests per hour. Try again later.")
             self._chat_timestamps.append(now)
             provider = self.red_provider if mode == "red" else self.chat_provider
+            extra = {"project_id": project_id} if getattr(provider, "needs_project_id", False) else {}
             return {"response": provider.send(
-                request["message"], request["history"], project_context, question_context,
+                request["message"], request["history"], project_context, question_context, **extra,
             )}
         finally:
             self._chat_lock.release()

@@ -253,3 +253,22 @@ class ParallelTests(VPTests):
         self.rt.vp.tick(self.pid)
         self.assertEqual(len([1 for t, w in self.work().items() if t.startswith("Task") and w["status"] == "completed"]), 3)
         self.rt.store.verified_events(self.pid)  # hash chain still verifies after concurrent writes
+
+
+class RepoChatTests(VPTests):
+    def test_chat_reads_from_the_repository_not_an_empty_directory(self):
+        import subprocess
+        repo = Path(self.temp.name) / "repo2"; repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        (repo / "README.md").write_text("hello\n")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"], check=True)
+        rep = self.rt.inspect_repository(str(repo))
+        pid = self.rt.create_project({"mode": "existing", "name": "R", "goal": "g", "repositoryPath": str(repo), "inspectionFingerprint": rep["fingerprint"]})["projectId"]
+        seen = {}
+        self.runner.explore = lambda system, prompt, cwd: seen.update(cwd=cwd, system=system) or "I read README.md"
+        reply = self.rt.send_project_chat(pid, {"message": "what exists?", "history": []})
+        self.assertEqual(reply["response"], "I read README.md")
+        self.assertEqual(Path(seen["cwd"]).resolve(), repo.resolve())
+        self.assertIn("READ and SEARCH", seen["system"])
+        self.assertTrue(self.rt.chat_status(pid)["available"])
