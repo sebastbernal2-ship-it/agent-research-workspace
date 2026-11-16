@@ -176,7 +176,7 @@ class PrototypeRuntime:
     def activity(self, project_id: str, limit: int = 40) -> list[dict[str, Any]]:
         state, _events = self.project_application.get_project_snapshot(project_id)
         titles = {w["workId"]: w["title"] for w in state["workItems"].values()}
-        labels = {"vp": "Project VP", "orchestrator": "Orchestrator", "worker": "Subagent", "user": "You"}
+        labels = {"vp": "Project VP", "orchestrator": "Orchestrator", "worker": "Subagent", "reviewer": "Reviewer", "user": "You"}
         feed = [
             {"id": m["eventId"], "kind": "report", "workId": m["workId"], "workTitle": titles.get(m["workId"], m["workId"]),
              "actor": labels.get(m["actor"].get("role", ""), "Agent"), "text": m["content"][:4000], "at": m["occurredAt"]}

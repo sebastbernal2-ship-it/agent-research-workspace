@@ -16,12 +16,15 @@ class FakeRunner:
         ]}
         self.orchestrator = {"action": "execute"}
         self.worker_reply = "Did the thing.\nDONE: finished"
+        self.review_verdict = {"verdict": "accept"}
 
     def available(self):
         return True
 
     def think(self, system, payload):
         self.calls.append(("think", system[:20]))
+        if "independent reviewer" in system:
+            return json.dumps(self.review_verdict)
         if "orchestrator" in system:
             return "```json\n" + json.dumps(self.orchestrator) + "\n```"
         return json.dumps(self.board)
@@ -199,3 +202,32 @@ class WorktreeCommitTests(VPTests):
         self.assertIn("Edit README", log)
         self.assertEqual((repo / "README.md").read_text(), "old\n")  # owner's checkout untouched
         self.assertIn("Committed", self.rt.activity(pid)[1]["text"] + self.rt.activity(pid)[0]["text"])
+
+
+class ReviewerTests(VPTests):
+    def test_reviewer_challenge_triggers_one_revision_and_is_visible(self):
+        self.align(); self.rt.draft_board(self.pid)
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        self.runner.review_verdict = {"verdict": "revise", "feedback": "Add the missing comparison table."}
+        prompts = []
+        orig = self.runner.work
+        def work(system, prompt, cwd):
+            prompts.append(json.loads(prompt)); return orig(system, prompt, cwd)
+        self.runner.work = work
+        self.rt.vp.tick(self.pid)
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[1]["reviewerFeedback"], "Add the missing comparison table.")
+        self.assertEqual(self.work()["Survey options"]["status"], "completed")
+        self.assertTrue(any(a["actor"] == "Reviewer" for a in self.rt.activity(self.pid)))
+
+    def test_downstream_task_receives_upstream_report(self):
+        self.align(); self.rt.draft_board(self.pid)
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        seen = []
+        orig = self.runner.work
+        def work(system, prompt, cwd):
+            seen.append(json.loads(prompt)); return orig(system, prompt, cwd)
+        self.runner.work = work
+        self.rt.vp.tick(self.pid); self.rt.vp.tick(self.pid)
+        self.assertEqual(seen[1]["reportsFromTasksYouDependOn"][0]["task"], "Survey options")
+        self.assertIn("finished", seen[1]["reportsFromTasksYouDependOn"][0]["report"])
