@@ -35,12 +35,13 @@ class FakeRunner:
         return self.worker_reply
 
 
-class VPTests(unittest.TestCase):
+class VPBase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.runner = FakeRunner()
         self.rt = PrototypeRuntime(Path(self.temp.name) / "c.sqlite3", workspace_root=Path(self.temp.name) / "ws", runner=self.runner)
+        self.rt.sync_memory = True  # no background threads outliving a test
         self.pid = self.rt.create_project({"mode": "new", "name": "Garden", "goal": "Grow tomatoes"})["projectId"]
 
     def align(self):
@@ -51,6 +52,9 @@ class VPTests(unittest.TestCase):
     def work(self):
         return {w["title"]: w for w in self.rt.project_summary(self.pid)["workItems"]}
 
+
+
+class VPTests(VPBase):
     def test_new_project_gets_interview_then_board_draft(self):
         self.assertEqual(self.rt.project_summary(self.pid)["alignment"]["status"], "in_progress")
         self.align()
@@ -136,7 +140,7 @@ class RedModeTests(unittest.TestCase):
         self.assertTrue(LocalModelChat("http://127.0.0.1:8080/v1", "qwen").status()["available"])
 
 
-class AdaptiveInterviewTests(VPTests):
+class AdaptiveInterviewTests(VPBase):
     def test_followups_are_asked_before_the_interview_completes(self):
         self.runner.think_orig = self.runner.think
         asked = []
@@ -158,7 +162,7 @@ class AdaptiveInterviewTests(VPTests):
         self.assertEqual(self.rt.list_questions(self.pid)["questions"], [])
 
 
-class RecoveryTests(VPTests):
+class RecoveryTests(VPBase):
     def test_restart_fails_interrupted_work_and_retry_requeues_it(self):
         self.align(); self.rt.draft_board(self.pid)
         a = self.work()["Survey options"]
@@ -173,7 +177,7 @@ class RecoveryTests(VPTests):
         self.assertEqual(self.work()["Survey options"]["status"], "completed")
 
 
-class WorktreeCommitTests(VPTests):
+class WorktreeCommitTests(VPBase):
     def test_review_task_depends_on_previous_and_edits_are_committed_on_branch(self):
         import subprocess
         repo = Path(self.temp.name) / "repo"
@@ -204,7 +208,7 @@ class WorktreeCommitTests(VPTests):
         self.assertIn("Committed", self.rt.activity(pid)[1]["text"] + self.rt.activity(pid)[0]["text"])
 
 
-class ReviewerTests(VPTests):
+class ReviewerTests(VPBase):
     def test_reviewer_challenge_triggers_one_revision_and_is_visible(self):
         self.align(); self.rt.draft_board(self.pid)
         self.rt.set_automation(self.pid, {"autoRun": True})
@@ -233,7 +237,7 @@ class ReviewerTests(VPTests):
         self.assertIn("finished", seen[1]["reportsFromTasksYouDependOn"][0]["report"])
 
 
-class ParallelTests(VPTests):
+class ParallelTests(VPBase):
     def test_independent_tasks_run_concurrently_without_write_conflicts(self):
         import threading
         self.runner.board = {"tasks": [{"key": f"t{i}", "title": f"Task {i}", "objective": "o", "workType": "research"} for i in range(3)]}
@@ -255,7 +259,7 @@ class ParallelTests(VPTests):
         self.rt.store.verified_events(self.pid)  # hash chain still verifies after concurrent writes
 
 
-class RepoChatTests(VPTests):
+class RepoChatTests(VPBase):
     def test_chat_reads_from_the_repository_not_an_empty_directory(self):
         import subprocess
         repo = Path(self.temp.name) / "repo2"; repo.mkdir()
@@ -274,7 +278,7 @@ class RepoChatTests(VPTests):
         self.assertTrue(self.rt.chat_status(pid)["available"])
 
 
-class DurableChatTests(VPTests):
+class DurableChatTests(VPBase):
     def test_thread_survives_restart_stays_bounded_and_drafts_an_answer(self):
         self.align()
         self.runner.explore = lambda system, prompt, cwd: "VP reply"
@@ -307,7 +311,7 @@ class DurableChatTests(VPTests):
         return q, self.rt.converse(self.pid, q, {"message": message})
 
 
-class ConversationTests(VPTests):
+class ConversationTests(VPBase):
     def test_btw_is_answered_saved_and_notes_reach_later_context(self):
         self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "The repo has no topic model.", "learned": ["Owner wants no photos"]})
         q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
@@ -317,7 +321,7 @@ class ConversationTests(VPTests):
         self.assertEqual([t["role"] for t in self.rt.chat_history(self.pid, q)["turns"]], ["user", "assistant"])  # notes are memory, not chat bubbles
         from ui.prototype.vp import owner_notes
         self.assertEqual(owner_notes(self.rt.control.projector.replay(self.pid)), ["Owner wants no photos"])
-        self.assertEqual(self.rt.vp._context(self.rt.control.projector.replay(self.pid))["ownerNotes"], ["Owner wants no photos"])
+        self.assertEqual(self.rt.vp._context(self.rt.control.projector.replay(self.pid))["ownerMemory"]["notYetMergedNotes"], ["Owner wants no photos"])
 
     def test_settling_message_only_proposes_the_owner_confirms_by_recording(self):
         self.runner.explore = lambda s, p, c: json.dumps({"intent": "answer", "reply": "Recording: keep the goal.",
@@ -340,20 +344,87 @@ class ConversationTests(VPTests):
         self.assertEqual(out["proposedAnswer"], {"text": "mine", "selectedOptionId": None})
 
 
-class OwnerWordsTests(VPTests):
-    def test_recorded_answer_always_keeps_the_owners_own_messages_verbatim(self):
-        self.runner.explore = lambda s, p, c: json.dumps({"intent": "answer", "reply": "ok", "answer": {"selectedOptionId": None, "text": "Consolidated summary."}})
+class MemoryTests(VPBase):
+    MEMORY_V1 = {"vision": ["Build an extraction system first."], "decisions": ["No models yet."], "definitions": [],
+                 "constraints": [], "deferred": ["Prediction inputs"], "open_questions": [], "corrections": []}
+
+    def setUp(self):
+        super().setUp()
+        self.rt.sync_memory = True
+        self.curator_calls = []
+        orig = self.runner.think
+        def think(system, payload):
+            if "curate the project's long-term memory" in system:
+                self.curator_calls.append(json.loads(payload))
+                return json.dumps(self.next_memory)
+            return orig(system, payload)
+        self.runner.think = think
+        self.next_memory = self.MEMORY_V1
+
+    def _say(self, learned, text="ok", intent="btw", answer=None):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": intent, "reply": text, "learned": learned, **({"answer": answer} if answer else {})})
         q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
-        self.rt.converse(self.pid, q, {"message": "First I said this long important plan about extraction."})
-        out = self.rt.converse(self.pid, q, {"message": "NONE. models later."})
+        return q, self.rt.converse(self.pid, q, {"message": "msg"})
+
+    def test_recorded_answer_is_only_the_concise_consolidation_not_the_whole_thread(self):
+        q, out = self._say([], intent="answer", answer={"selectedOptionId": None, "text": "Extraction system first; models later."})
+        for i in range(10):
+            self.rt.converse(self.pid, q, {"message": f"chatter {i}"})
         full = self.rt.get_question(self.pid, q)
         self.rt.answer_question(self.pid, q, {"expectedEtag": full["etag"], **out["proposedAnswer"]})
         recorded = self.rt.control.projector.replay(self.pid)["questions"][q]["answer"]["text"]
-        self.assertTrue(recorded.startswith("Consolidated summary."))
-        self.assertIn("First I said this long important plan about extraction.", recorded)  # not lost behind the last message
-        self.assertIn("NONE. models later.", recorded)
+        self.assertEqual(recorded, "Extraction system first; models later.")
+        self.assertNotIn("chatter", recorded)
+
+    def test_notes_are_visible_immediately_then_merged_into_curated_memory_after_the_answer(self):
+        from ui.prototype.vp import project_memory
+        q, out = self._say(["Models are deferred."], intent="answer", answer={"selectedOptionId": None, "text": "Models later."})
+        pm = project_memory(self.rt.control.projector.replay(self.pid))
+        self.assertEqual(pm["notYetMergedNotes"], ["Models are deferred."])  # usable before curation runs
+        full = self.rt.get_question(self.pid, q)
+        self.rt.answer_question(self.pid, q, {"expectedEtag": full["etag"], **out["proposedAnswer"]})  # triggers curation
+        pm = project_memory(self.rt.control.projector.replay(self.pid))
+        self.assertEqual(pm["memory"]["decisions"], ["No models yet."])
+        self.assertEqual(pm["notYetMergedNotes"], [])  # merged, so no longer duplicated
+        self.assertEqual(self.curator_calls[0]["newNotes"], ["Models are deferred."])
+        # every VP call (board drafting, orchestrator, workers) gets the memory
+        self.assertEqual(self.rt.vp._context(self.rt.control.projector.replay(self.pid))["ownerMemory"]["memory"]["vision"], ["Build an extraction system first."])
+
+    def test_change_of_mind_replaces_the_old_statement_and_output_is_bounded(self):
+        from ui.prototype.vp import project_memory
+        self.rt.vp.curate_memory(self.pid)  # first curation from recorded answers
+        self.next_memory = {**self.MEMORY_V1, "decisions": ["Models start after extraction."] + [f"d{i}" + "x" * 400 for i in range(40)]}
+        self._say(["Actually models can start once extraction exists."])
+        self.rt.vp.curate_memory(self.pid)
+        mem = project_memory(self.rt.control.projector.replay(self.pid))["memory"]
+        self.assertNotIn("No models yet.", mem["decisions"])
+        self.assertLessEqual(len(mem["decisions"]), 20)
+        self.assertTrue(all(len(x) <= 300 for x in mem["decisions"]))
+
+    def test_curator_failure_is_harmless(self):
+        def broken(system, payload):
+            raise VPError("model down")
+        self.runner.think = broken
+        q, _ = self._say(["A note."])
+        self.assertFalse(self.rt.vp.curate_memory.__self__ is None)
+        with self.assertRaises(VPError):
+            self.rt.vp.curate_memory(self.pid)  # raises to the caller...
+        self.rt._curate_soon(self.pid)  # ...but the runtime wrapper swallows it
+        from ui.prototype.vp import uncurated_notes
+        self.assertEqual(uncurated_notes(self.rt.control.projector.replay(self.pid)), ["A note."])  # note not lost
 
     def test_many_notes_per_message_are_kept(self):
         self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "ok", "learned": [f"point {i}" for i in range(12)]})
         q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
         self.assertEqual(self.rt.converse(self.pid, q, {"message": "long plan"})["notesSaved"], 8)
+
+
+class ChatLearningTests(VPBase):
+    def test_a_correction_typed_in_project_chat_becomes_a_note(self):
+        from ui.prototype.vp import uncurated_notes
+        self.rt.sync_memory = True
+        orig = self.runner.think
+        self.runner.think = lambda system, payload: json.dumps({"learned": ["Models may start once extraction exists."]}) if "durable points the OWNER stated" in system else orig(system, payload)
+        self.runner.explore = lambda s, p, c: "Got it."
+        self.rt.send_project_chat(self.pid, {"message": "That's wrong, models can start once extraction exists.", "history": []})
+        self.assertEqual(uncurated_notes(self.rt.control.projector.replay(self.pid)), ["Models may start once extraction exists."])

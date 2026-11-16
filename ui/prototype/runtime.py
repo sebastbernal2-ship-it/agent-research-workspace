@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import CHAT_WORK, CONVERSE_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, owner_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -125,6 +125,7 @@ class PrototypeRuntime:
         self._autopilot_stop = threading.Event()
         self._autopilot: threading.Thread | None = None
         self._drafting: set[str] = set()
+        self.sync_memory = False  # tests run curation inline
 
     # ---- autopilot -----------------------------------------------------
     def start_autopilot(self, interval: float = 5.0) -> None:
@@ -677,7 +678,7 @@ class PrototypeRuntime:
             work_id, thread_id = self._chat_target(project_id, question_id)
             summary, history = self._chat_context(project_id, thread_id)
             project_context["earlierConversationSummary"] = summary
-            project_context["ownerNotes"] = owner_notes(state)
+            project_context["ownerMemory"] = project_memory(state)
             self.control.add_discussion_message(
                 project_id, work_id, thread_id=thread_id, message_type="question", content=request["message"].strip(),
                 actor=DEMO_USER, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
@@ -688,9 +689,47 @@ class PrototypeRuntime:
             self.control.add_discussion_message(
                 project_id, work_id, thread_id=thread_id, message_type="status", content=reply,
                 actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            self._learn_soon(project_id, work_id, thread_id, request["message"].strip(), history[-4:] + [{"role": "assistant", "content": reply[:1500]}])
             return {"response": reply}
         finally:
             self._chat_lock.release()
+
+    # ---- curated memory --------------------------------------------------
+    def _curate_soon(self, project_id: str) -> None:
+        def run() -> None:
+            try:
+                self.vp.curate_memory(project_id)
+            except Exception:
+                pass  # memory curation is best effort; notes and answers remain in the record
+
+        if self.sync_memory:
+            run()
+        else:
+            threading.Thread(target=run, name="northstar-memory", daemon=True).start()
+
+    def _learn_soon(self, project_id: str, work_id: str, thread_id: str, message: str, recent: list[dict[str, str]]) -> None:
+        """Project chat feeds memory too: corrections and decisions typed anywhere are saved as notes."""
+        def run() -> None:
+            try:
+                state = self.control.projector.replay(project_id)
+                reply = _json_object(self.vp.runner.think(LEARN_SYSTEM, json.dumps({
+                    "currentMemory": project_memory(state), "recentTurns": recent, "ownerMessage": message[:4000]})))
+                notes = [n.strip()[:500] for n in (reply.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
+                for note in notes:
+                    self.control.add_discussion_message(
+                        project_id, work_id, thread_id=thread_id, message_type="evidence", content="NOTE: " + note,
+                        actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+                if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
+                    self.vp.curate_memory(project_id)
+            except Exception:
+                pass  # learning is best effort; the chat itself is already saved
+
+        if not self.vp.runner.available():
+            return
+        if self.sync_memory:
+            run()
+        else:
+            threading.Thread(target=run, name="northstar-learn", daemon=True).start()
 
     # ---- durable chat ----------------------------------------------------
     def _chat_target(self, project_id: str, question_id: str | None) -> tuple[str, str]:
@@ -748,23 +787,6 @@ class PrototypeRuntime:
             {"role": "user" if t["actor"]["role"] == "user" else "assistant", "content": t["content"][:2000]}
             for t in recent if t["content"].strip()]
 
-    def _with_owner_words(self, project_id: str, question_id: str, text: str) -> str:
-        """Safety net: whatever the VP consolidated, the owner's own messages from the discussion are kept verbatim."""
-        try:
-            said = [m["content"].strip() for m in self._thread(project_id, f"thread.chat.{question_id}")
-                    if m["actor"]["role"] == "user" and m["messageType"] == "question" and m["content"].strip()]
-        except Exception:
-            return text
-        if not said:
-            return text
-        block, room = [], 10_000 - len(text) - 80
-        for message in said:
-            if room - len(message) - 4 < 0:
-                break
-            block.append("- " + message)
-            room -= len(message) + 4
-        return text if not block else text + "\n\n— Your own words in this discussion —\n" + "\n".join(block)
-
     def chat_history(self, project_id: str, question_id: str | None = None) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
         thread_id = f"thread.chat.{question_id}" if question_id else "thread.chat.project"
@@ -810,7 +832,7 @@ class PrototypeRuntime:
                        for o in question.get("options", [])]
             payload = {
                 "openQuestion": {"text": question["questionText"][:1500], "impact": question.get("impact", "")[:1500], "options": options},
-                "ownerNotes": owner_notes(state), "earlierSummary": summary, "conversation": turns,
+                "ownerMemory": project_memory(state), "earlierSummary": summary, "conversation": turns,
                 "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
                                    for q in state["questions"].values() if q["status"] == "answered"][-12:],
                 "ownerMessage": message.strip(),
@@ -842,6 +864,8 @@ class PrototypeRuntime:
                 text = "\n\nNote: ".join(part for part in (label, note) if part)
                 if text:
                     proposal = {"text": text, "selectedOptionId": option_id}
+            if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
+                self._curate_soon(project_id)
             return {"reply": reply, "proposedAnswer": proposal, "notesSaved": len(learned)}
         finally:
             self._chat_lock.release()
@@ -922,6 +946,7 @@ class PrototypeRuntime:
             "recentEvents": recent_events,
             "alignment": alignment,
             "automation": self.automation(project_id),
+            "memory": project_memory(state),
             "activity": self.activity(project_id, 15),
             "drafting": project_id in self._drafting,
             "counts": {
@@ -983,7 +1008,6 @@ class PrototypeRuntime:
             goal_replacement = text.split(marker, 1)[1].strip() if marker in text else ""
             if not goal_replacement or len(goal_replacement) > 1000:
                 raise ValueError("enter a complete replacement goal of at most 1000 characters")
-        text = self._with_owner_words(project_id, question_id, text)
         answered = self.application.answer_question(
             project_id,
             question_id,
@@ -997,6 +1021,7 @@ class PrototypeRuntime:
                 charter = {**project["charter"], "goals": [goal_replacement]}
                 self.project_application.revise_project_charter(project_id, charter)
         self._advance_alignment_interview(project_id, question_id)
+        self._curate_soon(project_id)
         return answered
 
     def close_question(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:
