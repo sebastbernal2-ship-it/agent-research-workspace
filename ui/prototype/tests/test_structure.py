@@ -27,7 +27,7 @@ class PrototypeStructureTests(unittest.TestCase):
         self.assertNotIn('How you’ll know it worked', self.tsx)
         self.assertIn('WorkTree', self.tsx)
         self.assertIn('parentWorkId', self.tsx)
-        self.assertIn('Record response', self.tsx)
+        self.assertIn('Record answer', self.tsx)
         self.assertIn('breakdownItems.length ? <WorkTree', self.tsx)
         self.assertNotIn('No outcome or implementation breakdown has been agreed', self.tsx)
         self.assertNotIn('No agent response yet', self.tsx)
@@ -51,7 +51,7 @@ class PrototypeStructureTests(unittest.TestCase):
             "Alignment interview", "Add an outcome or nested step", "OPEN DECISIONS",
             "Chat only discusses", "not authenticated",
             "Task board", "Project chat", "Nothing is running right now", "Approve task",
-            "Auto-run", "SERVER-SIDE CODEX CONNECTION", "bounded snapshot of the selected project's charter, work items", "KanbanBoard", "ProjectChat", "QuestionDiscussion", "Discuss this question with Codex",
+            "Auto-run", "SERVER-SIDE CODEX CONNECTION", "bounded snapshot of the selected project's charter, work items", "KanbanBoard", "ProjectChat", "QuestionChat", "RECORD THIS AS YOUR ANSWER?",
         ):
             self.assertIn(text, self.tsx)
         self.assertIn("/api/v1/projects", self.tsx)

@@ -44,9 +44,6 @@ function App() {
   const [projectsOpen, setProjectsOpen] = React.useState(false);
   const [questions, setQuestions] = React.useState<Question[]>([]);
   const [selectedQuestion, setSelectedQuestion] = React.useState<QuestionDetail | null>(null);
-  const [selectedOption, setSelectedOption] = React.useState("");
-  const [answerNote, setAnswerNote] = React.useState("");
-  const [decisionBusy, setDecisionBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [projectDialog, setProjectDialog] = React.useState(false);
   const [projectMode, setProjectMode] = React.useState<ProjectMode>("choose");
@@ -71,8 +68,6 @@ function App() {
     if (!result.questions.length) { setSelectedQuestion(null); return result.questions; }
     const detail = await request<QuestionDetail>(`/api/v1/projects/${encodeURIComponent(id)}/inbox/${encodeURIComponent(result.questions[0].questionId)}`);
     setSelectedQuestion(detail);
-    setSelectedOption(detail.record.options[0]?.optionId || "");
-    setAnswerNote("");
     return result.questions;
   }, []);
 
@@ -183,7 +178,7 @@ function App() {
     if (!project) return;
     try {
       const detail = await request<QuestionDetail>(`/api/v1/projects/${encodeURIComponent(project.projectId)}/inbox/${encodeURIComponent(questionId)}`);
-      setSelectedQuestion(detail); setSelectedOption(detail.record.options[0]?.optionId || ""); setAnswerNote("");
+      setSelectedQuestion(detail);
     } catch (e) { setError(e instanceof Error ? e.message : "Could not load question."); }
   }
 
@@ -192,24 +187,12 @@ function App() {
     setView("inbox");
   }
 
-  async function submitDecision(reject = false) {
+  async function questionRecorded() {
     if (!project || !selectedQuestion) return;
-    setDecisionBusy(true);
-    try {
-      if (reject) {
-        if (!answerNote.trim()) throw new Error("Add a reason before rejecting this question.");
-        await request(`/api/v1/projects/${encodeURIComponent(project.projectId)}/inbox/${encodeURIComponent(selectedQuestion.questionId)}/closure`, { method: "POST", body: JSON.stringify({ expectedEtag: selectedQuestion.etag, newStatus: "rejected", reason: answerNote.trim() }) });
-      } else {
-        const option = selectedQuestion.record.options.find((item) => item.optionId === selectedOption);
-        const text = [option?.label, answerNote.trim()].filter(Boolean).join("\n\nNote: ");
-        if (!text) throw new Error("Choose an option or add a written response.");
-        await request(`/api/v1/projects/${encodeURIComponent(project.projectId)}/inbox/${encodeURIComponent(selectedQuestion.questionId)}/answers`, { method: "POST", body: JSON.stringify({ expectedEtag: selectedQuestion.etag, text, ...(option ? { selectedOptionId: option.optionId } : {}) }) });
-      }
-      await loadProject(project.projectId);
-      const remaining = await loadInbox(project.projectId);
-      if (selectedQuestion.questionId.startsWith("question.alignment.") && remaining.length === 0) setView("overview");
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not save the decision."); }
-    finally { setDecisionBusy(false); }
+    const wasAlignment = selectedQuestion.questionId.startsWith("question.alignment.");
+    await loadProject(project.projectId);
+    const remaining = await loadInbox(project.projectId);
+    if (wasAlignment && remaining.length === 0) setView("overview");
   }
 
   async function switchProject(id: string) {
@@ -232,7 +215,7 @@ function App() {
       <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Your input" : view === "board" ? "Task board" : view === "activity" ? "Activity" : view === "chat" ? "Project chat" : project?.name || "Project"}</h1><small>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Repo-grounded alignment · one segment at a time" : "Decisions that need your attention" : view === "board" ? "Work at a glance · click cards for details" : view === "activity" ? "What your agents are doing and have done" : view === "chat" ? "Conversation with the project assistant" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{(view === "overview" || view === "board") && (openQuestionCount > 0 ? <button className="button secondary" onClick={() => setView("inbox")}><Inbox size={14}/>Review decisions</button> : breakdownItems.length > 0 && view === "overview" ? <button className="button primary" onClick={() => setView("board")}><FolderKanban size={14}/>See task status</button> : <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add outcome or step</button>)}</div></header>
       <div className="goal-stage">
         {error && <div className="error-banner" role="alert">{error}</div>}
-        {view === "inbox" ? <InboxView projectId={project?.projectId || ""} projectName={project?.name || ""} questions={questions} selected={selectedQuestion} selectedOption={selectedOption} setSelectedOption={setSelectedOption} note={answerNote} setNote={setAnswerNote} busy={decisionBusy} choose={chooseQuestion} answer={() => void submitDecision(false)} reject={() => void submitDecision(true)}/> : view === "board" && project ? <KanbanBoard items={workItems} busy={busy} decide={decideWork} automation={summary?.automation} setAutoRun={setAutoRun} draftBoard={draftBoard} drafting={Boolean(summary?.drafting)} alignmentCompleted={alignmentCompleted}/> : view === "activity" && project ? <ActivityView items={summary?.activity || []} running={runningWorkCount} workItems={workItems}/> : view === "chat" && project ? <ProjectChat projectId={project.projectId} projectName={project.name}/> : project ? <div className="goal-scroll">
+        {view === "inbox" ? <InboxView projectId={project?.projectId || ""} questions={questions} selected={selectedQuestion} choose={chooseQuestion} recorded={questionRecorded}/> : view === "board" && project ? <KanbanBoard items={workItems} busy={busy} decide={decideWork} automation={summary?.automation} setAutoRun={setAutoRun} draftBoard={draftBoard} drafting={Boolean(summary?.drafting)} alignmentCompleted={alignmentCompleted}/> : view === "activity" && project ? <ActivityView items={summary?.activity || []} running={runningWorkCount} workItems={workItems}/> : view === "chat" && project ? <ProjectChat projectId={project.projectId} projectName={project.name}/> : project ? <div className="goal-scroll">
           <section className="goal-hero"><div className="eyebrow"><Sparkles size={13}/> {alignmentPending ? "PROVISIONAL REPOSITORY HYPOTHESIS" : "PROJECT DIRECTION"}</div><h2>{project.charter.goals.join(" ") || "No project goal defined"}</h2>{alignmentPending && <p className="goal-context-note">This wording comes from the repository, not from a confirmed conversation with you. It is not yet the agreed overarching vision.</p>}<div className="goal-project-meta"><span>{project.name}</span><span>Charter revision {project.charter.revision}</span></div></section>
           <section className={`project-pulse ${openQuestionCount ? "needs-input" : ""}`} aria-labelledby="pulse-title"><div className="pulse-icon"><Sparkles size={17}/></div><div className="pulse-copy"><div className="eyebrow">PROJECT STATE</div><h3 id="pulse-title">{pulse.title}</h3><p>{pulse.description}</p></div>{openQuestionCount > 0 && <button className="button secondary" onClick={() => setView("inbox")}>Your input <span aria-hidden="true">→</span></button>}</section>
           <div className="goal-columns">
@@ -344,23 +327,39 @@ function ProjectChat({projectId,projectName}:{projectId:string;projectName:strin
   </div>;
 }
 
-function QuestionDiscussion({projectId,projectName,questionId,onClose,onDraft}:{projectId:string;projectName:string;questionId:string;onClose:()=>void;onDraft:(text:string)=>void}) {
-  const [status,setStatus]=React.useState<{available:boolean;model:string;accountLabel:string}|null>(null);
-  const [turns,setTurns]=React.useState<{role:"user"|"assistant";content:string}[]>([]);
-  const [message,setMessage]=React.useState("");
-  const [sending,setSending]=React.useState(false);
-  const [error,setError]=React.useState("");
-  React.useEffect(()=>{let active=true;void request<{turns:Turn[]}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/history?questionId=${encodeURIComponent(questionId)}`).then((h)=>{if(active)setTurns(h.turns);}).catch(()=>{});void request<typeof status>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/status`).then((value)=>{if(active)setStatus(value);}).catch((e)=>{if(active)setError(e instanceof Error?e.message:"Could not check the Codex connection.");});return()=>{active=false;};},[projectId,questionId]);
-  const [drafting,setDrafting]=React.useState(false);
-  async function draft(){setDrafting(true);setError("");try{const r=await request<{draft:string}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/draft`,{method:"POST",body:JSON.stringify({questionId})});onDraft(r.draft);}catch(e){setError(e instanceof Error?e.message:"Could not draft an answer.");}finally{setDrafting(false);}}
-  async function send(event:React.FormEvent<HTMLFormElement>){event.preventDefault();const text=message.trim();if(!text||sending||!status?.available)return;setTurns((current)=>[...current,{role:"user",content:text}]);setMessage("");setSending(true);setError("");try{const result=await request<{response:string}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat`,{method:"POST",body:JSON.stringify({message:text,history:[],questionId})});setTurns((current)=>[...current,{role:"assistant",content:result.response}]);}catch(e){setError(e instanceof Error?e.message:"Codex could not discuss this question.");}finally{setSending(false);}}
-  return <section className="question-discussion" aria-label="Discuss this question with Codex"><header><div><div className="eyebrow">DISCUSS BEFORE DECIDING</div><b>Talk to the VP about this question</b></div><button className="button secondary" type="button" onClick={onClose}>Close</button></header><p className="question-discussion-note">The VP gets this question, its options, affected work, and {projectName}’s project context, and can read the repository (read-only) to answer. This discussion is saved in the project history and informs the VP later. It does not record your answer: when you are ready, draft one from the discussion, edit it, and record it yourself.</p>{status?.available?<><div className="question-chat-transcript" aria-live="polite">{turns.map((turn,index)=><article className={`chat-turn ${turn.role}`} key={`${index}-${turn.role}`}><b>{turn.role==="user"?"You":"VP"}</b><p>{turn.content}</p></article>)}{sending&&<p className="chat-thinking">The VP is responding…</p>}</div><form className="question-chat-composer" onSubmit={(event)=>void send(event)}><textarea aria-label="Ask the VP about this question" value={message} onChange={(event)=>setMessage(event.target.value)} maxLength={4000} disabled={sending} placeholder="Ask a follow-up about the question or its options…"/><button className="button primary" disabled={sending||!message.trim()}>{sending?"Sending…":"Ask the VP"}</button><button type="button" className="button secondary" disabled={drafting||sending||turns.length===0} onClick={()=>void draft()}>{drafting?"Drafting…":"Draft my answer from this discussion"}</button></form></>:<p className="question-discussion-unavailable">{status?"Pi Codex sign-in is unavailable.":"Checking the local Codex connection…"}</p>}{error&&<div className="chat-error" role="alert">{error}</div>}</section>;
+function InboxView({projectId,questions,selected,choose,recorded}:{projectId:string;questions:Question[];selected:QuestionDetail|null;choose:(id:string)=>void;recorded:()=>Promise<void>}) {
+  return <div className="inbox-layout"><section className="inbox-questions"><div className="inbox-heading"><span>OPEN DECISIONS</span><span>{questions.length}</span></div>{questions.length ? questions.map((question)=><button key={question.questionId} className={`question-link ${selected?.questionId===question.questionId?"chosen":""}`} onClick={()=>choose(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking?"Your answer is needed to continue":"May affect project direction"}</small></span></button>) : <div className="inbox-empty"><Inbox size={19}/><b>Nothing needs your attention</b><small>No open project decisions.</small></div>}</section><section className="inbox-detail">{selected ? <QuestionChat key={selected.questionId} projectId={projectId} question={selected} recorded={recorded}/> : <div className="inbox-empty"><Inbox size={19}/><b>Select a decision</b><small>The VP will ask you here, like a chat.</small></div>}</section></div>;
 }
 
-function InboxView({projectId,projectName,questions,selected,selectedOption,setSelectedOption,note,setNote,busy,choose,answer,reject}:{projectId:string;projectName:string;questions:Question[];selected:QuestionDetail|null;selectedOption:string;setSelectedOption:(value:string)=>void;note:string;setNote:(value:string)=>void;busy:boolean;choose:(id:string)=>void;answer:()=>void;reject:()=>void}) {
-  const [discussionOpen,setDiscussionOpen]=React.useState(true);
-  React.useEffect(()=>setDiscussionOpen(true),[selected?.questionId]);
-  return <div className="inbox-layout"><section className="inbox-questions"><div className="inbox-heading"><span>OPEN DECISIONS</span><span>{questions.length}</span></div>{questions.length ? questions.map((question)=><button key={question.questionId} className={`question-link ${selected?.questionId===question.questionId?"chosen":""}`} onClick={()=>choose(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking?"Your answer is needed to continue":"May affect project direction"}</small></span></button>) : <div className="inbox-empty"><Inbox size={19}/><b>Nothing needs your attention</b><small>No open project decisions.</small></div>}</section><section className="inbox-detail">{selected ? <><div className="eyebrow">{selected.blocking?"YOUR INPUT IS NEEDED":"PROJECT DECISION"}</div><h2>{selected.questionText}</h2>{selected.questionId.startsWith("question.alignment.")&&<div className="eyebrow">WHAT I SAW · REPOSITORY EVIDENCE</div>}<p className={selected.questionId.startsWith("question.alignment.") ? "alignment-evidence" : ""}>{selected.record.impact}</p><div className="question-discussion-action"><button className="button secondary" type="button" onClick={()=>setDiscussionOpen((open)=>!open)}>{discussionOpen?"Hide discussion":"Discuss this question with the VP"}</button><span>Talk it through here; it is saved, and you can draft your answer from it below.</span></div>{discussionOpen&&<QuestionDiscussion key={selected.questionId} projectId={projectId} projectName={projectName} questionId={selected.questionId} onClose={()=>setDiscussionOpen(false)} onDraft={setNote}/>}{selected.affectedWork.length>0&&<details className="affected-details"><summary>Why this matters <span>{selected.affectedWork.length} affected planned item{selected.affectedWork.length===1?"":"s"}</span></summary><div>{selected.affectedWork.map((item)=><span key={item.workId}>{item.title}</span>)}</div></details>}{selected.record.options.length>0&&<fieldset className="decision-options"><legend>Choose an option</legend>{selected.record.options.map((option)=><label key={option.optionId}><input type="radio" name="decision" value={option.optionId} checked={selectedOption===option.optionId} onChange={()=>setSelectedOption(option.optionId)}/><span><b>{option.label}</b>{option.consequence&&<small>{option.consequence}</small>}</span></label>)}</fieldset>}<label className="note-label">{selected.record.options.length?"ADDITIONAL CONTEXT (OPTIONAL)":"YOUR RESPONSE"}<textarea value={note} onChange={(event)=>setNote(event.target.value)} rows={3} placeholder={selected.record.options.length ? "Add context for this decision…" : "Write your response; partial answers are fine."}/></label><div className="decision-actions">{!selected.questionId.startsWith("question.alignment.") && <button className="button secondary" disabled={busy} onClick={reject}>Reject question</button>}<button className="button primary" disabled={busy} onClick={answer}>{busy?"Saving…":selected.record.questionType==="clarification"?"Record response":"Record decision"}</button></div><p className="form-hint">{selected.record.questionType==="clarification"?"Your response is saved as project input; it does not approve execution or start an agent.":"Your decision is checked against the current project state."}</p></> : <div className="inbox-empty"><Inbox size={19}/><b>Select a decision</b><small>Review its impact and record your direction.</small></div>}</section></div>;
+function QuestionChat({projectId,question,recorded}:{projectId:string;question:QuestionDetail;recorded:()=>Promise<void>}) {
+  const base=`/api/v1/projects/${encodeURIComponent(projectId)}/inbox/${encodeURIComponent(question.questionId)}`;
+  const [turns,setTurns]=React.useState<Turn[]>([]);
+  const [text,setText]=React.useState("");
+  const [sending,setSending]=React.useState(false);
+  const [proposal,setProposal]=React.useState<{text:string;selectedOptionId:string|null}|null>(null);
+  const [replaceMode,setReplaceMode]=React.useState<{optionId:string;label:string}|null>(null);
+  const [error,setError]=React.useState("");
+  const isAlignment=question.questionId.startsWith("question.alignment.");
+  React.useEffect(()=>{let active=true;void request<{turns:Turn[]}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/history?questionId=${encodeURIComponent(question.questionId)}`).then((h)=>{if(active)setTurns(h.turns);}).catch(()=>{});return()=>{active=false;};},[projectId,question.questionId]);
+  async function send(event:React.FormEvent){event.preventDefault();const message=text.trim();if(!message||sending)return;setError("");
+    if(replaceMode){setProposal({text:`${replaceMode.label}\n\nNote: ${message}`,selectedOptionId:replaceMode.optionId});setReplaceMode(null);setText("");return;}
+    setTurns((t)=>[...t,{role:"user",content:message}]);setText("");setSending(true);setProposal(null);
+    try{const r=await request<{reply:string;proposedAnswer:{text:string;selectedOptionId:string|null}|null}>(`${base}/conversation`,{method:"POST",body:JSON.stringify({message})});setTurns((t)=>[...t,{role:"assistant",content:r.reply}]);if(r.proposedAnswer)setProposal(r.proposedAnswer);}
+    catch(e){setError(e instanceof Error?e.message:"The VP could not reply.");}finally{setSending(false);}}
+  function pick(option:{optionId:string;label:string}){setError("");if(option.optionId==="option.alignment.replace-goal"){setReplaceMode({optionId:option.optionId,label:option.label});setProposal(null);return;}setProposal({text:option.label,selectedOptionId:option.optionId});}
+  async function record(){if(!proposal)return;setSending(true);setError("");try{await request(`${base}/answers`,{method:"POST",body:JSON.stringify({expectedEtag:question.etag,text:proposal.text,...(proposal.selectedOptionId?{selectedOptionId:proposal.selectedOptionId}:{})})});await recorded();}catch(e){setError(e instanceof Error?e.message:"Could not record the answer.");setSending(false);}}
+  async function reject(){const reason=text.trim();if(!reason){setError("Type a reason in the box first, then reject.");return;}setSending(true);try{await request(`${base}/closure`,{method:"POST",body:JSON.stringify({expectedEtag:question.etag,newStatus:"rejected",reason})});await recorded();}catch(e){setError(e instanceof Error?e.message:"Could not reject.");setSending(false);}}
+  const options=question.record.options;
+  return <div className="qchat">
+    <div className="eyebrow">{question.blocking?"THE VP NEEDS YOUR INPUT":"THE VP ASKS"}</div>
+    <article className="chat-turn assistant qchat-question"><b>VP</b><h2>{question.questionText}</h2>{isAlignment&&<details><summary>What I saw</summary><p className="alignment-evidence">{question.record.impact}</p></details>}{!isAlignment&&question.record.impact&&<p>{question.record.impact}</p>}{question.affectedWork.length>0&&<details className="affected-details"><summary>Why this matters <span>{question.affectedWork.length} affected planned item{question.affectedWork.length===1?"":"s"}</span></summary><div>{question.affectedWork.map((item)=><span key={item.workId}>{item.title}</span>)}</div></details>}</article>
+    {options.length>0&&<div className="qchat-chips" role="group" aria-label="Quick answers">{options.map((option)=><button key={option.optionId} type="button" className="qchat-chip" title={option.consequence||""} onClick={()=>pick(option)}><b>{option.label}</b>{option.consequence&&<small>{option.consequence}</small>}</button>)}<span className="qchat-or">or type something below</span></div>}
+    <div className="question-chat-transcript" aria-live="polite">{turns.map((turn,index)=><article className={`chat-turn ${turn.role}`} key={`${index}-${turn.role}`}><b>{turn.role==="user"?"You":"VP"}</b><p>{turn.content}</p></article>)}{sending&&!proposal&&<p className="chat-thinking">The VP is replying…</p>}</div>
+    {proposal&&<div className="qchat-proposal" role="group" aria-label="Confirm answer"><div className="eyebrow">RECORD THIS AS YOUR ANSWER?</div><p>{proposal.text}</p><div className="form-actions"><button className="button secondary" type="button" disabled={sending} onClick={()=>setProposal(null)}>Not yet</button><button className="button primary" type="button" disabled={sending} onClick={()=>void record()}>{sending?"Recording…":"Record answer"}</button></div></div>}
+    {error&&<div className="chat-error" role="alert">{error}</div>}
+    <form className="chat-composer" onSubmit={(event)=>void send(event)}><div className="chat-compose-row"><textarea aria-label="Reply to the VP" value={text} onChange={(event)=>setText(event.target.value)} maxLength={4000} disabled={sending} placeholder={replaceMode?"Type the full replacement goal…":"Answer, or ask a btw — I can read the repo to answer…"} onKeyDown={(event)=>{if(event.key==="Enter"&&!event.shiftKey){event.preventDefault();void send(event as unknown as React.FormEvent);}}}/><button className="button primary" disabled={sending||!text.trim()}>{sending?"…":"Send"}</button></div>{!isAlignment&&<button type="button" className="qchat-reject" disabled={sending} onClick={()=>void reject()}>Reject this question (uses what you typed as the reason)</button>}</form>
+    <p className="form-hint">Everything here is saved. Side questions don’t record an answer; useful things you say are kept as notes the VP and its agents use later. An answer is only recorded when you confirm it.</p>
+  </div>;
 }
 
 function RepoInspectionPreview({report}:{report:RepoReport}) {

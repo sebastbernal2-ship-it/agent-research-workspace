@@ -301,12 +301,40 @@ class DurableChatTests(VPTests):
         self.assertIn("small guide", summary)
         self.assertLessEqual(len(recent), 8)
 
-    def test_draft_answer_comes_from_the_saved_discussion(self):
-        self.runner.explore = lambda s, p, c: "ok"
-        self.runner.think_orig = self.runner.think
-        self.runner.think = lambda system, payload: "I decided: X." if "Write the owner's answer" in system else self.runner.think_orig(system, payload)
+    def _converse_with(self, data, message="hello"):
+        self.runner.explore = lambda system, prompt, cwd: json.dumps(data) if isinstance(data, dict) else data
         q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
-        with self.assertRaises(ValueError):
-            self.rt.draft_answer(self.pid, q)  # nothing discussed yet
-        self.rt.send_project_chat(self.pid, {"message": "what do you think?", "history": [], "questionId": q})
-        self.assertEqual(self.rt.draft_answer(self.pid, q)["draft"], "I decided: X.")
+        return q, self.rt.converse(self.pid, q, {"message": message})
+
+
+class ConversationTests(VPTests):
+    def test_btw_is_answered_saved_and_notes_reach_later_context(self):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "The repo has no topic model.", "learned": ["Owner wants no photos"]})
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        out = self.rt.converse(self.pid, q, {"message": "btw what exists?"})
+        self.assertEqual((out["proposedAnswer"], out["notesSaved"]), (None, 1))
+        self.assertEqual(self.rt.list_questions(self.pid)["questions"][0]["questionId"], q)  # still open
+        self.assertEqual([t["role"] for t in self.rt.chat_history(self.pid, q)["turns"]], ["user", "assistant"])  # notes are memory, not chat bubbles
+        from ui.prototype.vp import owner_notes
+        self.assertEqual(owner_notes(self.rt.control.projector.replay(self.pid)), ["Owner wants no photos"])
+        self.assertEqual(self.rt.vp._context(self.rt.control.projector.replay(self.pid))["ownerNotes"], ["Owner wants no photos"])
+
+    def test_settling_message_only_proposes_the_owner_confirms_by_recording(self):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "answer", "reply": "Recording: keep the goal.",
+            "answer": {"selectedOptionId": "option.alignment.keep-goal", "text": "and keep it simple"}, "learned": []})
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        out = self.rt.converse(self.pid, q, {"message": "keep it as is, simple"})
+        self.assertEqual(out["proposedAnswer"]["selectedOptionId"], "option.alignment.keep-goal")
+        self.assertIn("\n\nNote: and keep it simple", out["proposedAnswer"]["text"])
+        self.assertEqual(self.rt.list_questions(self.pid)["questions"][0]["questionId"], q)  # nothing recorded yet
+        full = self.rt.get_question(self.pid, q)
+        self.rt.answer_question(self.pid, q, {"expectedEtag": full["etag"], **out["proposedAnswer"]})
+        self.assertNotEqual(self.rt.list_questions(self.pid)["questions"][0]["questionId"], q)
+
+    def test_unparseable_model_output_degrades_to_a_plain_reply_and_bad_option_ids_are_dropped(self):
+        self.runner.explore = lambda s, p, c: "Just a plain sentence."
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        self.assertEqual(self.rt.converse(self.pid, q, {"message": "hi"})["reply"], "Just a plain sentence.")
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "answer", "reply": "ok", "answer": {"selectedOptionId": "bogus", "text": "mine"}})
+        out = self.rt.converse(self.pid, q, {"message": "mine"})
+        self.assertEqual(out["proposedAnswer"], {"text": "mine", "selectedOptionId": None})

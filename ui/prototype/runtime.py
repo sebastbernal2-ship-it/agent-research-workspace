@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import CHAT_WORK, DRAFT_ANSWER_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import CHAT_WORK, CONVERSE_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, owner_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -677,6 +677,7 @@ class PrototypeRuntime:
             work_id, thread_id = self._chat_target(project_id, question_id)
             summary, history = self._chat_context(project_id, thread_id)
             project_context["earlierConversationSummary"] = summary
+            project_context["ownerNotes"] = owner_notes(state)
             self.control.add_discussion_message(
                 project_id, work_id, thread_id=thread_id, message_type="question", content=request["message"].strip(),
                 actor=DEMO_USER, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
@@ -719,12 +720,16 @@ class PrototypeRuntime:
     def _is_summary(message: dict[str, Any]) -> bool:
         return message["messageType"] == "revision" and message["content"].startswith("SUMMARY: ")
 
+    @staticmethod
+    def _is_note(message: dict[str, Any]) -> bool:
+        return message["messageType"] == "evidence" and message["content"].startswith("NOTE: ")
+
     def _chat_context(self, project_id: str, thread_id: str) -> tuple[str, list[dict[str, str]]]:
         """Bounded model context from the durable thread: latest saved summary plus the most recent turns."""
         messages = self._thread(project_id, thread_id)
         last = max((i for i, m in enumerate(messages) if self._is_summary(m)), default=-1)
         summary = messages[last]["content"][len("SUMMARY: "):] if last >= 0 else ""
-        turns = [m for m in messages[last + 1:] if not self._is_summary(m)]
+        turns = [m for m in messages[last + 1:] if not self._is_summary(m) and not self._is_note(m)]
         if len(turns) > 16 and self.vp.runner.available():
             older = turns[:-6]
             try:
@@ -748,28 +753,81 @@ class PrototypeRuntime:
         thread_id = f"thread.chat.{question_id}" if question_id else "thread.chat.project"
         return {"turns": [
             {"role": "user" if m["actor"]["role"] == "user" else "assistant", "content": m["content"], "at": m["occurredAt"]}
-            for m in self._thread(project_id, thread_id) if not self._is_summary(m)]}
+            for m in self._thread(project_id, thread_id) if not self._is_summary(m) and not self._is_note(m)]}
 
-    def draft_answer(self, project_id: str, question_id: str) -> dict[str, str]:
-        """Turn the saved discussion into a proposed answer; the owner edits and records it explicitly."""
-        self.project_application._authorize(project_id, "inbox.read")
+    def converse(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """One owner message on an open question, handled like a chat turn.
+
+        The VP decides whether it answers the question, is a side question (answered in place), or is partial info.
+        Useful things the owner says are saved as notes that inform all later work. A settling message only yields a
+        *proposal*; the answer is recorded when the owner confirms it.
+        """
+        self.project_application._authorize(project_id, "inbox.answer")
+        if not isinstance(request, dict) or set(request) != {"message"}:
+            raise ValueError("conversation requires only message")
+        message = request["message"]
+        if not isinstance(message, str) or not message.strip() or len(message) > 4000:
+            raise ValueError("message must contain 1 to 4000 characters")
         state = self.control.projector.replay(project_id)
         question = state["questions"].get(question_id)
-        if question is None or question["status"] != "open":
-            raise ControlPlaneError("only an open question can have an answer drafted")
+        if question is None:
+            raise InboxNotFound("question was not found")
+        if question["status"] != "open":
+            raise ControlPlaneError("only an open question can be discussed")
         if not self.vp.runner.available():
-            raise PiChatError("No model runner is available to draft an answer.")
-        summary, turns = self._chat_context(project_id, f"thread.chat.{question_id}")
-        if not turns:
-            raise ValueError("discuss the question first; there is nothing to draft from yet")
-        payload = {"question": question["questionText"][:1500], "options": [o["label"] for o in question.get("options", [])],
-                   "earlierSummary": summary, "discussion": turns,
-                   "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
-                                      for q in state["questions"].values() if q["status"] == "answered"][-12:]}
+            raise PiChatError("No model runner is available.")
+        if not self._chat_lock.acquire(blocking=False):
+            raise PiChatError("A VP request is already in progress.")
         try:
-            return {"draft": self.vp.runner.think(DRAFT_ANSWER_SYSTEM, json.dumps(payload)).strip()}
-        except VPError as exc:
-            raise PiChatError(str(exc)) from exc
+            now = time.monotonic()
+            self._chat_timestamps = [stamp for stamp in self._chat_timestamps if now - stamp < 3600]
+            if len(self._chat_timestamps) >= 40:
+                raise PiChatError("The local chat limit is 40 requests per hour. Try again later.")
+            self._chat_timestamps.append(now)
+            work_id, thread_id = self._chat_target(project_id, question_id)
+            summary, turns = self._chat_context(project_id, thread_id)
+            both = [DEMO_USER["actorId"], DEMO_VP["actorId"]]
+            self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="question",
+                                                content=message.strip(), actor=DEMO_USER, visible_to=both)
+            options = [{"optionId": o["optionId"], "label": o["label"], "consequence": o.get("consequence", "")[:300]}
+                       for o in question.get("options", [])]
+            payload = {
+                "openQuestion": {"text": question["questionText"][:1500], "impact": question.get("impact", "")[:1500], "options": options},
+                "ownerNotes": owner_notes(state), "earlierSummary": summary, "conversation": turns,
+                "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
+                                   for q in state["questions"].values() if q["status"] == "answered"][-12:],
+                "ownerMessage": message.strip(),
+            }
+            runner = self.vp.runner
+            try:
+                raw = runner.explore(CONVERSE_SYSTEM, json.dumps(payload), self.vp.read_directory(project_id)) \
+                    if hasattr(runner, "explore") else runner.think(CONVERSE_SYSTEM, json.dumps(payload))
+            except VPError as exc:
+                raise PiChatError(str(exc)) from exc
+            try:
+                data = _json_object(raw)
+            except VPError:
+                data = {"intent": "btw", "reply": raw.strip()[:4000]}
+            reply = data.get("reply") if isinstance(data.get("reply"), str) and data["reply"].strip() else "Understood."
+            self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="status",
+                                                content=reply[:8000], actor=DEMO_VP, visible_to=both)
+            learned = [n.strip()[:500] for n in (data.get("learned") or []) if isinstance(n, str) and n.strip()][:5]
+            for note in learned:  # route anything useful back into project memory
+                self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="evidence",
+                                                    content="NOTE: " + note, actor=DEMO_VP, visible_to=both)
+            proposal = None
+            answer = data.get("answer") if data.get("intent") == "answer" and isinstance(data.get("answer"), dict) else None
+            if answer is not None:
+                option_ids = {o["optionId"] for o in options}
+                option_id = answer.get("selectedOptionId") if answer.get("selectedOptionId") in option_ids else None
+                label = next((o["label"] for o in options if o["optionId"] == option_id), None)
+                note = answer.get("text").strip()[:9000] if isinstance(answer.get("text"), str) else ""
+                text = "\n\nNote: ".join(part for part in (label, note) if part)
+                if text:
+                    proposal = {"text": text, "selectedOptionId": option_id}
+            return {"reply": reply, "proposedAnswer": proposal, "notesSaved": len(learned)}
+        finally:
+            self._chat_lock.release()
 
     def health(self) -> dict[str, Any]:
         return {
