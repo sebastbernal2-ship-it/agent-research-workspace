@@ -38,6 +38,7 @@ WORK_TYPES = {"research", "analysis", "planning", "writing", "review", "implemen
 CHAT_WORK = "work.project-chat"
 SKIP_WORK = {"work.alignment-intake", CHAT_WORK}
 MAX_SUBTASKS = 5
+MAX_AUTO_ISSUES_PER_PHASE = 8  # self-directed backlog tasks per phase; more are logged and wait for the owner
 MAX_COMMIT_FILE_BYTES = 2 * 1024 * 1024  # larger files are never committed by the VP (generated data, archives)
 
 BOARD_SYSTEM = (
@@ -83,8 +84,10 @@ WORKER_SYSTEM = (
     "real data). Do not report something as done that you have not seen working. If something is weak or you saw a "
     "better way, either fix it now or log it: add lines before your final line: `ISSUE(high|medium|low): <title> :: "
     "<detail>` for a defect or gap against the owner's vision, `IMPROVE: <title> :: <detail>` for a better approach, "
-    "`FUTURE: <title> :: <detail>` for a later idea. The VP queues and works through them on its own, so never leave a "
-    "known weakness unlogged.\n"
+    "`FUTURE: <title> :: <detail>` for a later idea. Log AT MOST 3 items per task and only what genuinely matters to "
+    "the owner's vision: no nitpicks, nothing you could simply fix now, and nothing already in ISSUES.md. high = the "
+    "owner would notice and object; medium = clearly worth doing; low = nice to have (low items are only recorded, "
+    "never worked on automatically).\n"
     "Your final line must be either `DONE: <one-sentence result>` or `NEEDS_INPUT: <the single question the owner "
     "must answer>` if you cannot responsibly continue. readOnlyDataRoots (if present) lists local data folders "
     "outside your workspace that you SHOULD read to do the task (inspect, count, sample; do not copy them "
@@ -775,16 +778,27 @@ class ProjectVP:
         free = self._slots(state) - running
         picked: list[dict[str, Any]] = []
         # Required work first; improvements (the background backlog) only get what is left over.
+        required_picked = False
         for work in sorted(items.values(), key=rank):
             if len(picked) >= free:
                 break
             if work["workId"] in SKIP_WORK or is_phase(work):
                 continue
             kind = issue_kind(work)
+            if kind is not None and required_picked:
+                continue  # backlog work only fills idle capacity: never alongside required work that is waiting
             if kind == "direction" and work["status"] != "ready":
                 continue  # future directions wait until the owner (or a later plan) promotes them
             if kind is not None and meta.get(work["workId"], {}).get("deferred"):
                 continue
+            if kind is not None and work["status"] != "ready":
+                # Autonomous backlog work is limited so the VP never polishes forever: only high/medium items run on their
+                # own, and only up to a per-phase cap; the rest stay logged for the owner to promote ("Work on this now").
+                if meta.get(work["workId"], {}).get("priority", "medium") == "low":
+                    continue
+                if sum(1 for w in items.values() if w.get("parentWorkId") == work.get("parentWorkId") and issue_kind(w) is not None
+                       and w["status"] in {"completed", "running"}) >= MAX_AUTO_ISSUES_PER_PHASE:
+                    continue
             parent = items.get(work.get("parentWorkId") or "")
             if parent is not None and not is_phase(parent) and parent["status"] == "running":
                 continue  # a split task's steps run inline under their parent
@@ -796,6 +810,7 @@ class ProjectVP:
                 ok_status = work["status"] == "ready" or (auto and work["status"] == "proposed")
             if ok_status and all(items[d]["status"] == "completed" for d in work["dependsOn"]):
                 picked.append(work)
+                required_picked = required_picked or kind is None
         return picked
 
     def recover(self, project_id: str) -> int:
@@ -820,6 +835,8 @@ class ProjectVP:
             if self.phases.ensure_planned(project_id):  # planning is automatic once the interview is done
                 return project_id
             self.phases.activate(project_id, auto)
+            if self.phases.steer_running(project_id):  # a phase whose required work is done is assessed BEFORE any backlog work
+                return project_id
             state = self._state(project_id)
             batch = self._eligible(state, auto)
             if not batch:

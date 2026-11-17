@@ -33,6 +33,7 @@ MAX_TASKS_PER_PHASE = 40
 MAX_STEERS_PER_PHASE = 12
 MAX_NEW_TASKS_PER_STEER = 6
 MAX_REVIEWS_PER_PHASE = 2
+MAX_ITEMS_PER_REPORT = 3
 MAX_QUALITY_PASSES = 3
 TERMINAL = {"completed", "failed", "cancelled"}
 START_NEXT = "option.phase.start-next"
@@ -317,6 +318,14 @@ class PhasePlanner:
                 self.vp._transition(project_id, phase["workId"], "running", ORCHESTRATOR, "Phase started.")
 
     # ---- steering -----------------------------------------------------------
+    def steer_running(self, project_id: str) -> bool:
+        """Assess each running phase whose required work is done. Runs before backlog tasks so they can never starve it."""
+        state = self.vp._state(project_id)
+        for phase in sorted((w for w in state["workItems"].values() if is_phase(w) and w["status"] == "running"), key=lambda w: w["createdAt"]):
+            if self._steer(project_id, phase):
+                return True
+        return False
+
     def steer_all(self, project_id: str) -> str | None:
         """Called when no task is eligible: assess running phases; then run quality passes on finished ones."""
         state = self.vp._state(project_id)
@@ -444,8 +453,15 @@ class PhasePlanner:
         passes = pass_records(state, pid)
         if len(passes) >= MAX_QUALITY_PASSES:
             return False
+        from .vp import MAX_AUTO_ISSUES_PER_PHASE
         mine = [i for i in active_issues(state) if i["phaseId"] == pid]
-        if any(i["kind"] != "direction" and not i["deferred"] and i["status"] in {"proposed", "ready", "running", "waiting_human", "blocked"} for i in mine):
+        capped = sum(1 for i in mine if i["status"] in {"completed", "running"}) >= MAX_AUTO_ISSUES_PER_PHASE
+
+        def will_run(i: dict[str, Any]) -> bool:  # items the VP is actually going to work on by itself
+            if i["kind"] == "direction" or i["deferred"]:
+                return False
+            return i["status"] == "running" or i["status"] == "ready" or (i["status"] in {"proposed", "waiting_human", "blocked"} and i["priority"] != "low" and not capped)
+        if any(will_run(i) for i in mine):
             return False  # work through the open issues first
         done_now = sum(1 for i in mine if i["status"] == "completed")
         if passes and passes[-1].get("completedIssues") == done_now:
@@ -521,12 +537,15 @@ class PhasePlanner:
         phase_id = phase_of(state["workItems"], work["workId"])
         if phase_id is None:
             return 0
-        kinds = {"IMPROVE": ("improvement", "medium"), "ISSUE": ("issue", "high"), "FUTURE": ("direction", "low")}
-        count = 0
+        kinds = {"IMPROVE": ("improvement", "medium"), "ISSUE": ("issue", "medium"), "FUTURE": ("direction", "low")}
+        count = seen = 0
         for line in report.splitlines()[-200:]:
+            if seen >= MAX_ITEMS_PER_REPORT:
+                break  # at most 3 lines are even considered per report, whether or not they were duplicates
             m = re.match(r"\s*(IMPROVE|ISSUE|FUTURE)\s*(?:\((high|medium|low)\))?\s*:\s*(.+)", line, re.I)
             if not m:
                 continue
+            seen += 1
             kind, default_priority = kinds[m.group(1).upper()]
             title, _sep, detail = m.group(3).partition("::")
             title, detail = title.strip(), detail.strip()

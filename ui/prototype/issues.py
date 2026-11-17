@@ -54,6 +54,23 @@ def norm(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", strip_prefix(title).lower()).strip()
 
 
+_FILLER = {"a", "an", "the", "is", "are", "was", "be", "still", "so", "and", "or", "of", "to", "in", "on", "for", "it", "its", "this",
+           "that", "with", "as", "by", "at", "can", "may", "not", "no", "but", "than", "from", "into", "now", "only", "more", "some"}
+
+
+def _content_words(title: str) -> set[str]:
+    return {w for w in norm(title).split() if w not in _FILLER and len(w) > 1}
+
+
+def similar(a: str, b: str) -> bool:
+    """Near-duplicate titles: same words in a different order or phrasing count as the same item."""
+    if norm(a) == norm(b):
+        return True
+    wa, wb = _content_words(a), _content_words(b)
+    small = min(len(wa), len(wb))
+    return small >= 3 and len(wa & wb) / small >= 0.65
+
+
 def issue_meta(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """priority/source/evidence/deferred per issue; later META messages override earlier ones."""
     meta: dict[str, dict[str, Any]] = {}
@@ -102,8 +119,8 @@ class IssueBoard:
             return None
         state = self.vp._state(project_id)
         items = state["workItems"]
-        if any(is_issue(w) and w["status"] != "cancelled" and norm(w["title"]) == norm(title) for w in items.values()):
-            return None  # already logged (open or done): not a new item
+        if any(is_issue(w) and w["status"] != "cancelled" and similar(w["title"], title) for w in items.values()):
+            return None  # already logged (open or done), or a near-duplicate of something that is: not a new item
         from .phases import phase_of
         open_here = sum(1 for w in items.values() if is_issue(w) and phase_of(items, w["workId"]) == phase_id
                         and w["status"] in {"proposed", "ready", "running"})

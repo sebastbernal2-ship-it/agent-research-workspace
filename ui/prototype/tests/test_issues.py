@@ -37,6 +37,7 @@ class LedgerTests(PhaseBase):
         self.assertIsNone(self.board.file(self.pid, self.phase_id, "bogus", "Bad kind", "x"))
 
     def test_issues_run_after_required_work_highest_priority_first_directions_wait_deferred_skip(self):
+        self.file(kind="improvement", title="Medium thing", priority="medium")
         self.file(kind="improvement", title="Low thing", priority="low")
         self.file(kind="issue", title="High thing", priority="high")
         direction = self.file(kind="direction", title="Later idea", priority="high")
@@ -50,12 +51,13 @@ class LedgerTests(PhaseBase):
             self.rt.vp.tick(self.pid)
         st = title_status(self.state())
         self.assertEqual(st["[Issue] High thing"], "completed")
-        self.assertEqual(st["[Improvement] Low thing"], "completed")
+        self.assertEqual(st["[Improvement] Medium thing"], "completed")
+        self.assertEqual(st["[Improvement] Low thing"], "proposed")        # low priority: logged only, never run on its own
         self.assertEqual(st["[Direction] Later idea"], "proposed")        # future directions are held
         self.assertEqual(st["[Issue] Deferred thing"], "proposed")        # and so is anything the owner deferred
         starts = [c["yourTask"]["title"] for c in self.runner.worker_calls]
         self.assertLess(starts.index("Build splitter"), starts.index("[Issue] High thing"))
-        self.assertLess(starts.index("[Issue] High thing"), starts.index("[Improvement] Low thing"))
+        self.assertLess(starts.index("[Issue] High thing"), starts.index("[Improvement] Medium thing"))
         self.board.act(self.pid, direction["workId"], "do_now")           # promoted by the owner: now it runs
         for _ in range(3):
             self.rt.vp.tick(self.pid)
@@ -282,3 +284,73 @@ class SessionHarnessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopConditionTests(PhaseBase):
+    """The live run showed the VP polishing forever and never assessing the phase. These pin the fixes."""
+
+    def setUp(self):
+        super().setUp()
+        self.rt.plan_phases(self.pid)
+        self.phase_id = next(w["workId"] for w in self.state()["workItems"].values() if is_phase(w) and not w["dependsOn"])
+        self.board = self.rt.vp.phases.board
+
+    def test_the_phase_is_assessed_before_any_backlog_work_so_it_can_never_be_starved(self):
+        for title in ("Tokeniser splits abbreviations", "Stop list misses archaic verbs", "Headings leak into counts",
+                      "Encoding fallback is undocumented", "Plural forms are counted separately"):
+            self.board.file(self.pid, self.phase_id, "issue", title, "d", priority="high")
+        order = []
+        original = self.runner.work
+        self.runner.work = lambda s, p, c: (order.append((json.loads(p)["yourTask"]["title"], len(self.runner.steer_calls))), original(s, p, c))[1]
+        self.accept()
+        self.steer([True, True], status="complete")
+        self.run_ticks(25)
+        self.assertEqual(order[0], ("Build splitter", 0))                      # required work first, with no assessment yet
+        backlog = [o for o in order if o[0].startswith("[Issue]")]
+        self.assertGreaterEqual(len(backlog), 5)                                # the backlog does get worked...
+        self.assertTrue(all(steers >= 1 for _t, steers in backlog))             # ...but only AFTER the phase was assessed
+        self.assertEqual(self.phases()[0]["status"], "verifying")
+
+    def test_low_priority_items_are_only_logged_and_the_automatic_backlog_is_capped_per_phase(self):
+        from ui.prototype.vp import MAX_AUTO_ISSUES_PER_PHASE
+        low = self.board.file(self.pid, self.phase_id, "issue", "Nice to have polish alpha", "d", priority="low")
+        names = ["cache parsed files", "parallel file reading", "colourised output", "json export", "progress bar", "locale awareness",
+                 "memory profiling", "unicode normalisation", "config file support", "shell completion", "benchmark suite"]
+        for name in names[:MAX_AUTO_ISSUES_PER_PHASE + 3]:
+            self.board.file(self.pid, self.phase_id, "improvement", name, "d", priority="medium")
+        self.accept()
+        self.steer([True, True], status="complete")
+        self.run_ticks(40)
+        st = title_status(self.state())
+        self.assertEqual(st["[Issue] Nice to have polish alpha"], "proposed")  # low: logged, never run on its own
+        ran = [t for t, s in st.items() if t.startswith("[Improvement]") and s == "completed"]
+        self.assertEqual(len(ran), MAX_AUTO_ISSUES_PER_PHASE)                  # the cap: the VP stops polishing by itself
+        self.board.act(self.pid, low["workId"], "do_now")                       # the owner can still promote anything
+        self.run_ticks(3)
+        self.assertEqual(title_status(self.state())["[Issue] Nice to have polish alpha"], "completed")
+
+    def test_logged_only_items_do_not_block_quality_passes(self):
+        self.board.file(self.pid, self.phase_id, "issue", "Nice to have polish beta", "d", priority="low")
+        self.accept()
+        self.steer([True, True], status="complete")
+        self.run_ticks(30)
+        self.assertGreaterEqual(len(self.runner.quality_calls), 1)  # the pass ran although a low item is still open
+
+    def test_near_duplicates_are_folded_into_one_item(self):
+        a = self.board.file(self.pid, self.phase_id, "issue", '"art" verb detection is a short pattern list', "d")
+        self.assertIsNotNone(a)
+        for dup in ('"art" is still a pattern list, so unusual verb uses without "thou" are counted',
+                    "Pattern list for art verb detection is short"):
+            self.assertIsNone(self.board.file(self.pid, self.phase_id, "issue", dup, "d"))
+        self.assertIsNotNone(self.board.file(self.pid, self.phase_id, "issue", "Roman numerals leak into the top ten", "d"))  # genuinely different
+
+    def test_a_worker_can_log_at_most_three_items_per_task_and_defaults_are_not_high(self):
+        self.accept()
+        lines = "\n".join(f"ISSUE: {name} :: detail" for name in ("quote handling", "slow startup", "wrong encoding", "missing docs", "flaky tests", "odd exit codes", "no logging"))
+        self.runner.worker_reply = "Did it.\n" + lines + "\nDONE: ok"
+        self.run_ticks(2)
+        items = [i for i in active_issues(self.state()) if i["source"] == "worker"]
+        self.assertEqual(len(items), 3)
+        self.assertTrue(all(i["priority"] == "medium" for i in items))
+        for must in ("AT MOST 3 items per task", "no nitpicks", "low items are only recorded"):
+            self.assertIn(must, V.WORKER_SYSTEM)
