@@ -32,6 +32,7 @@ ORCHESTRATOR = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "
 SUBAGENT = {"actorType": "agent", "actorId": "agent.subagent", "role": "worker"}
 REVIEWER = {"actorType": "agent", "actorId": "agent.reviewer", "role": "reviewer"}
 OWNER_ID = "user.local-demo"
+OWNER_ACTOR = {"actorType": "human", "actorId": OWNER_ID, "role": "user"}  # the control plane only lets the owner dismiss a question
 WORK_TYPES = {"research", "analysis", "planning", "writing", "review", "implementation", "operations", "other"}
 CHAT_WORK = "work.project-chat"
 SKIP_WORK = {"work.alignment-intake", CHAT_WORK}
@@ -648,7 +649,10 @@ class ProjectVP:
                 continue  # a split task's steps run inline under their parent
             if parent is not None and is_phase(parent) and parent["status"] not in {"running", "verifying", "completed"}:
                 continue  # the phase has not started (or is waiting for approval / the owner)
-            ok_status = work["status"] == "ready" or (auto and work["status"] == "proposed")
+            if parent is not None and is_phase(parent):
+                ok_status = work["status"] in {"ready", "proposed"}  # accepting the phase covers everything the VP plans inside it
+            else:
+                ok_status = work["status"] == "ready" or (auto and work["status"] == "proposed")
             if ok_status and all(items[d]["status"] == "completed" for d in work["dependsOn"]):
                 picked.append(work)
         return picked
@@ -672,6 +676,8 @@ class ProjectVP:
         try:
             self._settle_parents(project_id)
             auto = self.settings.auto_run(project_id)
+            if self.phases.ensure_planned(project_id):  # planning is automatic once the interview is done
+                return project_id
             self.phases.activate(project_id, auto)
             state = self._state(project_id)
             batch = self._eligible(state, auto)

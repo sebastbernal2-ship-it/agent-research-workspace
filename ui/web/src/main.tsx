@@ -38,7 +38,7 @@ const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
 };
 
 
-const questionRank = (q: Question) => (q.questionId.startsWith("question.phase-") ? 0 : q.blocking ? 1 : 2);
+const questionRank = (q: Question) => (q.questionId.startsWith("question.phase") ? 0 : q.blocking ? 1 : 2);
 const firstLine = (text: string) => (text.split("\n").map((l) => l.trim()).filter(Boolean)[0] || text).replace(/^(\d+ of \d+ · |Follow-up · )/, "");
 const excerpt = (text: string) => { const done = text.split("\n").find((l) => l.trim().toUpperCase().startsWith("DONE:")); return (done ? done.replace(/^DONE:\s*/i, "") : text.replace(/\s+/g, " ")).slice(0, 170); };
 const ago = (iso: string) => { const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000); return s < 90 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} d ago`; };
@@ -219,7 +219,7 @@ function App() {
     <main className="goal-main">
       <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{titles[view]}</h1><small>{statusLine}</small></div></div>
         <div className="goal-topbar-actions">
-          <span className="auto-run-status"><span>Auto-run</span><button role="switch" aria-checked={Boolean(summary?.automation.autoRun)} disabled={busy || !summary || demo || !summary.automation.workerAvailable} title={demo ? "The synthetic demo project cannot run agents." : !summary?.automation.workerAvailable ? "No worker CLI (Claude Code or Codex) is available." : "On: the VP works the phases on its own and only stops for your review. Off: it proposes and waits for your approval."} onClick={() => void setAutoRun(!summary?.automation.autoRun)}><i/>{summary?.automation.autoRun ? "On" : "Off"}</button></span>
+          <span className="auto-run-status"><span>Full auto</span><button role="switch" aria-checked={Boolean(summary?.automation.autoRun)} disabled={busy || !summary || demo || !summary.automation.workerAvailable} title={demo ? "The synthetic demo project cannot run agents." : !summary?.automation.workerAvailable ? "No worker CLI (Claude Code or Codex) is available." : "On: the VP accepts its own plan and moves from phase to phase without stopping (you can read what happened in Latest). Off: you accept or change the plan and review each finished phase."} onClick={() => void setAutoRun(!summary?.automation.autoRun)}><i/>{summary?.automation.autoRun ? "On" : "Off"}</button></span>
           <button className="button secondary" onClick={() => setChatOpen((open) => !open)}><MessageSquare size={14}/>Ask the VP</button>
         </div></header>
       <div className="goal-stage">
@@ -259,7 +259,7 @@ function Home({goal,needs,open,activePhase,running,latest,plan,busy,demo,alignme
     {goal && <p className="home-goal">{goal}</p>}
     <section className={`home-card ${needs.length ? "needs" : ""}`} aria-labelledby="needs-title">
       <h2 id="needs-title">{needs.length ? `Needs you · ${needs.length}` : "Needs you"}</h2>
-      {needs.length ? <>{needs.slice(0, 5).map((q) => <button key={q.questionId} className="needs-row" onClick={() => open(q.questionId)}><span className={`question-dot ${q.priority}`}/><span><b>{firstLine(q.questionText).slice(0, 140)}</b><small>{q.questionId.startsWith("question.phase-") ? "Phase checkpoint · review what was built" : q.blocking ? "Needed to continue" : "When you have a moment"}</small></span><span aria-hidden="true">→</span></button>)}{needs.length > 5 && <button className="link-button" onClick={goAsk}>and {needs.length - 5} more</button>}</>
+      {needs.length ? <>{needs.slice(0, 5).map((q) => <button key={q.questionId} className="needs-row" onClick={() => open(q.questionId)}><span className={`question-dot ${q.priority}`}/><span><b>{firstLine(q.questionText).slice(0, 140)}</b><small>{q.questionId.startsWith("question.phaseplan-") ? "Plan ready · accept it or tell the VP what to change" : q.questionId.startsWith("question.phase-") ? "Phase checkpoint · review what was built" : q.blocking ? "Needed to continue" : "When you have a moment"}</small></span><span aria-hidden="true">→</span></button>)}{needs.length > 5 && <button className="link-button" onClick={goAsk}>and {needs.length - 5} more</button>}</>
         : <p className="empty-copy">Nothing needs you. The VP will tell you here when it does.</p>}
     </section>
     <section className="home-card" aria-labelledby="now-title">
@@ -272,7 +272,7 @@ function Home({goal,needs,open,activePhase,running,latest,plan,busy,demo,alignme
         {running.length > 0 && <p className="home-working"><b>Working on:</b> {running.map((w) => w.title).join(" · ")}</p>}
         <button className="link-button" onClick={goPhases}>Open the phase →</button>
       </> : alignmentPending ? <><p className="empty-copy">The VP is interviewing you. When you finish, it plans the project into phases and gets to work.</p><button className="button primary" onClick={goAsk}>Continue the interview</button></>
-        : !hasPhases && alignmentCompleted && !demo ? <><p className="empty-copy">Interview done. The VP can plan the whole project into phases from your answers, then work each one on its own.</p><button className="button primary" disabled={busy} onClick={plan}>Plan phases with the VP</button></>
+        : !hasPhases && alignmentCompleted && !demo ? <><p className="empty-copy">The VP is planning the project into phases from your answers. This takes a minute or two and then shows up under “Needs you” to accept or change.</p><button className="link-button" disabled={busy} onClick={plan}>Plan now</button></>
         : <p className="empty-copy">No active phase.</p>}
     </section>
     <section className="home-card" aria-labelledby="latest-title">
@@ -352,7 +352,7 @@ function ActivityView({items,running,workItems}:{items:Activity[];running:number
 const PHASE_STATUS: Record<string,string> = { proposed: "Planned · not started", ready: "Approved · starting", running: "In progress", verifying: "Done · needs your review", completed: "Completed", failed: "Failed", cancelled: "Cancelled", waiting_human: "Waiting for your answer", blocked: "Blocked" };
 function PhasesView({phases,items,busy,approve,decide,plan,review,alignmentCompleted,demo}:{phases:Phase[];items:Work[];busy:boolean;approve:(workId:string,revision:number,decision:"approve"|"reject"|"retry")=>Promise<boolean>;decide:(phaseId:string,moveOn:boolean)=>void;plan:()=>void;review:()=>void;alignmentCompleted:boolean;demo:boolean}) {
   const [confirm,setConfirm]=React.useState("");
-  if (!phases.length) return <div className="phase-list"><section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">PHASES</div><h3>No phases planned yet</h3></div><Layers3 size={17}/></div><p className="empty-copy">{demo?"The synthetic demo project does not use the VP.":alignmentCompleted?"The VP plans the whole project into phases from your vision, each with exit criteria. It then works each phase on its own until the criteria are evidenced, and stops for your review.":"Finish the alignment interview first; the VP plans the phases from your answers."}</p>{!demo&&alignmentCompleted&&<div className="form-actions"><button className="button primary" disabled={busy} onClick={plan}>Plan phases with the VP</button></div>}</section></div>;
+  if (!phases.length) return <div className="phase-list"><section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">PHASES</div><h3>No phases planned yet</h3></div><Layers3 size={17}/></div><p className="empty-copy">{demo?"The synthetic demo project does not use the VP.":alignmentCompleted?"The VP plans the whole project into phases on its own, each with exit criteria, then works each phase until the criteria are evidenced and stops for your review (or keeps going, in Full auto).":"Finish the alignment interview first; the VP plans the phases from your answers."}</p>{!demo&&alignmentCompleted&&<div className="form-actions"><button className="button primary" disabled={busy} onClick={plan}>Plan phases with the VP</button></div>}</section></div>;
   return <div className="phase-list">{phases.map((p)=>{
     const pct=p.tasks.total?Math.round(100*p.tasks.done/p.tasks.total):0;
     const unmet=p.assessment.filter((a)=>!a.met).length;
@@ -366,7 +366,7 @@ function PhasesView({phases,items,busy,approve,decide,plan,review,alignmentCompl
       {p.caveats.length>0&&<div className="memory-section"><b>Known weaknesses</b><ul>{p.caveats.map((c,i)=><li key={i}>{c}</li>)}</ul></div>}
       {(p.improvements.open>0||p.improvements.done>0)&&<div className="memory-section"><b>Improvement backlog · the VP works through this on its own</b><small>{p.improvements.open} open · {p.improvements.done} done</small>{p.improvements.titles.length>0&&<ul>{p.improvements.titles.map((t,i)=><li key={i}>{t}</li>)}</ul>}</div>}
       <div className="form-actions">
-        {p.status==="proposed"&&p.index===1&&phaseItem&&<button className="button primary" disabled={busy} onClick={()=>void approve(p.phaseId,phaseItem.revision,"approve")}>Approve plan &amp; start</button>}
+        {p.status==="proposed"&&p.index===1&&phaseItem&&<><button className="button primary" disabled={busy} onClick={()=>void approve(p.phaseId,phaseItem.revision,"approve")}>Accept the plan &amp; start</button><button className="button secondary" disabled={busy} onClick={review}>Change the plan…</button></>}
         {p.status==="proposed"&&p.index>1&&<small>Starts after you review the previous phase.</small>}
         {p.status==="verifying"&&<><button className="button primary" disabled={busy} onClick={review}>Review with the VP</button><button className="button secondary" disabled={busy} onClick={()=>decide(p.phaseId,false)}>Keep improving this phase</button><button className="button secondary" disabled={busy} onClick={()=>{if(confirm!==p.phaseId){setConfirm(p.phaseId);return;}setConfirm("");decide(p.phaseId,true);}}>{confirm===p.phaseId?"Really move on?":"Move on to the next phase"}</button></>}
         {p.status==="running"&&<button className="button secondary" disabled={busy} onClick={()=>{if(confirm!==p.phaseId){setConfirm(p.phaseId);return;}setConfirm("");decide(p.phaseId,true);}}>{confirm===p.phaseId?"Really close this phase?":"Close this phase now"}</button>}

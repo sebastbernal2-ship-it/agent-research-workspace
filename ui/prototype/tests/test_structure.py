@@ -58,8 +58,8 @@ class PrototypeStructureTests(unittest.TestCase):
     def test_core_project_work_inbox_and_limitations_are_visible(self):
         for text in (
             "New project", "Existing project", "Inspect repository", "Add an outcome or nested step", "OPEN DECISIONS",
-            "Alignment interview", "Auto-run", "KanbanBoard", "PhasesView", "PhasesPage", "MemoryPage", "QuestionChat",
-            "RECORD THIS AS YOUR ANSWER?", "Approve task", "Plan phases with the VP", "Move on to the next phase",
+            "Alignment interview", "Full auto", "KanbanBoard", "PhasesView", "PhasesPage", "MemoryPage", "QuestionChat",
+            "RECORD THIS AS YOUR ANSWER?", "Approve task", "Plan phases with the VP", "Accept the plan", "Change the plan", "Move on to the next phase",
             "LOCAL DATA AGENTS CAN READ", "Project settings", "loopback only",
         ):
             self.assertIn(text, self.tsx)

@@ -1204,6 +1204,8 @@ class PrototypeRuntime:
         self._advance_alignment_interview(project_id, question_id)
         if question_id.startswith("question.phase-"):  # a phase checkpoint: start the next phase or reopen this one
             self.vp.phases.on_checkpoint_answer(project_id, question_id, option_id)
+        if question_id.startswith("question.phaseplan-"):  # the plan: accept it, or reject it with what to change
+            self.vp.phases.on_plan_answer(project_id, question_id, option_id, text)
         self._curate_soon(project_id)
         return answered
 

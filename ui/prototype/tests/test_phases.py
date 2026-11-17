@@ -18,6 +18,8 @@ class ScriptedRunner:
             {"title": "Data readiness", "goal": "Clean data for every layer", "exitCriteria": ["Splitter verified", "Extraction reviewed"],
              "tasks": [{"key": "a", "title": "Build splitter", "objective": "split", "workType": "implementation", "acceptanceCriteria": ["tested"]}]},
             {"title": "Model inputs", "goal": "Feed models", "exitCriteria": ["Sources chosen"], "tasks": []}]}
+        self.plan_calls = []
+        self.plan_error = False
         self.steers = []          # replies returned in order by the steering call
         self.steer_calls = []
         self.worker_reply = "Built it.\nDONE: ok"
@@ -30,6 +32,9 @@ class ScriptedRunner:
         if "reviewer" in system.lower() and "independent" in system.lower():
             return json.dumps({"verdict": "accept"})
         if system.startswith("You are the project VP. Plan the WHOLE project"):
+            self.plan_calls.append(json.loads(payload))
+            if self.plan_error:
+                raise VPError("the model is unavailable")
             return json.dumps(self.plan)
         if system.startswith("You are the project VP running ONE phase"):
             self.steer_calls.append(json.loads(payload))
@@ -59,6 +64,11 @@ class PhaseBase(unittest.TestCase):
 
     def state(self):
         return self.rt.control.projector.replay(self.pid)
+
+    def accept(self):
+        """Review mode: the owner accepts the plan (phase 1 approved); everything inside it then runs on its own."""
+        first = next(w for w in self.state()["workItems"].values() if is_phase(w) and not w["dependsOn"] and w["status"] == "proposed")
+        self.rt.approve_work(self.pid, first["workId"], {"expectedRevision": first["revision"], "decision": "approve"})
 
     def phases(self):
         return phase_summaries(self.state())
@@ -128,7 +138,7 @@ class AutonomyTests(PhaseBase):
 
     def test_the_vp_keeps_working_until_exit_criteria_are_evidenced_then_stops_at_a_checkpoint(self):
         self.rt.plan_phases(self.pid)
-        self.rt.set_automation(self.pid, {"autoRun": True})
+        self.accept()
         # round 1 assessment: extraction criterion unmet -> the VP creates the next task ITSELF; round 2: complete
         self.steer([True, False], tasks=[{"key": "n1", "title": "Review extraction quality", "objective": "check", "workType": "review"}],
                    caveats=["keyword matches only"])
@@ -150,7 +160,7 @@ class AutonomyTests(PhaseBase):
         self.assertEqual(self.runner.steer_calls[1]["tasks"][1]["status"], "completed")  # the 2nd assessment saw the finished review
 
     def test_completion_cannot_be_declared_without_evidence_for_every_criterion(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, False], status="complete", tasks=[{"key": "n1", "title": "Fix gap", "objective": "o", "workType": "implementation"}])
         self.steer([True, True], status="complete")
         self.run_ticks(40)
@@ -158,7 +168,7 @@ class AutonomyTests(PhaseBase):
         self.assertEqual(self.phases()[0]["status"], "verifying")
 
     def test_owner_checkpoint_starts_the_next_phase_and_it_steers_itself(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, True], status="complete")
         self.run_ticks(30)
         q = next(q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phase-") and q["status"] == "open")
@@ -174,7 +184,7 @@ class AutonomyTests(PhaseBase):
         self.assertEqual(p2["tasks"]["total"], 1)
 
     def test_keep_improving_sends_the_phase_back_and_it_is_not_reassessed_until_new_work_finishes(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, True], status="complete", improvements=[{"title": "Handle abbreviations", "objective": "U.S. splits badly", "workType": "implementation"}])
         self.run_ticks(30)
         q = next(q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phase-") and q["status"] == "open")
@@ -188,7 +198,7 @@ class AutonomyTests(PhaseBase):
         self.assertGreaterEqual(len(self.runner.steer_calls), calls_before)  # no spinning on an unchanged phase
 
     def test_owner_can_move_on_from_the_phases_view_without_a_question(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, True], status="complete")
         self.run_ticks(30)
         phase_id = next(w["workId"] for w in self.state()["workItems"].values() if w["title"] == "Data readiness")
@@ -203,7 +213,7 @@ class AutonomyTests(PhaseBase):
 
 class ImprovementTests(PhaseBase):
     def test_workers_improve_lines_become_backlog_tasks_done_last_and_deduped(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.runner.worker_reply = "Did it.\nIMPROVE: Handle abbreviations like U.S. because they split into fragments.\nIMPROVE: handle ABBREVIATIONS like u.s. because...\nDONE: ok"
         self.steer([True, True], status="complete")
         self.run_ticks(30)
@@ -215,7 +225,7 @@ class ImprovementTests(PhaseBase):
         self.assertEqual(self.phases()[0]["improvements"]["open"] + self.phases()[0]["improvements"]["done"], 1)
 
     def test_improvements_never_block_phase_completion_and_run_in_parallel_with_the_next_phase(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, True], status="complete", improvements=[{"title": "Try better tokenizer", "objective": "o", "workType": "implementation"}])
         self.run_ticks(30)
         self.assertEqual(self.phases()[0]["status"], "verifying")  # complete although the backlog item exists
@@ -231,7 +241,7 @@ class ImprovementTests(PhaseBase):
 
 class SafetyTests(PhaseBase):
     def test_phase_containers_are_not_failed_by_restart_recovery_and_do_not_use_worker_slots(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.rt.vp.phases.activate(self.pid, True)
         self.assertEqual(self.phases()[0]["status"], "running")
         self.assertEqual(self.rt.vp.recover(self.pid), 0)
@@ -240,7 +250,7 @@ class SafetyTests(PhaseBase):
         self.assertEqual([w["title"] for w in eligible], ["Build splitter"])  # the running phase did not eat a slot
 
     def test_a_phase_that_runs_out_of_ideas_asks_the_owner_instead_of_spinning(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, False], status="continue", tasks=[])  # unmet criterion, nothing it can do on its own
         self.run_ticks(30)
         q = [q for q in self.state()["questions"].values() if q["status"] == "open" and q["blocking"]]
@@ -249,7 +259,7 @@ class SafetyTests(PhaseBase):
         self.assertEqual(len(self.runner.steer_calls), 1)  # one model call, then it waited
 
     def test_needs_owner_blocks_the_phase_and_resumes_after_the_answer(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         self.steer([True, False], status="needs_owner", question="Which licence applies to the transcripts?")
         self.run_ticks(30)
         q = next(q for q in self.state()["questions"].values() if q["status"] == "open" and q["blocking"])
@@ -261,26 +271,125 @@ class SafetyTests(PhaseBase):
         self.assertEqual(self.phases()[0]["status"], "verifying")  # resumed on its own and finished
 
     def test_steer_round_limit_asks_the_owner(self):
-        self.rt.plan_phases(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.plan_phases(self.pid); self.accept()
         for i in range(MAX_STEERS_PER_PHASE + 2):
             self.steer([True, False], tasks=[{"key": f"k{i}", "title": f"Gap {i}", "objective": "o", "workType": "implementation"}])
         self.run_ticks(120)
         self.assertLessEqual(len(self.runner.steer_calls), MAX_STEERS_PER_PHASE)
         self.assertTrue(any(q["blocking"] and q["status"] == "open" for q in self.state()["questions"].values()))
 
-    def test_with_auto_run_off_the_vp_still_proposes_but_never_runs_its_own_next_tasks(self):
+    def test_accepting_a_phase_covers_everything_inside_it_but_flat_tasks_still_need_approval(self):
         self.rt.plan_phases(self.pid)
-        phase = self.rt.control.projector.replay(self.pid)
-        first = next(w for w in phase["workItems"].values() if is_phase(w) and not w["dependsOn"])
-        self.rt.approve_work(self.pid, first["workId"], {"expectedRevision": first["revision"], "decision": "approve"})
-        task = next(w for w in self.state()["workItems"].values() if w["title"] == "Build splitter")
-        self.rt.approve_work(self.pid, task["workId"], {"expectedRevision": task["revision"], "decision": "approve"})
-        self.run_ticks(5)  # phase starts, the approved task runs; then steering needs a scripted reply
+        self.accept()
+        self.run_ticks(5)  # phase 1 starts; its planned task runs with NO per-task approval
+        self.assertEqual(self.tasks(next(w["workId"] for w in self.state()["workItems"].values() if w["title"] == "Data readiness"))["Build splitter"]["status"], "completed")
         self.runner.steers.append({"assessment": [{"criterion": "Splitter verified", "met": True, "evidence": "e"}, {"criterion": "Extraction reviewed", "met": False, "evidence": ""}],
                                    "status": "continue", "newTasks": [{"key": "n", "title": "Follow-up", "objective": "o", "workType": "implementation"}]})
         self.run_ticks(10)
         follow = next(w for w in self.state()["workItems"].values() if w["title"] == "Follow-up")
-        self.assertEqual(follow["status"], "proposed")  # waits for the owner's approval when auto-run is off
+        self.assertEqual(follow["status"], "completed")  # the VP's own follow-up ran without asking
+        flat = self.rt.vp._new_work(self.pid, "Legacy flat task", "o", "research", "proposed", {"actorType": "agent", "actorId": "agent.subagent", "role": "worker"}, [], [], None,
+                                    {"actorType": "agent", "actorId": "agent.project-vp", "role": "vp"})
+        self.run_ticks(5)
+        self.assertEqual(self.state()["workItems"][flat["workId"]]["status"], "proposed")  # outside any phase, approval is still required
+
+
+class AutomaticPlanningTests(PhaseBase):
+    def test_the_vp_plans_on_its_own_once_the_interview_is_done_and_asks_you_to_accept_or_change_it(self):
+        self.assertEqual(self.phases(), [])
+        self.run_ticks(3)  # no button pressed: the scheduler plans
+        self.assertEqual([p["status"] for p in self.phases()], ["proposed", "proposed"])
+        q = next(q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phaseplan-") and q["status"] == "open")
+        self.assertFalse(q["blocking"])
+        for text in ("Phase 1: Data readiness", "Splitter verified", "Phase 2: Model inputs"):
+            self.assertIn(text, q["questionText"])
+        self.assertEqual([o["label"] for o in q["options"]][0], "Accept the plan and start Phase 1")
+        self.assertEqual(self.runner.worker_calls, [])  # nothing runs before you accept
+        self.assertEqual(len(self.runner.plan_calls), 1)  # and it planned once, not on every pass
+        self.run_ticks(5)
+        self.assertEqual(len(self.runner.plan_calls), 1)
+
+    def test_it_does_not_plan_before_the_interview_is_finished(self):
+        rt = PrototypeRuntime(Path(self.temp.name) / "d.sqlite3", workspace_root=Path(self.temp.name) / "ws2", runner=self.runner)
+        pid = rt.create_project({"mode": "new", "name": "Q", "goal": "g"})["projectId"]
+        rt.vp.tick(pid)
+        self.assertEqual(phase_summaries(rt.control.projector.replay(pid)), [])
+
+    def test_accepting_the_plan_starts_phase_one_and_it_runs_on_its_own(self):
+        self.run_ticks(2)
+        q = next(q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phaseplan-") and q["status"] == "open")
+        full = self.rt.get_question(self.pid, q["questionId"])
+        self.rt.answer_question(self.pid, q["questionId"], {"expectedEtag": full["etag"], "text": "Accept the plan and start Phase 1", "selectedOptionId": "option.plan.accept"})
+        self.run_ticks(5)
+        self.assertEqual(self.phases()[0]["status"], "running")
+        self.assertEqual(self.phases()[0]["tasks"]["done"], 1)
+
+    def test_accepting_on_the_phases_page_withdraws_the_plan_question(self):
+        self.run_ticks(2)
+        self.accept()  # the Accept button on the Phases page approves phase 1 directly
+        self.run_ticks(2)
+        self.assertEqual([q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phaseplan-") and q["status"] == "open"], [])
+
+    def test_rejecting_the_plan_with_feedback_discards_it_and_replans_using_that_feedback(self):
+        self.run_ticks(2)
+        q = next(q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phaseplan-") and q["status"] == "open")
+        full = self.rt.get_question(self.pid, q["questionId"])
+        self.rt.answer_question(self.pid, q["questionId"], {"expectedEtag": full["etag"], "selectedOptionId": "option.plan.reject",
+                                                            "text": "Change the plan: I'll say what's wrong\n\nNote: Split data cleaning from extraction."})
+        self.run_ticks(3)
+        self.assertEqual(len(self.runner.plan_calls), 2)
+        self.assertEqual(self.runner.plan_calls[1]["planFeedback"], "Split data cleaning from extraction.")
+        self.assertTrue(self.runner.plan_calls[1]["rejectedPlan"][0]["title"])
+        self.assertEqual([p["status"] for p in self.phases()], ["proposed", "proposed"])  # only the NEW plan is shown; the old one is hidden
+        open_plans = [q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phaseplan-") and q["status"] == "open"]
+        self.assertEqual(len(open_plans), 1)  # and you are asked about the new one
+        self.assertEqual(self.runner.worker_calls, [])
+
+    def test_planning_failures_are_retried_a_few_times_never_spun_on(self):
+        import ui.prototype.phases as P
+        self.runner.plan_error = True
+        clock = [1000.0]
+        orig = P.time.time
+        P.time.time = lambda: clock[0]
+        try:
+            for _ in range(10):
+                self.rt.vp.tick(self.pid)
+                clock[0] += 130  # past the retry delay each time
+        finally:
+            P.time.time = orig
+        self.assertEqual(len(self.runner.plan_calls), 3)  # at most 3 attempts per hour
+        self.assertEqual(self.phases(), [])
+
+
+class FullAutoTests(PhaseBase):
+    def test_full_auto_accepts_its_own_plan_runs_every_phase_and_never_stops_for_you(self):
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        self.steer_for_all = lambda crits: {"assessment": [{"criterion": c, "met": True, "evidence": "verified"} for c in crits], "status": "complete", "caveats": []}
+        self.run_ticks(3)  # planned and accepted without a question
+        self.assertEqual([q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phaseplan-")], [])
+        self.runner.steers.append(self.steer_for_all(["Splitter verified", "Extraction reviewed"]))
+        self.run_ticks(15)
+        self.runner.steers.append(self.steer_for_all(["Sources chosen"]))
+        self.runner.plan["phases"][1]["tasks"] = []
+        self.run_ticks(15)
+        statuses = [p["status"] for p in self.phases()]
+        self.assertEqual(statuses[0], "completed")  # rolled on by itself
+        self.assertNotIn("verifying", statuses)
+        open_checkpoints = [q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phase-") and q["status"] == "open"]
+        self.assertEqual(open_checkpoints, [])  # nothing waits for you
+        fyi = [a for a in self.rt.activity(self.pid) if "is complete: every exit criterion is evidenced" in a["text"]]
+        self.assertTrue(fyi)  # but you can read what happened in Latest
+        self.assertIn("starts now", fyi[-1]["text"] + " ".join(a["text"] for a in fyi))
+
+    def test_turning_full_auto_on_passes_a_checkpoint_that_was_waiting_and_withdraws_its_question(self):
+        self.rt.plan_phases(self.pid); self.accept()
+        self.steer([True, True], status="complete")
+        self.run_ticks(15)
+        self.assertEqual(self.phases()[0]["status"], "verifying")
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        self.run_ticks(3)
+        self.assertEqual(self.phases()[0]["status"], "completed")
+        self.assertEqual([q for q in self.state()["questions"].values() if q["questionId"].startswith("question.phase-work.") and q["status"] == "open"], [])
 
 
 if __name__ == "__main__":
