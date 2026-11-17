@@ -419,11 +419,18 @@ class ProjectVP:
                          if m["threadId"].startswith("thread.chat.") and m["messageType"] == "evidence" and m["content"].startswith("NOTE: ")]
             answers = [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:900]}
                        for q in state["questions"].values() if q["status"] == "answered"][-12:]
-            if not notes and not answers:
+            closed_by_owner = any(q["status"] == "rejected" and q.get("closedBy", {}).get("role") == "user"
+                                  and (q.get("resolutionReason") or "").strip() for q in state["questions"].values())
+            if not notes and not answers and not closed_by_owner:
                 return False
             payload_json = json.dumps({
                 "currentMemory": memory, "newNotes": notes, "recordedAnswers": answers,
                 "alreadyAsked": [q["questionText"][:200] for q in state["questions"].values() if q["questionId"].startswith("question.memory-")],
+                # a question the owner closed with a reason may really be an answer typed in the wrong place
+                "ownerClosedQuestions": [{"q": q["questionText"][:300], "ownerWords": (q.get("resolutionReason") or "")[:900]}
+                                         for q in state["questions"].values()
+                                         if q["status"] == "rejected" and q.get("closedBy", {}).get("role") == "user"
+                                         and (q.get("resolutionReason") or "").strip()][-8:],
                 "projectGoals": state["project"]["charter"].get("goals", [])})
             reply = _json_object(self.runner.explore(MEMORY_SYSTEM, payload_json, self.read_directory(project_id))
                                  if hasattr(self.runner, "explore") else self.runner.think(MEMORY_SYSTEM, payload_json))
@@ -752,8 +759,10 @@ LEARN_SYSTEM = (
 MEMORY_SECTIONS = ("vision", "decisions", "definitions", "constraints", "deferred", "open_questions", "corrections")
 MEMORY_SYSTEM = (
     "You curate the project's long-term memory of what the OWNER has said, so the VP and its agents always know "
-    "what is being discussed without rereading chats. Input: the current memory, new notes the VP took, and the "
-    "owner's recorded answers. Output ONE JSON object with exactly these keys, each a list of short, atomic, "
+    "what is being discussed without rereading chats. Input: the current memory, new notes the VP took, the "
+    "owner's recorded answers, and ownerClosedQuestions (questions the owner closed without answering: their "
+    "ownerWords are the owner's OWN words and often a real answer typed in the wrong place; treat them as owner "
+    "statements). Output ONE JSON object with exactly these keys, each a list of short, atomic, "
     "self-contained statements: vision, decisions, definitions, constraints, deferred, open_questions, corrections. "
     "Rules: merge duplicates; when the owner changed their mind, REPLACE the old statement with the new one (and add a "
     "one-line corrections entry only if the change itself matters); drop chit-chat, venting, and anything that was "

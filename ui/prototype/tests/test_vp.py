@@ -561,3 +561,26 @@ class EditableDraftTests(VPBase):
         from ui.prototype.vp import CONVERSE_SYSTEM
         self.assertIn("draftWasEditedByOwner", CONVERSE_SYSTEM)
         self.assertIn("EXACTLY", CONVERSE_SYSTEM)
+
+
+class RejectedAnswerTests(VPBase):
+    def test_a_rejection_reason_counts_as_owner_words_for_memory(self):
+        self.rt.sync_memory = True
+        seen = []
+        def explore(system, prompt, cwd):
+            if "curate the project's long-term memory" in system:
+                seen.append(json.loads(prompt)); return json.dumps({k: [] for k in ("vision", "decisions", "definitions", "constraints", "deferred", "open_questions", "corrections")})
+            return json.dumps({"intent": "btw", "reply": "ok", "learned": []})
+        self.runner.explore = explore
+        # a non-alignment question closed by the owner with an answer-like reason
+        work = self.rt.vp._new_work(self.pid, "T", "o", "planning", "ready", {"actorType": "agent", "actorId": "agent.subagent", "role": "worker"}, [], [], None, {"actorType": "agent", "actorId": "agent.project-vp", "role": "vp"})
+        self.rt.vp._ask(self.pid, work, "Is the goal to forecast ideas?")
+        qid = next(x["questionId"] for x in self.rt.list_questions(self.pid)["questions"] if x["questionText"] == "Is the goal to forecast ideas?")
+        f = self.rt.get_question(self.pid, qid)
+        self.rt.close_question(self.pid, qid, {"expectedEtag": f["etag"], "newStatus": "rejected", "reason": "Yes exactly, forecast ideas at any granularity."})
+        self.rt.vp.curate_memory(self.pid)
+        self.assertEqual(seen[-1]["ownerClosedQuestions"][0]["ownerWords"], "Yes exactly, forecast ideas at any granularity.")
+
+    def test_curator_prompt_explains_owner_closed_questions(self):
+        from ui.prototype.vp import MEMORY_SYSTEM
+        self.assertIn("ownerClosedQuestions", MEMORY_SYSTEM)
