@@ -1,14 +1,12 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import {
-  ChevronDown, CircleHelp, Folder, FolderKanban, Inbox,
-  Activity as ActivityIcon, Layers3, MessageSquare, Plus, Search, ShieldAlert, Sparkles, X,
-} from "lucide-react";
+import { Brain, ChevronDown, Folder, House, Inbox, Layers3, MessageSquare, Plus, Settings, X } from "lucide-react";
 import "./style.css";
 import "./goal.css";
 import "./work-views.css";
 import "./kanban-board.css";
 import "./chat.css";
+import "./home.css";
 
 type Project = { projectId: string; name: string; status: string; charter: { revision: number; goals: string[]; nonGoals: string[]; acceptanceCriteria: string[] } };
 type Work = { workId: string; title: string; objective: string; workType: string; status: string; parentWorkId?: string | null; dependsOn: string[]; acceptanceCriteria: string[]; revision: number };
@@ -19,13 +17,14 @@ type Activity = { id: string; workId: string; workTitle: string; actor: string; 
 type Automation = { autoRun: boolean; workerAvailable: boolean; demoProject: boolean };
 type Log = { id: string; kind: string; title: string; detail: string; crucial: boolean; edited?: boolean };
 type Memory = { memory: Record<string, string[]>; detailedLogs?: Log[]; notYetMergedNotes: string[] };
-type Summary = { dataRoots?: string[]; memory?: Memory; automation: Automation; activity: Activity[]; drafting: boolean; project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number>; alignment?: Alignment | null };
+type Summary = { phases?: Phase[]; dataRoots?: string[]; memory?: Memory; automation: Automation; activity: Activity[]; drafting: boolean; project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number>; alignment?: Alignment | null };
 type RepoReport = { repositoryName: string; repositoryPath: string; head: string; branch: string; trackedFileCount: number; trackedChanges: number | null; topLevelAreas: string[]; documents: { path: string; title: string; excerpt: string }[]; goalHint: string; fingerprint: string; inspectionPolicy: string };
 type ProjectMode = "choose" | "new" | "existing";
 type Question = { questionId: string; questionType: string; questionText: string; priority: string; blocking: boolean; workIds: string[]; etag: string };
 type QuestionDetail = Question & { record: { questionType: string; options: { optionId: string; label: string; consequence?: string }[]; impact: string; status: string; questionText: string }; affectedWork: { workId: string; title: string; status: string }[] };
 type Turn = { role: "user" | "assistant"; content: string };
-type View = "overview" | "board" | "activity" | "chat" | "inbox";
+type View = "home" | "phases" | "memory" | "ask" | "activity";
+type Phase = { phaseId: string; index: number; title: string; goal: string; status: string; revision: number; exitCriteria: string[]; assessment: { criterion: string; met: boolean; evidence: string }[]; caveats: string[]; steers: number; tasks: { total: number; done: number; running: number; failed: number }; improvements: { open: number; done: number; titles: string[] } };
 
 const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
@@ -38,14 +37,21 @@ const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   return payload as T;
 };
 
+
+const questionRank = (q: Question) => (q.questionId.startsWith("question.phase-") ? 0 : q.blocking ? 1 : 2);
+const firstLine = (text: string) => (text.split("\n").map((l) => l.trim()).filter(Boolean)[0] || text).replace(/^(\d+ of \d+ · |Follow-up · )/, "");
+const excerpt = (text: string) => { const done = text.split("\n").find((l) => l.trim().toUpperCase().startsWith("DONE:")); return (done ? done.replace(/^DONE:\s*/i, "") : text.replace(/\s+/g, " ")).slice(0, 170); };
+const ago = (iso: string) => { const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000); return s < 90 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} d ago`; };
+
 function App() {
   const [projects, setProjects] = React.useState<Project[]>([]);
   const [projectId, setProjectId] = React.useState(() => new URLSearchParams(window.location.search).get("project") || "project.northstar");
   const [summary, setSummary] = React.useState<Summary | null>(null);
-  const [view, setView] = React.useState<View>("overview");
+  const [view, setView] = React.useState<View>("home");
   const [projectsOpen, setProjectsOpen] = React.useState(false);
   const [questions, setQuestions] = React.useState<Question[]>([]);
   const [selectedQuestion, setSelectedQuestion] = React.useState<QuestionDetail | null>(null);
+  const selectedIdRef = React.useRef("");
   const [error, setError] = React.useState("");
   const [projectDialog, setProjectDialog] = React.useState(false);
   const [projectMode, setProjectMode] = React.useState<ProjectMode>("choose");
@@ -55,6 +61,8 @@ function App() {
   const [draftGoal, setDraftGoal] = React.useState("");
   const [inspectionBusy, setInspectionBusy] = React.useState(false);
   const [workDialog, setWorkDialog] = React.useState(false);
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [chatOpen, setChatOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
   const loadProjects = React.useCallback(async () => {
@@ -63,12 +71,16 @@ function App() {
     return result.items;
   }, []);
 
+  // Keeps the question you are on; only falls back to the most urgent one when it is gone (answered/closed).
   const loadInbox = React.useCallback(async (id: string) => {
     await request(`/api/v1/projects/${encodeURIComponent(id)}/alignment/resume`, { method: "POST", body: JSON.stringify({}) });
     const result = await request<{questions: Question[]}>(`/api/v1/projects/${encodeURIComponent(id)}/inbox?status=open`);
     setQuestions(result.questions);
-    if (!result.questions.length) { setSelectedQuestion(null); return result.questions; }
-    const detail = await request<QuestionDetail>(`/api/v1/projects/${encodeURIComponent(id)}/inbox/${encodeURIComponent(result.questions[0].questionId)}`);
+    if (!result.questions.length) { selectedIdRef.current = ""; setSelectedQuestion(null); return result.questions; }
+    const keep = result.questions.some((q) => q.questionId === selectedIdRef.current) ? selectedIdRef.current : "";
+    const target = keep || [...result.questions].sort((a, b) => questionRank(a) - questionRank(b))[0].questionId;
+    const detail = await request<QuestionDetail>(`/api/v1/projects/${encodeURIComponent(id)}/inbox/${encodeURIComponent(target)}`);
+    selectedIdRef.current = detail.questionId;
     setSelectedQuestion(detail);
     return result.questions;
   }, []);
@@ -93,50 +105,54 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    const awaitingBoard = summary?.alignment?.status === "completed" && !summary.automation.demoProject && !summary.workItems.some((w) => w.workId !== "work.alignment-intake");
-    const live = summary && (summary.drafting || awaitingBoard || summary.automation.autoRun || summary.workItems.some((w) => ["running", "verifying", "ready"].includes(w.status)));
+    const live = summary && !summary.automation.demoProject && (summary.drafting || summary.automation.autoRun
+      || summary.workItems.some((w) => ["running", "verifying", "ready"].includes(w.status))
+      || (summary.phases || []).some((p) => ["running", "verifying", "ready"].includes(p.status))
+      || (summary.alignment?.status === "completed" && !summary.workItems.some((w) => w.workId !== "work.alignment-intake")));
     if (!live) return;
     const timer = window.setInterval(() => { loadProject(projectId).catch(() => {}); loadInbox(projectId).catch(() => {}); }, 4000);
     return () => window.clearInterval(timer);
   }, [summary, projectId]);
 
-  async function setAutoRun(enabled: boolean) {
+  async function post(path: string, body: unknown, fail: string) {
     setBusy(true);
-    try { await request(`/api/v1/projects/${encodeURIComponent(projectId)}/automation`, { method: "POST", body: JSON.stringify({ autoRun: enabled }) }); await loadProject(projectId); }
-    catch (e) { setError(e instanceof Error ? e.message : "Could not change auto-run."); }
+    try { await request(`/api/v1/projects/${encodeURIComponent(projectId)}/${path}`, { method: "POST", body: JSON.stringify(body) }); await loadProject(projectId); return true; }
+    catch (e) { setError(e instanceof Error ? e.message : fail); return false; }
     finally { setBusy(false); }
   }
-
-  async function draftBoard() {
-    setBusy(true);
-    try { await request(`/api/v1/projects/${encodeURIComponent(projectId)}/board/draft`, { method: "POST", body: JSON.stringify({}) }); await loadProject(projectId); setView("board"); }
-    catch (e) { setError(e instanceof Error ? e.message : "The VP could not draft a board."); }
-    finally { setBusy(false); }
-  }
+  const decidePhase = (phaseId: string, moveOn: boolean) => post(`phases/${encodeURIComponent(phaseId)}/decision`, { moveOn }, "Could not update the phase.");
+  const planPhases = async () => { if (await post("phases/plan", {}, "The VP could not plan phases.")) setView("phases"); };
+  const setAutoRun = (enabled: boolean) => post("automation", { autoRun: enabled }, "Could not change auto-run.");
+  const decideWork = (workId: string, revision: number, decision: "approve" | "reject" | "retry") => post(`work/${encodeURIComponent(workId)}/approval`, { expectedRevision: revision, decision }, "Could not record the work approval.");
 
   const project = summary?.project;
+  const phases = summary?.phases || [];
   const workItems = summary?.workItems || [];
-  const openQuestionCount = summary?.counts.openQuestions || 0;
-  const blockingQuestionCount = questions.filter((question) => question.blocking).length;
-  const alignmentQuestionCount = questions.filter((question) => question.questionType === "clarification").length;
+  const tasks = workItems.filter((w) => !w.workId.startsWith("work.phase-") && w.workId !== "work.alignment-intake");
+  const demo = Boolean(summary?.automation.demoProject);
+  const needs = [...questions].sort((a, b) => questionRank(a) - questionRank(b));
   const alignmentWork = workItems.find((item) => item.workId === "work.alignment-intake");
   const alignmentCompleted = alignmentWork?.status === "completed";
-  const alignmentPending = alignmentQuestionCount > 0 || Boolean(alignmentWork && !["completed", "cancelled"].includes(alignmentWork.status));
-  const breakdownItems = workItems.filter((item) => item.workId !== "work.alignment-intake" && item.status !== "cancelled");
-  const runningWorkCount = workItems.filter((item) => ["running", "verifying"].includes(item.status)).length;
-  const pulse = projectPulse(workItems.length, openQuestionCount, blockingQuestionCount, alignmentQuestionCount, alignmentWork, breakdownItems.length, runningWorkCount, alignmentCompleted);
+  const alignmentPending = questions.some((q) => q.questionId.startsWith("question.alignment.")) || Boolean(alignmentWork && !["completed", "cancelled"].includes(alignmentWork.status));
+  const activePhase = phases.find((p) => p.status === "verifying") || phases.find((p) => p.status === "running") || phases.find((p) => p.status === "ready");
+  const running = tasks.filter((w) => ["running", "verifying"].includes(w.status));
+  const reviewing = phases.find((p) => p.status === "verifying");
+  const statusLine = reviewing ? `Phase ${reviewing.index} is done and waiting for your review`
+    : needs.some((q) => q.blocking) ? "Waiting on your answer"
+    : alignmentPending ? "Alignment interview in progress"
+    : running.length ? `Working on: ${running[0].title}${running.length > 1 ? ` +${running.length - 1} more` : ""}`
+    : activePhase ? `Phase ${activePhase.index} in progress`
+    : phases.length === 0 && !demo ? "No plan yet" : "Idle";
+  const titles: Record<View, string> = { home: project?.name || "Project", phases: "Phases", memory: "What the VP remembers", ask: selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Needs you", activity: "Activity" };
 
-  function openProjectDialog() {
-    setProjectMode("choose"); setRepositoryPath(""); setRepoReport(null); setDraftName(""); setDraftGoal(""); setProjectDialog(true);
-  }
+  function openProjectDialog() { setProjectMode("choose"); setRepositoryPath(""); setRepoReport(null); setDraftName(""); setDraftGoal(""); setProjectDialog(true); }
 
   async function inspectRepository() {
     if (!repositoryPath.trim()) { setError("Choose a local Git repository path first."); return; }
     setInspectionBusy(true); setError("");
     try {
       const result = await request<{report: RepoReport}>("/api/v1/repositories/inspect", { method: "POST", body: JSON.stringify({ repositoryPath: repositoryPath.trim() }) });
-      setRepoReport(result.report); setDraftName(result.report.repositoryName);
-      setDraftGoal(result.report.goalHint || "");
+      setRepoReport(result.report); setDraftName(result.report.repositoryName); setDraftGoal(result.report.goalHint || "");
     } catch (e) { setError(e instanceof Error ? e.message : "Could not inspect the repository."); setRepoReport(null); }
     finally { setInspectionBusy(false); }
   }
@@ -148,20 +164,10 @@ function App() {
         ? { mode: "existing", name: draftName, goal: draftGoal, repositoryPath: repoReport?.repositoryPath, inspectionFingerprint: repoReport?.fingerprint }
         : { mode: "new", name: draftName, goal: draftGoal };
       const result = await request<{project: Project}>('/api/v1/projects', { method: 'POST', body: JSON.stringify(body) });
+      selectedIdRef.current = "";
       await loadProjects(); await loadProject(result.project.projectId); await loadInbox(result.project.projectId);
-      setView("inbox"); setProjectDialog(false);
+      setView("ask"); setProjectDialog(false);
     } catch (e) { setError(e instanceof Error ? e.message : "Could not create project."); }
-    finally { setBusy(false); }
-  }
-
-  async function decideWork(workId: string, revision: number, decision: "approve" | "reject" | "retry"): Promise<boolean> {
-    if (!project) return false;
-    setBusy(true);
-    try {
-      await request(`/api/v1/projects/${encodeURIComponent(project.projectId)}/work/${encodeURIComponent(workId)}/approval`, { method: "POST", body: JSON.stringify({ expectedRevision: revision, decision }) });
-      await loadProject(project.projectId);
-      return true;
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not record the work approval."); return false; }
     finally { setBusy(false); }
   }
 
@@ -171,22 +177,17 @@ function App() {
     try {
       const acceptanceCriteria = String(data.get('acceptanceCriteria') || "").split("\n").map((line) => line.trim()).filter(Boolean);
       await request(`/api/v1/projects/${encodeURIComponent(project.projectId)}/work`, { method: 'POST', body: JSON.stringify({ title: data.get('title'), objective: data.get('objective'), workType: data.get('workType'), parentWorkId: data.get('parentWorkId') || null, acceptanceCriteria }) });
-      await loadProject(project.projectId); setView("overview"); setWorkDialog(false); form.reset();
+      await loadProject(project.projectId); setView("phases"); setWorkDialog(false); form.reset();
     } catch (e) { setError(e instanceof Error ? e.message : "Could not add planned work."); }
     finally { setBusy(false); }
   }
 
-  async function chooseQuestion(questionId: string) {
+  async function openQuestion(questionId: string) {
     if (!project) return;
     try {
       const detail = await request<QuestionDetail>(`/api/v1/projects/${encodeURIComponent(project.projectId)}/inbox/${encodeURIComponent(questionId)}`);
-      setSelectedQuestion(detail);
+      selectedIdRef.current = detail.questionId; setSelectedQuestion(detail); setView("ask");
     } catch (e) { setError(e instanceof Error ? e.message : "Could not load question."); }
-  }
-
-  async function openQuestion(questionId: string) {
-    await chooseQuestion(questionId);
-    setView("inbox");
   }
 
   async function questionRecorded() {
@@ -194,46 +195,49 @@ function App() {
     const wasAlignment = selectedQuestion.questionId.startsWith("question.alignment.");
     await loadProject(project.projectId);
     const remaining = await loadInbox(project.projectId);
-    if (wasAlignment && remaining.length === 0) setView("overview");
+    if (wasAlignment && remaining.length === 0) setView("home");
   }
 
   async function switchProject(id: string) {
-    try { await loadProject(id); await loadInbox(id); setView("overview"); }
+    try { selectedIdRef.current = ""; await loadProject(id); await loadInbox(id); setView("home"); setChatOpen(false); }
     catch (e) { setError(e instanceof Error ? e.message : "Could not open the project."); }
   }
 
   return <div className="amp-shell">
     <aside className="amp-sidebar">
-      <div className="amp-brand-row"><button className="panel-toggle" aria-label="Sidebar collapse unavailable" title="Sidebar collapse is not implemented" disabled><span/></button><a className="amp-brand" href="#workspace"><span className="amp-logo"><Layers3 size={16}/></span><b>Northstar</b></a><button className="icon-button" aria-label="Search unavailable" title="Search is not connected" disabled><Search size={15}/></button><button className="new-thread" aria-label="New project" title="New project" onClick={openProjectDialog}><Plus size={16}/></button></div>
+      <div className="amp-brand-row"><a className="amp-brand" href="#workspace"><span className="amp-logo"><Layers3 size={16}/></span><b>Northstar</b></a><button className="new-thread" aria-label="New project" title="New project" onClick={openProjectDialog}><Plus size={16}/></button></div>
       <button className="amp-project-picker" onClick={() => setProjectsOpen((open) => !open)}><Folder size={15}/><span>{project?.name || "Projects"}</span><ChevronDown size={13}/></button>
       {projectsOpen && <div className="project-menu">{projects.map((item)=><button key={item.projectId} className={item.projectId===projectId?"current":""} onClick={()=>{void switchProject(item.projectId);setProjectsOpen(false);}}>{item.name}</button>)}<button onClick={()=>{openProjectDialog();setProjectsOpen(false);}}><Plus size={13}/>New project</button></div>}
-      <div className="sidebar-section-head"><span>PROJECT</span></div>
-      <nav className="amp-sidebar-links" aria-label="Project navigation"><button onClick={() => setView("overview")} className={view === "overview" ? "current" : ""}><Layers3 size={15}/>Overview</button><button onClick={() => setView("board")} className={view === "board" ? "current" : ""}><FolderKanban size={15}/>Task board <span>{workItems.length || ""}</span></button><button onClick={() => setView("activity")} className={view === "activity" ? "current" : ""}><ActivityIcon size={15}/>Activity <span>{runningWorkCount ? "live" : ""}</span></button><button onClick={() => setView("chat")} className={view === "chat" ? "current" : ""}><MessageSquare size={15}/>Chat with VP</button><button onClick={() => setView("inbox")} className={view === "inbox" ? "current" : ""}><Inbox size={15}/>Your input <span>{openQuestionCount || ""}</span></button></nav>
+      <nav className="amp-sidebar-links" aria-label="Project navigation">
+        <button onClick={() => setView("home")} className={view === "home" || view === "ask" || view === "activity" ? "current" : ""}><House size={15}/>Home <span className={needs.length ? "nav-alert" : ""}>{needs.length || ""}</span></button>
+        <button onClick={() => setView("phases")} className={view === "phases" ? "current" : ""}><Layers3 size={15}/>Phases <span className={reviewing ? "nav-alert" : ""}>{reviewing ? "review" : phases.length || ""}</span></button>
+        <button onClick={() => setView("memory")} className={view === "memory" ? "current" : ""}><Brain size={15}/>Memory</button>
+      </nav>
       <div className="sidebar-spacer"/>
-      <div className="amp-sidebar-links"><button onClick={openProjectDialog}><FolderKanban size={15}/>New project</button></div>
-      <div className="amp-user"><span className="amp-avatar">V</span><span><b>Local user</b><small>Prototype · not authenticated</small></span><CircleHelp size={15}/></div>
+      <div className="amp-sidebar-links"><button onClick={() => setSettingsOpen(true)}><Settings size={15}/>Settings</button></div>
     </aside>
     <main className="goal-main">
-      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Your input" : view === "board" ? "Task board" : view === "activity" ? "Activity" : view === "chat" ? "Project chat" : project?.name || "Project"}</h1><small>{view === "inbox" ? selectedQuestion?.questionId.startsWith("question.alignment.") ? "Repo-grounded alignment · one segment at a time" : "Decisions that need your attention" : view === "board" ? "Work at a glance · click cards for details" : view === "activity" ? "What your agents are doing and have done" : view === "chat" ? "Conversation with the project assistant" : "Goal, outcomes, and what needs attention"}</small></div></div><div className="goal-topbar-actions"><span className="prototype-status"><ShieldAlert size={13}/>Prototype · test data only</span>{(view === "overview" || view === "board") && (openQuestionCount > 0 ? <button className="button secondary" onClick={() => setView("inbox")}><Inbox size={14}/>Review decisions</button> : breakdownItems.length > 0 && view === "overview" ? <button className="button primary" onClick={() => setView("board")}><FolderKanban size={14}/>See task status</button> : <button className="button primary" onClick={() => setWorkDialog(true)}><Plus size={14}/>Add outcome or step</button>)}</div></header>
+      <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{titles[view]}</h1><small>{statusLine}</small></div></div>
+        <div className="goal-topbar-actions">
+          <span className="auto-run-status"><span>Auto-run</span><button role="switch" aria-checked={Boolean(summary?.automation.autoRun)} disabled={busy || !summary || demo || !summary.automation.workerAvailable} title={demo ? "The synthetic demo project cannot run agents." : !summary?.automation.workerAvailable ? "No worker CLI (Claude Code or Codex) is available." : "On: the VP works the phases on its own and only stops for your review. Off: it proposes and waits for your approval."} onClick={() => void setAutoRun(!summary?.automation.autoRun)}><i/>{summary?.automation.autoRun ? "On" : "Off"}</button></span>
+          <button className="button secondary" onClick={() => setChatOpen((open) => !open)}><MessageSquare size={14}/>Ask the VP</button>
+        </div></header>
       <div className="goal-stage">
         {error && <div className="error-banner" role="alert">{error}</div>}
-        {view === "inbox" ? <InboxView projectId={project?.projectId || ""} questions={questions} selected={selectedQuestion} choose={chooseQuestion} recorded={questionRecorded}/> : view === "board" && project ? <KanbanBoard items={workItems} busy={busy} decide={decideWork} automation={summary?.automation} setAutoRun={setAutoRun} draftBoard={draftBoard} drafting={Boolean(summary?.drafting)} alignmentCompleted={alignmentCompleted}/> : view === "activity" && project ? <ActivityView items={summary?.activity || []} running={runningWorkCount} workItems={workItems}/> : view === "chat" && project ? <ProjectChat projectId={project.projectId} projectName={project.name}/> : project ? <div className="goal-scroll">
-          <section className="goal-hero"><div className="eyebrow"><Sparkles size={13}/> {alignmentPending ? "PROVISIONAL REPOSITORY HYPOTHESIS" : "PROJECT DIRECTION"}</div><h2>{project.charter.goals.join(" ") || "No project goal defined"}</h2>{alignmentPending && <p className="goal-context-note">This wording comes from the repository, not from a confirmed conversation with you. It is not yet the agreed overarching vision.</p>}<div className="goal-project-meta"><span>{project.name}</span><span>Charter revision {project.charter.revision}</span></div></section>
-          <section className={`project-pulse ${openQuestionCount ? "needs-input" : ""}`} aria-labelledby="pulse-title"><div className="pulse-icon"><Sparkles size={17}/></div><div className="pulse-copy"><div className="eyebrow">PROJECT STATE</div><h3 id="pulse-title">{pulse.title}</h3><p>{pulse.description}</p></div>{openQuestionCount > 0 && <button className="button secondary" onClick={() => setView("inbox")}>Your input <span aria-hidden="true">→</span></button>}</section>
-          {summary&&!summary.automation.demoProject&&<DataRootsCard projectId={project.projectId} roots={summary.dataRoots||[]} reload={()=>loadProject(project.projectId)}/>}
-          {summary?.memory&&<MemoryCard memory={summary.memory} onCorrect={()=>setView("chat")}/>}
-          <div className="goal-columns">
-            <section className="goal-card outcome-card"><div className="goal-card-heading"><div><div className="eyebrow">PROJECT BREAKDOWN</div><h3>Goal → outcomes → workstreams → steps</h3></div><Layers3 size={17}/></div>{breakdownItems.length ? <WorkTree items={breakdownItems}/> : alignmentPending ? <p className="empty-copy">Alignment is still in progress. The current approved scope will appear here as outcome proposals; nothing starts automatically.</p> : alignmentCompleted ? <p className="empty-copy">The interview answers are recorded. The VP is drafting your task board; if nothing appears, use “Draft board with VP” on the Task board.</p> : <p className="empty-copy">No outcome hierarchy is recorded yet. Add a meaningful outcome when you are ready.</p>}</section>
-            <section className="goal-card attention-card"><div className="goal-card-heading"><div><div className="eyebrow">YOUR INPUT</div><h3>{openQuestionCount ? `${openQuestionCount} ${openQuestionCount === 1 ? "question" : "questions"} to answer` : "No open project questions"}</h3></div><Inbox size={17}/></div>{questions.length ? <div className="attention-list">{questions.slice(0,3).map((question)=><button key={question.questionId} className="attention-item" onClick={()=>void openQuestion(question.questionId)}><span className={`question-dot ${question.priority}`}/><span><b>{question.questionText}</b><small>{question.blocking ? "Needed before the alignment phase can continue" : "May shape the project direction"}</small></span><span aria-hidden="true">→</span></button>)}</div> : <p className="empty-copy">No decision is waiting on you. {breakdownItems.length ? "The task board shows the proposed work; no agent work is running." : "The project breakdown will appear here when proposals are recorded."}</p>}</section>
-          </div>
-          <details className="detail-disclosure"><summary><span><b>Process and work-item details</b><small>Proposals, statuses, and implementation detail</small></span><span className="detail-count">{workItems.length}</span></summary>{workItems.length ? <div className="plan-list">{workItems.map((item)=><article className="plan-item" key={item.workId}><div className="plan-item-title"><span className={`thread-status-dot ${item.status}`}/><b>{item.title}</b><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div><p>{item.objective}</p><small>{item.workType} · revision {item.revision}{item.parentWorkId ? ` · parent ${workItems.find((parent)=>parent.workId===item.parentWorkId)?.title || item.parentWorkId}` : ""}</small></article>)}</div> : <p className="empty-copy">No work items have been agreed.</p>}</details>
-          {project.charter.acceptanceCriteria.length > 0 && <details className="detail-disclosure"><summary><span><b>Recorded acceptance criteria</b><small>Stored wording only; nothing is automatically verified</small></span><span className="detail-count">{project.charter.acceptanceCriteria.length}</span></summary><ul className="criteria-list">{project.charter.acceptanceCriteria.map((criterion,index)=><li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></details>}
-          {summary?.alignment && <details className="detail-disclosure alignment-record"><summary><span><b>Alignment record</b><small>{summary.alignment.status === "completed" ? "Interview complete · answers retained as project input" : "Interview in progress · confirmed and open segments"}</small></span><span className="detail-count">{summary.alignment.segments.filter((segment)=>segment.status === "answered").length}/{summary.alignment.segments.length}</span></summary>{summary.alignment.head&&<div className="alignment-record-meta">{summary.alignment.repositoryName} · {summary.alignment.branch} · {summary.alignment.head.slice(0,12)}</div>}{summary.alignment.segments.map((segment)=><article className="alignment-record-segment" key={segment.index}><div className="alignment-record-title"><b>{segment.index}. {segment.title}</b><span>{segment.status.replaceAll("_"," ")}</span></div><p>{segment.prompt}</p><details><summary>Repository evidence reviewed</summary><p>{segment.evidence}</p></details><b className="alignment-answer-label">Your recorded response</b><p className="alignment-answer">{segment.answer?.text || "Not answered yet."}</p></article>)}</details>}
-          <details className="detail-disclosure history-disclosure"><summary><span><b>Project history</b><small>Event-by-event detail, kept out of the main progress view</small></span><span className="detail-count">{summary?.recentEvents.length || 0}</span></summary>{summary?.recentEvents.length ? <ol className="history-list">{summary.recentEvents.map((event)=><li key={event.eventId}><span><b>{event.title}</b><small>{event.description}</small><time>{event.actorLabel} · {new Date(event.occurredAt).toLocaleString()}</time></span></li>)}</ol> : <p className="empty-copy">No project events have been recorded yet.</p>}</details>
-          <div className="goal-footnote"><ShieldAlert size={13}/>Approved tasks run through local Claude Code or Codex workers in the project workspace. Chat only discusses; it cannot start or change work.</div>
-        </div> : <div className="loading">Loading your project…</div>}
+        {!project ? <div className="loading">Loading your project…</div>
+          : view === "ask" ? <InboxView projectId={project.projectId} questions={needs} selected={selectedQuestion} choose={openQuestion} recorded={questionRecorded}/>
+          : view === "phases" ? <PhasesPage phases={phases} items={workItems} tasks={tasks} busy={busy} approve={decideWork} decide={decidePhase} plan={planPhases} review={() => setView("ask")} alignmentCompleted={alignmentCompleted} demo={demo} addTask={() => setWorkDialog(true)}/>
+          : view === "memory" ? <MemoryPage memory={summary?.memory} alignment={summary?.alignment} onCorrect={() => setChatOpen(true)}/>
+          : view === "activity" ? <div className="goal-scroll"><button className="back-link" onClick={() => setView("home")}>← Home</button><ActivityView items={summary?.activity || []} running={running.length} workItems={tasks}/></div>
+          : <Home goal={project.charter.goals.join(" ")} needs={needs} open={openQuestion} activePhase={activePhase} running={running} latest={summary?.activity || []} plan={planPhases} busy={busy} demo={demo} alignmentPending={alignmentPending} alignmentCompleted={alignmentCompleted} hasPhases={phases.length > 0} goPhases={() => setView("phases")} goActivity={() => setView("activity")} goAsk={() => setView("ask")}/>}
       </div>
     </main>
+    {chatOpen && project && <ChatDrawer projectId={project.projectId} onClose={() => setChatOpen(false)}/>}
+    {settingsOpen && project && <Modal title="Project settings" onClose={() => setSettingsOpen(false)}>
+      {!demo ? <DataRootsCard projectId={project.projectId} roots={summary?.dataRoots || []} reload={() => loadProject(project.projectId)}/> : <p className="empty-copy">The synthetic demo project has no settings.</p>}
+      <p className="form-hint">Agents run as local Codex or Claude Code workers in a copy of your repository; nothing is pushed anywhere. This is a local prototype: no sign-in, loopback only.</p>
+    </Modal>}
+
     {projectDialog && <Modal title="Add a project" onClose={() => setProjectDialog(false)}>
       {projectMode === "choose" ? <div className="project-type-choice"><p>How should we start? Every project starts with an alignment interview; existing ones begin with a read-only repository review.</p><button className="project-type-card" onClick={()=>{setProjectMode("new");setDraftName("");setDraftGoal("");}}><b>New project</b><small>Start from a goal you describe, then the VP interviews you.</small></button><button className="project-type-card" onClick={()=>{setProjectMode("existing");setDraftName("");setDraftGoal("");}}><b>Existing project</b><small>Inspect a local repository, review what it says, then answer a five-part alignment interview.</small></button><button type="button" className="button secondary" onClick={()=>setProjectDialog(false)}>Cancel</button></div> : <>
         <button type="button" className="back-link" onClick={()=>setProjectMode("choose")}>← Choose project type</button>
@@ -247,42 +251,75 @@ function App() {
   </div>;
 }
 
-function projectPulse(workCount:number,questionCount:number,blockingCount:number,alignmentQuestionCount:number,alignmentWork?:Work,breakdownCount=0,runningCount=0,alignmentCompleted=false) {
-  if (blockingCount > 0) return { title: "Your input is needed", description: `${blockingCount} open question${blockingCount === 1 ? " is" : "s are"} blocking affected work. Review the impact before deciding.` };
-  if (alignmentQuestionCount > 0) return { title: "Your project direction needs alignment", description: "Some project scope is still unresolved. The current proposal is visible on the task board; unresolved choices are not being guessed." };
-  if (runningCount > 0) return { title: `${runningCount} work item${runningCount === 1 ? " is" : "s are"} in progress`, description: "This count comes from canonical work statuses. Open the task board for the exact items; no unrecorded progress is inferred." };
-  if (breakdownCount > 0) return { title: "Nothing is running right now", description: `${breakdownCount} work items are visible on the task board; proposed and ready statuses are not active execution. Approve a task, or turn on auto-run, to start work.` };
-  if (alignmentCompleted) return { title: "Alignment interview complete", description: "Your repo-grounded answers are stored in project history. The VP drafts the task board from them; approve each task, or turn on auto-run." };
-  if (alignmentWork && !["completed", "cancelled"].includes(alignmentWork.status)) return { title: "Planning is underway", description: "No task breakdown is recorded yet. The project will show proposed outcomes here before claiming any work has started." };
-  if (questionCount > 0) return { title: "A decision may shape the project", description: "There are open project questions to review; no progress is inferred from the plan." };
-  if (workCount > 0) return { title: "Work is recorded · nothing running", description: "Approve a task on the board, or turn on auto-run, to start work." };
-  return { title: "Project direction is recorded", description: "No outcome hierarchy is recorded yet. Add a meaningful outcome when you are ready; this prototype will not invent a finish line." };
+function Home({goal,needs,open,activePhase,running,latest,plan,busy,demo,alignmentPending,alignmentCompleted,hasPhases,goPhases,goActivity,goAsk}:{goal:string;needs:Question[];open:(id:string)=>void;activePhase?:Phase;running:Work[];latest:Activity[];plan:()=>void;busy:boolean;demo:boolean;alignmentPending:boolean;alignmentCompleted:boolean;hasPhases:boolean;goPhases:()=>void;goActivity:()=>void;goAsk:()=>void}) {
+  const pct = activePhase && activePhase.tasks.total ? Math.round(100 * activePhase.tasks.done / activePhase.tasks.total) : 0;
+  const unmet = activePhase ? activePhase.assessment.filter((a) => !a.met).length : 0;
+  const reports = latest.filter((a) => !/^(Committed |No files changed|The app stopped)/.test(a.text.trim()));  // housekeeping notes aren't news
+  return <div className="home">
+    {goal && <p className="home-goal">{goal}</p>}
+    <section className={`home-card ${needs.length ? "needs" : ""}`} aria-labelledby="needs-title">
+      <h2 id="needs-title">{needs.length ? `Needs you · ${needs.length}` : "Needs you"}</h2>
+      {needs.length ? <>{needs.slice(0, 5).map((q) => <button key={q.questionId} className="needs-row" onClick={() => open(q.questionId)}><span className={`question-dot ${q.priority}`}/><span><b>{firstLine(q.questionText).slice(0, 140)}</b><small>{q.questionId.startsWith("question.phase-") ? "Phase checkpoint · review what was built" : q.blocking ? "Needed to continue" : "When you have a moment"}</small></span><span aria-hidden="true">→</span></button>)}{needs.length > 5 && <button className="link-button" onClick={goAsk}>and {needs.length - 5} more</button>}</>
+        : <p className="empty-copy">Nothing needs you. The VP will tell you here when it does.</p>}
+    </section>
+    <section className="home-card" aria-labelledby="now-title">
+      <h2 id="now-title">Now</h2>
+      {activePhase ? <>
+        <div className="eyebrow">PHASE {activePhase.index} · {PHASE_STATUS[activePhase.status] || activePhase.status}</div>
+        <h3>{activePhase.title}</h3>
+        <div className="phase-progress" aria-label="Task progress"><span style={{width: `${pct}%`}}/></div>
+        <small>{activePhase.tasks.done} of {activePhase.tasks.total} tasks done{unmet > 0 && activePhase.status === "running" ? ` · ${unmet} exit criteri${unmet === 1 ? "on" : "a"} still open` : ""}</small>
+        {running.length > 0 && <p className="home-working"><b>Working on:</b> {running.map((w) => w.title).join(" · ")}</p>}
+        <button className="link-button" onClick={goPhases}>Open the phase →</button>
+      </> : alignmentPending ? <><p className="empty-copy">The VP is interviewing you. When you finish, it plans the project into phases and gets to work.</p><button className="button primary" onClick={goAsk}>Continue the interview</button></>
+        : !hasPhases && alignmentCompleted && !demo ? <><p className="empty-copy">Interview done. The VP can plan the whole project into phases from your answers, then work each one on its own.</p><button className="button primary" disabled={busy} onClick={plan}>Plan phases with the VP</button></>
+        : <p className="empty-copy">No active phase.</p>}
+    </section>
+    <section className="home-card" aria-labelledby="latest-title">
+      <h2 id="latest-title">Latest</h2>
+      {reports.length ? <><ul className="latest-list">{reports.slice(0, 5).map((a) => <li key={a.id}><div><b>{a.workTitle}</b><time>{ago(a.at)}</time></div><span>{excerpt(a.text)}</span></li>)}</ul><button className="link-button" onClick={goActivity}>All activity →</button></>
+        : <p className="empty-copy">Nothing yet. Reports from the agents appear here as work finishes.</p>}
+    </section>
+  </div>;
 }
 
-function WorkTree({items,showObjectives=false}:{items:Work[];showObjectives?:boolean}) {
-  const visible = items.filter((item)=>item.status !== "cancelled");
-  const byId = new Map(visible.map((item)=>[item.workId,item]));
-  const children = new Map<string,Work[]>();
-  for (const item of visible) {
-    if (item.parentWorkId && byId.has(item.parentWorkId)) {
-      const siblings = children.get(item.parentWorkId) || [];
-      siblings.push(item); children.set(item.parentWorkId,siblings);
-    }
-  }
-  const roots = visible.filter((item)=>!item.parentWorkId || !byId.has(item.parentWorkId));
-  if (!roots.length) return <p className="empty-copy">No agreed outcomes are recorded. Work should be added beneath a confirmed project goal, not invented from repository checklists.</p>;
-  const render = (item:Work,depth:number):React.ReactNode => <li key={item.workId}>
-    <article className={`outcome-node depth-${Math.min(depth,3)}`}>
-      <div className="outcome-node-heading"><span className="outcome-level">{depth===0?"OUTCOME":depth===1?"WORKSTREAM":"STEP"}</span><b>{item.title}</b><span className={`work-status ${item.status}`}><i/>{item.status.replaceAll("_"," ")}</span></div>
-      {(showObjectives || depth===0) && <p>{item.objective}</p>}
-      {showObjectives && item.acceptanceCriteria?.length>0 && <small>{item.acceptanceCriteria.length} stated acceptance criterion/criteria · not automatically verified</small>}
-    </article>
-    {(children.get(item.workId)||[]).length>0 && <ol>{(children.get(item.workId)||[]).map((child)=>render(child,depth+1))}</ol>}
-  </li>;
-  return <ol className={`outcome-tree ${showObjectives?"detailed":""}`}>{roots.map((root)=>render(root,0))}</ol>;
+function PhasesPage({phases,items,tasks,busy,approve,decide,plan,review,alignmentCompleted,demo,addTask}:{phases:Phase[];items:Work[];tasks:Work[];busy:boolean;approve:(workId:string,revision:number,decision:"approve"|"reject"|"retry")=>Promise<boolean>;decide:(phaseId:string,moveOn:boolean)=>unknown;plan:()=>void;review:()=>void;alignmentCompleted:boolean;demo:boolean;addTask:()=>void}) {
+  const [board, setBoard] = React.useState(false);
+  return <div className="goal-scroll">
+    <div className="seg-row"><div className="seg" role="group" aria-label="View"><button className={!board ? "on" : ""} onClick={() => setBoard(false)}>Phases</button><button className={board ? "on" : ""} onClick={() => setBoard(true)}>Board</button></div>{!demo && <button className="button secondary" onClick={addTask}><Plus size={14}/>Add task</button>}</div>
+    {board ? <KanbanBoard items={tasks} busy={busy} decide={approve}/> : <PhasesView phases={phases} items={items} busy={busy} approve={approve} decide={decide} plan={plan} review={review} alignmentCompleted={alignmentCompleted} demo={demo}/>}
+  </div>;
 }
 
-function KanbanBoard({items,busy,decide,automation,setAutoRun,draftBoard,drafting,alignmentCompleted}:{items:Work[];busy:boolean;decide:(workId:string,revision:number,decision:"approve"|"reject"|"retry")=>Promise<boolean>;automation?:Automation;setAutoRun:(enabled:boolean)=>void;draftBoard:()=>void;drafting:boolean;alignmentCompleted:boolean}) {
+function MemoryPage({memory,alignment,onCorrect}:{memory?:Memory;alignment?:Alignment|null;onCorrect:()=>void}) {
+  return <div className="goal-scroll">
+    <MemoryCard memory={memory || { memory: {}, notYetMergedNotes: [] }} onCorrect={onCorrect}/>
+    {alignment && alignment.segments.length > 0 && <details className="goal-card"><summary><b>Interview answers</b> <small>{alignment.segments.filter((s) => s.status === "answered").length} of {alignment.segments.length} answered</small></summary>{alignment.segments.map((s) => <article className="alignment-record-segment" key={s.index}><b>{s.index}. {s.title}</b><p>{s.prompt}</p><p className="alignment-answer">{s.answer?.text || "Not answered yet."}</p></article>)}</details>}
+  </div>;
+}
+
+function ChatDrawer({projectId,onClose}:{projectId:string;onClose:()=>void}) {
+  const [status,setStatus]=React.useState<{available:boolean;red?:{available:boolean}}|null>(null);
+  const [mode,setMode]=React.useState<"blue"|"red">("blue");
+  const [turns,setTurns]=React.useState<Turn[]>([]);
+  const [message,setMessage]=React.useState("");
+  const [sending,setSending]=React.useState(false);
+  const [chatError,setChatError]=React.useState("");
+  const endRef=React.useRef<HTMLDivElement>(null);
+  const usable=mode==="red"?Boolean(status?.red?.available):Boolean(status?.available);
+  React.useEffect(()=>{let active=true;setTurns([]);setChatError("");void request<{turns:Turn[]}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/history`).then((h)=>{if(active)setTurns(h.turns);}).catch(()=>{});void request<typeof status>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/status`).then((v)=>{if(active)setStatus(v);}).catch((e)=>{if(active)setChatError(e instanceof Error?e.message:"Could not reach the VP.");});return()=>{active=false;};},[projectId]);
+  React.useEffect(()=>{endRef.current?.scrollIntoView?.({block:"end"});},[turns,sending]);
+  async function send(event:React.FormEvent<HTMLFormElement>){event.preventDefault();const text=message.trim();if(!text||sending||!usable)return;setTurns((t)=>[...t,{role:"user",content:text}]);setMessage("");setSending(true);setChatError("");try{const r=await request<{response:string}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat`,{method:"POST",body:JSON.stringify({message:text,history:[],mode})});setTurns((t)=>[...t,{role:"assistant",content:r.response}]);}catch(e){setChatError(e instanceof Error?e.message:"The VP could not reply.");}finally{setSending(false);}}
+  return <aside className="chat-drawer" aria-label="Ask the VP">
+    <header><div><b>Ask the VP</b><small>Knows your answers, reads the repo, can’t change anything. Saved to the project record.</small></div><button className="icon-button" aria-label="Close" onClick={onClose}><X size={16}/></button></header>
+    {status?.red?.available && <div className="chat-mode" role="group" aria-label="VP model"><button type="button" className={`button ${mode==="blue"?"primary":"secondary"}`} onClick={()=>setMode("blue")}>Codex</button><button type="button" className={`button ${mode==="red"?"primary":"secondary"}`} onClick={()=>setMode("red")}>Local model</button></div>}
+    <div className="chat-transcript" aria-live="polite">{turns.length===0&&!sending&&<p className="empty-copy">Ask what was built, why, or what’s weak. It can read the repo to answer.</p>}{turns.map((turn,index)=><article className={`chat-turn ${turn.role}`} key={`${index}-${turn.role}`}><b>{turn.role==="user"?"You":"VP"}</b><p>{turn.content}</p></article>)}{sending&&<p className="chat-thinking">The VP is replying…</p>}<div ref={endRef}/></div>
+    {chatError&&<div className="chat-error" role="alert">{chatError}</div>}
+    <form className="chat-composer" onSubmit={(event)=>void send(event)}><div className="chat-compose-row"><textarea aria-label="Chat message" value={message} onChange={(event)=>setMessage(event.target.value)} maxLength={4000} disabled={!usable||sending} placeholder={usable?"Message the VP…":"The VP’s model isn’t available (is Codex signed in?)"} onKeyDown={(event)=>{if(event.key==="Enter"&&!event.shiftKey){event.preventDefault();void send(event as unknown as React.FormEvent<HTMLFormElement>);}}}/><button className="button primary" disabled={!usable||sending||!message.trim()}>Send</button></div></form>
+  </aside>;
+}
+
+function KanbanBoard({items,busy,decide}:{items:Work[];busy:boolean;decide:(workId:string,revision:number,decision:"approve"|"reject"|"retry")=>Promise<boolean>}) {
   const [selectedWork,setSelectedWork]=React.useState<Work|null>(null);
   const columns = [
     { id: "proposed", title: "Proposed", statuses: ["proposed"] },
@@ -294,7 +331,6 @@ function KanbanBoard({items,busy,decide,automation,setAutoRun,draftBoard,draftin
   const byId = new Map(items.map((item)=>[item.workId,item]));
   const stopped = items.filter((item)=>["failed","cancelled"].includes(item.status));
   return <div className="board-page">
-    <header className="board-toolbar"><div><div className="eyebrow">PROJECT BOARD</div><h2>Work items</h2><p>Click a card to see its details and approval controls.</p></div><div className="board-toolbar-actions"><span className="board-item-total">{items.length} items</span>{alignmentCompleted&&items.filter((i)=>i.workId!=="work.alignment-intake").length===0&&!automation?.demoProject&&<button className="button primary" disabled={busy||drafting} onClick={draftBoard}>{drafting?"VP is drafting…":"Draft board with VP"}</button>}<span className="auto-run-status"><span>Auto-run</span><button role="switch" aria-checked={Boolean(automation?.autoRun)} disabled={busy||!automation||automation.demoProject||!automation.workerAvailable} title={automation?.demoProject?"The synthetic demo project cannot run agents.":!automation?.workerAvailable?"No worker CLI (Claude Code or Codex) is available.":"When on, the VP approves and runs every proposed task in dependency order without asking."} onClick={()=>setAutoRun(!automation?.autoRun)}><i/>{automation?.autoRun?"On":"Off"}</button></span></div></header>
     <section className="kanban-board" aria-label="Project work kanban board">{columns.map((column)=>{
       const cards=items.filter((item)=>column.statuses.includes(item.status));
       return <div className="kanban-column" key={column.id}><header><h3>{column.title}</h3><span>{cards.length}</span></header>{cards.length ? <div className="kanban-cards">{cards.map((item)=>{
@@ -303,14 +339,38 @@ function KanbanBoard({items,busy,decide,automation,setAutoRun,draftBoard,draftin
       })}</div> : <p className="kanban-empty">Empty</p>}</div>;
     })}</section>
     {stopped.length>0&&<details className="stopped-items"><summary>Stopped · {stopped.length}</summary><div>{stopped.map((item)=><button key={item.workId} onClick={()=>setSelectedWork(item)}>{item.title}<span>{item.status}</span></button>)}</div></details>}
-    {selectedWork&&<Modal title={selectedWork.title} onClose={()=>setSelectedWork(null)}><div className="work-detail-modal"><div className="work-detail-meta"><span className={`work-status ${selectedWork.status}`}><i/>{selectedWork.status.replaceAll("_"," ")}</span><span>{selectedWork.workType}</span>{selectedWork.parentWorkId&&<span>Under {byId.get(selectedWork.parentWorkId)?.title||selectedWork.parentWorkId}</span>}</div><p>{selectedWork.objective}</p>{selectedWork.acceptanceCriteria.length>0&&<div><b>Acceptance criteria</b><ul>{selectedWork.acceptanceCriteria.map((criterion,index)=><li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{selectedWork.status==="proposed"?<><p className="form-hint">Approving makes this task ready; the VP's agents pick it up in dependency order, one at a time.</p><div className="form-actions"><button className="button secondary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"reject"))setSelectedWork(null);}}>Decline</button><button className="button primary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"approve"))setSelectedWork(null);}}>Approve task</button></div></>:selectedWork.status==="ready"?<p className="form-hint">Approved. It starts as soon as earlier tasks it depends on are done.</p>:selectedWork.status==="failed"?<><p className="form-hint">This task failed or was interrupted. See the Activity tab for the report.</p><div className="form-actions"><button className="button primary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"retry"))setSelectedWork(null);}}>Retry task</button></div></>:null}</div></Modal>}
+    {selectedWork&&<Modal title={selectedWork.title} onClose={()=>setSelectedWork(null)}><div className="work-detail-modal"><div className="work-detail-meta"><span className={`work-status ${selectedWork.status}`}><i/>{selectedWork.status.replaceAll("_"," ")}</span><span>{selectedWork.workType}</span>{selectedWork.parentWorkId&&<span>Under {byId.get(selectedWork.parentWorkId)?.title||selectedWork.parentWorkId}</span>}</div><p>{selectedWork.objective}</p>{selectedWork.acceptanceCriteria.length>0&&<div><b>Acceptance criteria</b><ul>{selectedWork.acceptanceCriteria.map((criterion,index)=><li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{selectedWork.status==="proposed"?<><p className="form-hint">Approving makes this task ready; the VP's agents pick it up in dependency order, one at a time.</p><div className="form-actions"><button className="button secondary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"reject"))setSelectedWork(null);}}>Decline</button><button className="button primary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"approve"))setSelectedWork(null);}}>Approve task</button></div></>:selectedWork.status==="ready"?<p className="form-hint">Approved. It starts as soon as earlier tasks it depends on are done.</p>:selectedWork.status==="failed"?<><p className="form-hint">This task failed or was interrupted. The VP will see the failure and plan the fix, or you can retry it.</p><div className="form-actions"><button className="button primary" disabled={busy} onClick={async()=>{if(await decide(selectedWork.workId,selectedWork.revision,"retry"))setSelectedWork(null);}}>Retry task</button></div></>:null}</div></Modal>}
   </div>;
 }
 
 function ActivityView({items,running,workItems}:{items:Activity[];running:number;workItems:Work[]}) {
   const active = workItems.filter((w)=>["running","verifying"].includes(w.status));
-  return <div className="goal-scroll"><section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">RIGHT NOW</div><h3>{running ? `${running} task${running===1?"":"s"} in progress` : "Nothing running"}</h3></div><ActivityIcon size={17}/></div>{active.length?<ul className="criteria-list">{active.map((w)=><li key={w.workId}><b>{w.title}</b> · {w.workType}</li>)}</ul>:<p className="empty-copy">Approve a task on the board, or turn on auto-run, and agent work shows up here as it happens.</p>}</section>
+  return <div className="goal-scroll"><section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">RIGHT NOW</div><h3>{running ? `${running} task${running===1?"":"s"} in progress` : "Nothing running"}</h3></div></div>{active.length?<ul className="criteria-list">{active.map((w)=><li key={w.workId}><b>{w.title}</b> · {w.workType}</li>)}</ul>:<p className="empty-copy">Turn on auto-run, or approve work in Phases, and agent work shows up here as it happens.</p>}</section>
     <section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">REPORTS</div><h3>What agents have reported</h3></div></div>{items.length?<ol className="history-list">{items.map((a)=><li key={a.id}><span><b>{a.workTitle}</b><small style={{whiteSpace:"pre-wrap"}}>{a.text}</small><time>{a.actor} · {new Date(a.at).toLocaleString()}</time></span></li>)}</ol>:<p className="empty-copy">No agent reports yet.</p>}</section></div>;
+}
+
+const PHASE_STATUS: Record<string,string> = { proposed: "Planned · not started", ready: "Approved · starting", running: "In progress", verifying: "Done · needs your review", completed: "Completed", failed: "Failed", cancelled: "Cancelled", waiting_human: "Waiting for your answer", blocked: "Blocked" };
+function PhasesView({phases,items,busy,approve,decide,plan,review,alignmentCompleted,demo}:{phases:Phase[];items:Work[];busy:boolean;approve:(workId:string,revision:number,decision:"approve"|"reject"|"retry")=>Promise<boolean>;decide:(phaseId:string,moveOn:boolean)=>void;plan:()=>void;review:()=>void;alignmentCompleted:boolean;demo:boolean}) {
+  const [confirm,setConfirm]=React.useState("");
+  if (!phases.length) return <div className="phase-list"><section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">PHASES</div><h3>No phases planned yet</h3></div><Layers3 size={17}/></div><p className="empty-copy">{demo?"The synthetic demo project does not use the VP.":alignmentCompleted?"The VP plans the whole project into phases from your vision, each with exit criteria. It then works each phase on its own until the criteria are evidenced, and stops for your review.":"Finish the alignment interview first; the VP plans the phases from your answers."}</p>{!demo&&alignmentCompleted&&<div className="form-actions"><button className="button primary" disabled={busy} onClick={plan}>Plan phases with the VP</button></div>}</section></div>;
+  return <div className="phase-list">{phases.map((p)=>{
+    const pct=p.tasks.total?Math.round(100*p.tasks.done/p.tasks.total):0;
+    const unmet=p.assessment.filter((a)=>!a.met).length;
+    const phaseItem=items.find((w)=>w.workId===p.phaseId);
+    return <section key={p.phaseId} className={`goal-card phase-card ${p.status}`}><div className="goal-card-heading"><div><div className="eyebrow">PHASE {p.index} · {PHASE_STATUS[p.status]||p.status}</div><h3>{p.title}</h3></div></div>
+      <p>{p.goal}</p>
+      <div className="phase-progress" aria-label="Task progress"><span style={{width:`${pct}%`}}/></div>
+      <small>{p.tasks.done} of {p.tasks.total} tasks done{p.tasks.running?` · ${p.tasks.running} running`:""}{p.tasks.failed?` · ${p.tasks.failed} failed`:""}{p.steers?` · ${p.steers} self-check${p.steers===1?"":"s"}`:""}</small>
+      <div className="memory-section"><b>Exit criteria · how we know it&rsquo;s truly done</b><ul className="phase-criteria">{p.exitCriteria.map((c,i)=>{const a=p.assessment.find((x)=>x.criterion===c);return <li key={i} className={a?.met?"met":""}><span aria-hidden="true">{a?.met?"✓":"○"}</span> {c}{a?.met&&a.evidence&&<small>{a.evidence}</small>}</li>;})}</ul>{p.assessment.length>0&&p.status==="running"&&<small>{unmet} criteri{unmet===1?"on":"a"} still open; the VP is creating the work to close {unmet===1?"it":"them"}.</small>}</div>
+      {items.some((w)=>w.parentWorkId===p.phaseId)&&<details className="phase-tasks"><summary>Tasks ({items.filter((w)=>w.parentWorkId===p.phaseId).length})</summary><ul>{items.filter((w)=>w.parentWorkId===p.phaseId).sort((a,b)=>a.title.localeCompare(b.title)).map((w)=><li key={w.workId}><span className={`thread-status-dot ${w.status}`}/><span>{w.title}</span><small>{w.status.replaceAll("_"," ")}</small></li>)}</ul></details>}
+      {p.caveats.length>0&&<div className="memory-section"><b>Known weaknesses</b><ul>{p.caveats.map((c,i)=><li key={i}>{c}</li>)}</ul></div>}
+      {(p.improvements.open>0||p.improvements.done>0)&&<div className="memory-section"><b>Improvement backlog · the VP works through this on its own</b><small>{p.improvements.open} open · {p.improvements.done} done</small>{p.improvements.titles.length>0&&<ul>{p.improvements.titles.map((t,i)=><li key={i}>{t}</li>)}</ul>}</div>}
+      <div className="form-actions">
+        {p.status==="proposed"&&p.index===1&&phaseItem&&<button className="button primary" disabled={busy} onClick={()=>void approve(p.phaseId,phaseItem.revision,"approve")}>Approve plan &amp; start</button>}
+        {p.status==="proposed"&&p.index>1&&<small>Starts after you review the previous phase.</small>}
+        {p.status==="verifying"&&<><button className="button primary" disabled={busy} onClick={review}>Review with the VP</button><button className="button secondary" disabled={busy} onClick={()=>decide(p.phaseId,false)}>Keep improving this phase</button><button className="button secondary" disabled={busy} onClick={()=>{if(confirm!==p.phaseId){setConfirm(p.phaseId);return;}setConfirm("");decide(p.phaseId,true);}}>{confirm===p.phaseId?"Really move on?":"Move on to the next phase"}</button></>}
+        {p.status==="running"&&<button className="button secondary" disabled={busy} onClick={()=>{if(confirm!==p.phaseId){setConfirm(p.phaseId);return;}setConfirm("");decide(p.phaseId,true);}}>{confirm===p.phaseId?"Really close this phase?":"Close this phase now"}</button>}
+      </div></section>;})}</div>;
 }
 
 function DataRootsCard({projectId,roots,reload}:{projectId:string;roots:string[];reload:()=>Promise<void>}) {
@@ -330,30 +390,12 @@ function MemoryCard({memory,onCorrect}:{memory:Memory;onCorrect:()=>void}) {
   const sections = Object.entries(memory.memory).filter(([,items])=>items.length>0);
   const pending = memory.notYetMergedNotes;
   const logs = memory.detailedLogs || [];
-  if (!sections.length && !pending.length && !logs.length) return null;
-  return <section className="goal-card memory-card"><div className="goal-card-heading"><div><div className="eyebrow">WHAT THE VP REMEMBERS</div><h3>Everything agents are told about what you said</h3></div><button className="button secondary" onClick={onCorrect}>Something wrong? Tell the VP</button></div>
+  if (!sections.length && !pending.length && !logs.length) return <section className="goal-card"><div className="eyebrow">WHAT THE VP REMEMBERS</div><p className="empty-copy">Nothing yet. As you answer questions and talk to the VP, what matters is kept here, merged and corrected over time.</p></section>;
+  return <section className="goal-card memory-card"><div className="goal-card-heading"><div><div className="eyebrow">WHAT THE VP REMEMBERS</div><h3>What every agent is told about you and the project</h3></div><button className="button secondary" onClick={onCorrect}>Something wrong? Tell the VP</button></div>
     {sections.map(([key,items])=><div key={key} className="memory-section"><b>{MEMORY_LABELS[key]||key}</b><ul>{items.map((item,index)=><li key={`${key}-${index}`}>{item}</li>)}</ul></div>)}
     {logs.length>0&&<details className="memory-section"><summary><b>Logged details ({logs.length}) · full detail agents are given</b></summary>{logs.map((log,index)=><div key={`l-${index}`} className="memory-log"><b>{log.crucial?"★ ":""}{log.title}</b> <small>{log.kind.replaceAll("_"," ")}</small><p>{log.detail}</p></div>)}</details>}
     {pending.length>0&&<div className="memory-section"><b>Just noted (not yet merged)</b><ul>{pending.map((item,index)=><li key={`p-${index}`}>{item}</li>)}</ul></div>}
     <p className="form-hint">This is curated from your conversations: duplicates merged, things you changed your mind about replaced, chit-chat dropped. Correct anything by telling the VP in chat.</p></section>;
-}
-
-function ProjectChat({projectId,projectName}:{projectId:string;projectName:string}) {
-  const [status,setStatus]=React.useState<{available:boolean;model:string;accountLabel:string;red?:{available:boolean;model:string}}|null>(null);
-  const [mode,setMode]=React.useState<"blue"|"red">("blue");
-  const [turns,setTurns]=React.useState<{role:"user"|"assistant";content:string}[]>([]);
-  const [message,setMessage]=React.useState("");
-  const [sending,setSending]=React.useState(false);
-  const [chatError,setChatError]=React.useState("");
-  React.useEffect(()=>{let active=true;setTurns([]);setStatus(null);setChatError("");void request<{turns:Turn[]}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/history`).then((h)=>{if(active)setTurns(h.turns);}).catch(()=>{});void request<typeof status>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat/status`).then((value)=>{if(active)setStatus(value);}).catch((e)=>{if(active)setChatError(e instanceof Error?e.message:"Could not check the local Codex connection.");});return()=>{active=false;};},[projectId]);
-  async function send(event:React.FormEvent<HTMLFormElement>){event.preventDefault();const text=message.trim();if(!text||sending||!(mode==="red"?status?.red?.available:status?.available))return;setTurns((current)=>[...current,{role:"user",content:text}]);setMessage("");setSending(true);setChatError("");try{const result=await request<{response:string}>(`/api/v1/projects/${encodeURIComponent(projectId)}/chat`,{method:"POST",body:JSON.stringify({message:text,history:[],mode})});setTurns((current)=>[...current,{role:"assistant",content:result.response}]);}catch(e){setChatError(e instanceof Error?e.message:"Codex chat request failed.");}finally{setSending(false);}}
-  return <div className="chat-page"><section className="chat-heading"><div className="eyebrow">PROJECT CONVERSATION</div><h2>Talk through {projectName}</h2><p>The VP knows this project’s goals, your recorded answers, the board, and agent reports, and can read and search the project’s repository to answer. It cannot change files, create tasks, or start work.</p></section>
-    <div className="chat-mode" role="group" aria-label="VP model"><button type="button" className={`button ${mode==="blue"?"primary":"secondary"}`} onClick={()=>setMode("blue")}>Blue · Codex VP</button><button type="button" className={`button ${mode==="red"?"primary":"secondary"}`} disabled={!status?.red?.available} title={status?.red?.available?"Local uncensored model on this machine":"Set NORTHSTAR_RED_ENDPOINT and NORTHSTAR_RED_MODEL to enable"} onClick={()=>setMode("red")}>Red · local model</button></div><section className="chat-connection"><div className="chat-agent-mark"><MessageSquare size={18}/></div><div><div className="eyebrow">SERVER-SIDE CODEX CONNECTION</div><h3>{status?.available?"Pi Codex auth file detected":status?"Pi Codex sign-in unavailable":"Checking local Pi setup…"}</h3><p>{status?.available?`${status.accountLabel} · ${status.model}. No account switching.`:"Start Pi and sign in to OpenAI Codex on this machine. Credentials stay in Pi's local auth store; they are never sent to the browser."}</p></div></section>
-    <div className="chat-data-notice"><b>Project context:</b> A bounded snapshot of the selected project's charter, work items, open questions, recorded decisions, and automation state is included with each message. Your message and recent chat turns also go to the active Codex sign-in and may use its provider usage. The VP may open and read repository files itself (read-only) when your question needs it; nothing is modified. Every message is saved in the project’s permanent history, so reloading or a very long chat loses nothing; older turns are folded into a saved summary and the VP always gets a fresh, bounded context.</div>
-    <div className="chat-transcript" aria-live="polite">{turns.map((turn,index)=><article className={`chat-turn ${turn.role}`} key={`${index}-${turn.role}`}><b>{turn.role==="user"?"You":"VP"}</b><p>{turn.content}</p></article>)}{sending&&<p className="chat-thinking">The VP is responding…</p>}</div>
-    {chatError&&<div className="chat-error" role="alert">{chatError}</div>}
-    <form className="chat-composer" onSubmit={(event)=>void send(event)}><div className="chat-compose-row"><textarea aria-label="Chat message" value={message} onChange={(event)=>setMessage(event.target.value)} maxLength={4000} disabled={!(mode==="red"?status?.red?.available:status?.available)||sending} placeholder={status?.available?"Write a message to Codex…":"Chat unavailable until Pi Codex sign-in is detected"}/><button className="button primary" disabled={!(mode==="red"?status?.red?.available:status?.available)||sending||!message.trim()}>{sending?"Sending…":"Send"}</button></div></form>
-  </div>;
 }
 
 function InboxView({projectId,questions,selected,choose,recorded}:{projectId:string;questions:Question[];selected:QuestionDetail|null;choose:(id:string)=>void;recorded:()=>Promise<void>}) {

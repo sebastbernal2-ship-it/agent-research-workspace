@@ -24,6 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
+from .phases import phase_summaries
 from .vp import DataRoots, LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
@@ -164,13 +165,36 @@ class PrototypeRuntime:
 
         def draft() -> None:
             try:
-                self.vp.draft_board(project_id)
+                self.vp.phases.plan(project_id)  # the whole project as phases; the VP steers each one itself
             except Exception:
-                pass  # the owner can retry with "Draft board"
+                try:
+                    self.vp.draft_board(project_id)  # fall back to a flat board
+                except Exception:
+                    pass  # the owner can retry with "Plan phases" / "Draft board"
             finally:
                 self._drafting.discard(project_id)
 
         threading.Thread(target=draft, name="northstar-draft", daemon=True).start()
+
+    def plan_phases(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "board.draft")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project does not use the VP")
+        try:
+            return {"phases": self.vp.phases.plan(project_id)}
+        except VPError as exc:
+            raise ControlPlaneError(str(exc)) from exc
+
+    def decide_phase(self, project_id: str, phase_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner moves on from a phase (starting the next) or sends it back for more work, outside a checkpoint question."""
+        self.project_application._authorize(project_id, "work.approve")
+        if not isinstance(request, dict) or set(request) != {"moveOn"} or type(request["moveOn"]) is not bool:
+            raise ValueError("a phase decision requires only a boolean moveOn")
+        state = self.control.projector.replay(project_id)
+        if not phase_id.startswith("work.phase-") or phase_id not in state["workItems"]:
+            raise InboxNotFound("phase was not found")
+        self.vp.phases.decide(project_id, phase_id, request["moveOn"])
+        return {"phases": phase_summaries(self.control.projector.replay(project_id))}
 
     def draft_board(self, project_id: str) -> dict[str, Any]:
         self.project_application._authorize(project_id, "board.draft")
@@ -1101,6 +1125,7 @@ class PrototypeRuntime:
             "recentEvents": recent_events,
             "alignment": alignment,
             "automation": self.automation(project_id),
+            "phases": phase_summaries(state),
             "dataRoots": self.data_roots.get(project_id),
             "memory": project_memory(state),
             "activity": self.activity(project_id, 15),
@@ -1177,6 +1202,8 @@ class PrototypeRuntime:
                 charter = {**project["charter"], "goals": [goal_replacement]}
                 self.project_application.revise_project_charter(project_id, charter)
         self._advance_alignment_interview(project_id, question_id)
+        if question_id.startswith("question.phase-"):  # a phase checkpoint: start the next phase or reopen this one
+            self.vp.phases.on_checkpoint_answer(project_id, question_id, option_id)
         self._curate_soon(project_id)
         return answered
 

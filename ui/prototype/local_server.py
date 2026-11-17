@@ -41,6 +41,8 @@ BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
 CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
+PHASES_PLAN_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/plan$")
+PHASE_DECISION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/([^/]+)/decision$")
 DATA_ROOTS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/data-roots$")
 LOG_PATH = re.compile(r"^/api/v1/projects/([^/]+)/logs/([^/]+)$")
 DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/draft$")
@@ -274,6 +276,20 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        plan_match = PHASES_PLAN_PATH.fullmatch(path)
+        if plan_match:
+            project_id = unquote(plan_match.group(1))
+            def plan() -> None:
+                if body:
+                    raise ValueError("phase planning accepts an empty object")
+                self._send_json(201, self.runtime.plan_phases(project_id))
+            self._run(plan)
+            return
+        decision_match = PHASE_DECISION_PATH.fullmatch(path)
+        if decision_match:
+            project_id, phase_id = map(unquote, decision_match.groups())
+            self._run(lambda: self._send_json(200, self.runtime.decide_phase(project_id, phase_id, body)))
             return
         roots_match = DATA_ROOTS_PATH.fullmatch(path)
         if roots_match:
