@@ -24,7 +24,8 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .phases import phase_summaries
+from .issues import PREFIX as ISSUE_KINDS, active_issues
+from .phases import is_phase, phase_summaries
 from .vp import DataRoots, LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
@@ -184,6 +185,39 @@ class PrototypeRuntime:
             return {"phases": self.vp.phases.plan(project_id)}
         except VPError as exc:
             raise ControlPlaneError(str(exc)) from exc
+
+    def add_issue(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner logs an issue, improvement or future direction themselves; it goes on the current (or last) phase."""
+        self.project_application._authorize(project_id, "work.create")
+        if not isinstance(request, dict) or not {"kind", "title"} <= set(request) <= {"kind", "title", "detail", "priority"}:
+            raise ValueError("an issue needs kind and title, and optionally detail and priority")
+        if request["kind"] not in ISSUE_KINDS:
+            raise ValueError("kind must be issue, improvement or direction")
+        for key, limit in (("title", 140), ("detail", 2000)):
+            if key in request and (not isinstance(request[key], str) or len(request[key].strip()) > limit):
+                raise ValueError(f"{key} must be at most {limit} characters")
+        if not isinstance(request["title"], str) or not request["title"].strip():
+            raise ValueError("title is required")
+        state = self.control.projector.replay(project_id)
+        phases = sorted((w for w in state["workItems"].values() if is_phase(w) and w["status"] != "cancelled"), key=lambda w: w["createdAt"])
+        current = (next((w for w in phases if w["status"] in {"running", "verifying"}), None)
+                   or next((w for w in phases if w["status"] in {"proposed", "ready"}), None) or (phases[-1] if phases else None))
+        if current is None:
+            raise ControlPlaneError("plan phases first: issues belong to a phase")
+        made = self.vp.phases.board.file(project_id, current["workId"], request["kind"], request["title"].strip(),
+                                         (request.get("detail") or request["title"]).strip(), priority=str(request.get("priority") or "medium").lower(), source="owner")
+        if made is None:
+            raise ControlPlaneError("that is already on the list, or this phase has too many open items")
+        return {"issue": next(i for i in active_issues(self.control.projector.replay(project_id)) if i["id"] == made["workId"])}
+
+    def act_on_issue(self, project_id: str, issue_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "work.approve")
+        if not isinstance(request, dict) or set(request) != {"action"} or not isinstance(request["action"], str):
+            raise ValueError("an issue action requires only an action")
+        try:
+            return {"issue": self.vp.phases.board.act(project_id, issue_id, request["action"])}
+        except KeyError as exc:
+            raise InboxNotFound("issue was not found") from exc
 
     def decide_phase(self, project_id: str, phase_id: str, request: dict[str, Any]) -> dict[str, Any]:
         """The owner moves on from a phase (starting the next) or sends it back for more work, outside a checkpoint question."""
@@ -1126,6 +1160,7 @@ class PrototypeRuntime:
             "alignment": alignment,
             "automation": self.automation(project_id),
             "phases": phase_summaries(state),
+            "issues": [{k: v for k, v in i.items() if k != "revision"} for i in active_issues(state)][:200],
             "dataRoots": self.data_roots.get(project_id),
             "memory": project_memory(state),
             "activity": self.activity(project_id, 15),

@@ -41,6 +41,8 @@ BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
 CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
+ISSUES_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues$")
+ISSUE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues/([^/]+)$")
 PHASES_PLAN_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/plan$")
 PHASE_DECISION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/([^/]+)/decision$")
 DATA_ROOTS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/data-roots$")
@@ -276,6 +278,26 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        issues_match = ISSUES_PATH.fullmatch(path)
+        if issues_match:
+            project_id = unquote(issues_match.group(1))
+            def add() -> None:
+                try:
+                    self._send_json(201, self.runtime.add_issue(project_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_issue", str(exc))
+            self._run(add)
+            return
+        issue_match = ISSUE_PATH.fullmatch(path)
+        if issue_match:
+            project_id, issue_id = map(unquote, issue_match.groups())
+            def act() -> None:
+                try:
+                    self._send_json(200, self.runtime.act_on_issue(project_id, issue_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_issue_action", str(exc))
+            self._run(act)
             return
         plan_match = PHASES_PLAN_PATH.fullmatch(path)
         if plan_match:

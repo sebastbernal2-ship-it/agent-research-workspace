@@ -1,6 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { Brain, ChevronDown, Folder, House, Inbox, Layers3, MessageSquare, Plus, Settings, X } from "lucide-react";
+import { Brain, ChevronDown, Folder, House, Inbox, Layers3, ListChecks, MessageSquare, Plus, Settings, X } from "lucide-react";
 import "./style.css";
 import "./goal.css";
 import "./work-views.css";
@@ -17,14 +17,15 @@ type Activity = { id: string; workId: string; workTitle: string; actor: string; 
 type Automation = { autoRun: boolean; workerAvailable: boolean; demoProject: boolean };
 type Log = { id: string; kind: string; title: string; detail: string; crucial: boolean; edited?: boolean };
 type Memory = { memory: Record<string, string[]>; detailedLogs?: Log[]; notYetMergedNotes: string[] };
-type Summary = { phases?: Phase[]; dataRoots?: string[]; memory?: Memory; automation: Automation; activity: Activity[]; drafting: boolean; project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number>; alignment?: Alignment | null };
+type Summary = { issues?: Issue[]; phases?: Phase[]; dataRoots?: string[]; memory?: Memory; automation: Automation; activity: Activity[]; drafting: boolean; project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number>; alignment?: Alignment | null };
 type RepoReport = { repositoryName: string; repositoryPath: string; head: string; branch: string; trackedFileCount: number; trackedChanges: number | null; topLevelAreas: string[]; documents: { path: string; title: string; excerpt: string }[]; goalHint: string; fingerprint: string; inspectionPolicy: string };
 type ProjectMode = "choose" | "new" | "existing";
 type Question = { questionId: string; questionType: string; questionText: string; priority: string; blocking: boolean; workIds: string[]; etag: string };
 type QuestionDetail = Question & { record: { questionType: string; options: { optionId: string; label: string; consequence?: string }[]; impact: string; status: string; questionText: string }; affectedWork: { workId: string; title: string; status: string }[] };
 type Turn = { role: "user" | "assistant"; content: string };
-type View = "home" | "phases" | "memory" | "ask" | "activity";
-type Phase = { phaseId: string; index: number; title: string; goal: string; status: string; revision: number; exitCriteria: string[]; assessment: { criterion: string; met: boolean; evidence: string }[]; caveats: string[]; steers: number; tasks: { total: number; done: number; running: number; failed: number }; improvements: { open: number; done: number; titles: string[] } };
+type View = "home" | "phases" | "issues" | "memory" | "ask" | "activity";
+type Issue = { id: string; kind: "issue" | "improvement" | "direction"; title: string; detail: string; priority: string; source: string; evidence: string; deferred: boolean; phaseId?: string | null; status: string; createdAt: string };
+type Phase = { phaseId: string; index: number; title: string; goal: string; status: string; revision: number; exitCriteria: string[]; assessment: { criterion: string; met: boolean; evidence: string }[]; caveats: string[]; steers: number; tasks: { total: number; done: number; running: number; failed: number }; improvements: { open: number; done: number; directions?: number; titles: string[] }; passes?: number; reviewed?: boolean; reviewSummary?: string; visionGaps?: { gap: string; severity: string }[] };
 
 const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
@@ -122,6 +123,8 @@ function App() {
   }
   const decidePhase = (phaseId: string, moveOn: boolean) => post(`phases/${encodeURIComponent(phaseId)}/decision`, { moveOn }, "Could not update the phase.");
   const planPhases = async () => { if (await post("phases/plan", {}, "The VP could not plan phases.")) setView("phases"); };
+  const actOnIssue = (id: string, action: string) => post(`issues/${encodeURIComponent(id)}`, { action }, "Could not update that item.");
+  const addIssue = (body: { kind: string; title: string; detail: string; priority: string }) => post("issues", body, "Could not add that item.");
   const setAutoRun = (enabled: boolean) => post("automation", { autoRun: enabled }, "Could not change auto-run.");
   const decideWork = (workId: string, revision: number, decision: "approve" | "reject" | "retry") => post(`work/${encodeURIComponent(workId)}/approval`, { expectedRevision: revision, decision }, "Could not record the work approval.");
 
@@ -143,7 +146,9 @@ function App() {
     : running.length ? `Working on: ${running[0].title}${running.length > 1 ? ` +${running.length - 1} more` : ""}`
     : activePhase ? `Phase ${activePhase.index} in progress`
     : phases.length === 0 && !demo ? "No plan yet" : "Idle";
-  const titles: Record<View, string> = { home: project?.name || "Project", phases: "Phases", memory: "What the VP remembers", ask: selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Needs you", activity: "Activity" };
+  const issues = summary?.issues || [];
+  const openIssues = issues.filter((i) => i.kind !== "direction" && !["completed", "cancelled"].includes(i.status) && !i.deferred).length;
+  const titles: Record<View, string> = { home: project?.name || "Project", phases: "Phases", issues: "Issues & future directions", memory: "What the VP remembers", ask: selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Needs you", activity: "Activity" };
 
   function openProjectDialog() { setProjectMode("choose"); setRepositoryPath(""); setRepoReport(null); setDraftName(""); setDraftGoal(""); setProjectDialog(true); }
 
@@ -211,6 +216,7 @@ function App() {
       <nav className="amp-sidebar-links" aria-label="Project navigation">
         <button onClick={() => setView("home")} className={view === "home" || view === "ask" || view === "activity" ? "current" : ""}><House size={15}/>Home <span className={needs.length ? "nav-alert" : ""}>{needs.length || ""}</span></button>
         <button onClick={() => setView("phases")} className={view === "phases" ? "current" : ""}><Layers3 size={15}/>Phases <span className={reviewing ? "nav-alert" : ""}>{reviewing ? "review" : phases.length || ""}</span></button>
+        <button onClick={() => setView("issues")} className={view === "issues" ? "current" : ""}><ListChecks size={15}/>Issues <span>{openIssues || ""}</span></button>
         <button onClick={() => setView("memory")} className={view === "memory" ? "current" : ""}><Brain size={15}/>Memory</button>
       </nav>
       <div className="sidebar-spacer"/>
@@ -227,6 +233,7 @@ function App() {
         {!project ? <div className="loading">Loading your project…</div>
           : view === "ask" ? <InboxView projectId={project.projectId} questions={needs} selected={selectedQuestion} choose={openQuestion} recorded={questionRecorded}/>
           : view === "phases" ? <PhasesPage phases={phases} items={workItems} tasks={tasks} busy={busy} approve={decideWork} decide={decidePhase} plan={planPhases} review={() => setView("ask")} alignmentCompleted={alignmentCompleted} demo={demo} addTask={() => setWorkDialog(true)}/>
+          : view === "issues" ? <IssuesPage issues={issues} phases={phases} busy={busy} act={actOnIssue} add={addIssue} demo={demo}/>
           : view === "memory" ? <MemoryPage memory={summary?.memory} alignment={summary?.alignment} onCorrect={() => setChatOpen(true)}/>
           : view === "activity" ? <div className="goal-scroll"><button className="back-link" onClick={() => setView("home")}>← Home</button><ActivityView items={summary?.activity || []} running={running.length} workItems={tasks}/></div>
           : <Home goal={project.charter.goals.join(" ")} needs={needs} open={openQuestion} activePhase={activePhase} running={running} latest={summary?.activity || []} plan={planPhases} busy={busy} demo={demo} alignmentPending={alignmentPending} alignmentCompleted={alignmentCompleted} hasPhases={phases.length > 0} goPhases={() => setView("phases")} goActivity={() => setView("activity")} goAsk={() => setView("ask")}/>}
@@ -270,6 +277,7 @@ function Home({goal,needs,open,activePhase,running,latest,plan,busy,demo,alignme
         <div className="phase-progress" aria-label="Task progress"><span style={{width: `${pct}%`}}/></div>
         <small>{activePhase.tasks.done} of {activePhase.tasks.total} tasks done{unmet > 0 && activePhase.status === "running" ? ` · ${unmet} exit criteri${unmet === 1 ? "on" : "a"} still open` : ""}</small>
         {running.length > 0 && <p className="home-working"><b>Working on:</b> {running.map((w) => w.title).join(" · ")}</p>}
+        {(activePhase.improvements.open > 0 || (activePhase.improvements.directions || 0) > 0) && <small>{activePhase.improvements.open} open issue{activePhase.improvements.open === 1 ? "" : "s"} the VP is working through{(activePhase.improvements.directions || 0) > 0 ? ` · ${activePhase.improvements.directions} future direction${activePhase.improvements.directions === 1 ? "" : "s"} held for later` : ""}</small>}
         <button className="link-button" onClick={goPhases}>Open the phase →</button>
       </> : alignmentPending ? <><p className="empty-copy">The VP is interviewing you. When you finish, it plans the project into phases and gets to work.</p><button className="button primary" onClick={goAsk}>Continue the interview</button></>
         : !hasPhases && alignmentCompleted && !demo ? <><p className="empty-copy">The VP is planning the project into phases from your answers. This takes a minute or two and then shows up under “Needs you” to accept or change.</p><button className="link-button" disabled={busy} onClick={plan}>Plan now</button></>
@@ -349,6 +357,27 @@ function ActivityView({items,running,workItems}:{items:Activity[];running:number
     <section className="goal-card"><div className="goal-card-heading"><div><div className="eyebrow">REPORTS</div><h3>What agents have reported</h3></div></div>{items.length?<ol className="history-list">{items.map((a)=><li key={a.id}><span><b>{a.workTitle}</b><small style={{whiteSpace:"pre-wrap"}}>{a.text}</small><time>{a.actor} · {new Date(a.at).toLocaleString()}</time></span></li>)}</ol>:<p className="empty-copy">No agent reports yet.</p>}</section></div>;
 }
 
+const ISSUE_STATUS: Record<string,string> = { proposed: "queued", ready: "queued", running: "working on it", completed: "done", cancelled: "won’t do", failed: "failed", blocked: "blocked", waiting_human: "waiting for you" };
+const SOURCE_LABEL: Record<string,string> = { worker: "a worker noticed", reviewer: "the reviewer found", vp: "the VP found", "quality-pass": "a quality pass found", owner: "you added" };
+function IssuesPage({issues,phases,busy,act,add,demo}:{issues:Issue[];phases:Phase[];busy:boolean;act:(id:string,action:string)=>unknown;add:(body:{kind:string;title:string;detail:string;priority:string})=>Promise<boolean>;demo:boolean}) {
+  const [tab,setTab]=React.useState<"todo"|"directions"|"done">("todo");
+  const [open,setOpen]=React.useState("");
+  const [adding,setAdding]=React.useState(false);
+  const [form,setForm]=React.useState({kind:"issue",title:"",detail:"",priority:"medium"});
+  const closed=(i:Issue)=>["completed","cancelled"].includes(i.status);
+  const shown=issues.filter((i)=>tab==="todo"?i.kind!=="direction"&&!closed(i):tab==="directions"?i.kind==="direction"&&!closed(i):closed(i));
+  const phaseName=(id?:string|null)=>phases.find((p)=>p.phaseId===id);
+  const counts={todo:issues.filter((i)=>i.kind!=="direction"&&!closed(i)).length,directions:issues.filter((i)=>i.kind==="direction"&&!closed(i)).length,done:issues.filter(closed).length};
+  return <div className="goal-scroll">
+    <div className="seg-row"><div className="seg" role="group" aria-label="Filter">{(["todo","directions","done"] as const).map((t)=><button key={t} className={tab===t?"on":""} onClick={()=>setTab(t)}>{t==="todo"?"To do":t==="directions"?"Future directions":"Done"} · {counts[t]}</button>)}</div>{!demo&&<button className="button secondary" onClick={()=>setAdding((a)=>!a)}><Plus size={14}/>Add</button>}</div>
+    {adding&&<form className="goal-card issue-form" onSubmit={async(e)=>{e.preventDefault();if(await add(form)){setForm({kind:"issue",title:"",detail:"",priority:"medium"});setAdding(false);}}}><div className="chat-compose-row"><select aria-label="Kind" value={form.kind} onChange={(e)=>setForm({...form,kind:e.target.value})}><option value="issue">Issue</option><option value="improvement">Improvement</option><option value="direction">Future direction</option></select><select aria-label="Priority" value={form.priority} onChange={(e)=>setForm({...form,priority:e.target.value})}><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></div><input aria-label="Title" required maxLength={140} placeholder="What is it?" value={form.title} onChange={(e)=>setForm({...form,title:e.target.value})}/><textarea aria-label="Detail" rows={3} maxLength={2000} placeholder="Details (what you saw, why it matters)" value={form.detail} onChange={(e)=>setForm({...form,detail:e.target.value})}/><div className="form-actions"><button className="button primary" disabled={busy||!form.title.trim()}>Log it</button></div></form>}
+    {shown.length===0?<section className="goal-card"><p className="empty-copy">{tab==="todo"?"Nothing open. Whenever a worker, the reviewer or a quality pass notices a weakness or a better approach it lands here, and the VP works through it on its own, highest priority first.":tab==="directions"?"No future directions yet. Good ideas for later are held here; nothing runs until you or a later plan promotes one.":"Nothing finished yet."}</p></section>
+    :<ul className="issue-list">{shown.map((i)=><li key={i.id} className={`issue-row ${i.priority}`}><button className="issue-head" onClick={()=>setOpen(open===i.id?"":i.id)}><span className={`prio-dot ${i.priority}`} title={`${i.priority} priority`}/><span className="issue-kind">{i.kind==="direction"?"future":i.kind}</span><b>{i.title}</b><small>{i.deferred?"deferred":i.kind==="direction"&&i.status==="proposed"?"held for later":ISSUE_STATUS[i.status]||i.status}</small></button>
+      {open===i.id&&<div className="issue-detail"><p>{i.detail}</p>{i.evidence&&<p className="form-hint">Evidence: {i.evidence}</p>}<p className="form-hint">{SOURCE_LABEL[i.source]||i.source}{phaseName(i.phaseId)?` · Phase ${phaseName(i.phaseId)!.index}: ${phaseName(i.phaseId)!.title}`:""} · {i.priority} priority</p>
+        {!closed(i)&&<div className="form-actions">{(i.kind==="direction"||i.deferred)&&i.status!=="running"&&<button className="button primary" disabled={busy} onClick={()=>act(i.id,"do_now")}>Work on this now</button>}{i.deferred?<button className="button secondary" disabled={busy} onClick={()=>act(i.id,"undefer")}>Resume</button>:i.kind!=="direction"&&i.status!=="running"&&<button className="button secondary" disabled={busy} onClick={()=>act(i.id,"defer")}>Defer</button>}{i.status==="failed"&&<button className="button secondary" disabled={busy} onClick={()=>act(i.id,"retry")}>Retry</button>}{i.status!=="running"&&<button className="button secondary" disabled={busy} onClick={()=>act(i.id,"wont_do")}>Won’t do</button>}</div>}</div>}</li>)}</ul>}
+  </div>;
+}
+
 const PHASE_STATUS: Record<string,string> = { proposed: "Planned · not started", ready: "Approved · starting", running: "In progress", verifying: "Done · needs your review", completed: "Completed", failed: "Failed", cancelled: "Cancelled", waiting_human: "Waiting for your answer", blocked: "Blocked" };
 function PhasesView({phases,items,busy,approve,decide,plan,review,alignmentCompleted,demo}:{phases:Phase[];items:Work[];busy:boolean;approve:(workId:string,revision:number,decision:"approve"|"reject"|"retry")=>Promise<boolean>;decide:(phaseId:string,moveOn:boolean)=>void;plan:()=>void;review:()=>void;alignmentCompleted:boolean;demo:boolean}) {
   const [confirm,setConfirm]=React.useState("");
@@ -363,6 +392,7 @@ function PhasesView({phases,items,busy,approve,decide,plan,review,alignmentCompl
       <small>{p.tasks.done} of {p.tasks.total} tasks done{p.tasks.running?` · ${p.tasks.running} running`:""}{p.tasks.failed?` · ${p.tasks.failed} failed`:""}{p.steers?` · ${p.steers} self-check${p.steers===1?"":"s"}`:""}</small>
       <div className="memory-section"><b>Exit criteria · how we know it&rsquo;s truly done</b><ul className="phase-criteria">{p.exitCriteria.map((c,i)=>{const a=p.assessment.find((x)=>x.criterion===c);return <li key={i} className={a?.met?"met":""}><span aria-hidden="true">{a?.met?"✓":"○"}</span> {c}{a?.met&&a.evidence&&<small>{a.evidence}</small>}</li>;})}</ul>{p.assessment.length>0&&p.status==="running"&&<small>{unmet} criteri{unmet===1?"on":"a"} still open; the VP is creating the work to close {unmet===1?"it":"them"}.</small>}</div>
       {items.some((w)=>w.parentWorkId===p.phaseId)&&<details className="phase-tasks"><summary>Tasks ({items.filter((w)=>w.parentWorkId===p.phaseId).length})</summary><ul>{items.filter((w)=>w.parentWorkId===p.phaseId).sort((a,b)=>a.title.localeCompare(b.title)).map((w)=><li key={w.workId}><span className={`thread-status-dot ${w.status}`}/><span>{w.title}</span><small>{w.status.replaceAll("_"," ")}</small></li>)}</ul></details>}
+      {(p.reviewed||(p.passes||0)>0)&&<small>{p.reviewed?"Independently reviewed against your vision":""}{p.reviewed&&(p.passes||0)>0?" · ":""}{(p.passes||0)>0?`${p.passes} quality pass${p.passes===1?"":"es"}`:""}</small>}
       {p.caveats.length>0&&<div className="memory-section"><b>Known weaknesses</b><ul>{p.caveats.map((c,i)=><li key={i}>{c}</li>)}</ul></div>}
       {(p.improvements.open>0||p.improvements.done>0)&&<div className="memory-section"><b>Improvement backlog · the VP works through this on its own</b><small>{p.improvements.open} open · {p.improvements.done} done</small>{p.improvements.titles.length>0&&<ul>{p.improvements.titles.map((t,i)=><li key={i}>{t}</li>)}</ul>}</div>}
       <div className="form-actions">

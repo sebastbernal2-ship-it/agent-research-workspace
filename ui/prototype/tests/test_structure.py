@@ -30,8 +30,8 @@ class PrototypeStructureTests(unittest.TestCase):
 
     def test_navigation_is_three_places_and_the_slop_is_gone(self):
         nav = self.tsx[self.tsx.index('aria-label="Project navigation"'):self.tsx.index('<div className="sidebar-spacer"/>')]
-        self.assertEqual(len(re.findall(r"<button onClick=\{\(\) => setView\(", nav)), 3)  # Home, Phases, Memory
-        for label in ("Home", "Phases", "Memory"):
+        self.assertEqual(len(re.findall(r"<button onClick=\{\(\) => setView\(", nav)), 4)  # Home, Phases, Issues, Memory
+        for label in ("Home", "Phases", "Issues", "Memory"):
             self.assertIn(label, nav)
         for home_block in ("Needs you", "Now", "Latest"):
             self.assertIn(home_block, self.tsx)
@@ -58,7 +58,7 @@ class PrototypeStructureTests(unittest.TestCase):
     def test_core_project_work_inbox_and_limitations_are_visible(self):
         for text in (
             "New project", "Existing project", "Inspect repository", "Add an outcome or nested step", "OPEN DECISIONS",
-            "Alignment interview", "Full auto", "KanbanBoard", "PhasesView", "PhasesPage", "MemoryPage", "QuestionChat",
+            "Alignment interview", "Full auto", "KanbanBoard", "PhasesView", "PhasesPage", "IssuesPage", "MemoryPage", "QuestionChat",
             "RECORD THIS AS YOUR ANSWER?", "Approve task", "Plan phases with the VP", "Accept the plan", "Change the plan", "Move on to the next phase",
             "LOCAL DATA AGENTS CAN READ", "Project settings", "loopback only",
         ):

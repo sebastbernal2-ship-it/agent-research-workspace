@@ -18,6 +18,9 @@ class ScriptedRunner:
             {"title": "Data readiness", "goal": "Clean data for every layer", "exitCriteria": ["Splitter verified", "Extraction reviewed"],
              "tasks": [{"key": "a", "title": "Build splitter", "objective": "split", "workType": "implementation", "acceptanceCriteria": ["tested"]}]},
             {"title": "Model inputs", "goal": "Feed models", "exitCriteria": ["Sources chosen"], "tasks": []}]}
+        self.review_calls, self.quality_calls = [], []
+        self.reviews, self.qualities = [], []   # scripted replies for the independent reviewer and the quality passes
+        self.review_error = False
         self.plan_calls = []
         self.plan_error = False
         self.steers = []          # replies returned in order by the steering call
@@ -29,13 +32,21 @@ class ScriptedRunner:
         return True
 
     def think(self, system, payload):
-        if "reviewer" in system.lower() and "independent" in system.lower():
+        if system.startswith("You are an independent reviewer agent"):  # the per-task reviewer
             return json.dumps({"verdict": "accept"})
         if system.startswith("You are the project VP. Plan the WHOLE project"):
             self.plan_calls.append(json.loads(payload))
             if self.plan_error:
                 raise VPError("the model is unavailable")
             return json.dumps(self.plan)
+        if system.startswith("You are an independent, skeptical reviewer"):
+            self.review_calls.append(json.loads(payload))
+            if self.review_error:
+                raise VPError("reviewer unavailable")
+            return json.dumps(self.reviews.pop(0) if self.reviews else {"verdict": "pass", "gaps": [], "summary": "Checked real outputs; they match."})
+        if system.startswith("You are the project's quality reviewer"):
+            self.quality_calls.append(json.loads(payload))
+            return json.dumps(self.qualities.pop(0) if self.qualities else {"issues": [], "summary": "nothing to add"})
         if system.startswith("You are the project VP running ONE phase"):
             self.steer_calls.append(json.loads(payload))
             if not self.steers:
@@ -124,8 +135,10 @@ class PlanTests(PhaseBase):
     def test_prompts_demand_verifiable_criteria_and_forbid_claiming_done_without_evidence(self):
         self.assertIn("VERIFIABLE", PHASE_PLAN_SYSTEM)
         self.assertIn("NEVER make the owner's review or approval a criterion", PHASE_PLAN_SYSTEM)
-        for must in ("met=true only with concrete evidence", "status=complete ONLY if every criterion is met", "never repeat a completed task",
-                     "only the owner can supply", "NOT needed for the exit criteria"):
+        for must in ("met=true only with concrete evidence", "status=complete ONLY if every criterion is met AND nothing blocks",
+                     "never repeat a completed task", "only the owner can supply", "DONE MEANS the work serves the owner's vision",
+                     "they never block completion"):
+            self.assertIn(must, STEER_SYSTEM)
             self.assertIn(must, STEER_SYSTEM)
 
 
