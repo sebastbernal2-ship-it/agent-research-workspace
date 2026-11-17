@@ -584,3 +584,10 @@ class RejectedAnswerTests(VPBase):
     def test_curator_prompt_explains_owner_closed_questions(self):
         from ui.prototype.vp import MEMORY_SYSTEM
         self.assertIn("ownerClosedQuestions", MEMORY_SYSTEM)
+
+
+    def test_prompts_keep_the_draft_on_this_question_only(self):
+        from ui.prototype.vp import CONVERSE_SYSTEM, REFRESH_SYSTEM
+        self.assertIn("THIS open question only", CONVERSE_SYSTEM)
+        self.assertIn("do NOT paste them into the draft", CONVERSE_SYSTEM)
+        self.assertIn("THIS question only", REFRESH_SYSTEM)

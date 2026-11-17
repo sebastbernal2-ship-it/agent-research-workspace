@@ -831,7 +831,8 @@ def new_project_segments(goal: str) -> list[dict[str, str]]:
 
 REFRESH_SYSTEM = (
     "Read the conversation between the owner and the VP about the open question and write the owner's CURRENT position "
-    "on it as a concise first-person draft record (under 120 words), flagging anything tentative, keeping the owner's "
+    "on THIS question only (ownerMemory is background; do not paste it in or restate other questions' decisions) as a "
+    "concise first-person draft record (under 120 words), flagging anything tentative, keeping the owner's "
     "own wording and numbers, and omitting anything the owner never said (never the VP's own findings or suggestions). Reply JSON only: "
     '{"settled":false,"answer":{"selectedOptionId":null,"text":"..."}}; settled=true only if the owner clearly finished '
     "deciding. If the owner has said nothing bearing on the question, reply {\"answer\":null}. "
@@ -851,8 +852,10 @@ CONVERSE_SYSTEM = (
     '"answer":{"selectedOptionId":null,"text":""},"learned":["..."]}. '
     "Rules: if the owner's message ASKS you anything (a question mark, 'what do we have', 'show me', 'which'), it is a "
     "btw: answer it and use intent=btw (intent=answer is only for settled questions). "
-    "ALWAYS keep a running draft in answer: the owner's position on the open question, concise, tentative parts "
-    "flagged. The draft contains ONLY what the OWNER said or decided. NEVER put your own findings, suggestions or "
+    "ALWAYS keep a running draft in answer: the owner's position on THIS open question only, concise, tentative parts "
+    "flagged. ownerMemory and ownerDecisions are background for you: do NOT paste them into the draft or restate "
+    "decisions made for other questions, and never present as settled anything that is a separate open question. "
+    "The draft contains ONLY what the OWNER said or decided. NEVER put your own findings, suggestions or "
     "repo facts into it as if the owner had said them; those belong in your reply, and enter the draft only after the "
     "owner adopts them. currentDraft (if present) is what the owner is already looking at: EDIT it minimally. If "
     "draftWasEditedByOwner is true, the owner wrote that wording themselves: keep it EXACTLY and change only what "
