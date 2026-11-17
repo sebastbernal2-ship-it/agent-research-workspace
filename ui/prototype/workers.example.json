@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy to ~/.config/northstar/workers.json. Keys are NEVER written here: secretEnv maps a provider variable to the NAME of an environment variable that holds the key (export it before starting the app). Verify each provider's current endpoint and model names in its docs.",
+  "profiles": {
+    "codex":    { "kind": "codex" },
+    "claude":   { "kind": "claude" },
+    "deepseek": {
+      "kind": "claude",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_MODEL": "deepseek-chat",
+        "ANTHROPIC_API_KEY": ""
+      },
+      "secretEnv": { "ANTHROPIC_AUTH_TOKEN": "DEEPSEEK_API_KEY" }
+    },
+    "qwen-local": {
+      "kind": "claude",
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
+        "ANTHROPIC_MODEL": "qwen3-coder",
+        "ANTHROPIC_API_KEY": "",
+        "ANTHROPIC_AUTH_TOKEN": "local"
+      }
+    }
+  },
+  "roles": { "vp": "codex", "orchestrator": "codex", "worker": "deepseek", "reviewer": "claude" }
+}

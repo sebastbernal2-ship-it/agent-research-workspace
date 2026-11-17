@@ -142,14 +142,19 @@ class CliRunner:
     Credentials stay in each CLI's own store; nothing is copied or passed on argv.
     """
 
-    def __init__(self, kind: str = "claude", *, think_timeout: float = 120, work_timeout: float = 900):
+    def __init__(self, kind: str = "claude", *, think_timeout: float = 120, work_timeout: float = 900,
+                 env: dict[str, str] | None = None, secret_env: dict[str, str] | None = None):
         if kind not in {"claude", "codex"}:
             raise ValueError("kind must be claude or codex")
         self.kind, self.think_timeout, self.work_timeout = kind, think_timeout, work_timeout
         self.executable = shutil.which(kind)
+        # A "profile": the same CLI harness pointed at another provider (e.g. Claude Code on DeepSeek or Qwen).
+        # `env` are plain overrides; `secret_env` maps TARGET_VAR -> NAME_OF_ENV_VAR_HOLDING_THE_KEY, so keys
+        # live in the environment and never in config files, argv, or logs.
+        self.extra_env, self.secret_env = dict(env or {}), dict(secret_env or {})
 
     def available(self) -> bool:
-        return self.executable is not None
+        return self.executable is not None and all(src in os.environ for src in self.secret_env.values())
 
     def _env(self) -> dict[str, str]:
         env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home()),
@@ -157,6 +162,8 @@ class CliRunner:
         for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
             if key in os.environ:
                 env[key] = os.environ[key]
+        env.update(self.extra_env)
+        env.update({target: os.environ[src] for target, src in self.secret_env.items() if src in os.environ})
         return env
 
     def _run(self, args: list[str], prompt: str, cwd: Path, timeout: float) -> bytes:
@@ -220,15 +227,85 @@ class NullRunner:
         raise VPError("No model runner is configured.")
 
 
+_PROFILE_ENV_KEY = re.compile(r"(ANTHROPIC|CLAUDE_CODE|OPENAI|CODEX)_[A-Z0-9_]{1,60}\Z")
+_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+ROLES = ("vp", "orchestrator", "worker", "reviewer")
+
+
+def load_worker_config(path: Path) -> tuple[dict[str, CliRunner], dict[str, str]]:
+    """Per-role model routing, e.g. VP on Codex, workers on Claude Code pointed at DeepSeek.
+
+    Only provider-style environment variables may be overridden (not PATH, LD_PRELOAD, ...); API keys are
+    referenced by environment-variable NAME, never stored in the file.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    profiles: dict[str, CliRunner] = {}
+    for name, spec in (data.get("profiles") or {}).items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", name) or not isinstance(spec, dict):
+            raise ValueError(f"bad profile name or shape: {name!r}")
+        env, secret = spec.get("env") or {}, spec.get("secretEnv") or {}
+        if any(not _PROFILE_ENV_KEY.fullmatch(k) or not isinstance(v, str) for k, v in env.items()):
+            raise ValueError(f"profile {name}: env may only set ANTHROPIC_/CLAUDE_CODE_/OPENAI_/CODEX_ variables")
+        if any(not _PROFILE_ENV_KEY.fullmatch(k) or not isinstance(v, str) or not _ENV_NAME.fullmatch(v) for k, v in secret.items()):
+            raise ValueError(f"profile {name}: secretEnv must map a provider variable to the NAME of an environment variable")
+        profiles[name] = CliRunner(spec.get("kind", ""), env=env, secret_env=secret)
+    roles = {r: n for r, n in (data.get("roles") or {}).items()}
+    if any(r not in ROLES or n not in profiles for r, n in roles.items()):
+        raise ValueError(f"roles must be a subset of {ROLES} and name existing profiles")
+    return profiles, roles
+
+
+class RoutedRunner:
+    """Routes each kind of call to the profile configured for its role; falls back to any available profile."""
+
+    kind = "routed"
+
+    def __init__(self, profiles: dict[str, CliRunner], roles: dict[str, str]):
+        self.profiles, self.roles = profiles, roles
+        self._by_system = {BOARD_SYSTEM: "vp", INTERVIEWER_SYSTEM: "vp", MEMORY_SYSTEM: "vp", SUMMARY_SYSTEM: "vp",
+                           LEARN_SYSTEM: "vp", ORCHESTRATOR_SYSTEM: "orchestrator", REVIEWER_SYSTEM: "reviewer"}
+
+    def _pick(self, role: str) -> CliRunner:
+        chosen = self.profiles.get(self.roles.get(role, ""))
+        if chosen is not None and chosen.available():
+            return chosen
+        for profile in self.profiles.values():
+            if profile.available():
+                return profile
+        raise VPError("No configured worker profile is available (is the CLI installed and the API key variable set?).")
+
+    def available(self) -> bool:
+        return any(p.available() for p in self.profiles.values())
+
+    def think(self, system: str, payload: str) -> str:
+        return self._pick(self._by_system.get(system, "vp")).think(system, payload)
+
+    def work(self, system: str, prompt: str, cwd: Path) -> str:
+        return self._pick("worker").work(system, prompt, cwd)
+
+    def explore(self, system: str, prompt: str, cwd: Path) -> str:
+        return self._pick("vp").explore(system, prompt, cwd)
+
+    def describe(self) -> dict[str, str]:
+        return {role: self.roles.get(role, "(any available)") for role in ROLES}
+
+
 def default_runner() -> ModelRunner:
-    """NORTHSTAR_RUNNER=codex|claude|pi (default codex, falling back to whatever is installed)."""
+    """~/.config/northstar/workers.json (or NORTHSTAR_WORKERS_CONFIG) routes roles to profiles; otherwise
+    NORTHSTAR_RUNNER=codex|claude|pi (default codex, falling back to whatever is installed)."""
+    config = Path(os.environ.get("NORTHSTAR_WORKERS_CONFIG") or Path.home() / ".config" / "northstar" / "workers.json")
+    if config.is_file():
+        try:
+            return RoutedRunner(*load_worker_config(config))
+        except (ValueError, OSError) as exc:
+            print(f"Ignoring invalid worker config {config}: {exc}", flush=True)
     choice = os.environ.get("NORTHSTAR_RUNNER", "codex")
     if choice == "pi":
         return PiRunner()
     for kind in dict.fromkeys([choice, "codex", "claude"]):
         if kind in {"claude", "codex"} and shutil.which(kind):
             return CliRunner(kind)
-    return PiRunner()
+    return NullRunner()
 
 
 def _json_object(text: str) -> dict[str, Any]:
