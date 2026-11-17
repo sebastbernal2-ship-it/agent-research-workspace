@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import DataRoots, LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -119,6 +119,7 @@ class PrototypeRuntime:
         self._chat_lock = threading.Lock()
         self._chat_timestamps: list[float] = []
         self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
+        self.data_roots = DataRoots(Path(db_path).parent / "data_roots.json", self.workspace_root)
         self.vp = ProjectVP(self, runner or default_runner(), self.settings)
         if self.chat_provider is None:
             self.chat_provider = RepoChat(self.vp, self._plain_chat)
@@ -179,6 +180,14 @@ class PrototypeRuntime:
             return {"workItems": self.vp.draft_board(project_id)}
         except VPError as exc:
             raise ControlPlaneError(str(exc)) from exc
+
+    def set_data_roots(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "automation.manage")
+        if not isinstance(request, dict) or set(request) != {"paths"}:
+            raise ValueError("data folders require only paths")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project does not use local data")
+        return {"dataRoots": self.data_roots.set(project_id, request["paths"])}
 
     def automation(self, project_id: str) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
@@ -1092,6 +1101,7 @@ class PrototypeRuntime:
             "recentEvents": recent_events,
             "alignment": alignment,
             "automation": self.automation(project_id),
+            "dataRoots": self.data_roots.get(project_id),
             "memory": project_memory(state),
             "activity": self.activity(project_id, 15),
             "drafting": project_id in self._drafting,

@@ -675,3 +675,50 @@ class DetailedLogTests(VPBase):
         for key in MEMORY_SECTIONS:
             self.assertIn(key, MEMORY_SYSTEM)
         self.assertIn("CRUCIAL", MEMORY_SYSTEM)
+
+
+class DataRootsTests(VPBase):
+    def setUp(self):
+        super().setUp()
+        self.home = Path(self.temp.name) / "home"
+        (self.home / "data").mkdir(parents=True)
+        (self.home / "data" / "a.txt").write_text("x")
+        self.rt.data_roots.home = self.home.resolve()  # sandbox "home" for validation
+
+    def test_roots_are_validated_and_persisted(self):
+        out = self.rt.set_data_roots(self.pid, {"paths": [str(self.home / "data"), str(self.home / "data")]})
+        self.assertEqual(out["dataRoots"], [str((self.home / "data").resolve())])  # deduplicated, resolved
+        self.assertEqual(self.rt.project_summary(self.pid)["dataRoots"], out["dataRoots"])
+        for bad in ({}, {"paths": "x"}, {"paths": ["relative/dir"]}, {"paths": [str(self.home / "missing")]},
+                    {"paths": [str(self.home)]}, {"paths": ["/etc"]}, {"paths": [str(self.rt.workspace_root)]},
+                    {"paths": [str(self.home / "data")] * 1 + ["/tmp"] * 5}):
+            with self.assertRaises(ValueError):
+                self.rt.set_data_roots(self.pid, bad)
+        with self.assertRaises(ValueError):
+            self.rt.set_data_roots("project.northstar", {"paths": []})
+
+    def test_every_agent_prompt_carries_the_roots_and_workers_are_told_to_only_read(self):
+        from ui.prototype.vp import WORKER_SYSTEM
+        self.rt.set_data_roots(self.pid, {"paths": [str(self.home / "data")]})
+        ctx = self.rt.vp._context(self.rt.control.projector.replay(self.pid))
+        self.assertEqual(ctx["readOnlyDataRoots"], [str((self.home / "data").resolve())])
+        for must in ("readOnlyDataRoots", "never modify, move or delete", "write all outputs inside your workspace"):
+            self.assertIn(must, WORKER_SYSTEM)
+        seen = []
+        self.runner.work = lambda s, p, c: seen.append(json.loads(p)) or "ok\nDONE: x"
+        self.align(); self.rt.draft_board(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        self.rt.vp.tick(self.pid)
+        self.assertEqual(seen[0]["readOnlyDataRoots"], [str((self.home / "data").resolve())])
+
+    def test_claude_worker_gets_add_dir_for_each_root_and_nothing_else_changes(self):
+        from unittest import mock
+        from harness.bounded_process import BoundedProcessResult
+        import ui.prototype.vp as V
+        captured = {}
+        def fake_run(args, **kw):
+            captured["args"] = list(args); return BoundedProcessResult(returncode=0, stdout=json.dumps({"result": "hi"}).encode(), stderr=b"")
+        with mock.patch("shutil.which", return_value="/usr/bin/claude"), mock.patch.object(V, "run_bounded_subprocess", fake_run):
+            runner = V.CliRunner("claude")
+            runner.work("sys", json.dumps({"readOnlyDataRoots": [str(self.home / "data"), "/does/not/exist"]}), self.home)
+        self.assertEqual(captured["args"].count("--add-dir"), 1)  # only the real folder
+        self.assertIn(str(self.home / "data"), captured["args"])

@@ -41,6 +41,7 @@ BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
 CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
+DATA_ROOTS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/data-roots$")
 LOG_PATH = re.compile(r"^/api/v1/projects/([^/]+)/logs/([^/]+)$")
 DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/draft$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
@@ -273,6 +274,16 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        roots_match = DATA_ROOTS_PATH.fullmatch(path)
+        if roots_match:
+            project_id = unquote(roots_match.group(1))
+            def set_roots() -> None:
+                try:
+                    self._send_json(200, self.runtime.set_data_roots(project_id, body))
+                except ValueError as exc:  # these messages are written for the owner (e.g. "must be inside your home folder")
+                    self._error(422, "invalid_data_folder", str(exc))
+            self._run(set_roots)
             return
         log_match = LOG_PATH.fullmatch(path)
         if log_match:
