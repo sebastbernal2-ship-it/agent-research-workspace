@@ -1,6 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { Brain, ChevronDown, Folder, House, Inbox, Layers3, ListChecks, MessageSquare, Plus, Settings, X } from "lucide-react";
+import { Brain, ChevronDown, Folder, House, Inbox, Layers3, Lightbulb, ListChecks, MessageSquare, Plus, Settings, X } from "lucide-react";
 import "./style.css";
 import "./goal.css";
 import "./work-views.css";
@@ -23,7 +23,8 @@ type ProjectMode = "choose" | "new" | "existing";
 type Question = { questionId: string; questionType: string; questionText: string; priority: string; blocking: boolean; workIds: string[]; etag: string };
 type QuestionDetail = Question & { record: { questionType: string; options: { optionId: string; label: string; consequence?: string }[]; impact: string; status: string; questionText: string }; affectedWork: { workId: string; title: string; status: string }[] };
 type Turn = { role: "user" | "assistant"; content: string };
-type View = "home" | "phases" | "issues" | "memory" | "ask" | "activity";
+type View = "home" | "phases" | "issues" | "memory" | "ask" | "activity" | "ideas";
+type Idea = { id: string; title: string; note: string; status: "idea" | "started" | "archived"; projectId: string | null; createdAt: string; updatedAt: string };
 type Issue = { id: string; kind: "issue" | "improvement" | "direction"; title: string; detail: string; priority: string; source: string; evidence: string; deferred: boolean; phaseId?: string | null; status: string; createdAt: string };
 type Phase = { phaseId: string; index: number; title: string; goal: string; status: string; revision: number; exitCriteria: string[]; assessment: { criterion: string; met: boolean; evidence: string }[]; caveats: string[]; steers: number; tasks: { total: number; done: number; running: number; failed: number }; improvements: { open: number; done: number; directions?: number; titles: string[] }; passes?: number; reviewed?: boolean; reviewSummary?: string; visionGaps?: { gap: string; severity: string }[] };
 
@@ -65,6 +66,9 @@ function App() {
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [chatOpen, setChatOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [ideas, setIdeas] = React.useState<Idea[]>([]);
+
+  const loadIdeas = React.useCallback(async () => { const r = await request<{ideas: Idea[]}>("/api/v1/ideas"); setIdeas(r.ideas); }, []);
 
   const loadProjects = React.useCallback(async () => {
     const result = await request<{items: Project[]}>('/api/v1/projects');
@@ -98,6 +102,7 @@ function App() {
     void (async () => {
       try {
         await request('/api/v1/health');
+        loadIdeas().catch(() => {});
         const items = await loadProjects();
         const preferred = items.find((item) => item.projectId === projectId) || items[0];
         if (preferred) { await loadProject(preferred.projectId); await loadInbox(preferred.projectId); }
@@ -128,6 +133,21 @@ function App() {
   const setAutoRun = (enabled: boolean) => post("automation", { autoRun: enabled }, "Could not change auto-run.");
   const decideWork = (workId: string, revision: number, decision: "approve" | "reject" | "retry") => post(`work/${encodeURIComponent(workId)}/approval`, { expectedRevision: revision, decision }, "Could not record the work approval.");
 
+  async function ideaCall(path: string, body: unknown, fail: string) {
+    setBusy(true);
+    try { const r = await request<{idea?: Idea; project?: Project}>(`/api/v1/ideas${path}`, { method: "POST", body: JSON.stringify(body) }); await loadIdeas(); return r; }
+    catch (e) { setError(e instanceof Error ? e.message : fail); return null; }
+    finally { setBusy(false); }
+  }
+  const addIdea = async (title: string, note: string) => Boolean(await ideaCall("", { title, ...(note.trim() ? { note } : {}) }, "Could not save the idea."));
+  const updateIdea = async (id: string, changes: Record<string, string>) => Boolean(await ideaCall(`/${encodeURIComponent(id)}`, changes, "Could not update the idea."));
+  async function startIdea(id: string) {
+    const r = await ideaCall(`/${encodeURIComponent(id)}/start`, {}, "Could not start a project from that idea.");
+    if (!r?.project) return;
+    try { selectedIdRef.current = ""; await loadProjects(); await loadProject(r.project.projectId); await loadInbox(r.project.projectId); setView("ask"); }
+    catch (e) { setError(e instanceof Error ? e.message : "The project was created but could not be opened."); }
+  }
+
   const project = summary?.project;
   const phases = summary?.phases || [];
   const workItems = summary?.workItems || [];
@@ -140,7 +160,7 @@ function App() {
   const activePhase = phases.find((p) => p.status === "verifying") || phases.find((p) => p.status === "running") || phases.find((p) => p.status === "ready");
   const running = tasks.filter((w) => ["running", "verifying"].includes(w.status));
   const reviewing = phases.find((p) => p.status === "verifying");
-  const statusLine = reviewing ? `Phase ${reviewing.index} is done and waiting for your review`
+  const statusLine = view === "ideas" ? "Things you want to build someday" : reviewing ? `Phase ${reviewing.index} is done and waiting for your review`
     : needs.some((q) => q.blocking) ? "Waiting on your answer"
     : alignmentPending ? "Alignment interview in progress"
     : running.length ? `Working on: ${running[0].title}${running.length > 1 ? ` +${running.length - 1} more` : ""}`
@@ -148,7 +168,7 @@ function App() {
     : phases.length === 0 && !demo ? "No plan yet" : "Idle";
   const issues = summary?.issues || [];
   const openIssues = issues.filter((i) => i.kind !== "direction" && !["completed", "cancelled"].includes(i.status) && !i.deferred).length;
-  const titles: Record<View, string> = { home: project?.name || "Project", phases: "Phases", issues: "Issues & future directions", memory: "What the VP remembers", ask: selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Needs you", activity: "Activity" };
+  const titles: Record<View, string> = { ideas: "Ideas", home: project?.name || "Project", phases: "Phases", issues: "Issues & future directions", memory: "What the VP remembers", ask: selectedQuestion?.questionId.startsWith("question.alignment.") ? "Alignment interview" : "Needs you", activity: "Activity" };
 
   function openProjectDialog() { setProjectMode("choose"); setRepositoryPath(""); setRepoReport(null); setDraftName(""); setDraftGoal(""); setProjectDialog(true); }
 
@@ -220,7 +240,7 @@ function App() {
         <button onClick={() => setView("memory")} className={view === "memory" ? "current" : ""}><Brain size={15}/>Memory</button>
       </nav>
       <div className="sidebar-spacer"/>
-      <div className="amp-sidebar-links"><button onClick={() => setSettingsOpen(true)}><Settings size={15}/>Settings</button></div>
+      <div className="amp-sidebar-links"><button onClick={() => { setView("ideas"); loadIdeas().catch(() => {}); }} className={view === "ideas" ? "current" : ""}><Lightbulb size={15}/>Ideas <span>{ideas.filter((i) => i.status === "idea").length || ""}</span></button><button onClick={() => setSettingsOpen(true)}><Settings size={15}/>Settings</button></div>
     </aside>
     <main className="goal-main">
       <header className="goal-topbar"><div className="goal-topbar-title"><span className="project-dot"/><div><h1>{titles[view]}</h1><small>{statusLine}</small></div></div>
@@ -230,7 +250,8 @@ function App() {
         </div></header>
       <div className="goal-stage">
         {error && <div className="error-banner" role="alert">{error}</div>}
-        {!project ? <div className="loading">Loading your project…</div>
+        {view === "ideas" ? <IdeasPage ideas={ideas} busy={busy} add={addIdea} update={updateIdea} start={startIdea} openProject={(id) => void switchProject(id)}/>
+          : !project ? <div className="loading">Loading your project…</div>
           : view === "ask" ? <InboxView projectId={project.projectId} questions={needs} selected={selectedQuestion} choose={openQuestion} recorded={questionRecorded}/>
           : view === "phases" ? <PhasesPage phases={phases} items={workItems} tasks={tasks} busy={busy} approve={decideWork} decide={decidePhase} plan={planPhases} review={() => setView("ask")} alignmentCompleted={alignmentCompleted} demo={demo} addTask={() => setWorkDialog(true)}/>
           : view === "issues" ? <IssuesPage issues={issues} phases={phases} busy={busy} act={actOnIssue} add={addIssue} demo={demo}/>
@@ -256,6 +277,22 @@ function App() {
     </Modal>}
     {workDialog && <Modal title="Add an outcome or nested step" onClose={() => setWorkDialog(false)}><form onSubmit={createWork}><label>Meaningful result<input name="title" required maxLength={160} autoFocus placeholder="Describe the outcome or workstream"/></label><label>Why does it advance the project goal?<textarea name="objective" required maxLength={2000} rows={3} placeholder="Describe the result, not an agent's internal checklist."/></label><label>Parent outcome or workstream<select name="parentWorkId"><option value="">Top-level project outcome</option>{workItems.filter((item)=>item.workId!=="work.alignment-intake"&&item.status!=="cancelled").map((item)=><option key={item.workId} value={item.workId}>{item.title} · {item.status.replaceAll("_"," ")}</option>)}</select></label><label>Category<select name="workType"><option value="research">Research</option><option value="analysis">Analysis</option><option value="planning">Planning</option><option value="implementation">Implementation</option><option value="review">Review</option><option value="writing">Writing</option><option value="operations">Operations</option></select></label><label>Acceptance criteria (optional, one per line)<textarea name="acceptanceCriteria" maxLength={4000} rows={2} placeholder="Only add criteria you actually want to judge the result by."/></label><p className="form-hint">This records a proposal in the project hierarchy; it does not start an agent or claim progress.</p><div className="form-actions"><button type="button" className="button secondary" onClick={() => setWorkDialog(false)}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Saving…" : "Add proposal"}</button></div></form></Modal>}
   </div>;
+}
+
+function IdeasPage({ideas,busy,add,update,start,openProject}:{ideas:Idea[];busy:boolean;add:(title:string,note:string)=>Promise<boolean>;update:(id:string,changes:Record<string,string>)=>Promise<boolean>;start:(id:string)=>void;openProject:(projectId:string)=>void}) {
+  const [title,setTitle]=React.useState("");
+  const [note,setNote]=React.useState("");
+  const [editing,setEditing]=React.useState<{id:string;title:string;note:string}|null>(null);
+  const live=ideas.filter((i)=>i.status==="idea");
+  const started=ideas.filter((i)=>i.status==="started");
+  const archived=ideas.filter((i)=>i.status==="archived");
+  return <div className="goal-scroll"><div className="home">
+    <form className="home-card" onSubmit={async(e)=>{e.preventDefault();if(await add(title.trim(),note)){setTitle("");setNote("");}}}><h2>Capture an idea</h2><input aria-label="Idea title" className="idea-input" placeholder="What do you want to build?" maxLength={140} value={title} onChange={(e)=>setTitle(e.target.value)}/><textarea aria-label="Idea notes" className="qchat-edit" rows={4} maxLength={4000} placeholder="Anything you want to remember: the why, who it's for, rough shape. Write as much as you like; it all carries into the project when you start it." value={note} onChange={(e)=>setNote(e.target.value)}/><div className="form-actions"><button className="button primary" disabled={busy||!title.trim()}>Save idea</button></div></form>
+    {live.length===0&&started.length===0?<section className="home-card"><p className="empty-copy">No ideas yet. Capture one above whenever it strikes. Nothing is built until you start it as a project.</p></section>:null}
+    {live.map((i)=><section key={i.id} className="home-card idea-card">{editing?.id===i.id?<><input aria-label="Edit title" className="idea-input" maxLength={140} value={editing.title} onChange={(e)=>setEditing({...editing,title:e.target.value})}/><textarea aria-label="Edit notes" className="qchat-edit" rows={5} maxLength={4000} value={editing.note} onChange={(e)=>setEditing({...editing,note:e.target.value})}/><div className="form-actions"><button className="button secondary" onClick={()=>setEditing(null)}>Cancel</button><button className="button primary" disabled={busy||!editing.title.trim()} onClick={async()=>{if(await update(i.id,{title:editing.title.trim(),note:editing.note}))setEditing(null);}}>Save</button></div></>:<><h3>{i.title}</h3>{i.note&&<p className="idea-note">{i.note}</p>}<small>Added {ago(i.createdAt)}</small><div className="form-actions"><button className="button secondary" disabled={busy} onClick={()=>void update(i.id,{action:"archive"})}>Archive</button><button className="button secondary" disabled={busy} onClick={()=>setEditing({id:i.id,title:i.title,note:i.note})}>Edit</button><button className="button primary" disabled={busy} onClick={()=>start(i.id)}>Start as a project</button></div></>}</section>)}
+    {started.length>0&&<section className="home-card"><h2>Started as projects</h2>{started.map((i)=><button key={i.id} className="needs-row" onClick={()=>i.projectId&&openProject(i.projectId)}><span><b>{i.title}</b><small>Open the project</small></span><span aria-hidden="true">→</span></button>)}</section>}
+    {archived.length>0&&<details className="home-card"><summary><b>Archived · {archived.length}</b></summary>{archived.map((i)=><div key={i.id} className="idea-archived"><span>{i.title}</span><button className="link-button" disabled={busy} onClick={()=>void update(i.id,{action:"unarchive"})}>Restore</button></div>)}</details>}
+  </div></div>;
 }
 
 function Home({goal,needs,open,activePhase,running,latest,plan,busy,demo,alignmentPending,alignmentCompleted,hasPhases,goPhases,goActivity,goAsk}:{goal:string;needs:Question[];open:(id:string)=>void;activePhase?:Phase;running:Work[];latest:Activity[];plan:()=>void;busy:boolean;demo:boolean;alignmentPending:boolean;alignmentCompleted:boolean;hasPhases:boolean;goPhases:()=>void;goActivity:()=>void;goAsk:()=>void}) {

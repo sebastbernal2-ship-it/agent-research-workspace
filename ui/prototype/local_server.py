@@ -41,6 +41,9 @@ BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
 CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
+IDEAS_PATH = "/api/v1/ideas"
+IDEA_PATH = re.compile(r"^/api/v1/ideas/([^/]+)$")
+IDEA_START_PATH = re.compile(r"^/api/v1/ideas/([^/]+)/start$")
 ISSUES_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues$")
 ISSUE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues/([^/]+)$")
 PHASES_PLAN_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/plan$")
@@ -184,6 +187,9 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/projects":
             self._run(lambda: self._send_json(200, {"items": self.runtime.list_projects()}))
             return
+        if path == IDEAS_PATH:
+            self._run(lambda: self._send_json(200, self.runtime.list_ideas()))
+            return
 
         chat_status_match = CHAT_STATUS_PATH.fullmatch(path)
         if chat_status_match:
@@ -278,6 +284,33 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        if path == IDEAS_PATH:
+            def add_idea() -> None:
+                try:
+                    self._send_json(201, self.runtime.add_idea(body))
+                except ValueError as exc:
+                    self._error(422, "invalid_idea", str(exc))
+            self._run(add_idea)
+            return
+        idea_start = IDEA_START_PATH.fullmatch(path)
+        if idea_start:
+            idea_id = unquote(idea_start.group(1))
+            def start() -> None:
+                if body:
+                    raise ValueError("starting an idea accepts an empty object")
+                self._send_json(201, self.runtime.start_idea(idea_id))
+            self._run(start)
+            return
+        idea_match = IDEA_PATH.fullmatch(path)
+        if idea_match:
+            idea_id = unquote(idea_match.group(1))
+            def update() -> None:
+                try:
+                    self._send_json(200, self.runtime.update_idea(idea_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_idea", str(exc))
+            self._run(update)
             return
         issues_match = ISSUES_PATH.fullmatch(path)
         if issues_match:

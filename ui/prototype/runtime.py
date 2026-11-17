@@ -24,6 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
+from .ideas import IdeaStore
 from .issues import PREFIX as ISSUE_KINDS, active_issues
 from .phases import is_phase, phase_summaries
 from .vp import DataRoots, LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
@@ -121,6 +122,7 @@ class PrototypeRuntime:
         self._chat_lock = threading.Lock()
         self._chat_timestamps: list[float] = []
         self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
+        self.ideas = IdeaStore(Path(db_path).parent / "ideas.json")
         self.data_roots = DataRoots(Path(db_path).parent / "data_roots.json", self.workspace_root)
         self.vp = ProjectVP(self, runner or default_runner(), self.settings)
         if self.chat_provider is None:
@@ -185,6 +187,37 @@ class PrototypeRuntime:
             return {"phases": self.vp.phases.plan(project_id)}
         except VPError as exc:
             raise ControlPlaneError(str(exc)) from exc
+
+    # ---- ideas: things to build someday, escalated into projects on demand --------------------------
+    def list_ideas(self) -> dict[str, Any]:
+        return {"ideas": self.ideas.list()}
+
+    def add_idea(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request, dict) or not {"title"} <= set(request) <= {"title", "note"}:
+            raise ValueError("an idea needs a title and optionally a note")
+        return {"idea": self.ideas.add(request["title"], request.get("note", ""))}
+
+    def update_idea(self, idea_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {"idea": self.ideas.update(idea_id, request)}
+        except KeyError as exc:
+            raise InboxNotFound("idea was not found") from exc
+
+    def start_idea(self, idea_id: str) -> dict[str, Any]:
+        """Escalate an idea into a project: the owner's own words become the goal and the first logged detail."""
+        try:
+            idea = self.ideas.get(idea_id)
+        except KeyError as exc:
+            raise InboxNotFound("idea was not found") from exc
+        if idea["status"] != "idea":
+            raise ControlPlaneError("only an idea that has not been started or archived can become a project")
+        goal = (idea["note"].split("\n")[0].strip() if idea["note"] else "") or idea["title"]
+        project = self.create_project({"mode": "new", "name": idea["title"][:100], "goal": goal[:1000]})
+        if idea["note"]:  # keep everything they wrote, in full, so the interview and every agent start from it
+            work_id, thread_id = self._chat_target(project["projectId"], None)
+            self._save_logs(project["projectId"], work_id, thread_id, [{
+                "kind": "insight", "title": "The original idea: " + idea["title"][:90], "detail": idea["note"][:1500], "crucial": False}])
+        return {"project": project, "idea": self.ideas.mark_started(idea_id, project["projectId"])}
 
     def add_issue(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         """The owner logs an issue, improvement or future direction themselves; it goes on the current (or last) phase."""
