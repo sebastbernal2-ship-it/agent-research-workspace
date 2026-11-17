@@ -6,6 +6,8 @@ The task board uses five compact kanban columns (Proposed, Ready, In progress, W
 
 ## Run locally
 
+Shortcut: `bin/northstar` checks prerequisites (a worker CLI, the built UI), builds the UI if needed, and starts the app; `bin/northstar --check` only reports readiness.
+
 From the repository root:
 
 ```bash
