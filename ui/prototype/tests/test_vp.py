@@ -722,3 +722,32 @@ class DataRootsTests(VPBase):
             runner.work("sys", json.dumps({"readOnlyDataRoots": [str(self.home / "data"), "/does/not/exist"]}), self.home)
         self.assertEqual(captured["args"].count("--add-dir"), 1)  # only the real folder
         self.assertIn(str(self.home / "data"), captured["args"])
+
+
+    def test_large_generated_files_are_left_out_of_the_commit_and_reported(self):
+        import subprocess, ui.prototype.vp as V
+        repo = Path(self.temp.name) / "repo3"; repo.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a], capture_output=True, text=True, check=True)
+        g("init", "-q"); (repo / "README.md").write_text("old\n"); g("add", "-A"); g("commit", "-qm", "init")
+        rep = self.rt.inspect_repository(str(repo))
+        pid = self.rt.create_project({"mode": "existing", "name": "R", "goal": "g", "repositoryPath": str(repo), "inspectionFingerprint": rep["fingerprint"]})["projectId"]
+        while self.rt.list_questions(pid)["questions"]:
+            q = self.rt.get_question(pid, self.rt.list_questions(pid)["questions"][0]["questionId"])
+            self.rt.answer_question(pid, q["questionId"], {"expectedEtag": q["etag"], "text": "x"})
+        self.runner.board = {"tasks": [{"key": "a", "title": "Make output", "objective": "o", "workType": "implementation"}]}
+        self.rt.draft_board(pid); self.rt.set_automation(pid, {"autoRun": True})
+        def work(system, prompt, cwd):
+            (Path(cwd) / "code.py").write_text("print(1)\n")
+            big = Path(cwd) / ".cache" / "out"; big.mkdir(parents=True)
+            (big / "data.jsonl").write_bytes(b"x" * (V.MAX_COMMIT_FILE_BYTES + 1024))
+            return "ok\nDONE: wrote"
+        self.runner.work = work
+        self.rt.vp.tick(pid)
+        wt = self.rt.workspace_root / pid / "repo"
+        tracked = g("-C", str(wt), "ls-files").stdout.split()
+        self.assertIn("code.py", tracked)
+        self.assertNotIn(".cache/out/data.jsonl", tracked)  # the big generated file is not committed
+        self.assertTrue((wt / ".cache" / "out" / "data.jsonl").exists())  # ...but it is still on disk for the owner
+        note = next(a["text"] for a in self.rt.activity(pid) if a["text"].startswith("Committed"))
+        self.assertIn("data.jsonl", note)
+        self.assertIn("large generated files", note)

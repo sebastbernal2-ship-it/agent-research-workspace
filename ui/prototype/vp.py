@@ -36,6 +36,7 @@ WORK_TYPES = {"research", "analysis", "planning", "writing", "review", "implemen
 CHAT_WORK = "work.project-chat"
 SKIP_WORK = {"work.alignment-intake", CHAT_WORK}
 MAX_SUBTASKS = 5
+MAX_COMMIT_FILE_BYTES = 2 * 1024 * 1024  # larger files are never committed by the VP (generated data, archives)
 
 BOARD_SYSTEM = (
     "You are the project VP: the owner's aligned stand-in. From the project goal and the owner's recorded "
@@ -784,10 +785,27 @@ class ProjectVP:
             if not subprocess.run([*git, "status", "--porcelain"], capture_output=True, text=True, timeout=60).stdout.strip():
                 return "No files changed."
             subprocess.run([*git, "add", "-A"], capture_output=True, timeout=60, check=True)
+            # Generated data and other big artifacts must not land in the branch: unstage them and say so.
+            skipped = []
+            staged = subprocess.run([*git, "diff", "--cached", "--name-only", "-z"], capture_output=True, timeout=60, check=True).stdout.split(b"\0")
+            for raw in staged:
+                if not raw:
+                    continue
+                name = raw.decode("utf-8", "replace")
+                try:
+                    size = (worktree / name).stat().st_size
+                except OSError:
+                    continue
+                if size > MAX_COMMIT_FILE_BYTES:
+                    subprocess.run([*git, "reset", "-q", "--", name], capture_output=True, timeout=60, check=True)
+                    skipped.append(f"{name} ({size // (1024 * 1024)} MB)")
+            left = f" Not committed because they are large generated files (still on disk): {', '.join(skipped)}." if skipped else ""
+            if not subprocess.run([*git, "diff", "--cached", "--name-only"], capture_output=True, text=True, timeout=60).stdout.strip():
+                return "No committable changes." + left
             subprocess.run([*git, "commit", "-q", "-m", f"{work['title']}\n\nTask {work['workId']} (Northstar worker)"], capture_output=True, timeout=60, check=True)
             sha = subprocess.run([*git, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=30).stdout.strip()
             branch = subprocess.run([*git, "branch", "--show-current"], capture_output=True, text=True, timeout=30).stdout.strip()
-            return f"Committed {sha} on branch {branch}. Review with: git -C {worktree} show {sha}"
+            return f"Committed {sha} on branch {branch}. Review with: git -C {worktree} show {sha}.{left}"
         except (subprocess.SubprocessError, OSError):
             return "Files changed, but the commit failed; the edits remain uncommitted in the worktree."
 
