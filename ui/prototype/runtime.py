@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -761,7 +761,25 @@ class PrototypeRuntime:
 
     @staticmethod
     def _is_note(message: dict[str, Any]) -> bool:
-        return message["messageType"] == "evidence" and message["content"].startswith("NOTE: ")
+        """Notes and drafts are memory/state stored in the thread, not chat bubbles."""
+        return (message["messageType"] == "evidence" and message["content"].startswith("NOTE: ")) or \
+            (message["messageType"] == "proposal" and message["content"].startswith("DRAFT: "))
+
+    def _proposal(self, answer: Any, options: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not isinstance(answer, dict):
+            return None
+        option_ids = {o["optionId"] for o in options}
+        option_id = answer.get("selectedOptionId") if answer.get("selectedOptionId") in option_ids else None
+        label = next((o["label"] for o in options if o["optionId"] == option_id), None)
+        note = answer.get("text").strip()[:9000] if isinstance(answer.get("text"), str) else ""
+        text = "\n\nNote: ".join(part for part in (label, note) if part)
+        return {"text": text, "selectedOptionId": option_id} if text else None
+
+    def _save_draft(self, project_id: str, work_id: str, thread_id: str, proposal: dict[str, Any], settled: bool) -> None:
+        self.control.add_discussion_message(
+            project_id, work_id, thread_id=thread_id, message_type="proposal",
+            content="DRAFT: " + json.dumps({**proposal, "settled": settled}, ensure_ascii=False),
+            actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
 
     def _chat_context(self, project_id: str, thread_id: str) -> tuple[str, list[dict[str, str]]]:
         """Bounded model context from the durable thread: latest saved summary plus the most recent turns."""
@@ -787,10 +805,47 @@ class PrototypeRuntime:
             {"role": "user" if t["actor"]["role"] == "user" else "assistant", "content": t["content"][:2000]}
             for t in recent if t["content"].strip()]
 
+    def refresh_draft(self, project_id: str, question_id: str) -> dict[str, Any]:
+        """Rebuild the running draft from the saved discussion (e.g. when none was shown yet)."""
+        self.project_application._authorize(project_id, "inbox.answer")
+        state = self.control.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None or question["status"] != "open":
+            raise ControlPlaneError("only an open question has a draft")
+        if not self.vp.runner.available():
+            raise PiChatError("No model runner is available.")
+        work_id, thread_id = self._chat_target(project_id, question_id)
+        summary, turns = self._chat_context(project_id, thread_id)
+        if not any(t["role"] == "user" for t in turns):
+            return {"draft": None}
+        options = [{"optionId": o["optionId"], "label": o["label"]} for o in question.get("options", [])]
+        payload = json.dumps({"openQuestion": {"text": question["questionText"][:1500], "options": options},
+                              "earlierSummary": summary, "conversation": turns,
+                              "ownerMemory": project_memory(state)})
+        try:
+            data = _json_object(self.vp.runner.think(REFRESH_SYSTEM, payload))
+        except VPError:
+            return {"draft": None}
+        proposal = self._proposal(data.get("answer"), options)
+        if proposal is None:
+            return {"draft": None}
+        settled = bool(data.get("settled"))
+        self._save_draft(project_id, work_id, thread_id, proposal, settled)
+        return {"draft": {**proposal, "settled": settled}}
+
     def chat_history(self, project_id: str, question_id: str | None = None) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
         thread_id = f"thread.chat.{question_id}" if question_id else "thread.chat.project"
-        return {"turns": [
+        draft = None
+        if question_id:
+            question = self.control.projector.replay(project_id)["questions"].get(question_id)
+            drafts = [m for m in self._thread(project_id, thread_id) if m["messageType"] == "proposal" and m["content"].startswith("DRAFT: ")]
+            if question and question["status"] == "open" and drafts:
+                try:
+                    draft = json.loads(drafts[-1]["content"][len("DRAFT: "):])
+                except ValueError:
+                    draft = None
+        return {"draft": draft, "turns": [
             {"role": "user" if m["actor"]["role"] == "user" else "assistant", "content": m["content"], "at": m["occurredAt"]}
             for m in self._thread(project_id, thread_id) if not self._is_summary(m) and not self._is_note(m)]}
 
@@ -854,19 +909,13 @@ class PrototypeRuntime:
             for note in learned:  # route anything useful back into project memory
                 self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="evidence",
                                                     content="NOTE: " + note, actor=DEMO_VP, visible_to=both)
-            proposal = None
-            answer = data.get("answer") if data.get("intent") == "answer" and isinstance(data.get("answer"), dict) else None
-            if answer is not None:
-                option_ids = {o["optionId"] for o in options}
-                option_id = answer.get("selectedOptionId") if answer.get("selectedOptionId") in option_ids else None
-                label = next((o["label"] for o in options if o["optionId"] == option_id), None)
-                note = answer.get("text").strip()[:9000] if isinstance(answer.get("text"), str) else ""
-                text = "\n\nNote: ".join(part for part in (label, note) if part)
-                if text:
-                    proposal = {"text": text, "selectedOptionId": option_id}
+            settled = data.get("intent") == "answer"
+            proposal = self._proposal(data.get("answer"), options)
+            if proposal is not None:  # the running draft is always visible and survives a reload
+                self._save_draft(project_id, work_id, thread_id, proposal, settled)
             if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
                 self._curate_soon(project_id)
-            return {"reply": reply, "proposedAnswer": proposal, "notesSaved": len(learned)}
+            return {"reply": reply, "proposedAnswer": proposal, "settled": settled and proposal is not None, "notesSaved": len(learned)}
         finally:
             self._chat_lock.release()
 

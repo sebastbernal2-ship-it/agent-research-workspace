@@ -41,6 +41,7 @@ BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
 CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
+DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/draft$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -271,6 +272,15 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        draft_refresh = DRAFT_PATH.fullmatch(path)
+        if draft_refresh:
+            project_id, question_id = map(unquote, draft_refresh.groups())
+            def refresh() -> None:
+                if body:
+                    raise ValueError("draft refresh accepts an empty object")
+                self._send_json(200, self.runtime.refresh_draft(project_id, question_id))
+            self._run(refresh)
             return
         converse_match = CONVERSE_PATH.fullmatch(path)
         if converse_match:

@@ -458,3 +458,44 @@ class ChatLearningTests(VPBase):
         self.runner.explore = lambda s, p, c: "Got it."
         self.rt.send_project_chat(self.pid, {"message": "That's wrong, models can start once extraction exists.", "history": []})
         self.assertEqual(uncurated_notes(self.rt.control.projector.replay(self.pid)), ["Models may start once extraction exists."])
+
+
+class RunningDraftTests(VPBase):
+    def _converse(self, data):
+        self.runner.explore = lambda s, p, c: json.dumps(data)
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        return q, self.rt.converse(self.pid, q, {"message": "my view, and also can you check the repo?"})
+
+    def test_a_tentative_position_given_with_a_question_still_shows_a_draft_that_survives_reload(self):
+        q, out = self._converse({"intent": "btw", "reply": "Repo agrees. I'd record your view; tap Record when right.",
+                                 "answer": {"selectedOptionId": None, "text": "Topics are 1-3 word concepts (tentative)."}, "learned": []})
+        self.assertFalse(out["settled"])
+        self.assertIn("1-3 word", out["proposedAnswer"]["text"])
+        hist = self.rt.chat_history(self.pid, q)
+        self.assertEqual(hist["draft"]["text"], out["proposedAnswer"]["text"])
+        self.assertFalse(hist["draft"]["settled"])
+        self.assertEqual([t["role"] for t in hist["turns"]], ["user", "assistant"])  # drafts are not chat bubbles
+        restarted = PrototypeRuntime(Path(self.temp.name) / "c.sqlite3", workspace_root=Path(self.temp.name) / "ws", runner=self.runner)
+        self.assertIn("1-3 word", restarted.chat_history(self.pid, q)["draft"]["text"])  # survives a restart
+        self.assertEqual(self.rt.list_questions(self.pid)["questions"][0]["questionId"], q)  # still nothing recorded
+
+    def test_no_position_yet_means_no_draft_and_recording_clears_it(self):
+        q, out = self._converse({"intent": "btw", "reply": "It's a classifier.", "learned": []})
+        self.assertIsNone(out["proposedAnswer"])
+        self.assertIsNone(self.rt.chat_history(self.pid, q)["draft"])
+        q, out = self._converse({"intent": "answer", "reply": "ok", "answer": {"selectedOptionId": None, "text": "Final."}})
+        self.assertTrue(out["settled"])
+        full = self.rt.get_question(self.pid, q)
+        self.rt.answer_question(self.pid, q, {"expectedEtag": full["etag"], **out["proposedAnswer"]})
+        self.assertIsNone(self.rt.chat_history(self.pid, q)["draft"])  # answered questions show no stale draft
+
+    def test_refresh_rebuilds_a_draft_from_an_existing_thread_without_a_new_owner_message(self):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "Checked.", "learned": []})
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        self.rt.converse(self.pid, q, {"message": "I think topics are short concepts."})  # no draft was produced
+        self.assertIsNone(self.rt.chat_history(self.pid, q)["draft"])
+        orig = self.runner.think
+        self.runner.think = lambda system, payload: json.dumps({"settled": False, "answer": {"selectedOptionId": None, "text": "Topics are short concepts."}}) if "CURRENT position" in system else orig(system, payload)
+        out = self.rt.refresh_draft(self.pid, q)
+        self.assertEqual(out["draft"]["text"], "Topics are short concepts.")
+        self.assertEqual(len(self.rt.chat_history(self.pid, q)["turns"]), 2)  # no fake owner turn was added
