@@ -24,7 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .vp import LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -714,6 +714,7 @@ class PrototypeRuntime:
                 state = self.control.projector.replay(project_id)
                 reply = _json_object(self.vp.runner.think(LEARN_SYSTEM, json.dumps({
                     "currentMemory": project_memory(state), "recentTurns": recent, "ownerMessage": message[:4000]})))
+                self._save_logs(project_id, work_id, thread_id, self._clean_logs(reply.get("logs")))
                 notes = [n.strip()[:500] for n in (reply.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
                 for note in notes:
                     self.control.add_discussion_message(
@@ -762,8 +763,68 @@ class PrototypeRuntime:
     @staticmethod
     def _is_note(message: dict[str, Any]) -> bool:
         """Notes and drafts are memory/state stored in the thread, not chat bubbles."""
-        return (message["messageType"] == "evidence" and message["content"].startswith("NOTE: ")) or \
-            (message["messageType"] == "proposal" and message["content"].startswith("DRAFT: "))
+        content = message["content"]
+        return (message["messageType"] == "evidence" and content.startswith(("NOTE: ", "LOG: "))) or \
+            (message["messageType"] == "proposal" and content.startswith("DRAFT: ")) or \
+            (message["messageType"] == "revision" and content.startswith(("LOGEDIT: ", "LOGDEL: ")))
+
+    def _clean_logs(self, raw: Any) -> list[dict[str, Any]]:
+        out = []
+        for item in (raw if isinstance(raw, list) else [])[:15]:
+            if not isinstance(item, dict):
+                continue
+            title, detail = str(item.get("title") or "").strip()[:120], str(item.get("detail") or "").strip()[:1500]
+            if not title or not detail:
+                continue
+            kind = item.get("kind") if item.get("kind") in LOG_KINDS else "insight"
+            out.append({"kind": kind, "title": title, "detail": detail, "crucial": bool(item.get("crucial"))})
+        return out
+
+    def _save_logs(self, project_id: str, work_id: str, thread_id: str, logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        saved = []
+        for log in logs:
+            entry = {"id": "log-" + secrets.token_hex(5), **log}
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id=thread_id, message_type="evidence", content="LOG: " + json.dumps(entry, ensure_ascii=False),
+                actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            saved.append(entry)
+        return saved
+
+    def edit_log(self, project_id: str, log_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner edits or removes one of the logs the VP took. Both are immutable events; nothing is erased."""
+        self.project_application._authorize(project_id, "inbox.answer")
+        if not isinstance(request, dict) or not request or set(request) - {"kind", "title", "detail", "crucial", "remove"}:
+            raise ValueError("log edit accepts kind, title, detail, crucial or remove")
+        state = self.control.projector.replay(project_id)
+        log = next((l for l in active_logs(state) if l["id"] == log_id), None)
+        if log is None:
+            raise InboxNotFound("log was not found")
+        both = [DEMO_USER["actorId"], DEMO_VP["actorId"]]
+        work_id = next(m["workId"] for m in state["messages"] if m["threadId"] == log["threadId"])
+        if request.get("remove") is True:
+            self.control.add_discussion_message(project_id, work_id, thread_id=log["threadId"], message_type="revision",
+                                                content="LOGDEL: " + log_id, actor=DEMO_USER, visible_to=both)
+            return {"removed": log_id}
+        changes = {}
+        if "kind" in request:
+            if request["kind"] not in LOG_KINDS:
+                raise ValueError("unknown log kind")
+            changes["kind"] = request["kind"]
+        for key, limit in (("title", 120), ("detail", 1500)):
+            if key in request:
+                if not isinstance(request[key], str) or not request[key].strip() or len(request[key].strip()) > limit:
+                    raise ValueError(f"{key} must contain 1 to {limit} characters")
+                changes[key] = request[key].strip()
+        if "crucial" in request:
+            if type(request["crucial"]) is not bool:
+                raise ValueError("crucial must be a boolean")
+            changes["crucial"] = request["crucial"]
+        if not changes:
+            raise ValueError("nothing to change")
+        self.control.add_discussion_message(project_id, work_id, thread_id=log["threadId"], message_type="revision",
+                                            content="LOGEDIT: " + json.dumps({"id": log_id, **changes}, ensure_ascii=False),
+                                            actor=DEMO_USER, visible_to=both)
+        return {"log": {**{k: log[k] for k in ("id", "kind", "title", "detail", "crucial")}, **changes, "edited": True}}
 
     def _proposal(self, answer: Any, options: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not isinstance(answer, dict):
@@ -875,7 +936,9 @@ class PrototypeRuntime:
                     draft = json.loads(drafts[-1]["content"][len("DRAFT: "):])
                 except ValueError:
                     draft = None
-        return {"draft": draft, "turns": [
+        logs = [{k: l.get(k) for k in ("id", "kind", "title", "detail", "crucial", "edited")}
+                for l in active_logs(self.control.projector.replay(project_id)) if l["threadId"] == thread_id]
+        return {"draft": draft, "logs": logs, "turns": [
             {"role": "user" if m["actor"]["role"] == "user" else "assistant", "content": m["content"], "at": m["occurredAt"]}
             for m in self._thread(project_id, thread_id) if not self._is_summary(m) and not self._is_note(m)]}
 
@@ -937,6 +1000,7 @@ class PrototypeRuntime:
             reply = data.get("reply") if isinstance(data.get("reply"), str) and data["reply"].strip() else "Understood."
             self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="status",
                                                 content=reply[:8000], actor=DEMO_VP, visible_to=both)
+            new_logs = self._save_logs(project_id, work_id, thread_id, self._clean_logs(data.get("logs")))
             learned = [n.strip()[:500] for n in (data.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
             for note in learned:  # route anything useful back into project memory
                 self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="evidence",
@@ -947,7 +1011,8 @@ class PrototypeRuntime:
                 self._save_draft(project_id, work_id, thread_id, proposal, settled)
             if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
                 self._curate_soon(project_id)
-            return {"reply": reply, "proposedAnswer": proposal, "settled": settled and proposal is not None, "notesSaved": len(learned)}
+            return {"reply": reply, "proposedAnswer": proposal, "settled": settled and proposal is not None,
+                    "notesSaved": len(learned), "logs": new_logs}
         finally:
             self._chat_lock.release()
 

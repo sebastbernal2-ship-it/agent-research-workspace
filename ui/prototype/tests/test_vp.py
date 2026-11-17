@@ -402,7 +402,7 @@ class MemoryTests(VPBase):
         mem = project_memory(self.rt.control.projector.replay(self.pid))["memory"]
         self.assertNotIn("No models yet.", mem["decisions"])
         self.assertLessEqual(len(mem["decisions"]), 20)
-        self.assertTrue(all(len(x) <= 300 for x in mem["decisions"]))
+        self.assertTrue(all(len(x) <= 500 for x in mem["decisions"]))
 
     def test_curator_failure_is_harmless(self):
         q, _ = self._say(["A note."])
@@ -591,3 +591,87 @@ class RejectedAnswerTests(VPBase):
         self.assertIn("THIS open question only", CONVERSE_SYSTEM)
         self.assertIn("do NOT paste them into the draft", CONVERSE_SYSTEM)
         self.assertIn("THIS question only", REFRESH_SYSTEM)
+
+
+class DetailedLogTests(VPBase):
+    LONG = "Relevance must decay by time horizon: a source from 1 week ago may still matter, one from 2 days ago may not. " * 5
+
+    def _logs_reply(self, logs, **extra):
+        self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "ok", "logs": logs, **extra})
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        return q, self.rt.converse(self.pid, q, {"message": "a long rich message"})
+
+    def test_a_rich_message_becomes_many_full_detail_logs_saved_immediately(self):
+        logs = [{"kind": "phase", "title": "Phase 1: data readiness", "detail": "Process raw transcripts into per-layer clean data.", "crucial": False},
+                {"kind": "requirement", "title": "Relevance by time horizon", "detail": self.LONG, "crucial": True},
+                {"kind": "insight", "title": "Cross-source reinforcement", "detail": "3 news articles + a Truth Social post 4 days ago beat no post.", "crucial": False},
+                {"kind": "weird-kind", "title": "Unknown kinds fall back", "detail": "x"}, {"title": "", "detail": "dropped: no title"}]
+        q, out = self._logs_reply(logs)
+        self.assertEqual([l["kind"] for l in out["logs"]], ["phase", "requirement", "insight", "insight"])  # blank-title one dropped
+        self.assertTrue(out["logs"][1]["crucial"])
+        self.assertTrue(out["logs"][1]["detail"].startswith("Relevance must decay"))
+        self.assertGreater(len(out["logs"][1]["detail"]), 400)  # not squeezed into a short note
+        hist = self.rt.chat_history(self.pid, q)
+        self.assertEqual(len(hist["logs"]), 4)
+        self.assertEqual([t["role"] for t in hist["turns"]], ["user", "assistant"])  # logs are not chat bubbles
+        restarted = PrototypeRuntime(Path(self.temp.name) / "c.sqlite3", workspace_root=Path(self.temp.name) / "ws", runner=self.runner)
+        self.assertEqual(len(restarted.chat_history(self.pid, q)["logs"]), 4)  # durable
+
+    def test_every_vp_call_sees_the_logs_crucial_first(self):
+        from ui.prototype.vp import project_memory
+        self._logs_reply([{"kind": "decision", "title": "A", "detail": "first"}, {"kind": "requirement", "title": "B", "detail": "key", "crucial": True}])
+        pm = project_memory(self.rt.control.projector.replay(self.pid))
+        self.assertEqual([l["title"] for l in pm["detailedLogs"]], ["B", "A"])
+        self.assertTrue(pm["detailedLogs"][0]["crucial"])
+        ctx = self.rt.vp._context(self.rt.control.projector.replay(self.pid))
+        self.assertEqual(len(ctx["ownerMemory"]["detailedLogs"]), 2)  # board drafting, orchestrators and workers get them
+        self.assertEqual(pm["notYetMergedNotes"], [])  # logs are listed once (detailedLogs), not duplicated as notes
+        from ui.prototype.vp import uncurated_notes
+        self.assertTrue(any("[requirement CRUCIAL] B: key" in n for n in uncurated_notes(self.rt.control.projector.replay(self.pid))))  # but curation merges them
+
+    def test_owner_can_edit_and_remove_logs_without_erasing_history(self):
+        from ui.prototype.vp import active_logs
+        q, out = self._logs_reply([{"kind": "decision", "title": "T", "detail": "old detail"}, {"kind": "insight", "title": "Gone", "detail": "x"}])
+        keep, drop = out["logs"]
+        res = self.rt.edit_log(self.pid, keep["id"], {"detail": "new detail", "crucial": True, "kind": "priority"})
+        self.assertEqual((res["log"]["detail"], res["log"]["crucial"], res["log"]["kind"], res["log"]["edited"]), ("new detail", True, "priority", True))
+        self.rt.edit_log(self.pid, drop["id"], {"remove": True})
+        state = self.rt.control.projector.replay(self.pid)
+        self.assertEqual([(l["title"], l["detail"]) for l in active_logs(state)], [("T", "new detail")])
+        raw = [m["content"] for m in state["messages"] if m["content"].startswith(("LOG: ", "LOGEDIT: ", "LOGDEL: "))]
+        self.assertEqual(len(raw), 4)  # 2 logs + 1 edit + 1 removal: all still in the immutable record
+        for bad in ({}, {"kind": "nope"}, {"detail": ""}, {"crucial": "yes"}, {"extra": 1}):
+            with self.assertRaises(ValueError):
+                self.rt.edit_log(self.pid, keep["id"], bad)
+        with self.assertRaises(Exception):
+            self.rt.edit_log(self.pid, "log-missing", {"detail": "x"})
+
+    def test_logs_trigger_curation_and_new_memory_sections_exist(self):
+        from ui.prototype.vp import MEMORY_SECTIONS
+        self.assertIn("plan", MEMORY_SECTIONS)
+        self.assertIn("crucial", MEMORY_SECTIONS)
+        self.rt.sync_memory = True
+        calls = []
+        def explore(system, prompt, cwd):
+            if "curate the project's long-term memory" in system:
+                calls.append(json.loads(prompt)); return json.dumps({k: [] for k in MEMORY_SECTIONS})
+            return json.dumps({"intent": "btw", "reply": "ok", "logs": [{"kind": "insight", "title": f"L{i}", "detail": "d"} for i in range(7)]})
+        self.runner.explore = explore
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        self.rt.converse(self.pid, q, {"message": "lots"})
+        self.assertTrue(calls)  # 7 logs crossed the threshold
+        self.assertTrue(any("[insight] L0: d" in n for n in calls[-1]["newNotes"]))
+
+    def test_prompts_demand_one_log_per_point_with_full_detail_and_a_fuller_answer(self):
+        from ui.prototype.vp import CONVERSE_SYSTEM, LEARN_SYSTEM
+        for must in ("its OWN log", "5 to 12 logs", "NEVER compress", "crucial=true", "up to about 250 words"):
+            self.assertIn(must, CONVERSE_SYSTEM)
+        self.assertIn("one log per distinct point", LEARN_SYSTEM.lower())
+        self.assertNotIn("under 120 words", CONVERSE_SYSTEM)
+
+
+    def test_curator_prompt_knows_the_plan_and_crucial_sections(self):
+        from ui.prototype.vp import MEMORY_SYSTEM, MEMORY_SECTIONS
+        for key in MEMORY_SECTIONS:
+            self.assertIn(key, MEMORY_SYSTEM)
+        self.assertIn("CRUCIAL", MEMORY_SYSTEM)
