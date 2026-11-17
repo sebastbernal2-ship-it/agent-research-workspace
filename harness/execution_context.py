@@ -45,6 +45,8 @@ def execution_context_record(
         raise ExecutionContextError("project is not active")
     if work.get("status") != "ready":
         raise ExecutionContextError("work is not canonically ready")
+    if work.get("capabilityGrantIds"):
+        raise ExecutionContextError("work requires a capability executor that is not connected")
 
     for dependency_id in work.get("dependsOn", []):
         if work_items.get(dependency_id, {}).get("status") != "completed":

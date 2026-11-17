@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from ui.prototype.vp import NullRunner
 from ui.prototype.local_server import build_server
 from harness.evidence import EvidenceRegistrar
 from harness.run_ledger import RunLedger
@@ -20,7 +21,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "canonical.sqlite3"
         self.workspace_root = Path(self.temp.name) / "AI-Projects"
-        self.runtime = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        self.runtime = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
         self.server = build_server(self.runtime, 0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -55,6 +56,90 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             "Origin": self.base_url,
             "X-Local-Prototype": "1",
         }
+
+    def test_chat_is_persisted_in_project_history_and_always_includes_project_context(self):
+        class FakeChat:
+            def __init__(self):
+                self.calls = []
+
+            def status(self):
+                return {"available": True, "model": "offline-fake", "accountLabel": "fake"}
+
+            def send(self, message, history, project_context=None, question_context=None):
+                self.calls.append((message, history, project_context, question_context))
+                return "Synthetic offline response"
+
+        fake = FakeChat()
+        self.runtime.chat_provider = fake
+        event_count = len(self.runtime.store.verified_events(PROJECT_ID))
+        status, connection, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/chat/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(connection["available"])
+
+        status, result, _ = self.request(
+            f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
+            payload={
+                "message": "Discuss this idea.",
+                "history": [{"role": "user", "content": "Earlier message."}],
+            }, headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["response"], "Synthetic offline response")
+        self.assertEqual(len(fake.calls), 1)
+        message, history, context, question_context = fake.calls[0]
+        # The durable thread is the source of truth; a browser-supplied history is ignored.
+        self.assertEqual((message, history), ("Discuss this idea.", []))
+        self.assertEqual(context["project"]["name"], "Northstar research")
+        self.assertEqual(context["project"]["goals"], [
+            "Coordinate research and other project work across agent roles.",
+            "Keep project decisions, evidence, and permissions transparent.",
+        ])
+        self.assertEqual(context["workItemCount"], 4)
+        self.assertEqual(len(context["workItems"]), 4)
+        self.assertEqual(context["openQuestionCount"], 2)
+        self.assertEqual(context["automation"]["projectAutoRun"], "off")
+        self.assertFalse(context["automation"]["chatCanExecuteWork"])
+        self.assertFalse(context["repositoryFilesIncluded"])
+        self.assertIsNone(question_context)
+
+        status, result, _ = self.request(
+            f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
+            payload={"message": "What are the tradeoffs here?", "history": [], "questionId": "question.source-policy"},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200, result)
+        question_context = fake.calls[1][3]
+        self.assertEqual(question_context["questionId"], "question.source-policy")
+        self.assertIn("changes what evidence", question_context["impact"])
+        self.assertEqual(len(question_context["options"]), 2)
+        self.assertEqual(len(question_context["affectedWork"]), 2)
+        self.assertTrue(all("status" in item and "objective" in item for item in question_context["affectedWork"]))
+        self.assertIn("changes what evidence", question_context["impact"])
+        # chat log work item + 2 turns, then 2 more turns on the question thread: all durable, none lost
+        self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count + 5)
+        status, hist, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/chat/history")
+        self.assertEqual([t["role"] for t in hist["turns"]], ["user", "assistant"])
+        status, hist, _ = self.request(f"/api/v1/projects/{PROJECT_ID}/chat/history?questionId=question.source-policy")
+        self.assertEqual(hist["turns"][0]["content"], "What are the tradeoffs here?")
+        self.assertEqual(self.request(f"/api/v1/projects/{PROJECT_ID}")[1]["workItems"].__len__(), 4)  # chat log is hidden
+        event_count += 5
+
+        status, error, _ = self.request(
+            f"/api/v1/projects/{PROJECT_ID}/chat", method="POST",
+            payload={"message": "Try to disable context", "history": [], "includeProjectGoal": False},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
+
+        status, error, _ = self.request(
+            "/api/v1/projects/project.other/chat", method="POST",
+            payload={"message": "No project access", "history": []},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["error"], "project_access_denied")
 
     def test_user_can_create_a_project_and_add_proposed_work(self):
         status, created, _ = self.request(
@@ -96,13 +181,15 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(child["workItem"]["acceptanceCriteria"], ["Every finding links to a repository artifact."])
         summary_status, summary, _ = self.request(f"/api/v1/projects/{project_id}")
         self.assertEqual(summary_status, 200)
-        self.assertEqual(len(summary["workItems"]), 2)
-        self.assertEqual(summary["workItems"][1]["parentWorkId"], parent_id)
-        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        # New projects now start with the VP's alignment-intake item plus the two proposals.
+        self.assertEqual(len(summary["workItems"]), 3)
+        self.assertEqual(summary["workItems"][0]["workId"], "work.alignment-intake")
+        self.assertEqual(summary["workItems"][2]["parentWorkId"], parent_id)
+        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
         self.assertEqual(restarted.project_application.get_project(project_id)["name"], "My WSL project")
         reopened_work = restarted.project_application.list_work(project_id)
-        self.assertEqual(reopened_work[0]["title"], "Explore the question")
-        self.assertEqual(reopened_work[1]["parentWorkId"], parent_id)
+        self.assertEqual(reopened_work[1]["title"], "Explore the question")
+        self.assertEqual(reopened_work[2]["parentWorkId"], parent_id)
         self.assertTrue(restarted.store.verify(project_id))
 
     def test_existing_project_inspection_starts_a_durable_sequential_alignment_interview(self):
@@ -160,7 +247,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             if index == 1:
-                restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+                restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
                 sequence_before_resume = restarted.projector.replay(project_id)["_eventSequence"]
                 restarted.resume_alignment(project_id)
                 self.assertEqual(restarted.projector.replay(project_id)["_eventSequence"], sequence_before_resume)
@@ -283,7 +370,7 @@ class LocalPrototypeHTTPTests(unittest.TestCase):
         self.assertEqual(retried_rejection["record"]["status"], "rejected")
         self.assertEqual(len(self.runtime.store.verified_events(PROJECT_ID)), event_count)
 
-        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root)
+        restarted = PrototypeRuntime(self.db_path, workspace_root=self.workspace_root, runner=NullRunner())
         self.assertEqual(restarted.get_question(PROJECT_ID, "question.source-policy")["record"]["status"], "answered")
         self.assertEqual(restarted.get_question(PROJECT_ID, "question.ui-global-view")["record"]["status"], "rejected")
         counts = restarted.project_summary(PROJECT_ID)["counts"]

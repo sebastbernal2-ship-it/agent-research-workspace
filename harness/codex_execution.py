@@ -37,6 +37,7 @@ class CodexExecutionFactory:
         invocation_factory: Callable[[ExecutionContext], CodexInvocation],
         verify: Callable[[ExecutionContext], bool],
         parent_run_id: str | None = None,
+        expected_project_sequence: int | None = None,
     ) -> WorkExecution:
         decision = self.router.route(work)
         profile = self.router.profile_for(decision)
@@ -52,6 +53,10 @@ class CodexExecutionFactory:
             raise CodexExecutionFactoryError("context_hash must be a SHA-256 digest")
         if not callable(invocation_factory) or not callable(verify):
             raise CodexExecutionFactoryError("trusted invocation factory and independent verifier are required")
+        if expected_project_sequence is not None and (
+            type(expected_project_sequence) is not int or expected_project_sequence < 0
+        ):
+            raise CodexExecutionFactoryError("expected_project_sequence must be a non-negative integer")
         if not isinstance(verification_actor, dict) or set(verification_actor) != {"actorType", "actorId", "role"}:
             raise CodexExecutionFactoryError("verification_actor must be a canonical actor")
 
@@ -91,4 +96,5 @@ class CodexExecutionFactory:
             execute=execute,
             verify=verify,
             parent_run_id=parent_run_id,
+            expected_project_sequence=expected_project_sequence,
         )

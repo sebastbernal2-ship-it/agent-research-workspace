@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,8 @@ from harness.inbox import (
 )
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
+from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
+from .vp import CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -51,6 +55,7 @@ class LocalDemoProjectAccess(ProjectAccessPolicy):
         if action not in {
             "project.read", "project.charter.revise", "work.read", "work.create", "inbox.read", "inbox.answer", "inbox.close",
             "run.read", "evidence.read", "artifact.read", "work.approve", "discussion.read",
+            "board.draft", "automation.manage",
         }:
             raise InboxForbidden("action is not available in the local demo")
 
@@ -62,17 +67,40 @@ def _validated_etag(request: dict[str, Any]) -> str:
     return etag
 
 
+class _SerializedControl:
+    """Every control-plane write runs under one lock so parallel agents never race on event sequence numbers.
+
+    Each call replays and appends atomically; slow model calls happen outside it.
+    """
+
+    def __init__(self, inner: ProjectControlPlane):
+        self._inner, self._lock = inner, threading.RLock()
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def locked(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return attr(*args, **kwargs)
+        return locked
+
+
 class PrototypeRuntime:
     """Own one canonical store and the demo-only project/inbox facade."""
 
-    def __init__(self, db_path: str | Path, *, workspace_root: str | Path | None = None):
+    def __init__(
+        self, db_path: str | Path, *, workspace_root: str | Path | None = None,
+        chat_provider: Any | None = None, runner: Any | None = None,
+    ):
         self.workspace_root = Path(workspace_root or Path.home() / "AI-Projects").expanduser()
         self.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.workspace_root.is_symlink():
             raise RuntimeError("project workspace root must not be a symlink")
         self.workspace_root = self.workspace_root.resolve()
         self.store = SQLiteEventStore(db_path)
-        self.control = ProjectControlPlane(self.store)
+        self.control = _SerializedControl(ProjectControlPlane(self.store))
         self._seed_if_empty()
         self.projector = Projector(self.store)
         self.inbox = InboxReadModel(self.store)
@@ -85,6 +113,100 @@ class PrototypeRuntime:
             self.control, principal, access_policy,
         )
         self._ensure_workspace_directories()
+        self._plain_chat = chat_provider or PiCodexChat()
+        self.chat_provider = chat_provider
+        self.red_provider = LocalModelChat()
+        self._chat_lock = threading.Lock()
+        self._chat_timestamps: list[float] = []
+        self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
+        self.vp = ProjectVP(self, runner or default_runner(), self.settings)
+        if self.chat_provider is None:
+            self.chat_provider = RepoChat(self.vp, self._plain_chat)
+        self._autopilot_stop = threading.Event()
+        self._autopilot: threading.Thread | None = None
+        self._drafting: set[str] = set()
+        self.sync_memory = False  # tests run curation inline
+
+    # ---- autopilot -----------------------------------------------------
+    def start_autopilot(self, interval: float = 5.0) -> None:
+        """Run approved work in the background. Never touches the synthetic demo project."""
+        if self._autopilot is not None:
+            return
+
+        for project_id in sorted(self.store._project_ids()):
+            if project_id != PROJECT_ID:
+                try:
+                    self.vp.recover(project_id)
+                except Exception:
+                    pass
+
+        def loop() -> None:
+            while not self._autopilot_stop.wait(interval):
+                for project_id in sorted(self.store._project_ids()):
+                    if project_id == PROJECT_ID:
+                        continue
+                    try:
+                        self.vp.tick(project_id)
+                    except Exception:
+                        pass  # one project's failure must not stop the others
+
+        self._autopilot = threading.Thread(target=loop, name="northstar-autopilot", daemon=True)
+        self._autopilot.start()
+
+    def stop_autopilot(self) -> None:
+        self._autopilot_stop.set()
+
+    def _draft_in_background(self, project_id: str) -> None:
+        if self._autopilot is None or project_id in self._drafting:
+            return
+        self._drafting.add(project_id)
+
+        def draft() -> None:
+            try:
+                self.vp.draft_board(project_id)
+            except Exception:
+                pass  # the owner can retry with "Draft board"
+            finally:
+                self._drafting.discard(project_id)
+
+        threading.Thread(target=draft, name="northstar-draft", daemon=True).start()
+
+    def draft_board(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "board.draft")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project does not use the VP")
+        try:
+            return {"workItems": self.vp.draft_board(project_id)}
+        except VPError as exc:
+            raise ControlPlaneError(str(exc)) from exc
+
+    def automation(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "project.read")
+        return {
+            "autoRun": self.settings.auto_run(project_id),
+            "workerAvailable": self.vp.runner.available() and project_id != PROJECT_ID,
+            "demoProject": project_id == PROJECT_ID,
+        }
+
+    def set_automation(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "automation.manage")
+        if set(request) != {"autoRun"} or type(request["autoRun"]) is not bool:
+            raise ValueError("automation requires only a boolean autoRun")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project cannot run agents")
+        self.settings.set_auto_run(project_id, request["autoRun"])
+        return self.automation(project_id)
+
+    def activity(self, project_id: str, limit: int = 40) -> list[dict[str, Any]]:
+        state, _events = self.project_application.get_project_snapshot(project_id)
+        titles = {w["workId"]: w["title"] for w in state["workItems"].values()}
+        labels = {"vp": "Project VP", "orchestrator": "Orchestrator", "worker": "Subagent", "reviewer": "Reviewer", "user": "You"}
+        feed = [
+            {"id": m["eventId"], "kind": "report", "workId": m["workId"], "workTitle": titles.get(m["workId"], m["workId"]),
+             "actor": labels.get(m["actor"].get("role", ""), "Agent"), "text": m["content"][:4000], "at": m["occurredAt"]}
+            for m in state["messages"] if m["threadId"].startswith("thread.work.")
+        ]
+        return sorted(feed, key=lambda e: e["at"], reverse=True)[:limit]
 
     def _ensure_workspace_directories(self) -> None:
         for project_id in self.store._project_ids():
@@ -261,8 +383,7 @@ class PrototypeRuntime:
                 },
                 "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
             })
-            if report is not None:
-                self._start_alignment_interview(project_id, report)
+            self._start_alignment_interview(project_id, report, goal.strip())
         except Exception:
             if self.control.projector.replay(project_id)["project"] is None:
                 project_directory.rmdir()
@@ -276,19 +397,19 @@ class PrototypeRuntime:
         except RepositoryInspectionError as exc:
             raise ValueError(str(exc)) from exc
 
-    def _start_alignment_interview(self, project_id: str, report: dict[str, Any]) -> None:
+    def _start_alignment_interview(self, project_id: str, report: dict[str, Any] | None, goal: str = "") -> None:
         work_id = "work.alignment-intake"
         now = datetime.now(timezone.utc).isoformat()
         self.control.create_work({
             "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id,
             "workId": work_id, "revision": 1, "parentWorkId": None,
-            "title": "Guided repository alignment", "objective": "Review repository-derived hypotheses with the project owner before proposing delivery work.",
+            "title": "Guided repository alignment", "objective": "Interview the project owner to align on vision, scope, and constraints before any delivery work is proposed.",
             "workType": "planning", "status": "ready", "owner": DEMO_VP,
             "dependsOn": [], "capabilityGrantIds": [],
             "acceptanceCriteria": ["Record the owner's vision, current-state corrections, scope boundaries, unresolved choices, and approval preferences."],
             "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
         }, actor=DEMO_USER)
-        segments = alignment_segments(report)
+        segments = alignment_segments(report) if report is not None else new_project_segments(goal)
         plan = {"kind": "repo_alignment_plan.v1", "repository": report, "segments": segments}
         self.control.add_discussion_message(
             project_id, work_id, thread_id="thread.alignment-intake", message_type="proposal",
@@ -304,7 +425,7 @@ class PrototypeRuntime:
             "recordType": "human_question", "schemaVersion": "0.1", "projectId": project_id,
             "questionId": question_id, "questionType": "clarification", "priority": "high",
             "blocking": True, "requestedBy": DEMO_VP, "workIds": [work_id], "runId": None,
-            "questionText": f"{index + 1} of 5 · {segment['title']}\n\n{segment['prompt']}",
+            "questionText": (f"{index + 1} of 5 · " if index < 5 else "Follow-up · ") + f"{segment['title']}\n\n{segment['prompt']}",
             "impact": segment["evidence"][:3500],
             "options": ([
                 {"optionId": "option.alignment.keep-goal", "label": "Keep the initial goal text", "consequence": "The goal you reviewed before creating the project remains canonical."},
@@ -330,6 +451,16 @@ class PrototypeRuntime:
             if next_id not in state["questions"]:
                 self._open_alignment_question(project_id, index, segments[index], work_id)
             return
+        extra = sum(1 for qid in state["questions"] if qid.startswith("question.alignment.") and int(qid.rsplit(".", 1)[1]) > len(segments))
+        if index >= len(segments) and extra < 3:
+            # One blocking question per work item: ask a single follow-up, then re-evaluate after the answer.
+            followups = self.vp.followup_questions(project_id)
+            if followups:
+                self._open_alignment_question(project_id, len(segments) + extra, {**followups[0], "evidence": "Asked by the VP because earlier answers left this unclear."}, work_id)
+                return
+        if any(q["status"] == "open" for q in self.control.projector.replay(project_id)["questions"].values()
+               if q["questionId"].startswith("question.alignment.")):
+            return
         work = state["workItems"][work_id]
         if work["status"] == "ready":
             self.control.transition_work(
@@ -337,7 +468,7 @@ class PrototypeRuntime:
                 reason="All repository-alignment interview segments were answered by the project owner.",
                 expected_revision=work["revision"],
             )
-        completion_text = "Repository alignment interview completed. The recorded answers are project input; no delivery task was automatically approved or started."
+        completion_text = "Alignment interview completed. The VP will draft a task board from your answers; nothing starts until you approve a task or turn on auto-run."
         state = self.control.projector.replay(project_id)
         if not any(message["content"] == completion_text for message in state["messages"]):
             self.control.add_discussion_message(
@@ -345,6 +476,7 @@ class PrototypeRuntime:
                 content=completion_text, actor=DEMO_USER,
                 visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]],
             )
+            self._draft_in_background(project_id)
 
     def resume_alignment(self, project_id: str) -> None:
         self.project_application._authorize(project_id, "inbox.read")
@@ -368,11 +500,18 @@ class PrototypeRuntime:
     def approve_work(self, project_id: str, work_id: str, request: dict[str, Any]) -> dict[str, Any]:
         if set(request) != {"expectedRevision", "decision"} or type(request["expectedRevision"]) is not int:
             raise ValueError("approval requires expectedRevision and decision")
-        if request["decision"] not in {"approve", "reject"}:
-            raise ValueError("decision must be approve or reject")
+        if request["decision"] not in {"approve", "reject", "retry"}:
+            raise ValueError("decision must be approve, reject or retry")
         actor = self.project_application._authorize(project_id, "work.approve")
         state = self.control.projector.replay(project_id)
         work = state["workItems"].get(work_id)
+        if request["decision"] == "retry":
+            if work is None or work["status"] != "failed":
+                raise ControlPlaneError("only a failed work item can be retried")
+            return self.control.transition_work(
+                project_id, work_id, "ready", actor=actor, reason="Owner retried this failed task.",
+                expected_revision=request["expectedRevision"],
+            )
         if work is None or work["status"] != "proposed":
             raise ControlPlaneError("only a proposed work item may be approved or declined")
         next_status = "ready" if request["decision"] == "approve" else "cancelled"
@@ -423,6 +562,313 @@ class PrototypeRuntime:
 
     def projector_project(self) -> dict[str, Any]:
         return self.control.projector.replay(PROJECT_ID)["project"]
+
+    def chat_status(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "project.read")
+        return {**self.chat_provider.status(), "red": self.red_provider.status()}
+
+    def send_project_chat(self, project_id: str, request: dict[str, Any]) -> dict[str, str]:
+        if (
+            not isinstance(request, dict)
+            or set(request) - {"message", "history", "questionId", "mode"}
+            or not {"message", "history"}.issubset(request)
+        ):
+            raise ValueError("chat requires message, history, and optionally questionId")
+        mode = request.get("mode", "blue")
+        if mode not in {"blue", "red"}:
+            raise ValueError("mode must be blue or red")
+        question_id = request.get("questionId")
+        if question_id is not None and (
+            not isinstance(question_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", question_id) is None
+        ):
+            raise ValueError("questionId must identify an inbox question")
+        PiCodexChat._conversation(request["message"], request["history"])
+        state, _events = self.project_application.get_project_snapshot(project_id)
+        project = state["project"]
+        work_items = [w for w in state["workItems"].values() if w["workId"] != CHAT_WORK]
+        open_questions = [question for question in state["questions"].values() if question["status"] == "open"]
+        recorded_decisions = [question for question in state["questions"].values() if question["status"] == "answered"]
+        project_context = {
+            "project": {
+                "name": project["name"],
+                "goals": project["charter"].get("goals", [])[:4],
+                "nonGoals": project["charter"].get("nonGoals", [])[:6],
+                "acceptanceCriteria": project["charter"].get("acceptanceCriteria", [])[:6],
+            },
+            "workItems": [
+                {
+                    "workId": item["workId"], "parentWorkId": item.get("parentWorkId"),
+                    "title": item["title"][:160], "objective": item["objective"][:600],
+                    "workType": item["workType"], "status": item["status"],
+                    "dependsOn": item.get("dependsOn", [])[:10],
+                    "acceptanceCriteria": [criterion[:200] for criterion in item.get("acceptanceCriteria", [])[:3]],
+                }
+                for item in work_items[:20]
+            ],
+            "workItemCount": len(work_items),
+            "openQuestions": [
+                {
+                    "questionId": question["questionId"],
+                    "question": question["questionText"][:500],
+                    "blocking": question["blocking"],
+                    "workIds": question.get("workIds", [])[:10],
+                }
+                for question in open_questions[:10]
+            ],
+            "openQuestionCount": len(open_questions),
+            "recordedDecisions": [
+                {
+                    "question": question["questionText"][:400],
+                    "answer": question.get("answer", {}).get("text", "")[:600],
+                }
+                for question in recorded_decisions[-20:]
+            ],
+            "recordedDecisionCount": len(recorded_decisions),
+            "automation": {
+                "projectAutoRun": "on" if self.settings.auto_run(project_id) else "off",
+                "chatCanExecuteWork": False,
+                "note": "Approved tasks are run by background agents; chat only discusses and cannot start or change work.",
+            },
+            "recentAgentReports": [
+                {"task": entry["workTitle"][:120], "by": entry["actor"], "report": entry["text"][:500]}
+                for entry in self.activity(project_id, 6)
+            ],
+            "repositoryFilesIncluded": False,
+            "omittedWorkItems": max(0, len(work_items) - 20),
+            "omittedOpenQuestions": max(0, len(open_questions) - 10),
+        }
+        question_context = None
+        if question_id is not None:
+            question = state["questions"].get(question_id)
+            if question is None:
+                raise InboxNotFound("question was not found")
+            if question["status"] != "open":
+                raise ControlPlaneError("only open questions can be discussed in context")
+            question_context = {
+                "questionId": question["questionId"],
+                "question": question["questionText"][:1000],
+                "questionType": question["questionType"],
+                "priority": question["priority"],
+                "blocking": question["blocking"],
+                **({"impact": question.get("impact", "")[:600]} if not question_id.startswith("question.alignment.") else {}),
+                "options": [
+                    {"label": option["label"][:300], "consequence": option.get("consequence", "")[:500]}
+                    for option in question.get("options", [])[:8]
+                ],
+                "affectedWork": [
+                    {
+                        "title": state["workItems"][work_id]["title"][:160],
+                        "objective": state["workItems"][work_id]["objective"][:500],
+                        "status": state["workItems"][work_id]["status"],
+                    }
+                    for work_id in question.get("workIds", [])[:8]
+                    if work_id in state["workItems"]
+                ],
+            }
+        if not self._chat_lock.acquire(blocking=False):
+            raise PiChatError("A Codex chat request is already in progress.")
+        try:
+            now = time.monotonic()
+            self._chat_timestamps = [stamp for stamp in self._chat_timestamps if now - stamp < 3600]
+            if len(self._chat_timestamps) >= 20:
+                raise PiChatError("The local chat limit is 20 requests per hour. Try again later.")
+            self._chat_timestamps.append(now)
+            # The project record is the single source of truth for the conversation: the browser's copy is ignored.
+            work_id, thread_id = self._chat_target(project_id, question_id)
+            summary, history = self._chat_context(project_id, thread_id)
+            project_context["earlierConversationSummary"] = summary
+            project_context["ownerMemory"] = project_memory(state)
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id=thread_id, message_type="question", content=request["message"].strip(),
+                actor=DEMO_USER, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            request = {**request, "history": history}
+            provider = self.red_provider if mode == "red" else self.chat_provider
+            extra = {"project_id": project_id} if getattr(provider, "needs_project_id", False) else {}
+            reply = provider.send(request["message"], request["history"], project_context, question_context, **extra)
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id=thread_id, message_type="status", content=reply,
+                actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            self._learn_soon(project_id, work_id, thread_id, request["message"].strip(), history[-4:] + [{"role": "assistant", "content": reply[:1500]}])
+            return {"response": reply}
+        finally:
+            self._chat_lock.release()
+
+    # ---- curated memory --------------------------------------------------
+    def _curate_soon(self, project_id: str) -> None:
+        def run() -> None:
+            try:
+                self.vp.curate_memory(project_id)
+            except Exception:
+                pass  # memory curation is best effort; notes and answers remain in the record
+
+        if self.sync_memory:
+            run()
+        else:
+            threading.Thread(target=run, name="northstar-memory", daemon=True).start()
+
+    def _learn_soon(self, project_id: str, work_id: str, thread_id: str, message: str, recent: list[dict[str, str]]) -> None:
+        """Project chat feeds memory too: corrections and decisions typed anywhere are saved as notes."""
+        def run() -> None:
+            try:
+                state = self.control.projector.replay(project_id)
+                reply = _json_object(self.vp.runner.think(LEARN_SYSTEM, json.dumps({
+                    "currentMemory": project_memory(state), "recentTurns": recent, "ownerMessage": message[:4000]})))
+                notes = [n.strip()[:500] for n in (reply.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
+                for note in notes:
+                    self.control.add_discussion_message(
+                        project_id, work_id, thread_id=thread_id, message_type="evidence", content="NOTE: " + note,
+                        actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+                if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
+                    self.vp.curate_memory(project_id)
+            except Exception:
+                pass  # learning is best effort; the chat itself is already saved
+
+        if not self.vp.runner.available():
+            return
+        if self.sync_memory:
+            run()
+        else:
+            threading.Thread(target=run, name="northstar-learn", daemon=True).start()
+
+    # ---- durable chat ----------------------------------------------------
+    def _chat_target(self, project_id: str, question_id: str | None) -> tuple[str, str]:
+        state = self.control.projector.replay(project_id)
+        work_id = None
+        if question_id is not None:
+            question = state["questions"].get(question_id)
+            work_id = next((w for w in (question or {}).get("workIds", []) if w in state["workItems"]), None)
+        if work_id is None:
+            work_id = CHAT_WORK
+            if CHAT_WORK not in state["workItems"]:
+                now = datetime.now(timezone.utc).isoformat()
+                self.control.create_work({
+                    "recordType": "work_item", "schemaVersion": "0.1", "projectId": project_id, "workId": CHAT_WORK,
+                    "revision": 1, "parentWorkId": None, "title": "Project chat log",
+                    "objective": "Holds the durable owner-and-VP conversation; not a task.", "workType": "other",
+                    "status": "ready", "owner": DEMO_VP, "dependsOn": [], "capabilityGrantIds": [],
+                    "acceptanceCriteria": [], "createdBy": DEMO_USER, "createdAt": now, "updatedAt": now,
+                }, actor=DEMO_USER)
+        return work_id, f"thread.chat.{question_id}" if question_id else "thread.chat.project"
+
+    def _thread(self, project_id: str, thread_id: str) -> list[dict[str, Any]]:
+        messages = [m for m in self.control.projector.replay(project_id)["messages"] if m["threadId"] == thread_id]
+        return sorted(messages, key=lambda m: m["sequence"])
+
+    @staticmethod
+    def _is_summary(message: dict[str, Any]) -> bool:
+        return message["messageType"] == "revision" and message["content"].startswith("SUMMARY: ")
+
+    @staticmethod
+    def _is_note(message: dict[str, Any]) -> bool:
+        return message["messageType"] == "evidence" and message["content"].startswith("NOTE: ")
+
+    def _chat_context(self, project_id: str, thread_id: str) -> tuple[str, list[dict[str, str]]]:
+        """Bounded model context from the durable thread: latest saved summary plus the most recent turns."""
+        messages = self._thread(project_id, thread_id)
+        last = max((i for i, m in enumerate(messages) if self._is_summary(m)), default=-1)
+        summary = messages[last]["content"][len("SUMMARY: "):] if last >= 0 else ""
+        turns = [m for m in messages[last + 1:] if not self._is_summary(m) and not self._is_note(m)]
+        if len(turns) > 16 and self.vp.runner.available():
+            older = turns[:-6]
+            try:
+                folded = self.vp.runner.think(SUMMARY_SYSTEM, json.dumps({
+                    "previousSummary": summary,
+                    "turns": [{"by": "owner" if t["actor"]["role"] == "user" else "vp", "text": t["content"][:2000]} for t in older]}))
+                self.control.add_discussion_message(
+                    project_id, messages[0]["workId"], thread_id=thread_id, message_type="revision",
+                    content="SUMMARY: " + folded.strip()[:6000], actor=DEMO_VP,
+                    visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+                summary, turns = folded.strip()[:6000], turns[-6:]
+            except Exception:
+                pass  # summarizing is an optimization; the full thread stays safe in the record
+        recent = turns[-14:]
+        return summary, [
+            {"role": "user" if t["actor"]["role"] == "user" else "assistant", "content": t["content"][:2000]}
+            for t in recent if t["content"].strip()]
+
+    def chat_history(self, project_id: str, question_id: str | None = None) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "project.read")
+        thread_id = f"thread.chat.{question_id}" if question_id else "thread.chat.project"
+        return {"turns": [
+            {"role": "user" if m["actor"]["role"] == "user" else "assistant", "content": m["content"], "at": m["occurredAt"]}
+            for m in self._thread(project_id, thread_id) if not self._is_summary(m) and not self._is_note(m)]}
+
+    def converse(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """One owner message on an open question, handled like a chat turn.
+
+        The VP decides whether it answers the question, is a side question (answered in place), or is partial info.
+        Useful things the owner says are saved as notes that inform all later work. A settling message only yields a
+        *proposal*; the answer is recorded when the owner confirms it.
+        """
+        self.project_application._authorize(project_id, "inbox.answer")
+        if not isinstance(request, dict) or set(request) != {"message"}:
+            raise ValueError("conversation requires only message")
+        message = request["message"]
+        if not isinstance(message, str) or not message.strip() or len(message) > 4000:
+            raise ValueError("message must contain 1 to 4000 characters")
+        state = self.control.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None:
+            raise InboxNotFound("question was not found")
+        if question["status"] != "open":
+            raise ControlPlaneError("only an open question can be discussed")
+        if not self.vp.runner.available():
+            raise PiChatError("No model runner is available.")
+        if not self._chat_lock.acquire(blocking=False):
+            raise PiChatError("A VP request is already in progress.")
+        try:
+            now = time.monotonic()
+            self._chat_timestamps = [stamp for stamp in self._chat_timestamps if now - stamp < 3600]
+            if len(self._chat_timestamps) >= 40:
+                raise PiChatError("The local chat limit is 40 requests per hour. Try again later.")
+            self._chat_timestamps.append(now)
+            work_id, thread_id = self._chat_target(project_id, question_id)
+            summary, turns = self._chat_context(project_id, thread_id)
+            both = [DEMO_USER["actorId"], DEMO_VP["actorId"]]
+            self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="question",
+                                                content=message.strip(), actor=DEMO_USER, visible_to=both)
+            options = [{"optionId": o["optionId"], "label": o["label"], "consequence": o.get("consequence", "")[:300]}
+                       for o in question.get("options", [])]
+            payload = {
+                "openQuestion": {"text": question["questionText"][:1500], "impact": question.get("impact", "")[:1500], "options": options},
+                "ownerMemory": project_memory(state), "earlierSummary": summary, "conversation": turns,
+                "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
+                                   for q in state["questions"].values() if q["status"] == "answered"][-12:],
+                "ownerMessage": message.strip(),
+            }
+            runner = self.vp.runner
+            try:
+                raw = runner.explore(CONVERSE_SYSTEM, json.dumps(payload), self.vp.read_directory(project_id)) \
+                    if hasattr(runner, "explore") else runner.think(CONVERSE_SYSTEM, json.dumps(payload))
+            except VPError as exc:
+                raise PiChatError(str(exc)) from exc
+            try:
+                data = _json_object(raw)
+            except VPError:
+                data = {"intent": "btw", "reply": raw.strip()[:4000]}
+            reply = data.get("reply") if isinstance(data.get("reply"), str) and data["reply"].strip() else "Understood."
+            self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="status",
+                                                content=reply[:8000], actor=DEMO_VP, visible_to=both)
+            learned = [n.strip()[:500] for n in (data.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
+            for note in learned:  # route anything useful back into project memory
+                self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="evidence",
+                                                    content="NOTE: " + note, actor=DEMO_VP, visible_to=both)
+            proposal = None
+            answer = data.get("answer") if data.get("intent") == "answer" and isinstance(data.get("answer"), dict) else None
+            if answer is not None:
+                option_ids = {o["optionId"] for o in options}
+                option_id = answer.get("selectedOptionId") if answer.get("selectedOptionId") in option_ids else None
+                label = next((o["label"] for o in options if o["optionId"] == option_id), None)
+                note = answer.get("text").strip()[:9000] if isinstance(answer.get("text"), str) else ""
+                text = "\n\nNote: ".join(part for part in (label, note) if part)
+                if text:
+                    proposal = {"text": text, "selectedOptionId": option_id}
+            if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
+                self._curate_soon(project_id)
+            return {"reply": reply, "proposedAnswer": proposal, "notesSaved": len(learned)}
+        finally:
+            self._chat_lock.release()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -485,7 +931,7 @@ class PrototypeRuntime:
                     "status": question["status"] if question else "pending",
                     "answer": question.get("answer") if question else None,
                 })
-            repository = plan.get("repository", {})
+            repository = plan.get("repository") or {}
             intake = state["workItems"].get("work.alignment-intake", {})
             alignment = {
                 "status": "completed" if intake.get("status") == "completed" else "in_progress",
@@ -496,9 +942,13 @@ class PrototypeRuntime:
             }
         return {
             "project": project,
-            "workItems": list(state["workItems"].values()),
+            "workItems": [w for w in state["workItems"].values() if w["workId"] != CHAT_WORK],
             "recentEvents": recent_events,
             "alignment": alignment,
+            "automation": self.automation(project_id),
+            "memory": project_memory(state),
+            "activity": self.activity(project_id, 15),
+            "drafting": project_id in self._drafting,
             "counts": {
                 "workItems": len(state["workItems"]),
                 "runningWorkItems": sum(item["status"] == "running" for item in state["workItems"].values()),
@@ -571,6 +1021,7 @@ class PrototypeRuntime:
                 charter = {**project["charter"], "goals": [goal_replacement]}
                 self.project_application.revise_project_charter(project_id, charter)
         self._advance_alignment_interview(project_id, question_id)
+        self._curate_soon(project_id)
         return answered
 
     def close_question(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:

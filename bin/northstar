@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Start the Northstar workspace on http://127.0.0.1:4173 (loopback only).
+#   bin/northstar            check prerequisites, build the UI if needed, start the app
+#   bin/northstar --check    only report what is ready or missing
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ok=1
+say() { printf '%-34s %s\n' "$1" "$2"; }
+
+command -v python3 >/dev/null && say "python3" "ok" || { say "python3" "MISSING"; ok=0; }
+if command -v codex >/dev/null; then say "codex CLI (default worker)" "ok"
+elif command -v claude >/dev/null; then say "claude CLI (worker fallback)" "ok"
+else say "worker CLI (codex or claude)" "MISSING - agents cannot run"; ok=0; fi
+[ -d ui/prototype/build ] && say "built UI" "ok" || say "built UI" "will build"
+[ "${NORTHSTAR_WORKERS:-on}" = off ] && say "background workers" "OFF (NORTHSTAR_WORKERS=off)" || say "background workers" "on (approved tasks run)"
+
+[ "${1:-}" = "--check" ] && exit $((1 - ok))
+[ "$ok" = 1 ] || { echo "Fix the MISSING items above first."; exit 1; }
+if [ ! -d ui/prototype/build ]; then
+  command -v npm >/dev/null || { echo "npm is needed once to build the UI."; exit 1; }
+  (cd ui/web && npm ci --silent && npm run build --silent)
+fi
+echo "Starting on http://127.0.0.1:4173 (Ctrl-C to stop)"
+exec python3 -m ui.prototype.server

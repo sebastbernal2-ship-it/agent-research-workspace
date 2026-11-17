@@ -18,6 +18,7 @@ from harness.control_plane import ControlPlaneError, StaleQuestionRevision
 from harness.event_store import ConcurrentWriteConflict, EventStoreError
 from harness.inbox import InboxForbidden, InboxNotFound
 
+from .pi_chat import PiChatError
 from .runtime import PROJECT_ID, PrototypeRuntime
 
 
@@ -33,6 +34,13 @@ PROJECT_COLLECTION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/(runs|evidence|
 INBOX_LIST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox$")
 INBOX_DETAIL_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)$")
 INBOX_COMMAND_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/(answers|closure)$")
+CHAT_STATUS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/status$")
+CHAT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat$")
+AUTOMATION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/automation$")
+BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
+ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
+CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
+CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -146,6 +154,8 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._error(409, "stale_revision", "The project state changed. Refresh it before deciding.")
         except ControlPlaneError:
             self._error(409, "command_conflict", "The command conflicts with the current project state.")
+        except PiChatError as exc:
+            self._error(503, "chat_unavailable", str(exc))
         except ValueError:
             self._error(422, "invalid_request", "The command is invalid or missing required fields.")
         except EventStoreError:
@@ -166,6 +176,24 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/projects":
             self._run(lambda: self._send_json(200, {"items": self.runtime.list_projects()}))
+            return
+
+        chat_status_match = CHAT_STATUS_PATH.fullmatch(path)
+        if chat_status_match:
+            project_id = unquote(chat_status_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
+            return
+
+        history_match = CHAT_HISTORY_PATH.fullmatch(path)
+        if history_match:
+            project_id = unquote(history_match.group(1))
+            question_id = (parse_qs(parsed.query).get("questionId") or [None])[0]
+            self._run(lambda: self._send_json(200, self.runtime.chat_history(project_id, question_id)))
+            return
+        activity_match = ACTIVITY_PATH.fullmatch(path)
+        if activity_match:
+            project_id = unquote(activity_match.group(1))
+            self._run(lambda: self._send_json(200, {"items": self.runtime.activity(project_id, 100)}))
             return
 
         project_match = PROJECT_PATH.fullmatch(path)
@@ -230,6 +258,30 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         path = urlsplit(self.path).path
+        automation_match = AUTOMATION_PATH.fullmatch(path)
+        if automation_match:
+            project_id = unquote(automation_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.set_automation(project_id, body)))
+            return
+        draft_match = BOARD_DRAFT_PATH.fullmatch(path)
+        if draft_match:
+            project_id = unquote(draft_match.group(1))
+            def draft() -> None:
+                if body:
+                    raise ValueError("board drafting accepts an empty object")
+                self._send_json(201, self.runtime.draft_board(project_id))
+            self._run(draft)
+            return
+        converse_match = CONVERSE_PATH.fullmatch(path)
+        if converse_match:
+            project_id, question_id = map(unquote, converse_match.groups())
+            self._run(lambda: self._send_json(200, self.runtime.converse(project_id, question_id, body)))
+            return
+        chat_match = CHAT_PATH.fullmatch(path)
+        if chat_match:
+            project_id = unquote(chat_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.send_project_chat(project_id, body)))
+            return
         if path == REPOSITORY_INSPECTION_PATH:
             def inspect() -> None:
                 if set(body) != {"repositoryPath"}:

@@ -34,13 +34,15 @@ def main() -> None:
                 if path.exists():
                     os.chmod(path, 0o600)
         server = build_server(runtime, args.port)
+        if os.environ.get("NORTHSTAR_WORKERS", "on") != "off":
+            runtime.start_autopilot()
     except Exception as exc:
         parser.exit(1, f"Unable to start local prototype: {exc}\n")
 
     print("Northstar local prototype (synthetic data only)")
     print(f"URL: http://127.0.0.1:{args.port}")
     print(f"Canonical SQLite store: {database_path}")
-    print("Bound to 127.0.0.1 only. No real authentication, remote access, model providers, or tools.")
+    print("Bound to 127.0.0.1 only. No real authentication or remote access. A server-side Codex chat bridge handles explicit sends; approved tasks run in the background via Pi (NORTHSTAR_WORKERS=off disables).")
     print("Press Ctrl-C to stop.", flush=True)
     try:
         server.serve_forever(poll_interval=0.25)
