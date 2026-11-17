@@ -813,15 +813,25 @@ class ProjectVP:
                 required_picked = required_picked or kind is None
         return picked
 
+    MAX_AUTO_RETRIES = 2
+
     def recover(self, project_id: str) -> int:
-        """At startup nothing can still be running: fail interrupted work so it can be retried."""
+        """At startup nothing can still be running. An autonomous system must survive restarts and crashes, so
+        interrupted work is put straight back in the queue (up to twice per task); after that it is left failed."""
         count = 0
         with self._lock(project_id):
             from .phases import is_phase
-            for work in list(self._state(project_id)["workItems"].values()):
+            state = self._state(project_id)
+            for work in list(state["workItems"].values()):
                 if work["status"] in {"running", "verifying"} and not is_phase(work):  # phases are containers, not executions
-                    self._say(project_id, work["workId"], ORCHESTRATOR, "status", "The app stopped while this ran. Retry it from the board.")
+                    earlier = sum(1 for m in state["messages"] if m["workId"] == work["workId"] and m["content"].startswith("The app stopped while this ran"))
+                    retry = earlier < self.MAX_AUTO_RETRIES
+                    self._say(project_id, work["workId"], ORCHESTRATOR, "status",
+                              "The app stopped while this ran. Retrying it automatically." if retry
+                              else "The app stopped while this ran again. Retry it from the board.")
                     self._transition(project_id, work["workId"], "failed", ORCHESTRATOR, "Interrupted by an app restart.")
+                    if retry:
+                        self._transition(project_id, work["workId"], "ready", ORCHESTRATOR, "Re-queued after the interruption.")
                     count += 1
         return count
 

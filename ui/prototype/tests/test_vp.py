@@ -163,18 +163,24 @@ class AdaptiveInterviewTests(VPBase):
 
 
 class RecoveryTests(VPBase):
-    def test_restart_fails_interrupted_work_and_retry_requeues_it(self):
+    def test_restart_requeues_interrupted_work_and_the_owner_can_still_retry_a_task_that_keeps_failing(self):
         self.align(); self.rt.draft_board(self.pid)
         a = self.work()["Survey options"]
         self.rt.approve_work(self.pid, a["workId"], {"expectedRevision": a["revision"], "decision": "approve"})
-        self.rt.control.transition_work(self.pid, a["workId"], "running", actor={"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"})
+        orch = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"}
+        self.rt.control.transition_work(self.pid, a["workId"], "running", actor=orch)
         self.assertEqual(self.rt.vp.recover(self.pid), 1)
-        failed = self.work()["Survey options"]
-        self.assertEqual(failed["status"], "failed")
-        self.rt.approve_work(self.pid, failed["workId"], {"expectedRevision": failed["revision"], "decision": "retry"})
-        self.assertEqual(self.work()["Survey options"]["status"], "ready")
+        self.assertEqual(self.work()["Survey options"]["status"], "ready")  # back in the queue by itself
         self.assertEqual(self.rt.vp.tick(self.pid), a["workId"])
         self.assertEqual(self.work()["Survey options"]["status"], "completed")
+        # a task that fails for real (not an interruption) still shows as failed and can be retried by the owner
+        b = self.work()["Write recommendation"]
+        self.rt.approve_work(self.pid, b["workId"], {"expectedRevision": b["revision"], "decision": "approve"})
+        self.rt.control.transition_work(self.pid, b["workId"], "running", actor=orch)
+        self.rt.control.transition_work(self.pid, b["workId"], "failed", actor=orch)
+        failed = self.work()["Write recommendation"]
+        self.rt.approve_work(self.pid, failed["workId"], {"expectedRevision": failed["revision"], "decision": "retry"})
+        self.assertEqual(self.work()["Write recommendation"]["status"], "ready")
 
 
 class WorktreeCommitTests(VPBase):
@@ -751,3 +757,28 @@ class DataRootsTests(VPBase):
         note = next(a["text"] for a in self.rt.activity(pid) if a["text"].startswith("Committed"))
         self.assertIn("data.jsonl", note)
         self.assertIn("large generated files", note)
+
+
+class AutoRetryTests(VPBase):
+    def test_interrupted_work_is_re_queued_automatically_twice_then_left_for_the_owner(self):
+        self.align(); self.rt.draft_board(self.pid)
+        a = self.work()["Survey options"]
+        self.rt.approve_work(self.pid, a["workId"], {"expectedRevision": a["revision"], "decision": "approve"})
+        orch = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"}
+        for round_no, expected in ((1, "ready"), (2, "ready"), (3, "failed")):
+            self.rt.control.transition_work(self.pid, a["workId"], "running", actor=orch)
+            self.assertEqual(self.rt.vp.recover(self.pid), 1)                       # "the app restarted while it ran"
+            self.assertEqual(self.work()["Survey options"]["status"], expected, round_no)
+        notes = [x["text"] for x in self.rt.activity(self.pid) if "app stopped" in x["text"]]
+        self.assertTrue(any("Retrying it automatically" in n for n in notes))
+        self.assertTrue(any("Retry it from the board" in n for n in notes))
+
+    def test_a_re_queued_task_simply_runs_again_after_a_restart(self):
+        self.align(); self.rt.draft_board(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        a = self.work()["Survey options"]
+        orch = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"}
+        self.rt.control.transition_work(self.pid, a["workId"], "ready", actor=orch)
+        self.rt.control.transition_work(self.pid, a["workId"], "running", actor=orch)
+        self.rt.vp.recover(self.pid)
+        self.assertEqual(self.rt.vp.tick(self.pid), a["workId"])
+        self.assertEqual(self.work()["Survey options"]["status"], "completed")
