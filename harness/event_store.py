@@ -6,7 +6,9 @@ This is a reference implementation, not a multi-host production database.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
+import threading
 import json
 import math
 import sqlite3
@@ -71,6 +73,8 @@ class SQLiteEventStore:
         self._queue_lease_context: ContextVar[dict[str, Any] | None] = ContextVar(
             f"event_store_queue_lease_{id(self)}", default=None,
         )
+        self._verify_lock = threading.Lock()
+        self._verified_cache: dict[str, dict[str, Any]] = {}
         self._memory_keeper: sqlite3.Connection | None = None
         if self._uri:
             self._memory_keeper = sqlite3.connect(
@@ -1387,35 +1391,52 @@ class SQLiteEventStore:
         )
 
     def verified_events(self, project_id: str) -> list[dict[str, Any]]:
-        """Read one consistent event snapshot and verify its complete hash chain."""
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT sequence, event_json, previous_hash, record_hash FROM canonical_events "
-                "WHERE project_id=? ORDER BY sequence",
-                (project_id,),
-            ).fetchall()
-        finally:
-            conn.close()
-        expected_previous = ZERO_HASH
-        events: list[dict[str, Any]] = []
-        for expected_sequence, row in enumerate(rows, start=1):
-            event_json = row["event_json"]
-            event = json.loads(event_json)
-            if row["sequence"] != expected_sequence or event.get("sequence") != expected_sequence:
-                raise IntegrityFailure(f"non-contiguous sequence in project {project_id!r}")
-            if row["previous_hash"] != expected_previous:
-                raise IntegrityFailure(f"broken hash-chain link at sequence {expected_sequence}")
-            if self._canonical_json(event) != event_json:
-                raise IntegrityFailure(f"non-canonical event encoding at sequence {expected_sequence}")
-            self._validate(event)
-            actual = self._record_hash(expected_previous, event_json)
-            if actual != row["record_hash"]:
-                raise IntegrityFailure(f"event hash mismatch at sequence {expected_sequence}")
-            expected_previous = actual
-            events.append(event)
-        return events
+        """Return the project's events with the hash chain verified.
+
+        Events are append-only, so each is fully verified (chain link, canonical encoding, schema, hash) exactly once
+        per process and cached; later reads only fetch and verify what was appended, and re-check that the cached
+        tail still matches the database. ``verify()`` always re-checks everything from scratch.
+        """
+        return copy.deepcopy(self._verified(project_id, full=False))
+
+    def _verified(self, project_id: str, *, full: bool) -> list[dict[str, Any]]:
+        with self._verify_lock:
+            cached = None if full else self._verified_cache.get(project_id)
+            known = len(cached["events"]) if cached else 0
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT sequence, event_json, previous_hash, record_hash FROM canonical_events "
+                    "WHERE project_id=? AND sequence>=? ORDER BY sequence",
+                    (project_id, max(known, 1)),
+                ).fetchall()
+            finally:
+                conn.close()
+            if cached and known:
+                # the first fetched row is the last cached one: it must be byte-for-byte what we verified before
+                if not rows or rows[0]["sequence"] != known or rows[0]["record_hash"] != cached["lastHash"]:
+                    raise IntegrityFailure(f"verified history of project {project_id!r} changed underneath the cache")
+                rows = rows[1:]
+            events = list(cached["events"]) if cached else []
+            expected_previous = cached["lastHash"] if cached else ZERO_HASH
+            for expected_sequence, row in enumerate(rows, start=len(events) + 1):
+                event_json = row["event_json"]
+                event = json.loads(event_json)
+                if row["sequence"] != expected_sequence or event.get("sequence") != expected_sequence:
+                    raise IntegrityFailure(f"non-contiguous sequence in project {project_id!r}")
+                if row["previous_hash"] != expected_previous:
+                    raise IntegrityFailure(f"broken hash-chain link at sequence {expected_sequence}")
+                if self._canonical_json(event) != event_json:
+                    raise IntegrityFailure(f"non-canonical event encoding at sequence {expected_sequence}")
+                self._validate(event)
+                actual = self._record_hash(expected_previous, event_json)
+                if actual != row["record_hash"]:
+                    raise IntegrityFailure(f"event hash mismatch at sequence {expected_sequence}")
+                expected_previous = actual
+                events.append(event)
+            self._verified_cache[project_id] = {"events": events, "lastHash": expected_previous}
+            return events
 
     def verify(self, project_id: str) -> bool:
-        self.verified_events(project_id)
+        self._verified(project_id, full=True)
         return True
