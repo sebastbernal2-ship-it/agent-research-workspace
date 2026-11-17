@@ -277,8 +277,9 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if draft_refresh:
             project_id, question_id = map(unquote, draft_refresh.groups())
             def refresh() -> None:
-                if body:
-                    raise ValueError("draft refresh accepts an empty object")
+                if body:  # the owner editing the draft themselves
+                    self._send_json(200, self.runtime.set_draft(project_id, question_id, body))
+                    return
                 self._send_json(200, self.runtime.refresh_draft(project_id, question_id))
             self._run(refresh)
             return

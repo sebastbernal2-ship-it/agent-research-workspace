@@ -782,11 +782,32 @@ class PrototypeRuntime:
         except ValueError:
             return None
 
-    def _save_draft(self, project_id: str, work_id: str, thread_id: str, proposal: dict[str, Any], settled: bool) -> None:
+    def _save_draft(self, project_id: str, work_id: str, thread_id: str, proposal: dict[str, Any], settled: bool,
+                    edited_by_owner: bool = False) -> None:
         self.control.add_discussion_message(
             project_id, work_id, thread_id=thread_id, message_type="proposal",
-            content="DRAFT: " + json.dumps({**proposal, "settled": settled}, ensure_ascii=False),
-            actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            content="DRAFT: " + json.dumps({**proposal, "settled": settled, **({"editedByOwner": True} if edited_by_owner else {})}, ensure_ascii=False),
+            actor=DEMO_USER if edited_by_owner else DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+
+    def set_draft(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner edits the draft themselves. It becomes the draft to record, and the VP must keep their wording."""
+        self.project_application._authorize(project_id, "inbox.answer")
+        if not isinstance(request, dict) or not {"text"} <= set(request) <= {"text", "selectedOptionId"}:
+            raise ValueError("editing requires text and optionally selectedOptionId")
+        text = request["text"]
+        if not isinstance(text, str) or not text.strip() or len(text) > 9_000:
+            raise ValueError("text must contain 1 to 9000 characters")
+        state = self.control.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None or question["status"] != "open":
+            raise ControlPlaneError("only an open question has a draft")
+        option_id = request.get("selectedOptionId")
+        if option_id is not None and option_id not in {o["optionId"] for o in question.get("options", [])}:
+            raise ValueError("selectedOptionId is not an option of this question")
+        work_id, thread_id = self._chat_target(project_id, question_id)
+        draft = {"text": text.strip(), "selectedOptionId": option_id}
+        self._save_draft(project_id, work_id, thread_id, draft, True, edited_by_owner=True)
+        return {"draft": {**draft, "settled": True, "editedByOwner": True}}
 
     def _chat_context(self, project_id: str, thread_id: str) -> tuple[str, list[dict[str, str]]]:
         """Bounded model context from the durable thread: latest saved summary plus the most recent turns."""
@@ -829,6 +850,7 @@ class PrototypeRuntime:
         payload = json.dumps({"openQuestion": {"text": question["questionText"][:1500], "options": options},
                               "earlierSummary": summary, "conversation": turns,
                               "currentDraft": (self._latest_draft(project_id, thread_id) or {}).get("text"),
+                "draftWasEditedByOwner": bool((self._latest_draft(project_id, thread_id) or {}).get("editedByOwner")),
                               "ownerMemory": project_memory(state)})
         try:
             data = _json_object(self.vp.runner.think(REFRESH_SYSTEM, payload))
@@ -897,6 +919,7 @@ class PrototypeRuntime:
                 "openQuestion": {"text": question["questionText"][:1500], "impact": question.get("impact", "")[:1500], "options": options},
                 "ownerMemory": project_memory(state), "earlierSummary": summary, "conversation": turns,
                 "currentDraft": (self._latest_draft(project_id, thread_id) or {}).get("text"),
+                "draftWasEditedByOwner": bool((self._latest_draft(project_id, thread_id) or {}).get("editedByOwner")),
                 "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
                                    for q in state["questions"].values() if q["status"] == "answered"][-12:],
                 "ownerMessage": message.strip(),

@@ -518,3 +518,46 @@ class RunningDraftTests(VPBase):
         for must in ("ONLY what the OWNER said", "EDIT it minimally", "Never rewrite it from scratch", "think it through"):
             self.assertIn(must, CONVERSE_SYSTEM)
         self.assertIn("never the VP's own findings", REFRESH_SYSTEM)
+
+
+class EditableDraftTests(VPBase):
+    def _q(self):
+        return self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+
+    def test_owner_edit_becomes_the_draft_hidden_from_chat_and_kept_by_the_vp(self):
+        q = self._q()
+        out = self.rt.set_draft(self.pid, q, {"text": "  My own wording: topics are 1-3 words.  "})
+        self.assertEqual(out["draft"], {"text": "My own wording: topics are 1-3 words.", "selectedOptionId": None, "settled": True, "editedByOwner": True})
+        hist = self.rt.chat_history(self.pid, q)
+        self.assertEqual(hist["draft"]["text"], "My own wording: topics are 1-3 words.")
+        self.assertEqual(hist["turns"], [])  # an edit is not a chat bubble
+        seen = []
+        def explore(system, prompt, cwd):
+            seen.append(json.loads(prompt)); return json.dumps({"intent": "btw", "reply": "ok", "learned": []})
+        self.runner.explore = explore
+        self.rt.converse(self.pid, q, {"message": "what does the repo say?"})
+        self.assertEqual(seen[0]["currentDraft"], "My own wording: topics are 1-3 words.")
+        self.assertTrue(seen[0]["draftWasEditedByOwner"])
+        self.assertEqual(self.rt.chat_history(self.pid, q)["draft"]["text"], "My own wording: topics are 1-3 words.")  # VP left it alone
+
+    def test_an_edited_draft_is_what_gets_recorded_and_nothing_is_recorded_by_editing(self):
+        q = self._q()
+        self.rt.set_draft(self.pid, q, {"text": "Keep it exactly like this."})
+        self.assertEqual(self._q(), q)  # still open
+        full = self.rt.get_question(self.pid, q)
+        draft = self.rt.chat_history(self.pid, q)["draft"]
+        self.rt.answer_question(self.pid, q, {"expectedEtag": full["etag"], "text": draft["text"]})
+        self.assertEqual(self.rt.control.projector.replay(self.pid)["questions"][q]["answer"]["text"], "Keep it exactly like this.")
+
+    def test_edit_validation(self):
+        q = self._q()
+        for bad in ({}, {"text": ""}, {"text": "x" * 9001}, {"text": "ok", "extra": 1}, {"text": "ok", "selectedOptionId": "nope"}):
+            with self.assertRaises(ValueError):
+                self.rt.set_draft(self.pid, q, bad)
+        with self.assertRaises(Exception):
+            self.rt.set_draft(self.pid, "question.does-not-exist", {"text": "ok"})
+
+    def test_prompt_tells_the_vp_to_keep_owner_edited_wording(self):
+        from ui.prototype.vp import CONVERSE_SYSTEM
+        self.assertIn("draftWasEditedByOwner", CONVERSE_SYSTEM)
+        self.assertIn("EXACTLY", CONVERSE_SYSTEM)

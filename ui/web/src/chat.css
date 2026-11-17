@@ -6,3 +6,4 @@
 .qchat .qchat-question h2{font-size:15px;font-weight:600;line-height:1.4;margin:6px 0}
 .qchat-proposal.tentative{border-style:dashed;background:#fbfaf2;border-color:#bb8e00}
 .qchat .question-chat-transcript{max-height:none;overflow:visible}
+.qchat-edit{width:100%;box-sizing:border-box;margin:8px 0;padding:10px;border:1px solid #d6ddd2;border-radius:8px;font:inherit;line-height:1.45;resize:vertical}
