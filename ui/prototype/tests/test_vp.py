@@ -352,17 +352,20 @@ class MemoryTests(VPBase):
         super().setUp()
         self.rt.sync_memory = True
         self.curator_calls = []
-        orig = self.runner.think
-        def think(system, payload):
-            if "curate the project's long-term memory" in system:
-                self.curator_calls.append(json.loads(payload))
-                return json.dumps(self.next_memory)
-            return orig(system, payload)
-        self.runner.think = think
+        self.curator_fail = False
+        self.converse_reply = {"intent": "btw", "reply": "ok", "learned": []}
         self.next_memory = self.MEMORY_V1
+        def explore(system, prompt, cwd):  # the curator and the converse step both use the repo-reading call
+            if "curate the project's long-term memory" in system:
+                if self.curator_fail:
+                    raise VPError("model down")
+                self.curator_calls.append(json.loads(prompt))
+                return json.dumps(self.next_memory)
+            return json.dumps(self.converse_reply)
+        self.runner.explore = explore
 
     def _say(self, learned, text="ok", intent="btw", answer=None):
-        self.runner.explore = lambda s, p, c: json.dumps({"intent": intent, "reply": text, "learned": learned, **({"answer": answer} if answer else {})})
+        self.converse_reply = {"intent": intent, "reply": text, "learned": learned, **({"answer": answer} if answer else {})}
         q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
         return q, self.rt.converse(self.pid, q, {"message": "msg"})
 
@@ -402,10 +405,8 @@ class MemoryTests(VPBase):
         self.assertTrue(all(len(x) <= 300 for x in mem["decisions"]))
 
     def test_curator_failure_is_harmless(self):
-        def broken(system, payload):
-            raise VPError("model down")
-        self.runner.think = broken
         q, _ = self._say(["A note."])
+        self.curator_fail = True
         self.assertFalse(self.rt.vp.curate_memory.__self__ is None)
         with self.assertRaises(VPError):
             self.rt.vp.curate_memory(self.pid)  # raises to the caller...
@@ -414,9 +415,38 @@ class MemoryTests(VPBase):
         self.assertEqual(uncurated_notes(self.rt.control.projector.replay(self.pid)), ["A note."])  # note not lost
 
     def test_many_notes_per_message_are_kept(self):
-        self.runner.explore = lambda s, p, c: json.dumps({"intent": "btw", "reply": "ok", "learned": [f"point {i}" for i in range(12)]})
+        self.converse_reply = {"intent": "btw", "reply": "ok", "learned": [f"point {i}" for i in range(12)]}
         q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
         self.assertEqual(self.rt.converse(self.pid, q, {"message": "long plan"})["notesSaved"], 8)
+
+    def test_rebuild_ignores_stale_memory_and_curator_can_read_the_repo(self):
+        self._say(["Real owner statement."])
+        self.rt.vp.curate_memory(self.pid)
+        self.next_memory = {**self.MEMORY_V1, "decisions": ["Fresh."]}
+        self.rt.vp.curate_memory(self.pid, rebuild=True)
+        self.assertEqual(self.curator_calls[-1]["currentMemory"]["decisions"], [])  # stale memory not trusted
+        self.assertIn("Real owner statement.", self.curator_calls[-1]["newNotes"])  # re-derived from every saved note
+
+    def test_ambiguity_becomes_a_question_to_the_owner_once_and_never_a_guess(self):
+        self.next_memory = {**self.MEMORY_V1, "unclear": ["Did you mean topics replace ideas, or sit above them?", "Second?", "Third?"]}
+        self._say(["Topics and ideas are related."])
+        self.rt.vp.curate_memory(self.pid)
+        asked = [q for q in self.rt.list_questions(self.pid)["questions"] if q["questionId"].startswith("question.memory-")]
+        self.assertEqual(len(asked), 2)  # capped
+        self.assertFalse(asked[0]["blocking"])
+        self.assertIn("Did you mean topics replace ideas", " ".join(q["questionText"] for q in asked))
+        self.next_memory = {**self.MEMORY_V1, "decisions": ["x"], "unclear": ["Did you mean topics replace ideas, or sit above them?"]}
+        self._say(["another note"])
+        self.rt.vp.curate_memory(self.pid)
+        again = [q for q in self.rt.list_questions(self.pid)["questions"] if q["questionId"].startswith("question.memory-")]
+        self.assertEqual(len(again), 2)  # same question is not asked twice
+        from ui.prototype.vp import project_memory
+        self.assertNotIn("unclear", project_memory(self.rt.control.projector.replay(self.pid))["memory"])  # never stored as memory
+
+    def test_curator_is_told_drafted_answers_are_unconfirmed(self):
+        from ui.prototype.vp import MEMORY_SYSTEM
+        self.assertIn("[Drafted by Claude", MEMORY_SYSTEM)
+        self.assertIn("DO NOT GUESS", MEMORY_SYSTEM)
 
 
 class ChatLearningTests(VPBase):
