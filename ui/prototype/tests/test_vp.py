@@ -499,3 +499,22 @@ class RunningDraftTests(VPBase):
         out = self.rt.refresh_draft(self.pid, q)
         self.assertEqual(out["draft"]["text"], "Topics are short concepts.")
         self.assertEqual(len(self.rt.chat_history(self.pid, q)["turns"]), 2)  # no fake owner turn was added
+
+
+    def test_the_model_sees_the_current_draft_so_it_can_edit_instead_of_rewrite(self):
+        seen = []
+        def explore(system, prompt, cwd):
+            seen.append(json.loads(prompt))
+            return json.dumps({"intent": "btw", "reply": "ok", "answer": {"selectedOptionId": None, "text": "Draft v%d." % len(seen)}})
+        self.runner.explore = explore
+        q = self.rt.list_questions(self.pid)["questions"][0]["questionId"]
+        self.rt.converse(self.pid, q, {"message": "my view"})
+        self.assertIsNone(seen[0]["currentDraft"])
+        self.rt.converse(self.pid, q, {"message": "remove the stale line"})
+        self.assertEqual(seen[1]["currentDraft"], "Draft v1.")  # the owner's visible draft is the starting point
+
+    def test_prompt_forbids_leaking_the_vps_findings_into_the_owners_draft(self):
+        from ui.prototype.vp import CONVERSE_SYSTEM, REFRESH_SYSTEM
+        for must in ("ONLY what the OWNER said", "EDIT it minimally", "Never rewrite it from scratch", "think it through"):
+            self.assertIn(must, CONVERSE_SYSTEM)
+        self.assertIn("never the VP's own findings", REFRESH_SYSTEM)

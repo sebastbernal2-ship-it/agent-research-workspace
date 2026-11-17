@@ -775,6 +775,13 @@ class PrototypeRuntime:
         text = "\n\nNote: ".join(part for part in (label, note) if part)
         return {"text": text, "selectedOptionId": option_id} if text else None
 
+    def _latest_draft(self, project_id: str, thread_id: str) -> dict[str, Any] | None:
+        drafts = [m for m in self._thread(project_id, thread_id) if m["messageType"] == "proposal" and m["content"].startswith("DRAFT: ")]
+        try:
+            return json.loads(drafts[-1]["content"][len("DRAFT: "):]) if drafts else None
+        except ValueError:
+            return None
+
     def _save_draft(self, project_id: str, work_id: str, thread_id: str, proposal: dict[str, Any], settled: bool) -> None:
         self.control.add_discussion_message(
             project_id, work_id, thread_id=thread_id, message_type="proposal",
@@ -821,6 +828,7 @@ class PrototypeRuntime:
         options = [{"optionId": o["optionId"], "label": o["label"]} for o in question.get("options", [])]
         payload = json.dumps({"openQuestion": {"text": question["questionText"][:1500], "options": options},
                               "earlierSummary": summary, "conversation": turns,
+                              "currentDraft": (self._latest_draft(project_id, thread_id) or {}).get("text"),
                               "ownerMemory": project_memory(state)})
         try:
             data = _json_object(self.vp.runner.think(REFRESH_SYSTEM, payload))
@@ -888,6 +896,7 @@ class PrototypeRuntime:
             payload = {
                 "openQuestion": {"text": question["questionText"][:1500], "impact": question.get("impact", "")[:1500], "options": options},
                 "ownerMemory": project_memory(state), "earlierSummary": summary, "conversation": turns,
+                "currentDraft": (self._latest_draft(project_id, thread_id) or {}).get("text"),
                 "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
                                    for q in state["questions"].values() if q["status"] == "answered"][-12:],
                 "ownerMessage": message.strip(),
