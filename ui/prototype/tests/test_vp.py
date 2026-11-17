@@ -515,7 +515,7 @@ class RunningDraftTests(VPBase):
 
     def test_prompt_forbids_leaking_the_vps_findings_into_the_owners_draft(self):
         from ui.prototype.vp import CONVERSE_SYSTEM, REFRESH_SYSTEM
-        for must in ("ONLY what the OWNER said", "EDIT it minimally", "Never rewrite it from scratch", "think it through"):
+        for must in ("contains ONLY what the owner said or decided", "EDIT it", "never rewrite it from scratch", "think it through"):
             self.assertIn(must, CONVERSE_SYSTEM)
         self.assertIn("never the VP's own findings", REFRESH_SYSTEM)
 
@@ -589,7 +589,7 @@ class RejectedAnswerTests(VPBase):
     def test_prompts_keep_the_draft_on_this_question_only(self):
         from ui.prototype.vp import CONVERSE_SYSTEM, REFRESH_SYSTEM
         self.assertIn("THIS open question only", CONVERSE_SYSTEM)
-        self.assertIn("do NOT paste them into the draft", CONVERSE_SYSTEM)
+        self.assertIn("do not paste them in or restate decisions made for other questions", CONVERSE_SYSTEM)
         self.assertIn("THIS question only", REFRESH_SYSTEM)
 
 
