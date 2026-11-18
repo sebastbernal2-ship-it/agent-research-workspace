@@ -51,3 +51,24 @@ Workers are headless Claude Code or Codex CLIs using their own sign-ins: `NORTHS
 The workers are the vendors' own agent CLIs, so every model gets the same native tool loop instead of a custom harness. A *profile* is one CLI pointed at one provider: Codex natively, or **Claude Code on any Anthropic-compatible endpoint** (e.g. DeepSeek, Qwen via Alibaba's service, or a local model behind a translating proxy such as claude-code-router). Copy `workers.example.json` to `~/.config/northstar/workers.json` and route roles (`vp`, `orchestrator`, `worker`, `reviewer`) to profiles. API keys are referenced by environment-variable name (`secretEnv`) and never stored in the file; only `ANTHROPIC_/CLAUDE_CODE_/OPENAI_/CODEX_` variables can be overridden. A profile whose key variable is unset is skipped and routing falls back to an available one. Without the file, `NORTHSTAR_RUNNER` applies as before. No extra sandbox is layered on top: each CLI runs with its own native permission model.
 
 Verified live: VP calls on Codex with worker calls on Claude Code. DeepSeek and Qwen profiles are covered by unit tests (env handling, key never on argv, unsafe overrides rejected) but have **not** been run against those providers (no keys here); check each provider's current endpoint and model names first.
+
+## Integrations: external tools for a project's workers
+
+A project can declare MCP servers its workers may call (a research database, a literature service) without Northstar
+knowing anything about them. The same declaration is passed to whichever harness runs the worker: Claude Code via
+`--mcp-config`, Codex via `-c mcp_servers.<name>...` (verified live with both).
+
+```bash
+curl -X POST localhost:4173/api/v1/projects/$PID/integrations -H 'Content-Type: application/json' -H 'X-Local-Prototype: 1' -d '{
+  "name": "lf",
+  "spec": {"kind": "mcp-stdio", "command": ["python3", "-m", "lf_mcp"], "cwd": "/abs/path",
+           "env": {"LF_SCHEMA": "latent_foundry_clean"}, "secretEnv": {"LF_PASSWORD": "MY_LF_PASSWORD"},
+           "description": "Latent Foundry research web: search, verify, fold back"}}'
+```
+
+- `command` is an argv list, never a shell string. `kind` is `mcp-stdio` or `mcp-http` (https, or http on localhost).
+- `env` holds non-secret values. Secrets are never stored: `secretEnv` maps a variable to the NAME of an environment
+  variable set when the app starts. An integration missing its secret is skipped, and `GET .../integrations` shows `ready: false`.
+- Codex cannot carry secrets (they would appear in process arguments), so secret-bearing integrations are used by Claude Code workers only.
+- Declaring a server approves its tools to run without a prompt. Declare only servers you trust.
+- Workers are told which integrations exist and are asked to cite what they returned.
