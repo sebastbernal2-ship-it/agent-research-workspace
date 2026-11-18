@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import threading
@@ -26,6 +27,7 @@ from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
 from .digest import LastSeen, build_digest
 from .ideas import IdeaStore
+from .integrations import IntegrationStore, usable, validate
 from .issues import PREFIX as ISSUE_KINDS, active_issues
 from .phases import is_phase, phase_summaries
 from .vp import DataRoots, LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
@@ -124,6 +126,7 @@ class PrototypeRuntime:
         self._chat_timestamps: list[float] = []
         self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
         self.last_seen = LastSeen(Path(db_path).parent / "last_seen.json")
+        self.integrations = IntegrationStore(Path(db_path).parent / "integrations.json")
         self.ideas = IdeaStore(Path(db_path).parent / "ideas.json")
         self.data_roots = DataRoots(Path(db_path).parent / "data_roots.json", self.workspace_root)
         self.vp = ProjectVP(self, runner or default_runner(), self.settings)
@@ -199,6 +202,23 @@ class PrototypeRuntime:
         state, _events = self.project_application.get_project_snapshot(project_id)  # raises for an unknown project
         self.last_seen.mark(project_id, datetime.now(timezone.utc).isoformat())
         return {"seen": True}
+
+    def list_integrations(self, project_id: str) -> dict[str, Any]:
+        self.project_application.get_project_snapshot(project_id)  # raises for an unknown project
+        declared = self.integrations.get(project_id)
+        _ok, blocked = usable(declared, dict(os.environ))
+        return {"integrations": [{"name": n, **{k: v for k, v in sp.items() if k != "env"}, "envNames": sorted(sp.get("env") or {}),
+                                  "ready": n not in blocked, "missingSecrets": blocked.get(n, [])} for n, sp in declared.items()]}
+
+    def set_integration(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application.get_project_snapshot(project_id)
+        if not isinstance(request, dict) or "name" not in request or set(request) - {"name", "spec", "remove"}:
+            raise ValueError("send name and spec to declare an integration, or name and remove: true")
+        if request.get("remove") is True:
+            self.integrations.remove(project_id, request["name"])
+        else:
+            self.integrations.set(project_id, request["name"], request.get("spec"))
+        return self.list_integrations(project_id)
 
     # ---- ideas: things to build someday, escalated into projects on demand --------------------------
     def list_ideas(self) -> dict[str, Any]:

@@ -78,7 +78,7 @@ WORKER_SYSTEM = (
     "need into a local virtual environment inside the workspace. When your work satisfies an exit criterion, REGISTER A RUNNABLE CHECK for it: "
     "add it to .northstar/checks.json as {\"checks\": [{\"id\": \"short-id\", \"criterion\": \"the criterion in words\", \"command\": [\"python3\", \"-m\", \"unittest\", \"-q\"]}]} "
     "(an argv list, no shell string; it must exit 0 only when the criterion truly holds, be deterministic, finish within 3 minutes, and test real behaviour, "
-    "not something trivially true). Keep existing checks: never delete or weaken them; if one is wrong, say so in your report.\n"
+    "not something trivially true). If the payload lists integrations, those are the project's own external tools (MCP servers): prefer them over guessing or re-implementing, and cite what they returned. Keep existing checks: never delete or weaken them; if one is wrong, say so in your report.\n"
     "FIRST read the files in contextDir: VISION.md is what the owner actually wants and cares about (your work must "
     "serve THAT, not just the task wording); PHASE.md says what 'done' means for this phase and what earlier tasks "
     "found, in full; ISSUES.md lists known issues and future ideas so you neither repeat nor ignore them. "
@@ -234,7 +234,29 @@ class CliRunner:
             raise VPError(f"The {self.kind} CLI failed; check that it is signed in.")
         return result.stdout
 
-    def _ask(self, system: str, prompt: str, cwd: Path, *, mode: str, timeout: float, session: str | None = None) -> str:
+    def _ask(self, system: str, prompt: str, cwd: Path, *, mode: str, timeout: float, session: str | None = None,
+             mcp: dict[str, Any] | None = None) -> str:
+        """Run one call. Declared integrations (MCP servers) are handed to the harness only for write-mode worker calls."""
+        from . import integrations as integ
+        ok = {}
+        if mcp and mode == "write":
+            ok, _blocked = integ.usable(mcp, dict(os.environ))
+            if self.kind == "codex":  # secrets would appear in the process arguments (visible to `ps`), so Codex cannot carry them
+                ok = {n: sp for n, sp in ok.items() if not sp.get("secretEnv")}
+        if not ok:
+            return self._ask_inner(system, prompt, cwd, mode=mode, timeout=timeout, session=session, extra_args=[], extra_tools=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            if self.kind == "claude":
+                config = Path(tmp) / "mcp.json"
+                config.write_text(json.dumps(integ.claude_config(ok, dict(os.environ))), encoding="utf-8")
+                os.chmod(config, 0o600)
+                return self._ask_inner(system, prompt, cwd, mode=mode, timeout=timeout, session=session,
+                                       extra_args=["--mcp-config", str(config)], extra_tools=integ.claude_tools(ok))
+            return self._ask_inner(system, prompt, cwd, mode=mode, timeout=timeout, session=session,
+                                   extra_args=integ.codex_args(ok, dict(os.environ)), extra_tools=[])
+
+    def _ask_inner(self, system: str, prompt: str, cwd: Path, *, mode: str, timeout: float, session: str | None,
+                   extra_args: list[str], extra_tools: list[str]) -> str:
         if self.kind == "claude":
             args = ["-p", "--output-format", "json", "--append-system-prompt", system]
             try:  # extra folders the project lists (read-only data, the context files): Claude Code's native flag
@@ -245,7 +267,8 @@ class CliRunner:
                         args += ["--add-dir", root]
             except (ValueError, AttributeError):
                 pass
-            args += {"write": ["--permission-mode", "acceptEdits", "--allowedTools", self.WORKER_TOOLS],
+            args += extra_args
+            args += {"write": ["--permission-mode", "acceptEdits", "--allowedTools", ",".join([self.WORKER_TOOLS, *extra_tools])],
                      "read": ["--allowedTools", "Read,Glob,Grep"], "none": ["--tools", ""]}[mode]
             existing = self._sessions.get(session) if session and mode == "write" else None
             new_id = None if existing else (str(uuid.uuid4()) if session and mode == "write" else None)
@@ -272,6 +295,7 @@ class CliRunner:
                     # Workers need the network (package installs, scholarly APIs, local services); the default sandbox blocks even
                     # localhost. File writes stay confined to the workspace. NORTHSTAR_CODEX_NETWORK=off restores the strict default.
                     args += ["-c", "sandbox_workspace_write.network_access=true"]
+                args += extra_args
                 args += ["-o", last.name, "-"]
                 self._run(args, f"{system}\n\n{prompt}", cwd, timeout)
                 text = last.read().strip()
@@ -283,8 +307,8 @@ class CliRunner:
         with tempfile.TemporaryDirectory(prefix="northstar-vp-") as tmp:
             return self._ask(system, payload, Path(tmp), mode="none", timeout=self.think_timeout)
 
-    def work(self, system: str, prompt: str, cwd: Path, session: str | None = None) -> str:
-        return self._ask(system, prompt, cwd, mode="write", timeout=self.work_timeout, session=session)
+    def work(self, system: str, prompt: str, cwd: Path, session: str | None = None, mcp: dict[str, Any] | None = None) -> str:
+        return self._ask(system, prompt, cwd, mode="write", timeout=self.work_timeout, session=session, mcp=mcp)
 
     def explore(self, system: str, prompt: str, cwd: Path) -> str:
         """Read-only: may read and search files under cwd, cannot modify anything or run commands that write."""
@@ -366,9 +390,10 @@ class RoutedRunner:
     def supports_sessions(self) -> bool:
         return any(getattr(p, "supports_sessions", False) for p in self.profiles.values())
 
-    def work(self, system: str, prompt: str, cwd: Path, session: str | None = None) -> str:
+    def work(self, system: str, prompt: str, cwd: Path, session: str | None = None, mcp: dict[str, Any] | None = None) -> str:
         chosen = self._pick("worker")
-        return chosen.work(system, prompt, cwd, session=session) if getattr(chosen, "supports_sessions", False) else chosen.work(system, prompt, cwd)
+        extra = {"mcp": mcp} if mcp else {}
+        return chosen.work(system, prompt, cwd, session=session, **extra) if getattr(chosen, "supports_sessions", False) else chosen.work(system, prompt, cwd, **extra)
 
     def explore(self, system: str, prompt: str, cwd: Path) -> str:
         role = self._by_system.get(system, "vp")
@@ -722,11 +747,15 @@ class ProjectVP:
         """Run the worker with its context files, in the phase's persistent session when the harness supports it."""
         from .phases import phase_of
         payload = {**payload, "contextDir": str(self.write_context(project_id, state, work))}
+        declared = self.rt.integrations.get(project_id)
+        if declared:  # tell the worker what it can call, so it uses the project's tools instead of guessing
+            payload = {**payload, "integrations": [{"name": n, "tools": f"mcp__{n}__*", "description": sp.get("description", "")} for n, sp in declared.items()]}
         text = json.dumps(payload)
+        extra = {"mcp": declared} if declared else {}
         if getattr(self.runner, "supports_sessions", False):
             key = f"{project_id}:{phase_of(state['workItems'], work['workId']) or 'root'}"
-            return self.runner.work(WORKER_SYSTEM, text, directory, session=key)
-        return self.runner.work(WORKER_SYSTEM, text, directory)
+            return self.runner.work(WORKER_SYSTEM, text, directory, session=key, **extra)
+        return self.runner.work(WORKER_SYSTEM, text, directory, **extra)
 
     def work_directory(self, project_id: str, state: dict[str, Any]) -> Path:
         base = self.rt.workspace_root / project_id

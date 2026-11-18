@@ -45,6 +45,7 @@ IDEAS_PATH = "/api/v1/ideas"
 IDEA_PATH = re.compile(r"^/api/v1/ideas/([^/]+)$")
 IDEA_START_PATH = re.compile(r"^/api/v1/ideas/([^/]+)/start$")
 DIGEST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/digest(/seen)?$")
+INTEGRATIONS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/integrations$")
 ISSUES_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues$")
 ISSUE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues/([^/]+)$")
 PHASES_PLAN_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/plan$")
@@ -198,6 +199,11 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
             return
 
+        integrations_get = INTEGRATIONS_PATH.fullmatch(path)
+        if integrations_get:
+            project_id = unquote(integrations_get.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.list_integrations(project_id)))
+            return
         digest_match = DIGEST_PATH.fullmatch(path)
         if digest_match and not digest_match.group(2):
             project_id = unquote(digest_match.group(1))
@@ -290,6 +296,16 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        integrations_post = INTEGRATIONS_PATH.fullmatch(path)
+        if integrations_post:
+            project_id = unquote(integrations_post.group(1))
+            def declare() -> None:
+                try:
+                    self._send_json(200, self.runtime.set_integration(project_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_integration", str(exc))
+            self._run(declare)
             return
         digest_seen = DIGEST_PATH.fullmatch(path)
         if digest_seen and digest_seen.group(2):
