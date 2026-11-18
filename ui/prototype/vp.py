@@ -75,7 +75,10 @@ WORKER_SYSTEM = (
     "your full toolset (shell, files, web search, package installs). Stay in this directory for the work, never "
     "modify, move or delete anything outside it, and never perform irreversible external actions. Create and edit "
     "files only with RELATIVE paths inside the current working directory (never your home directory or absolute paths elsewhere). Install what you "
-    "need into a local virtual environment inside the workspace.\n"
+    "need into a local virtual environment inside the workspace. When your work satisfies an exit criterion, REGISTER A RUNNABLE CHECK for it: "
+    "add it to .northstar/checks.json as {\"checks\": [{\"id\": \"short-id\", \"criterion\": \"the criterion in words\", \"command\": [\"python3\", \"-m\", \"unittest\", \"-q\"]}]} "
+    "(an argv list, no shell string; it must exit 0 only when the criterion truly holds, be deterministic, finish within 3 minutes, and test real behaviour, "
+    "not something trivially true). Keep existing checks: never delete or weaken them; if one is wrong, say so in your report.\n"
     "FIRST read the files in contextDir: VISION.md is what the owner actually wants and cares about (your work must "
     "serve THAT, not just the task wording); PHASE.md says what 'done' means for this phase and what earlier tasks "
     "found, in full; ISSUES.md lists known issues and future ideas so you neither repeat nor ignore them. "
@@ -486,6 +489,8 @@ class AutomationSettings:
 class ProjectVP:
     def __init__(self, runtime: Any, runner: ModelRunner, settings: AutomationSettings):
         self.rt, self.runner, self.settings = runtime, runner, settings
+        self._ask_lock = threading.Lock()
+        self._inflight: set[str] = set()  # tasks being executed by a live thread right now
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
         from .phases import PhasePlanner  # imported here: phases.py builds on this module
@@ -819,11 +824,18 @@ class ProjectVP:
     def recover(self, project_id: str) -> int:
         """At startup nothing can still be running. An autonomous system must survive restarts and crashes, so
         interrupted work is put straight back in the queue (up to twice per task); after that it is left failed."""
-        count = 0
         with self._lock(project_id):
+            return self._requeue_interrupted(project_id, frozenset())
+
+    def _requeue_interrupted(self, project_id: str, skip: frozenset[str] | set[str]) -> int:
+        """Re-queue tasks marked running that no live thread is executing. Caller holds the project lock."""
+        count = 0
+        if True:
             from .phases import is_phase
             state = self._state(project_id)
             for work in list(state["workItems"].values()):
+                if work["workId"] in skip or work.get("parentWorkId") in skip:
+                    continue
                 if work["status"] in {"running", "verifying"} and not is_phase(work):  # phases are containers, not executions
                     earlier = sum(1 for m in state["messages"] if m["workId"] == work["workId"] and m["content"].startswith("The app stopped while this ran"))
                     retry = earlier < self.MAX_AUTO_RETRIES
@@ -842,6 +854,7 @@ class ProjectVP:
             return None
         try:
             self._settle_parents(project_id)
+            self._requeue_interrupted(project_id, set(self._inflight))  # a task nobody is running must never hold the project's slot
             self.resume_waiting_on(project_id)
             auto = self.settings.auto_run(project_id)
             if self.phases.ensure_planned(project_id):  # planning is automatic once the interview is done
@@ -871,6 +884,15 @@ class ProjectVP:
         wid = work["workId"]
         if work["status"] == "proposed":
             self._transition(project_id, wid, "ready", VP, "Auto-run is on: the owner delegated approval for this project.")
+        self._inflight.add(wid)
+        try:
+            self._run_task_inner(project_id, work)
+        finally:
+            self._inflight.discard(wid)
+        return wid
+
+    def _run_task_inner(self, project_id: str, work: dict[str, Any]) -> str:
+        wid = work["workId"]
         self._transition(project_id, wid, "running", ORCHESTRATOR, "Orchestrator picked up the task.")
         try:
             state = self._state(project_id)
@@ -1054,9 +1076,15 @@ class ProjectVP:
         return count
 
     def _ask(self, project_id: str, work: dict[str, Any], question: str) -> None:
+        with self._ask_lock:  # parallel tasks must see each other's questions: check-and-open is one atomic step
+            self._ask_locked(project_id, work, question)
+
+    def _ask_locked(self, project_id: str, work: dict[str, Any], question: str) -> None:
         related = self._related_open_question(self._state(project_id), question)
         if related:  # do not open a near-duplicate: wait on the one the owner already has to answer
             self._say(project_id, work["workId"], ORCHESTRATOR, "status", self.PIGGYBACK + related)
+            if self._state(project_id)["workItems"][work["workId"]]["status"] == "running":
+                self._transition(project_id, work["workId"], "waiting_human", ORCHESTRATOR, "Waiting for the owner's answer to a related question.")
             return
         now = datetime.now(timezone.utc).isoformat()
         self.rt.control.open_question({

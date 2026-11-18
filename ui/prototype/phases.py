@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .checks import run_checks
 from .issues import IssueBoard, active_issues, is_issue, issue_kind, issue_meta, strip_prefix
 from .vp import (
     CHAT_WORK, ORCHESTRATOR, OWNER_ACTOR, OWNER_ID, SUBAGENT, VP, WORK_TYPES, VPError, _clip, _json_object,
@@ -63,6 +64,8 @@ STEER_SYSTEM = (
     "You are the project VP running ONE phase autonomously to completion. You decide what to do next yourself and "
     "only involve the owner for decisions only they can make. Input: the phase goal and exit criteria, every task "
     "with its status and report, the owner's memory and logs (their vision), and earlier assessments. "
+    "executableChecks are checks the harness just RAN in the work directory (passed true/false with output): they are "
+    "ground truth, outranking any report. A criterion with a failing check is NOT met, and the phase cannot be complete. "
     'Reply with JSON only: {"assessment":[{"criterion":"<exact exit criterion>","met":true,"evidence":"concrete '
     'evidence from the task reports"}],"status":"continue|complete|needs_owner","caveats":["known weaknesses of what '
     'was built"],"newTasks":[{"key":"n1","title":"...","objective":"...","workType":"research|analysis|planning|'
@@ -171,6 +174,7 @@ def phase_summaries(state: dict[str, Any]) -> list[dict[str, Any]]:
             "phaseId": phase["workId"], "index": index, "title": phase["title"], "goal": phase["objective"],
             "status": phase["status"], "revision": phase["revision"], "exitCriteria": phase["acceptanceCriteria"],
             "assessment": (last or {}).get("assessment", []), "caveats": (last or {}).get("caveats", []),
+            "checks": (last or {}).get("checks", []),
             "steers": len(records),
             "tasks": {"total": len(required), "done": sum(w["status"] == "completed" for w in required),
                       "running": sum(w["status"] in {"running", "verifying"} for w in required),
@@ -355,8 +359,13 @@ class PhasePlanner:
                             "isn't at its exit criteria. Should I keep going, change the criteria, or stop? (Say what you want.)")
             self._record(project_id, pid, {"status": "needs_owner", "completedCount": completed_now, "assessment": [], "caveats": ["step limit reached"]})
             return True
+        try:  # run the registered checks (this phase's and every earlier phase's, which makes them the regression suite)
+            check_results = run_checks(self.vp.work_directory(project_id, state))
+        except (OSError, VPError):
+            check_results = []
         payload = {
             "phase": {"title": phase["title"], "goal": phase["objective"], "exitCriteria": phase["acceptanceCriteria"]},
+            "executableChecks": [{"id": r["id"], "criterion": r["criterion"], "passed": r["passed"], "outputTail": r["output"][-600:]} for r in check_results],
             "tasks": [self._task_digest(state, w) for w in sorted(tasks, key=lambda w: w["createdAt"]) if not is_issue(w)][:60],
             "issueLedger": self._ledger_digest(state),
             "earlierAssessments": [{"status": r.get("status"), "caveats": r.get("caveats", [])} for r in records[-3:]],
@@ -373,8 +382,12 @@ class PhasePlanner:
         blocking = [g["gap"] for g in gaps if g["severity"] == "blocking"]
         status = reply.get("status") if reply.get("status") in {"continue", "complete", "needs_owner"} else "continue"
         all_met = bool(criteria) and all(a["met"] for a in assessment) and len(assessment) == len(criteria)
-        if status == "complete" and (not all_met or blocking):
-            status = "continue"  # no "done" without evidence for every criterion and no blocking gap against the vision
+        failing = [r for r in check_results if not r["passed"]]
+        if status == "complete" and (not all_met or blocking or failing):
+            status = "continue"  # no "done" without evidence for every criterion, no blocking gap, and no failing executable check
+        if failing:
+            caveats = [f"Check '{r['id']}' is failing ({r['criterion']})" for r in failing][:6] + caveats
+            blocking = blocking + [f"Executable check '{r['id']}' fails: {r['criterion']}. Output: {r['output'][-300:]}" for r in failing[:3]]
         review = None
         if status == "complete" and sum(1 for r in records if r.get("reviewed")) < MAX_REVIEWS_PER_PHASE:
             review = self._review_phase(project_id, phase, state)  # a second, skeptical opinion that inspects the real outputs
@@ -397,6 +410,7 @@ class PhasePlanner:
         if review is not None:
             filed += self._file_items(project_id, pid, review["other"], "reviewer")
         record = {"status": status, "completedCount": completed_now, "assessment": assessment, "caveats": caveats, "visionGaps": gaps,
+                  "checks": [{"id": r["id"], "criterion": r["criterion"], "passed": r["passed"]} for r in check_results],
                   "reviewed": review is not None, "reviewSummary": review["summary"] if review else "",
                   "newTasks": [w["title"] for w in new_tasks], "filed": filed, "at": datetime.now(timezone.utc).isoformat()}
         self._record(project_id, pid, record)

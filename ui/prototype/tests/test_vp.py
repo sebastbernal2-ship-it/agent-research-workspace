@@ -816,3 +816,29 @@ class RelatedQuestionTests(VPBase):
         self.rt.vp._ask(self.pid, a, "Which GitHub repository should the pull request target?")
         self.rt.vp._ask(self.pid, b, "Can you install DuckDB so the archive scan can proceed?")
         self.assertEqual(len(self.open_vp()), 2)
+
+    def test_an_orchestrator_asking_a_related_question_leaves_the_task_waiting_not_running(self):
+        """Regression: the task used to stay 'running' forever and hold the project's only slot."""
+        from ui.prototype.vp import SUBAGENT, VP
+        self.align()
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        self.runner.orchestrator = {"action": "ask", "question": "Which GitHub repository should the pull request target?"}
+        for title in ("Task A", "Task B"):
+            self.rt.vp._new_work(self.pid, title, "obj", "research", "ready", SUBAGENT, [], ["done"], None, VP)
+        self.rt.vp.tick(self.pid)
+        self.rt.vp.tick(self.pid)
+        self.assertEqual((self.status("Task A"), self.status("Task B")), ("waiting_human", "waiting_human"))
+        self.assertEqual(len(self.open_vp()), 1)
+        q = self.rt.get_question(self.pid, self.open_vp()[0]["questionId"])
+        self.rt.answer_question(self.pid, q["questionId"], {"expectedEtag": q["etag"], "text": "the main repo"})
+        self.assertEqual((self.status("Task A"), self.status("Task B")), ("ready", "ready"))
+
+    def test_a_task_marked_running_that_no_thread_is_executing_is_requeued_so_it_can_never_hold_the_slot(self):
+        from ui.prototype.vp import ORCHESTRATOR, SUBAGENT, VP
+        self.align()
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        w = self.rt.vp._new_work(self.pid, "Orphan", "obj", "research", "ready", SUBAGENT, [], ["done"], None, VP)
+        self.rt.control.transition_work(self.pid, w["workId"], "running", actor={"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"})
+        self.rt.vp.tick(self.pid)                                   # the reaper re-queues it, then the same tick runs it
+        self.assertEqual(self.status("Orphan"), "completed")
+
