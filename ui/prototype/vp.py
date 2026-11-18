@@ -267,8 +267,12 @@ class CliRunner:
                 self._remember_session(session, str(data.get("session_id") or new_id or existing or "") or None)
         else:
             with tempfile.NamedTemporaryFile("r", suffix=".txt") as last:
-                args = ["exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "workspace-write" if mode == "write" else "read-only",
-                        "-o", last.name, "-"]
+                args = ["exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "workspace-write" if mode == "write" else "read-only"]
+                if mode == "write" and os.environ.get("NORTHSTAR_CODEX_NETWORK", "on") != "off":
+                    # Workers need the network (package installs, scholarly APIs, local services); the default sandbox blocks even
+                    # localhost. File writes stay confined to the workspace. NORTHSTAR_CODEX_NETWORK=off restores the strict default.
+                    args += ["-c", "sandbox_workspace_write.network_access=true"]
+                args += ["-o", last.name, "-"]
                 self._run(args, f"{system}\n\n{prompt}", cwd, timeout)
                 text = last.read().strip()
         if not text:

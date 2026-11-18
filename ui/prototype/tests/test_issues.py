@@ -354,3 +354,25 @@ class StopConditionTests(PhaseBase):
         self.assertTrue(all(i["priority"] == "medium" for i in items))
         for must in ("AT MOST 3 items per task", "no nitpicks", "low items are only recorded"):
             self.assertIn(must, V.WORKER_SYSTEM)
+
+
+class CodexNetworkTests(unittest.TestCase):
+    def _args(self, env, mode):
+        seen = {}
+        runner = V.CliRunner("codex")
+        runner._run = lambda args, stdin, cwd, timeout: seen.setdefault("args", args)
+        with mock.patch("shutil.which", return_value="/bin/x"), mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("NORTHSTAR_CODEX_NETWORK", None) if "NORTHSTAR_CODEX_NETWORK" not in env else None
+            try:
+                runner._ask("sys", "prompt", Path("."), mode=mode, timeout=5)
+            except V.VPError:
+                pass  # no output file is written by the fake; only the arguments matter
+        return seen["args"]
+
+    def test_codex_workers_get_network_by_default_but_readers_and_the_off_switch_stay_strict(self):
+        write = self._args({}, "write")
+        self.assertIn("sandbox_workspace_write.network_access=true", write)
+        self.assertIn("workspace-write", write)
+        self.assertNotIn("sandbox_workspace_write.network_access=true", self._args({}, "read"))
+        self.assertNotIn("sandbox_workspace_write.network_access=true", self._args({"NORTHSTAR_CODEX_NETWORK": "off"}, "write"))
+
