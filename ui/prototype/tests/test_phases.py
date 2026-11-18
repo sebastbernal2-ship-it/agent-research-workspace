@@ -43,6 +43,9 @@ class ScriptedRunner:
             self.review_calls.append(json.loads(payload))
             if self.review_error:
                 raise VPError("reviewer unavailable")
+            if getattr(self, "review_fail_once", False):
+                self.review_fail_once = False
+                raise VPError("transient reviewer failure")
             return json.dumps(self.reviews.pop(0) if self.reviews else {"verdict": "pass", "gaps": [], "summary": "Checked real outputs; they match."})
         if system.startswith("You are the project's quality reviewer"):
             self.quality_calls.append(json.loads(payload))
@@ -407,3 +410,14 @@ class FullAutoTests(PhaseBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewerRetryTests(PhaseBase):
+    def test_one_transient_reviewer_failure_is_retried_and_the_phase_still_gets_its_independent_review(self):
+        self.rt.plan_phases(self.pid)
+        self.runner.review_fail_once = True
+        self.accept()
+        self.steer([True, True], status="complete")
+        self.run_ticks(4)
+        self.assertEqual(len(self.runner.review_calls), 2)
+        self.assertTrue(self.phases()[0]["reviewed"])

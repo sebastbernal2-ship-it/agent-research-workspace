@@ -431,9 +431,14 @@ class PhasePlanner:
                           if phase_of(items, w["workId"]) == phase["workId"] and not is_phase(w) and not is_issue(w) and w["status"] == "completed"],
             "owner": self.vp._context(state),
         }
-        try:
-            reply = self._model(PHASE_REVIEW_SYSTEM, payload, project_id)
-        except VPError:
+        reply = None
+        for _attempt in range(2):  # one transient model or JSON failure must not cost the phase its independent review
+            try:
+                reply = self._model(PHASE_REVIEW_SYSTEM, payload, project_id)
+                break
+            except VPError:
+                continue
+        if reply is None:
             return None  # reviewer unavailable: the checkpoint says so, and quality passes still run
         blocking, other = [], []
         for g in (reply.get("gaps") if isinstance(reply.get("gaps"), list) else [])[:10]:
