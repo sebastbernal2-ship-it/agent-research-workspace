@@ -4,7 +4,9 @@ Workers register runnable checks in ``.northstar/checks.json`` inside the work d
 
     {"checks": [{"id": "unit-tests", "criterion": "All tests pass", "command": ["python3", "-m", "unittest", "-q"]}]}
 
-``command`` is an argv list (never a shell string) that exits 0 only when the criterion really holds. The file
+``command`` is an argv list (never a shell string) that exits 0 only when the criterion really holds. A check may add an
+optional ``"env": {"NAME": "value"}`` for non-secret variables it needs (for example a disposable test database URL);
+variables that look like secrets are ignored, because checks run in an environment scrubbed of API keys and tokens. The file
 accumulates across phases, so every phase assessment also re-runs earlier checks: that is the regression suite.
 Checks run in the work directory with a timeout and a scrubbed environment (no API keys or tokens).
 """
@@ -39,7 +41,10 @@ def load_checks(directory: Path) -> list[dict[str, Any]]:
                 or not isinstance(command, list) or not 1 <= len(command) <= MAX_ARGS
                 or any(not isinstance(a, str) or not a for a in command)):
             continue
-        out.append({"id": raw["id"], "criterion": raw["criterion"].strip()[:300], "command": command})
+        env = raw.get("env")
+        env = {k: v for k, v in env.items() if isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"[A-Z_][A-Z0-9_]{0,63}", k)
+               and not _SECRET.search(k) and len(v) <= 500} if isinstance(env, dict) else {}
+        out.append({"id": raw["id"], "criterion": raw["criterion"].strip()[:300], "command": command, "env": env})
     return out[:MAX_CHECKS]
 
 
@@ -52,7 +57,7 @@ def run_checks(directory: Path, checks: list[dict[str, Any]] | None = None) -> l
     results = []
     for check in load_checks(directory) if checks is None else checks:
         try:
-            done = subprocess.run(check["command"], cwd=directory, env=_clean_env(), capture_output=True, text=True,
+            done = subprocess.run(check["command"], cwd=directory, env={**_clean_env(), **(check.get("env") or {})}, capture_output=True, text=True,
                                   timeout=TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
             passed, output = done.returncode == 0, (done.stdout + done.stderr)
         except subprocess.TimeoutExpired:

@@ -59,6 +59,15 @@ class CheckRunnerTests(unittest.TestCase):
         self.assertEqual([r["passed"] for r in results], [True, True])
 
 
+    def test_a_check_can_declare_non_secret_env_but_secret_looking_names_are_dropped(self):
+        script = "import os,sys; sys.exit(0 if os.environ.get('TEST_DB_URL')=='postgresql://x' and 'OPENAI_API_KEY' not in os.environ else 1)"
+        register(self.dir, [{"id": "env", "criterion": "needs db", "command": ["python3", "-c", script],
+                             "env": {"TEST_DB_URL": "postgresql://x", "OPENAI_API_KEY": "sk-smuggled", "lower": "x", "MY_TOKEN": "t"}}])
+        self.assertEqual(load_checks(self.dir)[0]["env"], {"TEST_DB_URL": "postgresql://x"})
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-real"}):
+            self.assertTrue(run_checks(self.dir)[0]["passed"])
+
+
 class PhaseChecksTests(PhaseBase):
     def setUp(self):
         super().setUp()
