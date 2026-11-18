@@ -17,7 +17,7 @@ type Activity = { id: string; workId: string; workTitle: string; actor: string; 
 type Automation = { autoRun: boolean; workerAvailable: boolean; demoProject: boolean };
 type Log = { id: string; kind: string; title: string; detail: string; crucial: boolean; edited?: boolean };
 type Memory = { memory: Record<string, string[]>; detailedLogs?: Log[]; notYetMergedNotes: string[] };
-type Summary = { issues?: Issue[]; phases?: Phase[]; dataRoots?: string[]; memory?: Memory; automation: Automation; activity: Activity[]; drafting: boolean; project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number>; alignment?: Alignment | null };
+type Summary = { pausedUntil?: string | null; issues?: Issue[]; phases?: Phase[]; dataRoots?: string[]; memory?: Memory; automation: Automation; activity: Activity[]; drafting: boolean; project: Project; workItems: Work[]; recentEvents: ProjectEvent[]; counts: Record<string, number>; alignment?: Alignment | null };
 type RepoReport = { repositoryName: string; repositoryPath: string; head: string; branch: string; trackedFileCount: number; trackedChanges: number | null; topLevelAreas: string[]; documents: { path: string; title: string; excerpt: string }[]; goalHint: string; fingerprint: string; inspectionPolicy: string };
 type ProjectMode = "choose" | "new" | "existing";
 type Question = { questionId: string; questionType: string; questionText: string; priority: string; blocking: boolean; workIds: string[]; etag: string };
@@ -265,7 +265,7 @@ function App() {
           : view === "issues" ? <IssuesPage issues={issues} phases={phases} busy={busy} act={actOnIssue} add={addIssue} demo={demo}/>
           : view === "memory" ? <MemoryPage memory={summary?.memory} alignment={summary?.alignment} onCorrect={() => setChatOpen(true)}/>
           : view === "activity" ? <div className="goal-scroll"><button className="back-link" onClick={() => setView("home")}>← Home</button><ActivityView items={summary?.activity || []} running={running.length} workItems={tasks}/></div>
-          : <Home digest={digest} markSeen={() => void markSeen()} goal={project.charter.goals.join(" ")} needs={needs} open={openQuestion} activePhase={activePhase} running={running} latest={summary?.activity || []} plan={planPhases} busy={busy} demo={demo} alignmentPending={alignmentPending} alignmentCompleted={alignmentCompleted} hasPhases={phases.length > 0} goPhases={() => setView("phases")} goActivity={() => setView("activity")} goAsk={() => setView("ask")}/>}
+          : <Home pausedUntil={summary?.pausedUntil} digest={digest} markSeen={() => void markSeen()} goal={project.charter.goals.join(" ")} needs={needs} open={openQuestion} activePhase={activePhase} running={running} latest={summary?.activity || []} plan={planPhases} busy={busy} demo={demo} alignmentPending={alignmentPending} alignmentCompleted={alignmentCompleted} hasPhases={phases.length > 0} goPhases={() => setView("phases")} goActivity={() => setView("activity")} goAsk={() => setView("ask")}/>}
       </div>
     </main>
     {chatOpen && project && <ChatDrawer projectId={project.projectId} onClose={() => setChatOpen(false)}/>}
@@ -303,12 +303,13 @@ function IdeasPage({ideas,busy,add,update,start,openProject}:{ideas:Idea[];busy:
   </div></div>;
 }
 
-function Home({digest,markSeen,goal,needs,open,activePhase,running,latest,plan,busy,demo,alignmentPending,alignmentCompleted,hasPhases,goPhases,goActivity,goAsk}:{digest:Digest|null;markSeen:()=>void;goal:string;needs:Question[];open:(id:string)=>void;activePhase?:Phase;running:Work[];latest:Activity[];plan:()=>void;busy:boolean;demo:boolean;alignmentPending:boolean;alignmentCompleted:boolean;hasPhases:boolean;goPhases:()=>void;goActivity:()=>void;goAsk:()=>void}) {
+function Home({pausedUntil,digest,markSeen,goal,needs,open,activePhase,running,latest,plan,busy,demo,alignmentPending,alignmentCompleted,hasPhases,goPhases,goActivity,goAsk}:{pausedUntil?:string|null;digest:Digest|null;markSeen:()=>void;goal:string;needs:Question[];open:(id:string)=>void;activePhase?:Phase;running:Work[];latest:Activity[];plan:()=>void;busy:boolean;demo:boolean;alignmentPending:boolean;alignmentCompleted:boolean;hasPhases:boolean;goPhases:()=>void;goActivity:()=>void;goAsk:()=>void}) {
   const pct = activePhase && activePhase.tasks.total ? Math.round(100 * activePhase.tasks.done / activePhase.tasks.total) : 0;
   const unmet = activePhase ? activePhase.assessment.filter((a) => !a.met).length : 0;
   const reports = latest.filter((a) => !/^(Committed |No files changed|The app stopped)/.test(a.text.trim()));  // housekeeping notes aren't news
   return <div className="home">
     {goal && <p className="home-goal">{goal}</p>}
+    {pausedUntil && <section className="home-card paused" role="status"><h2>Paused: model usage limit</h2><p className="empty-copy">The model account's usage limit was reached. Nothing has failed: work resumes automatically around {new Date(pausedUntil).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.</p></section>}
     {digest && !digest.empty && <section className="home-card digest" aria-labelledby="digest-title">
       <h2 id="digest-title">Since you last looked</h2>
       <p className="digest-headline">{digest.headline}</p>

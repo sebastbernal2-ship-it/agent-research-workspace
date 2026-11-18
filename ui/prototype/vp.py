@@ -107,6 +107,31 @@ class VPError(RuntimeError):
     """Safe, user-facing VP failure."""
 
 
+class UsageLimit(VPError):
+    """The model account's usage limit is exhausted. Nothing is wrong with the work: pause and resume at ``until``."""
+
+    def __init__(self, message: str, until: float):
+        super().__init__(message)
+        self.until = until
+
+
+_USAGE_LIMIT = re.compile(r"usage limit|hit your .{0,20}limit", re.I)
+_RESET_AT = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AP]M)", re.I)
+DEFAULT_LIMIT_PAUSE = 1800  # seconds, when the CLI does not say when the limit resets
+
+
+def limit_reset_time(text: str, now: float | None = None) -> float:
+    """Epoch seconds when a usage limit lifts: the CLI's own 'try again at 3:50 PM' (local time), else a default pause."""
+    now = time.time() if now is None else now
+    m = _RESET_AT.search(text)
+    if not m:
+        return now + DEFAULT_LIMIT_PAUSE
+    hour, minute = int(m.group(1)) % 12 + (12 if m.group(3).upper() == "PM" else 0), int(m.group(2))
+    local = datetime.fromtimestamp(now).replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
+    when = local.timestamp() + 60  # a minute past the stated time
+    return when if when > now else when + 86400
+
+
 class ModelRunner(Protocol):
     def available(self) -> bool: ...
     def think(self, system: str, payload: str) -> str: ...
@@ -209,7 +234,7 @@ class CliRunner:
                     pass
 
     def available(self) -> bool:
-        return self.executable is not None and all(src in os.environ for src in self.secret_env.values())
+        return self.executable is not None and all(src in os.environ for src in self.secret_env.values()) and not self.limited()
 
     def _env(self) -> dict[str, str]:
         env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home()),
@@ -221,12 +246,19 @@ class CliRunner:
         env.update({target: os.environ[src] for target, src in self.secret_env.items() if src in os.environ})
         return env
 
+    limited_until = 0.0  # epoch seconds until which this account's usage limit is known to be exhausted
+
+    def limited(self) -> bool:
+        return time.time() < self.limited_until
+
     FAST_FAILURE_SECONDS = 90
     RETRY_PAUSES = (15, 45)  # seconds before the second and third attempt of a fast-failing call
 
     def _run(self, args: list[str], prompt: str, cwd: Path, timeout: float, *, retry: bool = True) -> bytes:
         if not self.executable:
             raise VPError(f"The {self.kind} CLI is not installed.")
+        if self.limited():  # do not spend calls on a known-exhausted account
+            raise UsageLimit(f"The {self.kind} usage limit is exhausted.", self.limited_until)
         result, attempt = None, 0
         while True:
             started = time.monotonic()
@@ -241,6 +273,10 @@ class CliRunner:
                 raise VPError(f"The model process could not start or crashed ({type(exc).__name__}).") from exc
             if result.returncode == 0:
                 return result.stdout
+            output = ((getattr(result, "stderr", b"") or b"") + (getattr(result, "stdout", b"") or b"")).decode("utf-8", "replace")
+            if _USAGE_LIMIT.search(output):  # not an outage: the account is out of quota until the stated time
+                self.limited_until = limit_reset_time(output)
+                raise UsageLimit(f"The {self.kind} usage limit was reached; resuming after {datetime.fromtimestamp(self.limited_until):%H:%M}.", self.limited_until)
             # A call that fails within seconds is an outage, a limit or a sign-in blip, not bad work: pause and retry it.
             # A failure after long work is not retried (that would repeat a long task).
             if retry and time.monotonic() - started < self.FAST_FAILURE_SECONDS and attempt < len(self.RETRY_PAUSES):
@@ -405,6 +441,11 @@ class RoutedRunner:
 
     def available(self) -> bool:
         return any(p.available() for p in self.profiles.values())
+
+    def limit_until(self) -> float:
+        """When every profile is limited, the earliest moment any of them comes back; else 0."""
+        times = [getattr(p, "limited_until", 0.0) for p in self.profiles.values() if getattr(p, "executable", None)]
+        return min(times) if times and all(time.time() < t for t in times) else 0.0
 
     def think(self, system: str, payload: str) -> str:
         return self._pick(self._by_system.get(system, "vp")).think(system, payload)
@@ -914,6 +955,7 @@ class ProjectVP:
         try:
             self._settle_parents(project_id)
             self._requeue_interrupted(project_id, set(self._inflight))  # a task nobody is running must never hold the project's slot
+            self._requeue_limit_failures(project_id)
             self.resume_waiting_on(project_id)
             auto = self.settings.auto_run(project_id)
             if self.phases.ensure_planned(project_id):  # planning is automatic once the interview is done
@@ -976,12 +1018,18 @@ class ProjectVP:
                     outcome = self._execute(project_id, child, brief, previous)
                     reports.append(outcome)
                     previous.append(outcome[1])
+                    if outcome[0] == "paused":  # the limit lifts later: the whole task restarts then
+                        self._pause_for_limit(project_id, work, UsageLimit(outcome[1], getattr(self.runner, "limited_until", 0.0)))
+                        return wid
                     if outcome[0] != "done":
                         self._finish(project_id, work, outcome[0], f"Step “{child['title']}” did not finish: {outcome[1][:500]}", parent=True)
                         return wid
                 self._finish(project_id, work, "done", "\n".join(r[1] for r in reports) or "All steps finished.", parent=True)
                 return wid
             self._execute(project_id, work, brief, [], already_running=True)
+            return wid
+        except UsageLimit as exc:
+            self._pause_for_limit(project_id, work, exc)
             return wid
         except Exception as exc:  # never leave a task stuck in "running"
             message = str(exc) if isinstance(exc, VPError) else "The VP hit an internal error running this task."
@@ -1006,6 +1054,9 @@ class ProjectVP:
             directory = self.work_directory(project_id, state)
             report = self._worker(project_id, state, work, payload, directory)
             report = self._review(project_id, work, payload, report, directory, state)
+        except UsageLimit as exc:
+            self._pause_for_limit(project_id, work, exc)
+            return "paused", str(exc)
         except VPError as exc:
             self._finish(project_id, work, "failed", str(exc), parent=already_running)
             return "failed", str(exc)
@@ -1035,6 +1086,31 @@ class ProjectVP:
         revised = self._worker(project_id, state, work, {**payload, "reviewerFeedback": feedback, "yourPreviousReport": report[-3000:]}, directory)
         self._say(project_id, work["workId"], SUBAGENT, "revision", "Revised after reviewer feedback.")
         return revised
+
+    def _pause_for_limit(self, project_id: str, work: dict[str, Any], exc: UsageLimit) -> None:
+        """The model account is out of quota: nothing is wrong with the task. Put it back in the queue, not in 'failed'."""
+        wid = work["workId"]
+        current = self._state(project_id)["workItems"][wid]["status"]
+        when = datetime.fromtimestamp(exc.until).strftime("%H:%M") if exc.until else "later"
+        self._say(project_id, wid, ORCHESTRATOR, "status", f"Paused: the model's usage limit was reached. It resumes automatically around {when}. (This is not a failure of the work.)")
+        if current == "running":
+            self._transition(project_id, wid, "failed", ORCHESTRATOR, "Paused by the usage limit.")
+            self._transition(project_id, wid, "ready", ORCHESTRATOR, "Re-queued until the usage limit resets.")
+
+    def _requeue_limit_failures(self, project_id: str) -> int:
+        """Tasks that an exhausted usage limit marked failed (older versions did this) are retried once calls work again."""
+        state, count = self._state(project_id), 0
+        from .phases import is_phase
+        for work in list(state["workItems"].values()):
+            if work["status"] != "failed" or is_phase(work):
+                continue
+            last = next((m["content"] for m in sorted(state["messages"], key=lambda m: m["sequence"], reverse=True)
+                         if m["workId"] == work["workId"] and not m["content"].startswith(("META:", "WAITING ON QUESTION"))), "")
+            if _USAGE_LIMIT.search(last):
+                self._say(project_id, work["workId"], ORCHESTRATOR, "status", "The usage limit has reset: retrying this task.")
+                self._transition(project_id, work["workId"], "ready", ORCHESTRATOR, "Retrying after the usage limit reset.")
+                count += 1
+        return count
 
     def _finish(self, project_id: str, work: dict[str, Any], outcome: str, report: str, parent: bool) -> None:
         wid, actor = work["workId"], ORCHESTRATOR if parent else SUBAGENT

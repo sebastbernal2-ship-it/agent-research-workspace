@@ -193,6 +193,12 @@ class PrototypeRuntime:
         except VPError as exc:
             raise ControlPlaneError(str(exc)) from exc
 
+    def paused_until(self) -> str | None:
+        """When the model account's usage limit lifts, if every usable model is currently limited."""
+        runner = self.vp.runner
+        until = runner.limit_until() if hasattr(runner, "limit_until") else (getattr(runner, "limited_until", 0.0) if getattr(runner, "limited", None) and runner.limited() else 0.0)
+        return datetime.fromtimestamp(until, timezone.utc).isoformat() if until and until > time.time() else None
+
     def project_digest(self, project_id: str) -> dict[str, Any]:
         """What changed since the owner last looked (their own marker; first look = since the project began)."""
         state, _events = self.project_application.get_project_snapshot(project_id)
@@ -1229,6 +1235,7 @@ class PrototypeRuntime:
             "dataRoots": self.data_roots.get(project_id),
             "memory": project_memory(state),
             "activity": self.activity(project_id, 15),
+            "pausedUntil": self.paused_until(),
             "drafting": project_id in self._drafting,
             "counts": {
                 "workItems": len(state["workItems"]),
