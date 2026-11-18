@@ -1,2 +1,0 @@
-policy_manifest: /app/plugins/moderation-*/manifest.yaml
-audit_dir: /runtime/audit
