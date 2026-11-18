@@ -355,5 +355,53 @@ class UsageLimitTests(VPBase):
         self.assertEqual(next(x["status"] for x in self.rt.control.projector.replay(self.pid)["workItems"].values() if x["title"] == "Genuinely broken"), "failed")  # real failures stay failed
 
 
+
+class AccountChainTests(unittest.TestCase):
+    def config(self, roles):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / "workers.json"
+        path.write_text(json.dumps({"profiles": {"codex_a": {"kind": "codex"}, "codex_b": {"kind": "codex", "env": {"CODEX_HOME": "/home/u/.codex-b"}},
+                                                  "claude": {"kind": "claude"}}, "roles": roles}))
+        return path
+
+    def test_a_role_can_name_an_ordered_chain_and_bad_chains_are_rejected(self):
+        profiles, roles = V.load_worker_config(self.config({"worker": ["codex_a", "codex_b", "claude"], "vp": "claude"}))
+        self.assertEqual(roles, {"worker": ["codex_a", "codex_b", "claude"], "vp": ["claude"]})
+        self.assertEqual(profiles["codex_b"].extra_env["CODEX_HOME"], "/home/u/.codex-b")      # a second Codex account is just another CODEX_HOME
+        for bad in ({"worker": []}, {"worker": ["nope"]}, {"worker": ["codex_a", 5]}, {"nobody": ["claude"]}):
+            with self.assertRaises(ValueError):
+                V.load_worker_config(self.config(bad))
+
+    def test_the_router_walks_the_chain_past_limited_accounts_and_back_when_they_recover(self):
+        profiles, roles = V.load_worker_config(self.config({"worker": ["codex_a", "codex_b", "claude"]}))
+        with mock.patch("shutil.which", return_value="/bin/x"):
+            for p in profiles.values():
+                p.executable = "/bin/x"
+            router = V.RoutedRunner(profiles, roles)
+            self.assertIs(router._pick("worker"), profiles["codex_a"])
+            profiles["codex_a"].limited_until = __import__("time").time() + 3600           # account A is out of quota
+            self.assertIs(router._pick("worker"), profiles["codex_b"])                      # account B takes over
+            profiles["codex_b"].limited_until = __import__("time").time() + 3600
+            self.assertIs(router._pick("worker"), profiles["claude"])                       # then Claude Code
+            self.assertEqual(router.limit_until(), 0.0)                                      # still usable: the project is not paused
+            profiles["claude"].limited_until = __import__("time").time() + 7200
+            self.assertFalse(router.available())                                             # everything limited: now it pauses
+            self.assertGreater(router.limit_until(), 0.0)
+            profiles["codex_a"].limited_until = 0.0
+            self.assertIs(router._pick("worker"), profiles["codex_a"])                      # back to the first account at its reset
+            self.assertEqual(router.describe()["worker"], "codex_a > codex_b > claude")
+
+    def test_the_model_tool_can_use_the_configured_chain(self):
+        from ui.prototype import model_mcp
+        root = str(Path(__file__).resolve().parents[3])
+        import subprocess, sys
+        path = self.config({"vp": ["codex_a", "claude"]})
+        done = subprocess.run([sys.executable, "-m", "ui.prototype.model_mcp"], input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n",
+                              capture_output=True, text=True, cwd=root, timeout=60,
+                              env={**os.environ, "NORTHSTAR_MODEL_KIND": "auto", "NORTHSTAR_WORKERS_CONFIG": str(path), "PYTHONPATH": root})
+        self.assertEqual(json.loads(done.stdout.splitlines()[0])["result"]["tools"][0]["name"], "ask_model")
+
+
 if __name__ == "__main__":
     unittest.main()

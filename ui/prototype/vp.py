@@ -409,9 +409,11 @@ def load_worker_config(path: Path) -> tuple[dict[str, CliRunner], dict[str, str]
         if any(not _PROFILE_ENV_KEY.fullmatch(k) or not isinstance(v, str) or not _ENV_NAME.fullmatch(v) for k, v in secret.items()):
             raise ValueError(f"profile {name}: secretEnv must map a provider variable to the NAME of an environment variable")
         profiles[name] = CliRunner(spec.get("kind", ""), env=env, secret_env=secret)
-    roles = {r: n for r, n in (data.get("roles") or {}).items()}
-    if any(r not in ROLES or n not in profiles for r, n in roles.items()):
-        raise ValueError(f"roles must be a subset of {ROLES} and name existing profiles")
+    # A role maps to one profile or to an ordered chain of profiles: the first one that is available (signed in, not
+    # usage-limited) is used, so an exhausted account falls through to the next one.
+    roles = {r: ([n] if isinstance(n, str) else n) for r, n in (data.get("roles") or {}).items()}
+    if any(r not in ROLES or not isinstance(chain, list) or not chain or any(n not in profiles for n in chain) for r, chain in roles.items()):
+        raise ValueError(f"roles must be a subset of {ROLES} and name existing profiles (one name or an ordered list)")
     return profiles, roles
 
 
@@ -431,9 +433,11 @@ class RoutedRunner:
             pass
 
     def _pick(self, role: str) -> CliRunner:
-        chosen = self.profiles.get(self.roles.get(role, ""))
-        if chosen is not None and chosen.available():
-            return chosen
+        chain = self.roles.get(role, [])
+        for name in ([chain] if isinstance(chain, str) else chain):  # the role's own chain, in order
+            chosen = self.profiles.get(name)
+            if chosen is not None and chosen.available():
+                return chosen
         for profile in self.profiles.values():
             if profile.available():
                 return profile
@@ -464,7 +468,7 @@ class RoutedRunner:
         return self._pick(role).explore(system, prompt, cwd)
 
     def describe(self) -> dict[str, str]:
-        return {role: self.roles.get(role, "(any available)") for role in ROLES}
+        return {role: " > ".join(self.roles[role]) if self.roles.get(role) else "(any available)" for role in ROLES}
 
 
 def default_runner() -> ModelRunner:
