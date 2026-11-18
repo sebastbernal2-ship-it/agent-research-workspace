@@ -72,3 +72,19 @@ curl -X POST localhost:4173/api/v1/projects/$PID/integrations -H 'Content-Type: 
 - Codex cannot carry secrets (they would appear in process arguments), so secret-bearing integrations are used by Claude Code workers only.
 - Declaring a server approves its tools to run without a prompt. Declare only servers you trust.
 - Workers are told which integrations exist and are asked to cite what they returned.
+
+### Asking a model from inside a worker (`ui.prototype.model_mcp`)
+
+A sandboxed worker cannot call a model CLI itself (Codex writes its state under `~/.codex`, which the sandbox cannot
+write). The built-in `ask_model` MCP server runs outside the worker's sandbox, started by its harness like any other
+integration, and uses the operator's normal sign-in, so no credentials are copied or exposed. It is a pure text call:
+the model it reaches has no tools, files or network. Limits: 60,000 characters per prompt, one call at a time, 200 calls
+per worker session (`NORTHSTAR_MODEL_MAX_CALLS`). Declare it like any integration:
+
+```json
+{"name": "model", "spec": {"kind": "mcp-stdio", "command": ["python3", "-m", "ui.prototype.model_mcp"],
+ "env": {"PYTHONPATH": "/path/to/agent-research-workspace", "NORTHSTAR_MODEL_KIND": "codex"},
+ "description": "ask_model(prompt, system?): ask the operator's model a text question"}}
+```
+
+Verified live: a Codex worker in its sandbox and a Claude Code worker each obtained an answer from Codex through it.

@@ -210,5 +210,67 @@ class FastFailureRetryTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
+
+class ModelMcpTests(unittest.TestCase):
+    class Runner:
+        def __init__(self):
+            self.seen = []
+
+        def think(self, system, prompt):
+            self.seen.append((system, prompt))
+            if "boom" in prompt:
+                raise V.VPError("limit reached")
+            return "answer:" + prompt
+
+    def call(self, server, args, mid=7):
+        return server.handle({"jsonrpc": "2.0", "id": mid, "method": "tools/call", "params": {"name": "ask_model", "arguments": args}})["result"]
+
+    def test_protocol_and_the_text_only_tool(self):
+        from ui.prototype.model_mcp import ModelServer
+        runner = self.Runner()
+        server = ModelServer(runner)
+        init = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+        self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
+        self.assertIsNone(server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))  # notifications get no reply
+        tools = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
+        self.assertEqual([t["name"] for t in tools], ["ask_model"])
+        ok = self.call(server, {"prompt": "hello", "system": "be brief"})
+        self.assertEqual(ok["content"][0]["text"], "answer:hello")
+        self.assertNotIn("isError", ok)
+        self.assertEqual(runner.seen[-1], ("be brief", "hello"))
+        self.assertEqual(server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "rm_rf"}})["error"]["code"], -32602)
+
+    def test_bad_input_failures_size_and_call_caps_are_reported_not_raised(self):
+        from ui.prototype import model_mcp
+        server = model_mcp.ModelServer(self.Runner())
+        for bad in ({}, {"prompt": ""}, {"prompt": 5}, {"prompt": "x", "system": 3}):
+            self.assertTrue(self.call(server, bad)["isError"], bad)
+        self.assertTrue(self.call(server, {"prompt": "x" * (model_mcp.MAX_PROMPT_CHARS + 1)})["isError"])
+        failed = self.call(server, {"prompt": "boom"})
+        self.assertTrue(failed["isError"])
+        self.assertIn("limit reached", failed["content"][0]["text"])
+        with mock.patch.object(model_mcp, "MAX_CALLS", 2):
+            capped = model_mcp.ModelServer(self.Runner())
+            self.assertFalse(self.call(capped, {"prompt": "a"}).get("isError"))
+            self.assertFalse(self.call(capped, {"prompt": "b"}).get("isError"))
+            self.assertIn("2 model calls", self.call(capped, {"prompt": "c"})["content"][0]["text"])
+
+    def test_the_real_server_process_speaks_mcp_over_stdio(self):
+        import subprocess
+        import sys
+        root = str(Path(__file__).resolve().parents[3])
+        lines = [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                 json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                 json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})]
+        done = subprocess.run([sys.executable, "-m", "ui.prototype.model_mcp"], input="\n".join(lines) + "\n", capture_output=True, text=True,
+                              cwd=root, env={**os.environ, "NORTHSTAR_MODEL_KIND": "claude", "PYTHONPATH": root}, timeout=60)
+        replies = [json.loads(x) for x in done.stdout.splitlines()]
+        self.assertEqual([r["id"] for r in replies], [1, 2])                      # exactly one reply per request
+        self.assertEqual(replies[1]["result"]["tools"][0]["name"], "ask_model")
+        bad = subprocess.run([sys.executable, "-m", "ui.prototype.model_mcp"], input="", capture_output=True, text=True, cwd=root,
+                             env={**os.environ, "NORTHSTAR_MODEL_KIND": "pi", "PYTHONPATH": root}, timeout=60)
+        self.assertNotEqual(bad.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
