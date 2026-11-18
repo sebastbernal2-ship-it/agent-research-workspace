@@ -184,7 +184,7 @@ class FastFailureRetryTests(unittest.TestCase):
         return mock.Mock(returncode=code, stdout=out, stderr=err)
 
     def test_a_fast_failure_is_retried_with_pauses_and_succeeds(self):
-        runner, calls, fake, clock = self._runner([self._result(1, err=b"usage limit"), self._result(1), self._result(0, b"done")])
+        runner, calls, fake, clock = self._runner([self._result(1, err=b"temporary network error"), self._result(1), self._result(0, b"done")])
         with mock.patch("ui.prototype.vp.run_bounded_subprocess", fake), mock.patch("ui.prototype.vp.time.sleep") as sleep, \
                 mock.patch("ui.prototype.vp.time.monotonic", lambda: next(clock)):
             self.assertEqual(runner._run(["exec"], "p", Path("."), 5), b"done")
@@ -192,12 +192,12 @@ class FastFailureRetryTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [15, 45])
 
     def test_persistent_fast_failure_raises_with_the_real_error_tail(self):
-        runner, calls, fake, clock = self._runner([self._result(1, err=b"ERROR: You've hit your usage limit.")] * 3)
+        runner, calls, fake, clock = self._runner([self._result(1, err=b"ERROR: connection reset by peer")] * 3)
         with mock.patch("ui.prototype.vp.run_bounded_subprocess", fake), mock.patch("ui.prototype.vp.time.sleep"), \
                 mock.patch("ui.prototype.vp.time.monotonic", lambda: next(clock)):
             with self.assertRaises(V.VPError) as caught:
                 runner._run(["exec"], "p", Path("."), 5)
-        self.assertIn("usage limit", str(caught.exception))
+        self.assertIn("connection reset", str(caught.exception))
         self.assertEqual(len(calls), 3)
 
     def test_a_failure_after_long_work_is_not_retried(self):
@@ -270,6 +270,89 @@ class ModelMcpTests(unittest.TestCase):
         bad = subprocess.run([sys.executable, "-m", "ui.prototype.model_mcp"], input="", capture_output=True, text=True, cwd=root,
                              env={**os.environ, "NORTHSTAR_MODEL_KIND": "pi", "PYTHONPATH": root}, timeout=60)
         self.assertNotEqual(bad.returncode, 0)
+
+
+
+class UsageLimitTests(VPBase):
+    LIMIT = b"ERROR: You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/settings/usage or try again at 3:50 PM."
+
+    def test_the_reset_time_is_read_from_the_cli_message_in_local_time(self):
+        from datetime import datetime
+        noon = datetime(2026, 11, 18, 12, 0).timestamp()
+        until = V.limit_reset_time("... try again at 3:50 PM.", now=noon)
+        self.assertEqual(datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M"), "2026-11-18 15:51")      # a minute past, same day
+        late = datetime(2026, 11, 18, 18, 0).timestamp()
+        self.assertEqual(datetime.fromtimestamp(V.limit_reset_time("try again at 3:50 PM", now=late)).strftime("%d %H:%M"), "19 15:51")  # next day
+        self.assertEqual(datetime.fromtimestamp(V.limit_reset_time("try again at 12:05 AM", now=noon)).strftime("%d %H:%M"), "19 00:06")
+        self.assertEqual(V.limit_reset_time("no time given", now=noon), noon + V.DEFAULT_LIMIT_PAUSE)
+
+    def test_a_limit_stops_further_calls_until_the_reset_and_is_not_retried_like_an_outage(self):
+        runner = V.CliRunner("codex")
+        runner.executable = "/bin/codex"
+        calls = []
+        runner_result = mock.Mock(returncode=1, stdout=b"", stderr=self.LIMIT)
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+            return runner_result
+
+        with mock.patch("ui.prototype.vp.run_bounded_subprocess", fake), mock.patch("ui.prototype.vp.time.sleep") as sleep:
+            with self.assertRaises(V.UsageLimit) as first:
+                runner._run(["exec"], "p", Path("."), 5)
+            self.assertGreater(first.exception.until, __import__("time").time())
+            self.assertFalse(runner.available())                         # the scheduler sees "no model right now"
+            with self.assertRaises(V.UsageLimit):
+                runner._run(["exec"], "p", Path("."), 5)
+        self.assertEqual(len(calls), 1)                                  # one real call; the second never reached the CLI
+        sleep.assert_not_called()
+        runner.limited_until = 0.0
+        self.assertTrue(runner.available())
+
+    def test_a_task_that_hits_the_limit_is_paused_and_requeued_not_failed_and_runs_after_the_reset(self):
+        self.align(); self.rt.draft_board(self.pid); self.rt.set_automation(self.pid, {"autoRun": True})
+        raised = {"n": 0}
+        original = self.runner.work
+
+        def work(system, prompt, cwd):
+            if raised["n"] == 0:
+                raised["n"] += 1
+                raise V.UsageLimit("limit", __import__("time").time() + 3600)
+            return original(system, prompt, cwd)
+
+        self.runner.work = work
+        self.rt.vp.tick(self.pid)
+        item = self.work()["Survey options"]
+        self.assertEqual(item["status"], "ready")                         # back in the queue, never 'failed'
+        notes = [a["text"] for a in self.rt.activity(self.pid) if "usage limit" in a["text"]]
+        self.assertTrue(any("not a failure of the work" in n for n in notes))
+        self.rt.vp.tick(self.pid)                                         # the limit has lifted
+        self.assertEqual(self.work()["Survey options"]["status"], "completed")
+
+    def test_the_summary_says_when_work_resumes_while_the_account_is_limited(self):
+        self.assertIsNone(self.rt.project_summary(self.pid)["pausedUntil"])
+        runner = V.CliRunner("codex")
+        runner.executable = "/bin/codex"
+        runner.limited_until = __import__("time").time() + 3600
+        self.rt.vp.runner = runner
+        self.assertIsNotNone(self.rt.project_summary(self.pid)["pausedUntil"])
+
+    def test_tasks_an_exhausted_limit_already_marked_failed_are_retried_automatically(self):
+        from ui.prototype.vp import ORCHESTRATOR, SUBAGENT, VP
+        self.align()
+        self.rt.set_automation(self.pid, {"autoRun": True})
+        w = self.rt.vp._new_work(self.pid, "Victim", "obj", "research", "ready", SUBAGENT, [], ["done"], None, VP)
+        orch = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"}
+        self.rt.control.transition_work(self.pid, w["workId"], "running", actor=orch)
+        self.rt.vp._finish(self.pid, self.rt.control.projector.replay(self.pid)["workItems"][w["workId"]], "failed",
+                           "The codex CLI failed (ERROR: You've hit your usage limit. try again at 3:50 PM.).", parent=False)
+        self.assertEqual(next(x["status"] for x in self.rt.control.projector.replay(self.pid)["workItems"].values() if x["title"] == "Victim"), "failed")
+        self.rt.vp.tick(self.pid)
+        self.assertEqual(next(x["status"] for x in self.rt.control.projector.replay(self.pid)["workItems"].values() if x["title"] == "Victim"), "completed")
+        other = self.rt.vp._new_work(self.pid, "Genuinely broken", "obj", "research", "ready", SUBAGENT, [], ["done"], None, VP)
+        self.rt.control.transition_work(self.pid, other["workId"], "running", actor=orch)
+        self.rt.vp._finish(self.pid, self.rt.control.projector.replay(self.pid)["workItems"][other["workId"]], "failed", "The tests do not pass.", parent=False)
+        self.rt.vp.tick(self.pid)
+        self.assertEqual(next(x["status"] for x in self.rt.control.projector.replay(self.pid)["workItems"].values() if x["title"] == "Genuinely broken"), "failed")  # real failures stay failed
 
 
 if __name__ == "__main__":
