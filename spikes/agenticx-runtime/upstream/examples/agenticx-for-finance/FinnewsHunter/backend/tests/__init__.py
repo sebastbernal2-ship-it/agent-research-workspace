@@ -1,1 +1,0 @@
-"""FinnewsHunter Tests"""

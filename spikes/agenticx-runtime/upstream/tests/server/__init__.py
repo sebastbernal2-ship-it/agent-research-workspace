@@ -1,3 +1,0 @@
-"""
-AgenticX Server Tests
-"""
