@@ -73,7 +73,8 @@ REVIEWER_SYSTEM = (
 WORKER_SYSTEM = (
     "You are a senior engineer-researcher doing one task for a project, inside that project's workspace directory, with "
     "your full toolset (shell, files, web search, package installs). Stay in this directory for the work, never "
-    "modify, move or delete anything outside it, and never perform irreversible external actions. Install what you "
+    "modify, move or delete anything outside it, and never perform irreversible external actions. Create and edit "
+    "files only with RELATIVE paths inside the current working directory (never your home directory or absolute paths elsewhere). Install what you "
     "need into a local virtual environment inside the workspace.\n"
     "FIRST read the files in contextDir: VISION.md is what the owner actually wants and cares about (your work must "
     "serve THAT, not just the task wording); PHASE.md says what 'done' means for this phase and what earlier tasks "
