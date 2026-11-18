@@ -87,6 +87,16 @@ class PhaseChecksTests(PhaseBase):
         self.assertEqual(self.phases()[0]["status"], "verifying")               # now it can be complete
         self.assertEqual(self.phases()[0]["checks"][0]["passed"], True)
 
+    def test_the_independent_reviewer_is_shown_the_check_results_and_told_to_treat_them_as_ground_truth(self):
+        from ui.prototype.phases import PHASE_REVIEW_SYSTEM
+        register(self.work_dir(), [{"id": "tests", "criterion": "All tests pass", "command": ["python3", "-c", "print('12 passed')"]}])
+        self.steer([True, True], status="complete")
+        self.run_ticks(4)
+        shown = self.runner.review_calls[0]["executableChecks"]
+        self.assertEqual([(c["id"], c["passed"], c["command"]) for c in shown], [("tests", True, ["python3", "-c", "print('12 passed')"])])
+        self.assertIn("12 passed", shown[0]["outputTail"])
+        self.assertIn("ground truth", PHASE_REVIEW_SYSTEM)
+
     def test_no_registered_checks_changes_nothing(self):
         self.steer([True, True], status="complete")
         self.run_ticks(4)

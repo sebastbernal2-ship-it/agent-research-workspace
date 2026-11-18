@@ -59,5 +59,5 @@ def run_checks(directory: Path, checks: list[dict[str, Any]] | None = None) -> l
             passed, output = False, f"timed out after {TIMEOUT_SECONDS}s"
         except (OSError, ValueError) as exc:
             passed, output = False, f"could not run: {exc}"
-        results.append({"id": check["id"], "criterion": check["criterion"], "passed": passed, "output": output[-OUTPUT_TAIL:]})
+        results.append({"id": check["id"], "criterion": check["criterion"], "command": check["command"], "passed": passed, "output": output[-OUTPUT_TAIL:]})
     return results
