@@ -372,18 +372,18 @@ class RoutedRunner:
 
 def default_runner() -> ModelRunner:
     """~/.config/northstar/workers.json (or NORTHSTAR_WORKERS_CONFIG) routes roles to profiles; otherwise
-    NORTHSTAR_RUNNER=claude|codex|pi (default Claude Code, falling back to whatever is installed)."""
+    NORTHSTAR_RUNNER=claude|codex|pi (default Codex, falling back to whatever is installed)."""
     config = Path(os.environ.get("NORTHSTAR_WORKERS_CONFIG") or Path.home() / ".config" / "northstar" / "workers.json")
     if config.is_file():
         try:
             return RoutedRunner(*load_worker_config(config))
         except (ValueError, OSError) as exc:
             print(f"Ignoring invalid worker config {config}: {exc}", flush=True)
-    choice = os.environ.get("NORTHSTAR_RUNNER", "claude")
+    choice = os.environ.get("NORTHSTAR_RUNNER", "codex")
     if choice == "pi":
         return PiRunner()
     sessions = Path.home() / ".local" / "state" / "northstar-ai-workspace-prototype" / "worker_sessions.json"
-    for kind in dict.fromkeys([choice, "claude", "codex"]):
+    for kind in dict.fromkeys([choice, "codex", "claude"]):
         if kind in {"claude", "codex"} and shutil.which(kind):
             return CliRunner(kind, sessions_path=sessions)
     return NullRunner()
