@@ -224,7 +224,7 @@ class CliRunner:
     FAST_FAILURE_SECONDS = 90
     RETRY_PAUSES = (15, 45)  # seconds before the second and third attempt of a fast-failing call
 
-    def _run(self, args: list[str], prompt: str, cwd: Path, timeout: float) -> bytes:
+    def _run(self, args: list[str], prompt: str, cwd: Path, timeout: float, *, retry: bool = True) -> bytes:
         if not self.executable:
             raise VPError(f"The {self.kind} CLI is not installed.")
         result, attempt = None, 0
@@ -243,7 +243,7 @@ class CliRunner:
                 return result.stdout
             # A call that fails within seconds is an outage, a limit or a sign-in blip, not bad work: pause and retry it.
             # A failure after long work is not retried (that would repeat a long task).
-            if time.monotonic() - started < self.FAST_FAILURE_SECONDS and attempt < len(self.RETRY_PAUSES):
+            if retry and time.monotonic() - started < self.FAST_FAILURE_SECONDS and attempt < len(self.RETRY_PAUSES):
                 time.sleep(self.RETRY_PAUSES[attempt])
                 attempt += 1
                 continue
@@ -291,7 +291,7 @@ class CliRunner:
             new_id = None if existing else (str(uuid.uuid4()) if session and mode == "write" else None)
             session_args = ["--resume", existing] if existing else (["--session-id", new_id] if new_id else [])
             try:
-                out = self._run([*args, *session_args], prompt, cwd, timeout)
+                out = self._run([*args, *session_args], prompt, cwd, timeout, **({"retry": False} if existing else {}))  # a lost session fails the same way every time
             except VPError:
                 if not existing:
                     raise
