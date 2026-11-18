@@ -128,5 +128,43 @@ class ProjectIntegrationTests(VPBase):
             self.rt.list_integrations("project.nope")
 
 
+
+class DataDirTests(unittest.TestCase):
+    def _args(self, kind, mode, prompt):
+        captured = {}
+        runner = V.CliRunner(kind)
+        runner._run = lambda args, stdin, cwd, timeout: (captured.setdefault("args", args), json.dumps({"result": "ok", "session_id": "s"}))[1]
+        with mock.patch("shutil.which", return_value="/bin/x"):
+            try:
+                runner._ask("sys", prompt, Path("."), mode=mode, timeout=5)
+            except V.VPError:
+                pass  # codex's fake writes no output file; only the arguments matter
+        return captured["args"]
+
+    def test_workers_get_a_writable_data_folder_outside_the_repository_but_readers_do_not(self):
+        with tempfile.TemporaryDirectory() as t:
+            prompt = json.dumps({"dataDir": t})
+            claude = self._args("claude", "write", prompt)
+            self.assertEqual(claude[claude.index("--add-dir") + 1], t)
+            self.assertIn(f"sandbox_workspace_write.writable_roots={json.dumps([t])}", self._args("codex", "write", prompt))
+            for kind in ("claude", "codex"):
+                self.assertNotIn(t, " ".join(self._args(kind, "read", prompt)))
+
+
+class ProjectDataDirTests(VPBase):
+    def test_the_worker_payload_names_a_data_folder_next_to_the_repo(self):
+        seen = {}
+        original = self.runner.work
+        self.runner.work = lambda system, prompt, cwd: (seen.setdefault("p", json.loads(prompt)), original(system, prompt, cwd))[1]
+        self.align(); self.rt.draft_board(self.pid)
+        a = self.work()["Survey options"]
+        self.rt.approve_work(self.pid, a["workId"], {"expectedRevision": a["revision"], "decision": "approve"})
+        self.rt.vp.tick(self.pid)
+        data = Path(seen["p"]["dataDir"])
+        self.assertEqual(data, self.rt.workspace_root / self.pid / "data")
+        self.assertTrue(data.is_dir())
+        self.assertIn("dataDir", V.WORKER_SYSTEM)
+
+
 if __name__ == "__main__":
     unittest.main()
