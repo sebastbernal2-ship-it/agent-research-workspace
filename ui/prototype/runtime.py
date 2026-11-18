@@ -24,6 +24,7 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
+from .digest import LastSeen, build_digest
 from .ideas import IdeaStore
 from .issues import PREFIX as ISSUE_KINDS, active_issues
 from .phases import is_phase, phase_summaries
@@ -122,6 +123,7 @@ class PrototypeRuntime:
         self._chat_lock = threading.Lock()
         self._chat_timestamps: list[float] = []
         self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
+        self.last_seen = LastSeen(Path(db_path).parent / "last_seen.json")
         self.ideas = IdeaStore(Path(db_path).parent / "ideas.json")
         self.data_roots = DataRoots(Path(db_path).parent / "data_roots.json", self.workspace_root)
         self.vp = ProjectVP(self, runner or default_runner(), self.settings)
@@ -187,6 +189,16 @@ class PrototypeRuntime:
             return {"phases": self.vp.phases.plan(project_id)}
         except VPError as exc:
             raise ControlPlaneError(str(exc)) from exc
+
+    def project_digest(self, project_id: str) -> dict[str, Any]:
+        """What changed since the owner last looked (their own marker; first look = since the project began)."""
+        state, _events = self.project_application.get_project_snapshot(project_id)
+        return build_digest(state, self.activity(project_id, 400), self.last_seen.get(project_id))
+
+    def mark_seen(self, project_id: str) -> dict[str, Any]:
+        state, _events = self.project_application.get_project_snapshot(project_id)  # raises for an unknown project
+        self.last_seen.mark(project_id, datetime.now(timezone.utc).isoformat())
+        return {"seen": True}
 
     # ---- ideas: things to build someday, escalated into projects on demand --------------------------
     def list_ideas(self) -> dict[str, Any]:

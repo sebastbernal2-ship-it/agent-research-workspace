@@ -44,6 +44,7 @@ CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversatio
 IDEAS_PATH = "/api/v1/ideas"
 IDEA_PATH = re.compile(r"^/api/v1/ideas/([^/]+)$")
 IDEA_START_PATH = re.compile(r"^/api/v1/ideas/([^/]+)/start$")
+DIGEST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/digest(/seen)?$")
 ISSUES_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues$")
 ISSUE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues/([^/]+)$")
 PHASES_PLAN_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/plan$")
@@ -197,6 +198,11 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
             return
 
+        digest_match = DIGEST_PATH.fullmatch(path)
+        if digest_match and not digest_match.group(2):
+            project_id = unquote(digest_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.project_digest(project_id)))
+            return
         history_match = CHAT_HISTORY_PATH.fullmatch(path)
         if history_match:
             project_id = unquote(history_match.group(1))
@@ -284,6 +290,15 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        digest_seen = DIGEST_PATH.fullmatch(path)
+        if digest_seen and digest_seen.group(2):
+            project_id = unquote(digest_seen.group(1))
+            def seen() -> None:
+                if body:
+                    raise ValueError("marking as seen accepts an empty object")
+                self._send_json(200, self.runtime.mark_seen(project_id))
+            self._run(seen)
             return
         if path == IDEAS_PATH:
             def add_idea() -> None:

@@ -24,6 +24,7 @@ type Question = { questionId: string; questionType: string; questionText: string
 type QuestionDetail = Question & { record: { questionType: string; options: { optionId: string; label: string; consequence?: string }[]; impact: string; status: string; questionText: string }; affectedWork: { workId: string; title: string; status: string }[] };
 type Turn = { role: "user" | "assistant"; content: string };
 type View = "home" | "phases" | "issues" | "memory" | "ask" | "activity" | "ideas";
+type Digest = { since: string; headline: string; empty: boolean; finished: { title: string; phase: string; at: string; summary: string }[]; commits: { text: string; at: string }[]; newIssues: { title: string; kind: string; priority: string }[]; needsYou: { questionId: string; text: string }[]; checks: { passing: number; failing: string[] }; phases: { index: number; title: string; status: string; done: number; total: number }[] };
 type Idea = { id: string; title: string; note: string; status: "idea" | "started" | "archived"; projectId: string | null; createdAt: string; updatedAt: string };
 type Issue = { id: string; kind: "issue" | "improvement" | "direction"; title: string; detail: string; priority: string; source: string; evidence: string; deferred: boolean; phaseId?: string | null; status: string; createdAt: string };
 type Phase = { phaseId: string; index: number; title: string; goal: string; status: string; revision: number; exitCriteria: string[]; assessment: { criterion: string; met: boolean; evidence: string }[]; checks?: { id: string; criterion: string; passed: boolean }[]; caveats: string[]; steers: number; tasks: { total: number; done: number; running: number; failed: number }; improvements: { open: number; done: number; directions?: number; titles: string[] }; passes?: number; reviewed?: boolean; reviewSummary?: string; visionGaps?: { gap: string; severity: string }[] };
@@ -67,6 +68,7 @@ function App() {
   const [chatOpen, setChatOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [ideas, setIdeas] = React.useState<Idea[]>([]);
+  const [digest, setDigest] = React.useState<Digest | null>(null);
 
   const loadIdeas = React.useCallback(async () => { const r = await request<{ideas: Idea[]}>("/api/v1/ideas"); setIdeas(r.ideas); }, []);
 
@@ -96,7 +98,13 @@ function App() {
     window.history.replaceState(window.history.state, "", `${window.location.pathname}?project=${encodeURIComponent(id)}`);
     setSummary(result);
     setError("");
+    request<Digest>(`/api/v1/projects/${encodeURIComponent(id)}/digest`).then(setDigest).catch(() => {});
   }, [projectId]);
+
+  async function markSeen() {
+    try { await request(`/api/v1/projects/${encodeURIComponent(projectId)}/digest/seen`, { method: "POST", body: JSON.stringify({}) }); await loadProject(projectId); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not mark as seen."); }
+  }
 
   React.useEffect(() => {
     void (async () => {
@@ -257,7 +265,7 @@ function App() {
           : view === "issues" ? <IssuesPage issues={issues} phases={phases} busy={busy} act={actOnIssue} add={addIssue} demo={demo}/>
           : view === "memory" ? <MemoryPage memory={summary?.memory} alignment={summary?.alignment} onCorrect={() => setChatOpen(true)}/>
           : view === "activity" ? <div className="goal-scroll"><button className="back-link" onClick={() => setView("home")}>← Home</button><ActivityView items={summary?.activity || []} running={running.length} workItems={tasks}/></div>
-          : <Home goal={project.charter.goals.join(" ")} needs={needs} open={openQuestion} activePhase={activePhase} running={running} latest={summary?.activity || []} plan={planPhases} busy={busy} demo={demo} alignmentPending={alignmentPending} alignmentCompleted={alignmentCompleted} hasPhases={phases.length > 0} goPhases={() => setView("phases")} goActivity={() => setView("activity")} goAsk={() => setView("ask")}/>}
+          : <Home digest={digest} markSeen={() => void markSeen()} goal={project.charter.goals.join(" ")} needs={needs} open={openQuestion} activePhase={activePhase} running={running} latest={summary?.activity || []} plan={planPhases} busy={busy} demo={demo} alignmentPending={alignmentPending} alignmentCompleted={alignmentCompleted} hasPhases={phases.length > 0} goPhases={() => setView("phases")} goActivity={() => setView("activity")} goAsk={() => setView("ask")}/>}
       </div>
     </main>
     {chatOpen && project && <ChatDrawer projectId={project.projectId} onClose={() => setChatOpen(false)}/>}
@@ -295,12 +303,20 @@ function IdeasPage({ideas,busy,add,update,start,openProject}:{ideas:Idea[];busy:
   </div></div>;
 }
 
-function Home({goal,needs,open,activePhase,running,latest,plan,busy,demo,alignmentPending,alignmentCompleted,hasPhases,goPhases,goActivity,goAsk}:{goal:string;needs:Question[];open:(id:string)=>void;activePhase?:Phase;running:Work[];latest:Activity[];plan:()=>void;busy:boolean;demo:boolean;alignmentPending:boolean;alignmentCompleted:boolean;hasPhases:boolean;goPhases:()=>void;goActivity:()=>void;goAsk:()=>void}) {
+function Home({digest,markSeen,goal,needs,open,activePhase,running,latest,plan,busy,demo,alignmentPending,alignmentCompleted,hasPhases,goPhases,goActivity,goAsk}:{digest:Digest|null;markSeen:()=>void;goal:string;needs:Question[];open:(id:string)=>void;activePhase?:Phase;running:Work[];latest:Activity[];plan:()=>void;busy:boolean;demo:boolean;alignmentPending:boolean;alignmentCompleted:boolean;hasPhases:boolean;goPhases:()=>void;goActivity:()=>void;goAsk:()=>void}) {
   const pct = activePhase && activePhase.tasks.total ? Math.round(100 * activePhase.tasks.done / activePhase.tasks.total) : 0;
   const unmet = activePhase ? activePhase.assessment.filter((a) => !a.met).length : 0;
   const reports = latest.filter((a) => !/^(Committed |No files changed|The app stopped)/.test(a.text.trim()));  // housekeeping notes aren't news
   return <div className="home">
     {goal && <p className="home-goal">{goal}</p>}
+    {digest && !digest.empty && <section className="home-card digest" aria-labelledby="digest-title">
+      <h2 id="digest-title">Since you last looked</h2>
+      <p className="digest-headline">{digest.headline}</p>
+      {digest.finished.length > 0 && <ul className="latest-list">{digest.finished.slice(0, 6).map((f) => <li key={f.title + f.at}><div><b>{f.title}</b><time>{ago(f.at)}</time></div><span>{f.summary}</span></li>)}</ul>}
+      {digest.checks.failing.length > 0 && <p className="digest-warn">Failing checks: {digest.checks.failing.join(" · ")}</p>}
+      {digest.newIssues.length > 0 && <small>Logged: {digest.newIssues.slice(0, 4).map((i) => i.title).join(" · ")}</small>}
+      <div className="form-actions"><button className="button secondary" onClick={markSeen}>Mark as seen</button></div>
+    </section>}
     <section className={`home-card ${needs.length ? "needs" : ""}`} aria-labelledby="needs-title">
       <h2 id="needs-title">{needs.length ? `Needs you · ${needs.length}` : "Needs you"}</h2>
       {needs.length ? <>{needs.slice(0, 5).map((q) => <button key={q.questionId} className="needs-row" onClick={() => open(q.questionId)}><span className={`question-dot ${q.priority}`}/><span><b>{firstLine(q.questionText).slice(0, 140)}</b><small>{q.questionId.startsWith("question.phaseplan-") ? "Plan ready · accept it or tell the VP what to change" : q.questionId.startsWith("question.phase-") ? "Phase checkpoint · review what was built" : q.blocking ? "Needed to continue" : "When you have a moment"}</small></span><span aria-hidden="true">→</span></button>)}{needs.length > 5 && <button className="link-button" onClick={goAsk}>and {needs.length - 5} more</button>}</>
