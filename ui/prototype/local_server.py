@@ -41,6 +41,17 @@ BOARD_DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/board/draft$")
 ACTIVITY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/activity$")
 CHAT_HISTORY_PATH = re.compile(r"^/api/v1/projects/([^/]+)/chat/history$")
 CONVERSE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/conversation$")
+IDEAS_PATH = "/api/v1/ideas"
+IDEA_PATH = re.compile(r"^/api/v1/ideas/([^/]+)$")
+IDEA_START_PATH = re.compile(r"^/api/v1/ideas/([^/]+)/start$")
+DIGEST_PATH = re.compile(r"^/api/v1/projects/([^/]+)/digest(/seen)?$")
+ISSUES_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues$")
+ISSUE_PATH = re.compile(r"^/api/v1/projects/([^/]+)/issues/([^/]+)$")
+PHASES_PLAN_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/plan$")
+PHASE_DECISION_PATH = re.compile(r"^/api/v1/projects/([^/]+)/phases/([^/]+)/decision$")
+DATA_ROOTS_PATH = re.compile(r"^/api/v1/projects/([^/]+)/data-roots$")
+LOG_PATH = re.compile(r"^/api/v1/projects/([^/]+)/logs/([^/]+)$")
+DRAFT_PATH = re.compile(r"^/api/v1/projects/([^/]+)/inbox/([^/]+)/draft$")
 class LoopbackHTTPServer(ThreadingHTTPServer):
     """Always bind to IPv4 loopback; no CLI option permits another interface."""
 
@@ -177,6 +188,9 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/projects":
             self._run(lambda: self._send_json(200, {"items": self.runtime.list_projects()}))
             return
+        if path == IDEAS_PATH:
+            self._run(lambda: self._send_json(200, self.runtime.list_ideas()))
+            return
 
         chat_status_match = CHAT_STATUS_PATH.fullmatch(path)
         if chat_status_match:
@@ -184,6 +198,11 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
             self._run(lambda: self._send_json(200, self.runtime.chat_status(project_id)))
             return
 
+        digest_match = DIGEST_PATH.fullmatch(path)
+        if digest_match and not digest_match.group(2):
+            project_id = unquote(digest_match.group(1))
+            self._run(lambda: self._send_json(200, self.runtime.project_digest(project_id)))
+            return
         history_match = CHAT_HISTORY_PATH.fullmatch(path)
         if history_match:
             project_id = unquote(history_match.group(1))
@@ -271,6 +290,101 @@ class LocalDemoHandler(BaseHTTPRequestHandler):
                     raise ValueError("board drafting accepts an empty object")
                 self._send_json(201, self.runtime.draft_board(project_id))
             self._run(draft)
+            return
+        digest_seen = DIGEST_PATH.fullmatch(path)
+        if digest_seen and digest_seen.group(2):
+            project_id = unquote(digest_seen.group(1))
+            def seen() -> None:
+                if body:
+                    raise ValueError("marking as seen accepts an empty object")
+                self._send_json(200, self.runtime.mark_seen(project_id))
+            self._run(seen)
+            return
+        if path == IDEAS_PATH:
+            def add_idea() -> None:
+                try:
+                    self._send_json(201, self.runtime.add_idea(body))
+                except ValueError as exc:
+                    self._error(422, "invalid_idea", str(exc))
+            self._run(add_idea)
+            return
+        idea_start = IDEA_START_PATH.fullmatch(path)
+        if idea_start:
+            idea_id = unquote(idea_start.group(1))
+            def start() -> None:
+                if body:
+                    raise ValueError("starting an idea accepts an empty object")
+                self._send_json(201, self.runtime.start_idea(idea_id))
+            self._run(start)
+            return
+        idea_match = IDEA_PATH.fullmatch(path)
+        if idea_match:
+            idea_id = unquote(idea_match.group(1))
+            def update() -> None:
+                try:
+                    self._send_json(200, self.runtime.update_idea(idea_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_idea", str(exc))
+            self._run(update)
+            return
+        issues_match = ISSUES_PATH.fullmatch(path)
+        if issues_match:
+            project_id = unquote(issues_match.group(1))
+            def add() -> None:
+                try:
+                    self._send_json(201, self.runtime.add_issue(project_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_issue", str(exc))
+            self._run(add)
+            return
+        issue_match = ISSUE_PATH.fullmatch(path)
+        if issue_match:
+            project_id, issue_id = map(unquote, issue_match.groups())
+            def act() -> None:
+                try:
+                    self._send_json(200, self.runtime.act_on_issue(project_id, issue_id, body))
+                except ValueError as exc:
+                    self._error(422, "invalid_issue_action", str(exc))
+            self._run(act)
+            return
+        plan_match = PHASES_PLAN_PATH.fullmatch(path)
+        if plan_match:
+            project_id = unquote(plan_match.group(1))
+            def plan() -> None:
+                if body:
+                    raise ValueError("phase planning accepts an empty object")
+                self._send_json(201, self.runtime.plan_phases(project_id))
+            self._run(plan)
+            return
+        decision_match = PHASE_DECISION_PATH.fullmatch(path)
+        if decision_match:
+            project_id, phase_id = map(unquote, decision_match.groups())
+            self._run(lambda: self._send_json(200, self.runtime.decide_phase(project_id, phase_id, body)))
+            return
+        roots_match = DATA_ROOTS_PATH.fullmatch(path)
+        if roots_match:
+            project_id = unquote(roots_match.group(1))
+            def set_roots() -> None:
+                try:
+                    self._send_json(200, self.runtime.set_data_roots(project_id, body))
+                except ValueError as exc:  # these messages are written for the owner (e.g. "must be inside your home folder")
+                    self._error(422, "invalid_data_folder", str(exc))
+            self._run(set_roots)
+            return
+        log_match = LOG_PATH.fullmatch(path)
+        if log_match:
+            project_id, log_id = map(unquote, log_match.groups())
+            self._run(lambda: self._send_json(200, self.runtime.edit_log(project_id, log_id, body)))
+            return
+        draft_refresh = DRAFT_PATH.fullmatch(path)
+        if draft_refresh:
+            project_id, question_id = map(unquote, draft_refresh.groups())
+            def refresh() -> None:
+                if body:  # the owner editing the draft themselves
+                    self._send_json(200, self.runtime.set_draft(project_id, question_id, body))
+                    return
+                self._send_json(200, self.runtime.refresh_draft(project_id, question_id))
+            self._run(refresh)
             return
         converse_match = CONVERSE_PATH.fullmatch(path)
         if converse_match:

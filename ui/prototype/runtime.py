@@ -24,7 +24,11 @@ from harness.inbox import (
 from harness.projection import Projector
 from harness.project_application import ProjectApplication
 from .pi_chat import LocalModelChat, PiChatError, PiCodexChat
-from .vp import CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
+from .digest import LastSeen, build_digest
+from .ideas import IdeaStore
+from .issues import PREFIX as ISSUE_KINDS, active_issues
+from .phases import is_phase, phase_summaries
+from .vp import DataRoots, LOG_KINDS, active_logs, CHAT_WORK, CONVERSE_SYSTEM, LEARN_SYSTEM, REFRESH_SYSTEM, SUMMARY_SYSTEM, AutomationSettings, _json_object, project_memory, uncurated_notes, RepoChat, ProjectVP, VPError, default_runner, new_project_segments
 from .repository_inspection import RepositoryInspectionError, alignment_segments, inspect_repository
 
 
@@ -119,6 +123,9 @@ class PrototypeRuntime:
         self._chat_lock = threading.Lock()
         self._chat_timestamps: list[float] = []
         self.settings = AutomationSettings(Path(db_path).parent / "automation.json")
+        self.last_seen = LastSeen(Path(db_path).parent / "last_seen.json")
+        self.ideas = IdeaStore(Path(db_path).parent / "ideas.json")
+        self.data_roots = DataRoots(Path(db_path).parent / "data_roots.json", self.workspace_root)
         self.vp = ProjectVP(self, runner or default_runner(), self.settings)
         if self.chat_provider is None:
             self.chat_provider = RepoChat(self.vp, self._plain_chat)
@@ -163,13 +170,110 @@ class PrototypeRuntime:
 
         def draft() -> None:
             try:
-                self.vp.draft_board(project_id)
+                self.vp.phases.plan(project_id)  # the whole project as phases; the VP steers each one itself
             except Exception:
-                pass  # the owner can retry with "Draft board"
+                try:
+                    self.vp.draft_board(project_id)  # fall back to a flat board
+                except Exception:
+                    pass  # the owner can retry with "Plan phases" / "Draft board"
             finally:
                 self._drafting.discard(project_id)
 
         threading.Thread(target=draft, name="northstar-draft", daemon=True).start()
+
+    def plan_phases(self, project_id: str) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "board.draft")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project does not use the VP")
+        try:
+            return {"phases": self.vp.phases.plan(project_id)}
+        except VPError as exc:
+            raise ControlPlaneError(str(exc)) from exc
+
+    def project_digest(self, project_id: str) -> dict[str, Any]:
+        """What changed since the owner last looked (their own marker; first look = since the project began)."""
+        state, _events = self.project_application.get_project_snapshot(project_id)
+        return build_digest(state, self.activity(project_id, 400), self.last_seen.get(project_id))
+
+    def mark_seen(self, project_id: str) -> dict[str, Any]:
+        state, _events = self.project_application.get_project_snapshot(project_id)  # raises for an unknown project
+        self.last_seen.mark(project_id, datetime.now(timezone.utc).isoformat())
+        return {"seen": True}
+
+    # ---- ideas: things to build someday, escalated into projects on demand --------------------------
+    def list_ideas(self) -> dict[str, Any]:
+        return {"ideas": self.ideas.list()}
+
+    def add_idea(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request, dict) or not {"title"} <= set(request) <= {"title", "note"}:
+            raise ValueError("an idea needs a title and optionally a note")
+        return {"idea": self.ideas.add(request["title"], request.get("note", ""))}
+
+    def update_idea(self, idea_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {"idea": self.ideas.update(idea_id, request)}
+        except KeyError as exc:
+            raise InboxNotFound("idea was not found") from exc
+
+    def start_idea(self, idea_id: str) -> dict[str, Any]:
+        """Escalate an idea into a project: the owner's own words become the goal and the first logged detail."""
+        try:
+            idea = self.ideas.get(idea_id)
+        except KeyError as exc:
+            raise InboxNotFound("idea was not found") from exc
+        if idea["status"] != "idea":
+            raise ControlPlaneError("only an idea that has not been started or archived can become a project")
+        goal = (idea["note"].split("\n")[0].strip() if idea["note"] else "") or idea["title"]
+        project = self.create_project({"mode": "new", "name": idea["title"][:100], "goal": goal[:1000]})
+        if idea["note"]:  # keep everything they wrote, in full, so the interview and every agent start from it
+            work_id, thread_id = self._chat_target(project["projectId"], None)
+            self._save_logs(project["projectId"], work_id, thread_id, [{
+                "kind": "insight", "title": "The original idea: " + idea["title"][:90], "detail": idea["note"][:1500], "crucial": False}])
+        return {"project": project, "idea": self.ideas.mark_started(idea_id, project["projectId"])}
+
+    def add_issue(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner logs an issue, improvement or future direction themselves; it goes on the current (or last) phase."""
+        self.project_application._authorize(project_id, "work.create")
+        if not isinstance(request, dict) or not {"kind", "title"} <= set(request) <= {"kind", "title", "detail", "priority"}:
+            raise ValueError("an issue needs kind and title, and optionally detail and priority")
+        if request["kind"] not in ISSUE_KINDS:
+            raise ValueError("kind must be issue, improvement or direction")
+        for key, limit in (("title", 140), ("detail", 2000)):
+            if key in request and (not isinstance(request[key], str) or len(request[key].strip()) > limit):
+                raise ValueError(f"{key} must be at most {limit} characters")
+        if not isinstance(request["title"], str) or not request["title"].strip():
+            raise ValueError("title is required")
+        state = self.control.projector.replay(project_id)
+        phases = sorted((w for w in state["workItems"].values() if is_phase(w) and w["status"] != "cancelled"), key=lambda w: w["createdAt"])
+        current = (next((w for w in phases if w["status"] in {"running", "verifying"}), None)
+                   or next((w for w in phases if w["status"] in {"proposed", "ready"}), None) or (phases[-1] if phases else None))
+        if current is None:
+            raise ControlPlaneError("plan phases first: issues belong to a phase")
+        made = self.vp.phases.board.file(project_id, current["workId"], request["kind"], request["title"].strip(),
+                                         (request.get("detail") or request["title"]).strip(), priority=str(request.get("priority") or "medium").lower(), source="owner")
+        if made is None:
+            raise ControlPlaneError("that is already on the list, or this phase has too many open items")
+        return {"issue": next(i for i in active_issues(self.control.projector.replay(project_id)) if i["id"] == made["workId"])}
+
+    def act_on_issue(self, project_id: str, issue_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "work.approve")
+        if not isinstance(request, dict) or set(request) != {"action"} or not isinstance(request["action"], str):
+            raise ValueError("an issue action requires only an action")
+        try:
+            return {"issue": self.vp.phases.board.act(project_id, issue_id, request["action"])}
+        except KeyError as exc:
+            raise InboxNotFound("issue was not found") from exc
+
+    def decide_phase(self, project_id: str, phase_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner moves on from a phase (starting the next) or sends it back for more work, outside a checkpoint question."""
+        self.project_application._authorize(project_id, "work.approve")
+        if not isinstance(request, dict) or set(request) != {"moveOn"} or type(request["moveOn"]) is not bool:
+            raise ValueError("a phase decision requires only a boolean moveOn")
+        state = self.control.projector.replay(project_id)
+        if not phase_id.startswith("work.phase-") or phase_id not in state["workItems"]:
+            raise InboxNotFound("phase was not found")
+        self.vp.phases.decide(project_id, phase_id, request["moveOn"])
+        return {"phases": phase_summaries(self.control.projector.replay(project_id))}
 
     def draft_board(self, project_id: str) -> dict[str, Any]:
         self.project_application._authorize(project_id, "board.draft")
@@ -179,6 +283,14 @@ class PrototypeRuntime:
             return {"workItems": self.vp.draft_board(project_id)}
         except VPError as exc:
             raise ControlPlaneError(str(exc)) from exc
+
+    def set_data_roots(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.project_application._authorize(project_id, "automation.manage")
+        if not isinstance(request, dict) or set(request) != {"paths"}:
+            raise ValueError("data folders require only paths")
+        if project_id == PROJECT_ID:
+            raise ValueError("the synthetic demo project does not use local data")
+        return {"dataRoots": self.data_roots.set(project_id, request["paths"])}
 
     def automation(self, project_id: str) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
@@ -714,6 +826,7 @@ class PrototypeRuntime:
                 state = self.control.projector.replay(project_id)
                 reply = _json_object(self.vp.runner.think(LEARN_SYSTEM, json.dumps({
                     "currentMemory": project_memory(state), "recentTurns": recent, "ownerMessage": message[:4000]})))
+                self._save_logs(project_id, work_id, thread_id, self._clean_logs(reply.get("logs")))
                 notes = [n.strip()[:500] for n in (reply.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
                 for note in notes:
                     self.control.add_discussion_message(
@@ -761,7 +874,113 @@ class PrototypeRuntime:
 
     @staticmethod
     def _is_note(message: dict[str, Any]) -> bool:
-        return message["messageType"] == "evidence" and message["content"].startswith("NOTE: ")
+        """Notes and drafts are memory/state stored in the thread, not chat bubbles."""
+        content = message["content"]
+        return (message["messageType"] == "evidence" and content.startswith(("NOTE: ", "LOG: "))) or \
+            (message["messageType"] == "proposal" and content.startswith("DRAFT: ")) or \
+            (message["messageType"] == "revision" and content.startswith(("LOGEDIT: ", "LOGDEL: ")))
+
+    def _clean_logs(self, raw: Any) -> list[dict[str, Any]]:
+        out = []
+        for item in (raw if isinstance(raw, list) else [])[:15]:
+            if not isinstance(item, dict):
+                continue
+            title, detail = str(item.get("title") or "").strip()[:120], str(item.get("detail") or "").strip()[:1500]
+            if not title or not detail:
+                continue
+            kind = item.get("kind") if item.get("kind") in LOG_KINDS else "insight"
+            out.append({"kind": kind, "title": title, "detail": detail, "crucial": bool(item.get("crucial"))})
+        return out
+
+    def _save_logs(self, project_id: str, work_id: str, thread_id: str, logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        saved = []
+        for log in logs:
+            entry = {"id": "log-" + secrets.token_hex(5), **log}
+            self.control.add_discussion_message(
+                project_id, work_id, thread_id=thread_id, message_type="evidence", content="LOG: " + json.dumps(entry, ensure_ascii=False),
+                actor=DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+            saved.append(entry)
+        return saved
+
+    def edit_log(self, project_id: str, log_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner edits or removes one of the logs the VP took. Both are immutable events; nothing is erased."""
+        self.project_application._authorize(project_id, "inbox.answer")
+        if not isinstance(request, dict) or not request or set(request) - {"kind", "title", "detail", "crucial", "remove"}:
+            raise ValueError("log edit accepts kind, title, detail, crucial or remove")
+        state = self.control.projector.replay(project_id)
+        log = next((l for l in active_logs(state) if l["id"] == log_id), None)
+        if log is None:
+            raise InboxNotFound("log was not found")
+        both = [DEMO_USER["actorId"], DEMO_VP["actorId"]]
+        work_id = next(m["workId"] for m in state["messages"] if m["threadId"] == log["threadId"])
+        if request.get("remove") is True:
+            self.control.add_discussion_message(project_id, work_id, thread_id=log["threadId"], message_type="revision",
+                                                content="LOGDEL: " + log_id, actor=DEMO_USER, visible_to=both)
+            return {"removed": log_id}
+        changes = {}
+        if "kind" in request:
+            if request["kind"] not in LOG_KINDS:
+                raise ValueError("unknown log kind")
+            changes["kind"] = request["kind"]
+        for key, limit in (("title", 120), ("detail", 1500)):
+            if key in request:
+                if not isinstance(request[key], str) or not request[key].strip() or len(request[key].strip()) > limit:
+                    raise ValueError(f"{key} must contain 1 to {limit} characters")
+                changes[key] = request[key].strip()
+        if "crucial" in request:
+            if type(request["crucial"]) is not bool:
+                raise ValueError("crucial must be a boolean")
+            changes["crucial"] = request["crucial"]
+        if not changes:
+            raise ValueError("nothing to change")
+        self.control.add_discussion_message(project_id, work_id, thread_id=log["threadId"], message_type="revision",
+                                            content="LOGEDIT: " + json.dumps({"id": log_id, **changes}, ensure_ascii=False),
+                                            actor=DEMO_USER, visible_to=both)
+        return {"log": {**{k: log[k] for k in ("id", "kind", "title", "detail", "crucial")}, **changes, "edited": True}}
+
+    def _proposal(self, answer: Any, options: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not isinstance(answer, dict):
+            return None
+        option_ids = {o["optionId"] for o in options}
+        option_id = answer.get("selectedOptionId") if answer.get("selectedOptionId") in option_ids else None
+        label = next((o["label"] for o in options if o["optionId"] == option_id), None)
+        note = answer.get("text").strip()[:9000] if isinstance(answer.get("text"), str) else ""
+        text = "\n\nNote: ".join(part for part in (label, note) if part)
+        return {"text": text, "selectedOptionId": option_id} if text else None
+
+    def _latest_draft(self, project_id: str, thread_id: str) -> dict[str, Any] | None:
+        drafts = [m for m in self._thread(project_id, thread_id) if m["messageType"] == "proposal" and m["content"].startswith("DRAFT: ")]
+        try:
+            return json.loads(drafts[-1]["content"][len("DRAFT: "):]) if drafts else None
+        except ValueError:
+            return None
+
+    def _save_draft(self, project_id: str, work_id: str, thread_id: str, proposal: dict[str, Any], settled: bool,
+                    edited_by_owner: bool = False) -> None:
+        self.control.add_discussion_message(
+            project_id, work_id, thread_id=thread_id, message_type="proposal",
+            content="DRAFT: " + json.dumps({**proposal, "settled": settled, **({"editedByOwner": True} if edited_by_owner else {})}, ensure_ascii=False),
+            actor=DEMO_USER if edited_by_owner else DEMO_VP, visible_to=[DEMO_USER["actorId"], DEMO_VP["actorId"]])
+
+    def set_draft(self, project_id: str, question_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """The owner edits the draft themselves. It becomes the draft to record, and the VP must keep their wording."""
+        self.project_application._authorize(project_id, "inbox.answer")
+        if not isinstance(request, dict) or not {"text"} <= set(request) <= {"text", "selectedOptionId"}:
+            raise ValueError("editing requires text and optionally selectedOptionId")
+        text = request["text"]
+        if not isinstance(text, str) or not text.strip() or len(text) > 9_000:
+            raise ValueError("text must contain 1 to 9000 characters")
+        state = self.control.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None or question["status"] != "open":
+            raise ControlPlaneError("only an open question has a draft")
+        option_id = request.get("selectedOptionId")
+        if option_id is not None and option_id not in {o["optionId"] for o in question.get("options", [])}:
+            raise ValueError("selectedOptionId is not an option of this question")
+        work_id, thread_id = self._chat_target(project_id, question_id)
+        draft = {"text": text.strip(), "selectedOptionId": option_id}
+        self._save_draft(project_id, work_id, thread_id, draft, True, edited_by_owner=True)
+        return {"draft": {**draft, "settled": True, "editedByOwner": True}}
 
     def _chat_context(self, project_id: str, thread_id: str) -> tuple[str, list[dict[str, str]]]:
         """Bounded model context from the durable thread: latest saved summary plus the most recent turns."""
@@ -787,10 +1006,51 @@ class PrototypeRuntime:
             {"role": "user" if t["actor"]["role"] == "user" else "assistant", "content": t["content"][:2000]}
             for t in recent if t["content"].strip()]
 
+    def refresh_draft(self, project_id: str, question_id: str) -> dict[str, Any]:
+        """Rebuild the running draft from the saved discussion (e.g. when none was shown yet)."""
+        self.project_application._authorize(project_id, "inbox.answer")
+        state = self.control.projector.replay(project_id)
+        question = state["questions"].get(question_id)
+        if question is None or question["status"] != "open":
+            raise ControlPlaneError("only an open question has a draft")
+        if not self.vp.runner.available():
+            raise PiChatError("No model runner is available.")
+        work_id, thread_id = self._chat_target(project_id, question_id)
+        summary, turns = self._chat_context(project_id, thread_id)
+        if not any(t["role"] == "user" for t in turns):
+            return {"draft": None}
+        options = [{"optionId": o["optionId"], "label": o["label"]} for o in question.get("options", [])]
+        payload = json.dumps({"openQuestion": {"text": question["questionText"][:1500], "options": options},
+                              "earlierSummary": summary, "conversation": turns,
+                              "currentDraft": (self._latest_draft(project_id, thread_id) or {}).get("text"),
+                "draftWasEditedByOwner": bool((self._latest_draft(project_id, thread_id) or {}).get("editedByOwner")),
+                              "ownerMemory": project_memory(state)})
+        try:
+            data = _json_object(self.vp.runner.think(REFRESH_SYSTEM, payload))
+        except VPError:
+            return {"draft": None}
+        proposal = self._proposal(data.get("answer"), options)
+        if proposal is None:
+            return {"draft": None}
+        settled = bool(data.get("settled"))
+        self._save_draft(project_id, work_id, thread_id, proposal, settled)
+        return {"draft": {**proposal, "settled": settled}}
+
     def chat_history(self, project_id: str, question_id: str | None = None) -> dict[str, Any]:
         self.project_application._authorize(project_id, "project.read")
         thread_id = f"thread.chat.{question_id}" if question_id else "thread.chat.project"
-        return {"turns": [
+        draft = None
+        if question_id:
+            question = self.control.projector.replay(project_id)["questions"].get(question_id)
+            drafts = [m for m in self._thread(project_id, thread_id) if m["messageType"] == "proposal" and m["content"].startswith("DRAFT: ")]
+            if question and question["status"] == "open" and drafts:
+                try:
+                    draft = json.loads(drafts[-1]["content"][len("DRAFT: "):])
+                except ValueError:
+                    draft = None
+        logs = [{k: l.get(k) for k in ("id", "kind", "title", "detail", "crucial", "edited")}
+                for l in active_logs(self.control.projector.replay(project_id)) if l["threadId"] == thread_id]
+        return {"draft": draft, "logs": logs, "turns": [
             {"role": "user" if m["actor"]["role"] == "user" else "assistant", "content": m["content"], "at": m["occurredAt"]}
             for m in self._thread(project_id, thread_id) if not self._is_summary(m) and not self._is_note(m)]}
 
@@ -833,6 +1093,8 @@ class PrototypeRuntime:
             payload = {
                 "openQuestion": {"text": question["questionText"][:1500], "impact": question.get("impact", "")[:1500], "options": options},
                 "ownerMemory": project_memory(state), "earlierSummary": summary, "conversation": turns,
+                "currentDraft": (self._latest_draft(project_id, thread_id) or {}).get("text"),
+                "draftWasEditedByOwner": bool((self._latest_draft(project_id, thread_id) or {}).get("editedByOwner")),
                 "ownerDecisions": [{"q": q["questionText"][:300], "a": q.get("answer", {}).get("text", "")[:600]}
                                    for q in state["questions"].values() if q["status"] == "answered"][-12:],
                 "ownerMessage": message.strip(),
@@ -850,23 +1112,19 @@ class PrototypeRuntime:
             reply = data.get("reply") if isinstance(data.get("reply"), str) and data["reply"].strip() else "Understood."
             self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="status",
                                                 content=reply[:8000], actor=DEMO_VP, visible_to=both)
+            new_logs = self._save_logs(project_id, work_id, thread_id, self._clean_logs(data.get("logs")))
             learned = [n.strip()[:500] for n in (data.get("learned") or []) if isinstance(n, str) and n.strip()][:8]
             for note in learned:  # route anything useful back into project memory
                 self.control.add_discussion_message(project_id, work_id, thread_id=thread_id, message_type="evidence",
                                                     content="NOTE: " + note, actor=DEMO_VP, visible_to=both)
-            proposal = None
-            answer = data.get("answer") if data.get("intent") == "answer" and isinstance(data.get("answer"), dict) else None
-            if answer is not None:
-                option_ids = {o["optionId"] for o in options}
-                option_id = answer.get("selectedOptionId") if answer.get("selectedOptionId") in option_ids else None
-                label = next((o["label"] for o in options if o["optionId"] == option_id), None)
-                note = answer.get("text").strip()[:9000] if isinstance(answer.get("text"), str) else ""
-                text = "\n\nNote: ".join(part for part in (label, note) if part)
-                if text:
-                    proposal = {"text": text, "selectedOptionId": option_id}
+            settled = data.get("intent") == "answer"
+            proposal = self._proposal(data.get("answer"), options)
+            if proposal is not None:  # the running draft is always visible and survives a reload
+                self._save_draft(project_id, work_id, thread_id, proposal, settled)
             if len(uncurated_notes(self.control.projector.replay(project_id))) >= 6:
                 self._curate_soon(project_id)
-            return {"reply": reply, "proposedAnswer": proposal, "notesSaved": len(learned)}
+            return {"reply": reply, "proposedAnswer": proposal, "settled": settled and proposal is not None,
+                    "notesSaved": len(learned), "logs": new_logs}
         finally:
             self._chat_lock.release()
 
@@ -946,6 +1204,9 @@ class PrototypeRuntime:
             "recentEvents": recent_events,
             "alignment": alignment,
             "automation": self.automation(project_id),
+            "phases": phase_summaries(state),
+            "issues": [{k: v for k, v in i.items() if k != "revision"} for i in active_issues(state)][:200],
+            "dataRoots": self.data_roots.get(project_id),
             "memory": project_memory(state),
             "activity": self.activity(project_id, 15),
             "drafting": project_id in self._drafting,
@@ -1021,6 +1282,12 @@ class PrototypeRuntime:
                 charter = {**project["charter"], "goals": [goal_replacement]}
                 self.project_application.revise_project_charter(project_id, charter)
         self._advance_alignment_interview(project_id, question_id)
+        if question_id.startswith("question.vp-"):
+            self.vp.resume_waiting_on(project_id, question_id)
+        if question_id.startswith("question.phase-"):  # a phase checkpoint: start the next phase or reopen this one
+            self.vp.phases.on_checkpoint_answer(project_id, question_id, option_id)
+        if question_id.startswith("question.phaseplan-"):  # the plan: accept it, or reject it with what to change
+            self.vp.phases.on_plan_answer(project_id, question_id, option_id, text)
         self._curate_soon(project_id)
         return answered
 

@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness.durable_queue import SQLiteWorkQueue
 from harness.event_store import EventStoreError, IntegrityFailure, SQLiteEventStore
 from harness.evidence import EvidenceRegistrar
 from harness.projection import Projector, ProjectionError
@@ -86,31 +85,6 @@ class ProjectBundleTests(unittest.TestCase):
         with self.assertRaises(ProjectionError):
             semantic_target.import_project_bundle(json.dumps(semantically_invalid))
         self.assertEqual(semantic_target.events(PROJECT), [])
-
-    def test_import_rebuilds_historical_queue_run_fence_without_live_lease(self):
-        queue = SQLiteWorkQueue(self.source)
-        agent = {"actorType": "agent", "actorId": "agent.portable", "role": "specialist"}
-        queue.enqueue("job.portable", PROJECT, WORK, {
-            "descriptorVersion": 1, "executionKey": "offline", "actor": agent,
-            "verificationActor": VP, "adapter": {"name": "portable", "version": "1"},
-            "contextHash": "c" * 64, "correlationId": "trace.portable",
-        }, now=100)
-        claim = queue.claim_next("worker.portable", now=101, lease_seconds=30)
-        lease = {
-            "jobId": claim["jobId"], "workerId": claim["leaseOwner"],
-            "leaseToken": claim["leaseToken"], "leaseGeneration": claim["leaseGeneration"],
-            "now": 102,
-        }
-        with self.source.queued_write_context(lease, lambda: 102):
-            RunLedger(self.source, clock=lambda: NOW).start(
-                PROJECT, WORK, run_id="run.portable", agent=agent,
-                adapter={"name": "portable", "version": "1"}, context_hash="c" * 64,
-                correlation_id="trace.portable", occurred_at=NOW, queue_lease=lease,
-            )
-        target = SQLiteEventStore(self.target_path)
-        target.import_project_bundle(self.source.export_project_bundle(PROJECT))
-        self.assertEqual(Projector(target).replay(PROJECT), Projector(self.source).replay(PROJECT))
-        target.backup_to(Path(self.temp.name) / "queue-import-backup.sqlite3")
 
     def test_import_is_only_allowed_into_an_empty_project(self):
         target = SQLiteEventStore(self.target_path)

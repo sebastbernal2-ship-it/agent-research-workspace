@@ -441,6 +441,29 @@ store.append_many(json.loads(sys.argv[3]))
         with self.assertRaises(IntegrityFailure):
             self.store.verify("project.alpha")
 
+    def test_reads_verify_each_event_once_but_full_verify_and_rewritten_history_are_still_caught(self):
+        events = initial_events()
+        self.store.append(events[0])
+        self.assertEqual(len(self.store.verified_events("project.alpha")), 1)       # now cached
+        self.store.append(events[1])
+        self.assertEqual([e["sequence"] for e in self.store.verified_events("project.alpha")], [1, 2])  # only the new event is fetched
+        calls = []
+        original = self.store._validate
+        self.store._validate = lambda event: (calls.append(event["sequence"]), original(event))[1]
+        self.store.verified_events("project.alpha")
+        self.assertEqual(calls, [])                                         # nothing is re-validated on a plain read
+        self.store.verify("project.alpha")
+        self.assertEqual(calls, [1, 2])                                     # verify() always checks everything
+        conn = sqlite3.connect(self.path)
+        conn.execute("DROP TRIGGER canonical_events_no_update")
+        conn.execute("UPDATE canonical_events SET event_json=replace(event_json, 'Synthetic project', 'Altered project')")
+        conn.execute("UPDATE canonical_events SET record_hash=? WHERE sequence=2", (HASH,))   # history rewritten under the cache
+        conn.commit(); conn.close()
+        with self.assertRaises(IntegrityFailure):
+            self.store.verified_events("project.alpha")                             # the cached tail no longer matches the database
+        with self.assertRaises(IntegrityFailure):
+            self.store.verify("project.alpha")
+
     def test_verified_backup_restores_event_chain_and_content_addressed_blobs(self):
         for event in initial_events():
             self.store.append(event)
