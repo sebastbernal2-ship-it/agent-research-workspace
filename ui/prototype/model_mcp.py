@@ -8,7 +8,7 @@ for the model it calls (a pure text question), a prompt-size limit, a per-call t
 Declare it for a project with the integrations API::
 
     {"name": "model", "spec": {"kind": "mcp-stdio", "command": ["python3", "-m", "ui.prototype.model_mcp"],
-     "env": {"PYTHONPATH": "/path/to/agent-research-workspace", "NORTHSTAR_MODEL_KIND": "codex"},
+     "env": {"PYTHONPATH": "/path/to/agent-research-workspace", "NORTHSTAR_MODEL_KIND": "auto"},
      "description": "ask_model(prompt, system?): ask the operator's model a text question"}}
 """
 
@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .vp import CliRunner, VPError
+from .vp import CliRunner, VPError, default_runner
 
 MAX_PROMPT_CHARS = 60_000
 MAX_CALLS = int(os.environ.get("NORTHSTAR_MODEL_MAX_CALLS", "200"))
@@ -84,9 +84,10 @@ class ModelServer:
 
 def main() -> None:
     kind = os.environ.get("NORTHSTAR_MODEL_KIND", "codex")
-    if kind not in {"codex", "claude"}:
-        sys.exit("NORTHSTAR_MODEL_KIND must be codex or claude")
-    server = ModelServer(CliRunner(kind))
+    if kind not in {"codex", "claude", "auto"}:
+        sys.exit("NORTHSTAR_MODEL_KIND must be codex, claude or auto")
+    # auto: the operator's configured worker profiles in order, so a usage-limited account falls through to the next one
+    server = ModelServer(default_runner() if kind == "auto" else CliRunner(kind))
     for line in sys.stdin:
         try:
             message = json.loads(line)

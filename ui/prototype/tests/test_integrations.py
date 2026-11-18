@@ -355,5 +355,197 @@ class UsageLimitTests(VPBase):
         self.assertEqual(next(x["status"] for x in self.rt.control.projector.replay(self.pid)["workItems"].values() if x["title"] == "Genuinely broken"), "failed")  # real failures stay failed
 
 
+
+class AccountChainTests(unittest.TestCase):
+    def config(self, roles):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / "workers.json"
+        path.write_text(json.dumps({"profiles": {"codex_a": {"kind": "codex"}, "codex_b": {"kind": "codex", "env": {"CODEX_HOME": "/home/u/.codex-b"}},
+                                                  "claude": {"kind": "claude"}}, "roles": roles}))
+        return path
+
+    def test_a_role_can_name_an_ordered_chain_and_bad_chains_are_rejected(self):
+        profiles, roles = V.load_worker_config(self.config({"worker": ["codex_a", "codex_b", "claude"], "vp": "claude"}))
+        self.assertEqual(roles, {"worker": ["codex_a", "codex_b", "claude"], "vp": ["claude"]})
+        self.assertEqual(profiles["codex_b"].extra_env["CODEX_HOME"], "/home/u/.codex-b")      # a second Codex account is just another CODEX_HOME
+        for bad in ({"worker": []}, {"worker": ["nope"]}, {"worker": ["codex_a", 5]}, {"nobody": ["claude"]}):
+            with self.assertRaises(ValueError):
+                V.load_worker_config(self.config(bad))
+
+    def test_the_router_walks_the_chain_past_limited_accounts_and_back_when_they_recover(self):
+        profiles, roles = V.load_worker_config(self.config({"worker": ["codex_a", "codex_b", "claude"]}))
+        with mock.patch("shutil.which", return_value="/bin/x"):
+            for p in profiles.values():
+                p.executable = "/bin/x"
+            router = V.RoutedRunner(profiles, roles)
+            self.assertIs(router._pick("worker"), profiles["codex_a"])
+            profiles["codex_a"].limited_until = __import__("time").time() + 3600           # account A is out of quota
+            self.assertIs(router._pick("worker"), profiles["codex_b"])                      # account B takes over
+            profiles["codex_b"].limited_until = __import__("time").time() + 3600
+            self.assertIs(router._pick("worker"), profiles["claude"])                       # then Claude Code
+            self.assertEqual(router.limit_until(), 0.0)                                      # still usable: the project is not paused
+            profiles["claude"].limited_until = __import__("time").time() + 7200
+            self.assertFalse(router.available())                                             # everything limited: now it pauses
+            self.assertGreater(router.limit_until(), 0.0)
+            profiles["codex_a"].limited_until = 0.0
+            self.assertIs(router._pick("worker"), profiles["codex_a"])                      # back to the first account at its reset
+            self.assertEqual(router.describe()["worker"], "codex_a > codex_b > claude")
+
+    def test_the_model_tool_can_use_the_configured_chain(self):
+        from ui.prototype import model_mcp
+        root = str(Path(__file__).resolve().parents[3])
+        import subprocess, sys
+        path = self.config({"vp": ["codex_a", "claude"]})
+        done = subprocess.run([sys.executable, "-m", "ui.prototype.model_mcp"], input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n",
+                              capture_output=True, text=True, cwd=root, timeout=60,
+                              env={**os.environ, "NORTHSTAR_MODEL_KIND": "auto", "NORTHSTAR_WORKERS_CONFIG": str(path), "PYTHONPATH": root})
+        self.assertEqual(json.loads(done.stdout.splitlines()[0])["result"]["tools"][0]["name"], "ask_model")
+
+
+
+class PiAccountRotationTests(unittest.TestCase):
+    """The rotation is exercised with a fake `pi` and a fake account tool that follow the real contracts; no real credential is touched."""
+
+    FAKE_TOOL = """#!{py}
+import json, os, sys
+live = os.path.join(os.environ["FAKE_DIR"], "live")
+if sys.argv[1] == "list":
+    print(json.dumps({{"ok": True, "live_name": open(live).read().strip()}}))
+elif sys.argv[1] == "use":
+    open(live, "w").write(sys.argv[2]); open(os.path.join(os.environ["FAKE_DIR"], "uses"), "a").write(sys.argv[2] + "\\n")
+    print(json.dumps({{"ok": True, "active": sys.argv[2]}}))
+"""
+    FAKE_PI = """#!{py}
+import os, sys
+base = os.path.dirname(os.environ["PI_CODING_AGENT_DIR"])
+live = open(os.path.join(base, "live")).read().strip()
+open(os.path.join(base, "calls"), "a").write(live + "\\n")
+spent = open(os.path.join(base, "spent")).read().strip().split(",") if os.path.exists(os.path.join(base, "spent")) else []
+if live in spent:
+    print("Codex error: The usage limit has been reached", file=sys.stderr); sys.exit(1)
+print("answer-from-" + live)
+"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name)
+        for name, body in (("tool", self.FAKE_TOOL), ("pi", self.FAKE_PI)):
+            path = self.dir / name
+            path.write_text(body.format(py=__import__("sys").executable))
+            path.chmod(0o755)
+        (self.dir / "live").write_text("current")
+        (self.dir / "agent").mkdir()
+        (self.dir / "agent" / "auth.json").write_text("{}")
+        self.patch = mock.patch.dict(os.environ, {"FAKE_DIR": str(self.dir)})
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def runner(self, rotation=True, now=None):
+        from ui.prototype.accounts import AccountRotation
+        rot = AccountRotation(self.dir / "tool", ["current", "roy", "sean"], state_path=self.dir / "blocks.json", **({"clock": now} if now else {})) if rotation else None
+        pi = V.PiRunner(agent_dir=self.dir / "agent", rotation=rot)
+        pi.executable = str(self.dir / "pi")
+        return pi, rot
+
+    def spend(self, *names):
+        (self.dir / "spent").write_text(",".join(names))
+
+    def uses(self):
+        path = self.dir / "uses"
+        return path.read_text().split() if path.exists() else []
+
+    def test_a_spent_account_rotates_to_the_next_then_stays_there_and_remembers_across_restarts(self):
+        self.spend("current")
+        pi, rot = self.runner()
+        self.assertEqual(pi.think("s", "p"), "answer-from-roy")          # current is spent: the tool switched to roy and the call was retried
+        self.assertEqual(self.uses(), ["roy"])
+        self.assertEqual(pi.think("s", "p"), "answer-from-roy")          # no more switching while roy works
+        self.assertEqual(self.uses(), ["roy"])
+        self.assertTrue(rot.is_blocked("current"))
+        again, _ = self.runner()                                          # a restarted process knows current is spent: no churn back
+        self.assertTrue(again.rotation.is_blocked("current"))
+        self.assertEqual(again.think("s", "p"), "answer-from-roy")
+        self.assertEqual(self.uses(), ["roy"])
+
+    def test_every_account_spent_pauses_until_the_earliest_reset_and_the_limit_lifts_by_itself(self):
+        self.spend("current", "roy", "sean")
+        clock = {"t": 1_000_000.0}
+        pi, rot = self.runner(now=lambda: clock["t"])
+        with mock.patch("ui.prototype.vp.time.time", lambda: clock["t"]):
+            with self.assertRaises(V.UsageLimit) as caught:
+                pi.think("s", "p")
+            self.assertEqual(self.uses(), ["roy", "sean"])                # it tried the others before giving up
+            self.assertFalse(pi.available())
+            self.assertGreater(caught.exception.until, clock["t"])
+            calls_before = len((self.dir / "calls").read_text().split())
+            with self.assertRaises(V.UsageLimit):
+                pi.think("s", "p")
+            self.assertEqual(len((self.dir / "calls").read_text().split()), calls_before)   # no calls are spent while everything is blocked
+            clock["t"] += 7300                                            # the default block has passed
+            self.spend()
+            self.assertTrue(pi.available())
+
+    def test_without_a_rotation_a_limit_just_pauses_the_profile(self):
+        self.spend("current")
+        pi, _ = self.runner(rotation=False)
+        with self.assertRaises(V.UsageLimit):
+            pi.think("s", "p")
+        self.assertFalse(pi.available())
+        self.assertEqual(self.uses(), [])                                 # nothing was ever switched
+
+    def test_the_config_loader_builds_a_pi_profile_and_rejects_bad_rotations(self):
+        cfg = self.dir / "workers.json"
+        good = {"profiles": {"pi": {"kind": "pi", "rotation": ["current", "roy"], "accountCli": str(self.dir / "tool")}, "claude": {"kind": "claude"}},
+                "roles": {"worker": ["pi", "claude"]}}
+        cfg.write_text(json.dumps(good))
+        profiles, roles = V.load_worker_config(cfg)
+        self.assertEqual(profiles["pi"].rotation.names, ["current", "roy"])
+        self.assertEqual(roles["worker"], ["pi", "claude"])
+        for bad in ({"kind": "pi", "rotation": ["current"]}, {"kind": "pi", "rotation": "roy", "accountCli": "/x"},
+                    {"kind": "pi", "rotation": ["Bad Name"], "accountCli": "/x"}, {"kind": "pi", "rotation": ["a"], "accountCli": "relative"}):
+            cfg.write_text(json.dumps({"profiles": {"pi": bad}}))
+            with self.assertRaises(ValueError):
+                V.load_worker_config(cfg)
+
+    def test_the_router_uses_pi_for_plain_calls_but_keeps_mcp_integrations_on_a_harness_that_supports_them(self):
+        pi, _ = self.runner()
+        claude = V.CliRunner("claude")
+        codex = V.CliRunner("codex")
+        for c in (claude, codex):
+            c.executable = "/bin/x"
+        codex.limited_until = __import__("time").time() + 3600            # codex is spent
+        router = V.RoutedRunner({"codex": codex, "pi": pi, "claude": claude}, {"worker": ["codex", "pi", "claude"]})
+        self.assertIs(router._pick("worker"), pi)                           # first available in the chain
+        self.assertIs(router._pick("worker", need="mcp"), claude)           # pi cannot carry MCP tools: claude can
+        self.assertIs(router._pick("worker", need="explore"), claude)
+
+    def test_a_call_that_hits_a_limit_moves_to_the_next_profile_immediately(self):
+        class Fake:
+            def __init__(self, name, spent=False):
+                self.name, self.spent, self.executable, self.limited_until, self.calls = name, spent, "/x", 0.0, 0
+
+            def available(self):
+                return self.limited_until < __import__("time").time()
+
+            def think(self, system, payload):
+                self.calls += 1
+                if self.spent:
+                    self.limited_until = __import__("time").time() + 3600
+                    raise V.UsageLimit("limit", self.limited_until)
+                return self.name
+
+        a, b = Fake("a", spent=True), Fake("b")
+        router = V.RoutedRunner({"a": a, "b": b}, {"vp": ["a", "b"]})
+        self.assertEqual(router.think("sys", "p"), "b")                     # a hit its limit mid-call; b answered in the same call
+        self.assertEqual((a.calls, b.calls), (1, 1))
+        self.assertEqual(router.think("sys", "p"), "b")
+        self.assertEqual(a.calls, 1)                                          # a is not tried again while limited
+        b.spent = True
+        with self.assertRaises(V.UsageLimit):
+            router.think("sys", "p")                                          # nothing left: the scheduler pauses
+
+
 if __name__ == "__main__":
     unittest.main()

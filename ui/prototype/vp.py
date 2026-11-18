@@ -120,12 +120,13 @@ _RESET_AT = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AP]M)", re.I)
 DEFAULT_LIMIT_PAUSE = 1800  # seconds, when the CLI does not say when the limit resets
 
 
-def limit_reset_time(text: str, now: float | None = None) -> float:
-    """Epoch seconds when a usage limit lifts: the CLI's own 'try again at 3:50 PM' (local time), else a default pause."""
+def limit_reset_time(text: str, now: float | None = None, default: float | None = None) -> float:
+    """Epoch seconds when a usage limit lifts: the CLI's own 'try again at 3:50 PM' (local time), else a default pause
+    (``default`` when given, where 0.0 means 'unknown': the caller picks its own)."""
     now = time.time() if now is None else now
     m = _RESET_AT.search(text)
     if not m:
-        return now + DEFAULT_LIMIT_PAUSE
+        return default if default is not None else now + DEFAULT_LIMIT_PAUSE
     hour, minute = int(m.group(1)) % 12 + (12 if m.group(3).upper() == "PM" else 0), int(m.group(2))
     local = datetime.fromtimestamp(now).replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
     when = local.timestamp() + 60  # a minute past the stated time
@@ -141,18 +142,51 @@ class ModelRunner(Protocol):
 class PiRunner:
     """Runs the local Pi CLI with the owner's existing sign-in. Credentials stay in Pi's store."""
 
+    kind = "pi"
+    supports_sessions = False
+
     def __init__(self, *, model: str = "gpt-6-luna", agent_dir: str | Path | None = None,
-                 think_timeout: float = 120, work_timeout: float = 900):
+                 think_timeout: float = 120, work_timeout: float = 900, rotation: Any = None):
+        self.rotation = rotation  # an AccountRotation: switch to the next account when this one is out of quota
+        self._limited_until = 0.0
         self.executable = os.environ.get("PI_CLI_PATH") or shutil.which("pi")
         self.model, self.think_timeout, self.work_timeout = model, think_timeout, work_timeout
         configured = agent_dir or os.environ.get("PI_CODING_AGENT_DIR")
         self.agent_dir = Path(configured).expanduser() if configured else Path.home() / ".pi" / "agent"
 
+    @property
+    def limited_until(self) -> float:
+        return self.rotation.earliest_unblock() if self.rotation else self._limited_until
+
+    @limited_until.setter
+    def limited_until(self, value: float) -> None:
+        self._limited_until = value
+
+    def limited(self) -> bool:
+        return time.time() < self.limited_until
+
     def available(self) -> bool:
-        return bool(self.executable and (self.agent_dir / "auth.json").is_file())
+        return bool(self.executable and (self.agent_dir / "auth.json").is_file()) and not self.limited()
 
     def _run(self, flags: list[str], system: str, prompt: str, cwd: Path, timeout: float, limit: int) -> str:
-        if not self.available():
+        if self.limited():
+            raise UsageLimit("Every configured Pi account is out of quota.", self.limited_until)
+        while True:
+            try:
+                return self._run_once(flags, system, prompt, cwd, timeout, limit)
+            except UsageLimit as exc:
+                if self.rotation is None:
+                    now = time.time()
+                    self.limited_until = exc.until if exc.until > now else now + DEFAULT_LIMIT_PAUSE  # unknown reset: the default pause
+                    raise UsageLimit(str(exc), self.limited_until) from exc
+                name = self.rotation.live_name()
+                self.rotation.block(name, exc.until)  # this account is spent until its reset
+                nxt = self.rotation.next_available(exclude=name)
+                if nxt is None or not self.rotation.switch(nxt):
+                    raise UsageLimit("Every configured Pi account is out of quota.", self.rotation.earliest_unblock() or exc.until) from exc
+
+    def _run_once(self, flags: list[str], system: str, prompt: str, cwd: Path, timeout: float, limit: int) -> str:
+        if not (self.executable and (self.agent_dir / "auth.json").is_file()):
             raise VPError("Pi is not signed in to OpenAI Codex on this machine.")
         env = {
             "PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home()),
@@ -174,6 +208,9 @@ class PiRunner:
         except (BoundedProcessOutputLimit, BoundedProcessError, OSError) as exc:
             raise VPError("The model process could not complete the request.") from exc
         if result.returncode != 0:
+            output = (result.stderr + result.stdout).decode("utf-8", errors="replace")
+            if _USAGE_LIMIT.search(output):
+                raise UsageLimit("Pi's Codex account usage limit was reached.", limit_reset_time(output, default=0.0))
             raise VPError("Pi could not complete the request. Check its Codex sign-in.")
         text = result.stdout.decode("utf-8", errors="replace").strip()
         if not text:
@@ -247,6 +284,8 @@ class CliRunner:
         return env
 
     limited_until = 0.0  # epoch seconds until which this account's usage limit is known to be exhausted
+    supports_mcp = True
+    supports_explore = True
 
     def limited(self) -> bool:
         return time.time() < self.limited_until
@@ -408,10 +447,22 @@ def load_worker_config(path: Path) -> tuple[dict[str, CliRunner], dict[str, str]
             raise ValueError(f"profile {name}: env may only set ANTHROPIC_/CLAUDE_CODE_/OPENAI_/CODEX_ variables")
         if any(not _PROFILE_ENV_KEY.fullmatch(k) or not isinstance(v, str) or not _ENV_NAME.fullmatch(v) for k, v in secret.items()):
             raise ValueError(f"profile {name}: secretEnv must map a provider variable to the NAME of an environment variable")
+        if spec.get("kind") == "pi":
+            # Pi with the operator's own account rotation (their `codex-account` tool switches the live account when one is spent)
+            from .accounts import AccountRotation
+            rotation = None
+            if spec.get("rotation"):
+                if not isinstance(spec.get("accountCli"), str) or not isinstance(spec["rotation"], list):
+                    raise ValueError(f"profile {name}: rotation needs accountCli (absolute path) and a list of account names")
+                rotation = AccountRotation(Path(spec["accountCli"]), spec["rotation"], state_path=path.parent / f"{name}-account-blocks.json")
+            profiles[name] = PiRunner(model=str(spec.get("model") or "gpt-6-luna"), rotation=rotation)
+            continue
         profiles[name] = CliRunner(spec.get("kind", ""), env=env, secret_env=secret)
-    roles = {r: n for r, n in (data.get("roles") or {}).items()}
-    if any(r not in ROLES or n not in profiles for r, n in roles.items()):
-        raise ValueError(f"roles must be a subset of {ROLES} and name existing profiles")
+    # A role maps to one profile or to an ordered chain of profiles: the first one that is available (signed in, not
+    # usage-limited) is used, so an exhausted account falls through to the next one.
+    roles = {r: ([n] if isinstance(n, str) else n) for r, n in (data.get("roles") or {}).items()}
+    if any(r not in ROLES or not isinstance(chain, list) or not chain or any(n not in profiles for n in chain) for r, chain in roles.items()):
+        raise ValueError(f"roles must be a subset of {ROLES} and name existing profiles (one name or an ordered list)")
     return profiles, roles
 
 
@@ -430,11 +481,14 @@ class RoutedRunner:
         except ImportError:
             pass
 
-    def _pick(self, role: str) -> CliRunner:
-        chosen = self.profiles.get(self.roles.get(role, ""))
-        if chosen is not None and chosen.available():
-            return chosen
-        for profile in self.profiles.values():
+    def _pick(self, role: str, need: str | None = None) -> CliRunner:
+        """The first available profile in the role's chain, then any available one. ``need`` names a capability
+        ('mcp' or 'explore') the profile must have; a profile without it is only used when nothing else is available."""
+        chain = self.roles.get(role, [])
+        ordered = [self.profiles[n] for n in ([chain] if isinstance(chain, str) else chain) if n in self.profiles]
+        ordered += [p for p in self.profiles.values() if p not in ordered]
+        capable = [p for p in ordered if need is None or getattr(p, f"supports_{need}", False)]
+        for profile in [*capable, *[p for p in ordered if p not in capable]]:
             if profile.available():
                 return profile
         raise VPError("No configured worker profile is available (is the CLI installed and the API key variable set?).")
@@ -447,24 +501,41 @@ class RoutedRunner:
         times = [getattr(p, "limited_until", 0.0) for p in self.profiles.values() if getattr(p, "executable", None)]
         return min(times) if times and all(time.time() < t for t in times) else 0.0
 
+    def _attempt(self, role: str, need: str | None, call: Any) -> str:
+        """Run ``call(profile)`` on the first available profile; if that profile's usage limit is hit, the next one in the
+        chain is tried at once (the spent profile is now unavailable). Raises UsageLimit only when none is left."""
+        last: UsageLimit | None = None
+        for _ in range(len(self.profiles) + 1):
+            try:
+                profile = self._pick(role, need)
+            except VPError:
+                if last is not None:
+                    raise last
+                raise
+            try:
+                return call(profile)
+            except UsageLimit as exc:
+                last = exc
+        raise last or VPError("No configured worker profile is available.")
+
     def think(self, system: str, payload: str) -> str:
-        return self._pick(self._by_system.get(system, "vp")).think(system, payload)
+        return self._attempt(self._by_system.get(system, "vp"), None, lambda p: p.think(system, payload))
 
     @property
     def supports_sessions(self) -> bool:
         return any(getattr(p, "supports_sessions", False) for p in self.profiles.values())
 
     def work(self, system: str, prompt: str, cwd: Path, session: str | None = None, mcp: dict[str, Any] | None = None) -> str:
-        chosen = self._pick("worker")
-        extra = {"mcp": mcp} if mcp else {}
-        return chosen.work(system, prompt, cwd, session=session, **extra) if getattr(chosen, "supports_sessions", False) else chosen.work(system, prompt, cwd, **extra)
+        def call(chosen: Any) -> str:
+            extra = {"mcp": mcp} if mcp and getattr(chosen, "supports_mcp", False) else {}
+            return chosen.work(system, prompt, cwd, session=session, **extra) if getattr(chosen, "supports_sessions", False) else chosen.work(system, prompt, cwd, **extra)
+        return self._attempt("worker", "mcp" if mcp else None, call)
 
     def explore(self, system: str, prompt: str, cwd: Path) -> str:
-        role = self._by_system.get(system, "vp")
-        return self._pick(role).explore(system, prompt, cwd)
+        return self._attempt(self._by_system.get(system, "vp"), "explore", lambda p: p.explore(system, prompt, cwd))
 
     def describe(self) -> dict[str, str]:
-        return {role: self.roles.get(role, "(any available)") for role in ROLES}
+        return {role: " > ".join(self.roles[role]) if self.roles.get(role) else "(any available)" for role in ROLES}
 
 
 def default_runner() -> ModelRunner:
