@@ -93,6 +93,9 @@ PHASE_REVIEW_SYSTEM = (
     "Inspect the ACTUAL outputs: read the files in the workspace and sample the data they were built from. Judge them "
     "against (1) the phase's exit criteria and (2) the owner's vision, priorities and crucial points in ownerMemory. "
     "Be concrete: open real files, check real samples, run what you can. A good-looking summary is not evidence. "
+    "executableChecks are checks the harness itself just ran in the work directory (passed true/false, with output): treat them "
+    "as ground truth for what they cover. You usually cannot run tests yourself, so do NOT report a test result as unverifiable "
+    "when a passing executable check covers it; instead judge whether the checks are meaningful or too weak or trivial for the criteria. "
     'Reply with JSON only: {"verdict":"pass|gaps","gaps":[{"title":"...","detail":"what is wrong, with the file or '
     'sample you checked","severity":"blocking|important|minor"}],"summary":"one honest paragraph"}. '
     "'blocking' = the owner would reject this phase as done; use it only when true. Never invent problems, and never "
@@ -390,7 +393,7 @@ class PhasePlanner:
             blocking = blocking + [f"Executable check '{r['id']}' fails: {r['criterion']}. Output: {r['output'][-300:]}" for r in failing[:3]]
         review = None
         if status == "complete" and sum(1 for r in records if r.get("reviewed")) < MAX_REVIEWS_PER_PHASE:
-            review = self._review_phase(project_id, phase, state)  # a second, skeptical opinion that inspects the real outputs
+            review = self._review_phase(project_id, phase, state, check_results)  # a second, skeptical opinion that inspects the real outputs
             if review is not None and review["blocking"]:
                 status, blocking = "continue", blocking + review["blocking"]
         known = {w["workId"]: w["workId"] for w in tasks}
@@ -415,7 +418,8 @@ class PhasePlanner:
                   "newTasks": [w["title"] for w in new_tasks], "filed": filed, "at": datetime.now(timezone.utc).isoformat()}
         self._record(project_id, pid, record)
         if status == "complete":
-            self._complete_phase(project_id, phase, assessment, caveats, review["summary"] if review else "")
+            earlier = next((r["reviewSummary"] for r in reversed(records) if r.get("reviewSummary")), "")  # reviews are capped per phase
+            self._complete_phase(project_id, phase, assessment, caveats, review["summary"] if review else earlier)
         elif status == "needs_owner":
             self._ask_owner(project_id, phase, _clip(reply.get("ownerQuestion"), 1500) or "I need a decision from you to finish this phase.")
         elif not new_tasks:
@@ -436,13 +440,16 @@ class PhasePlanner:
                 out.append({"gap": _clip(g["gap"], 500), "severity": g.get("severity") if g.get("severity") in {"blocking", "important", "minor"} else "minor"})
         return out
 
-    def _review_phase(self, project_id: str, phase: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+    def _review_phase(self, project_id: str, phase: dict[str, Any], state: dict[str, Any],
+                      check_results: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
         """An independent reviewer that sees the vision and the criteria but none of the VP's claims, and checks real outputs."""
         items = state["workItems"]
         payload = {
             "phase": {"title": phase["title"], "goal": phase["objective"], "exitCriteria": phase["acceptanceCriteria"]},
             "tasksDone": [{"title": w["title"], "objective": w["objective"][:300]} for w in items.values()
                           if phase_of(items, w["workId"]) == phase["workId"] and not is_phase(w) and not is_issue(w) and w["status"] == "completed"],
+            "executableChecks": [{"id": r["id"], "criterion": r["criterion"], "command": r.get("command"), "passed": r["passed"], "outputTail": r["output"][-400:]}
+                                 for r in (check_results or [])],
             "owner": self.vp._context(state),
         }
         reply = None
