@@ -166,5 +166,49 @@ class ProjectDataDirTests(VPBase):
         self.assertIn("dataDir", V.WORKER_SYSTEM)
 
 
+
+class FastFailureRetryTests(unittest.TestCase):
+    def _runner(self, results, elapsed=1.0):
+        runner = V.CliRunner("codex")
+        runner.executable = "/bin/codex"
+        calls = []
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+            return results.pop(0)
+
+        clock = iter(x * elapsed for x in range(0, 100))
+        return runner, calls, fake, clock
+
+    def _result(self, code, out=b"", err=b""):
+        return mock.Mock(returncode=code, stdout=out, stderr=err)
+
+    def test_a_fast_failure_is_retried_with_pauses_and_succeeds(self):
+        runner, calls, fake, clock = self._runner([self._result(1, err=b"usage limit"), self._result(1), self._result(0, b"done")])
+        with mock.patch("ui.prototype.vp.run_bounded_subprocess", fake), mock.patch("ui.prototype.vp.time.sleep") as sleep, \
+                mock.patch("ui.prototype.vp.time.monotonic", lambda: next(clock)):
+            self.assertEqual(runner._run(["exec"], "p", Path("."), 5), b"done")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [15, 45])
+
+    def test_persistent_fast_failure_raises_with_the_real_error_tail(self):
+        runner, calls, fake, clock = self._runner([self._result(1, err=b"ERROR: You've hit your usage limit.")] * 3)
+        with mock.patch("ui.prototype.vp.run_bounded_subprocess", fake), mock.patch("ui.prototype.vp.time.sleep"), \
+                mock.patch("ui.prototype.vp.time.monotonic", lambda: next(clock)):
+            with self.assertRaises(V.VPError) as caught:
+                runner._run(["exec"], "p", Path("."), 5)
+        self.assertIn("usage limit", str(caught.exception))
+        self.assertEqual(len(calls), 3)
+
+    def test_a_failure_after_long_work_is_not_retried(self):
+        runner, calls, fake, clock = self._runner([self._result(2, err=b"crashed")], elapsed=600)
+        with mock.patch("ui.prototype.vp.run_bounded_subprocess", fake), mock.patch("ui.prototype.vp.time.sleep") as sleep, \
+                mock.patch("ui.prototype.vp.time.monotonic", lambda: next(clock)):
+            with self.assertRaises(V.VPError):
+                runner._run(["exec"], "p", Path("."), 5)
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

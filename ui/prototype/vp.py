@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -220,21 +221,34 @@ class CliRunner:
         env.update({target: os.environ[src] for target, src in self.secret_env.items() if src in os.environ})
         return env
 
+    FAST_FAILURE_SECONDS = 90
+    RETRY_PAUSES = (15, 45)  # seconds before the second and third attempt of a fast-failing call
+
     def _run(self, args: list[str], prompt: str, cwd: Path, timeout: float) -> bytes:
         if not self.executable:
             raise VPError(f"The {self.kind} CLI is not installed.")
-        try:
-            result = run_bounded_subprocess([self.executable, *args], input_bytes=prompt.encode(), cwd=cwd,
-                                            env=self._env(), timeout=timeout, stdout_limit=2 * 1024 * 1024, stderr_limit=8 * 1024 * 1024)
-        except BoundedProcessTimeout as exc:
-            raise VPError("The model call timed out.") from exc
-        except BoundedProcessOutputLimit as exc:
-            raise VPError("The model produced more output than the safety limit allows.") from exc
-        except (BoundedProcessError, OSError) as exc:
-            raise VPError(f"The model process could not start or crashed ({type(exc).__name__}).") from exc
-        if result.returncode != 0:
-            raise VPError(f"The {self.kind} CLI failed; check that it is signed in.")
-        return result.stdout
+        result, attempt = None, 0
+        while True:
+            started = time.monotonic()
+            try:
+                result = run_bounded_subprocess([self.executable, *args], input_bytes=prompt.encode(), cwd=cwd,
+                                                env=self._env(), timeout=timeout, stdout_limit=2 * 1024 * 1024, stderr_limit=8 * 1024 * 1024)
+            except BoundedProcessTimeout as exc:
+                raise VPError("The model call timed out.") from exc
+            except BoundedProcessOutputLimit as exc:
+                raise VPError("The model produced more output than the safety limit allows.") from exc
+            except (BoundedProcessError, OSError) as exc:
+                raise VPError(f"The model process could not start or crashed ({type(exc).__name__}).") from exc
+            if result.returncode == 0:
+                return result.stdout
+            # A call that fails within seconds is an outage, a limit or a sign-in blip, not bad work: pause and retry it.
+            # A failure after long work is not retried (that would repeat a long task).
+            if time.monotonic() - started < self.FAST_FAILURE_SECONDS and attempt < len(self.RETRY_PAUSES):
+                time.sleep(self.RETRY_PAUSES[attempt])
+                attempt += 1
+                continue
+            tail = " ".join((getattr(result, "stderr", b"") or b"").decode("utf-8", "replace").split())[-300:]
+            raise VPError(f"The {self.kind} CLI failed" + (f" ({tail})" if tail else "; check that it is signed in") + ".")
 
     def _ask(self, system: str, prompt: str, cwd: Path, *, mode: str, timeout: float, session: str | None = None,
              mcp: dict[str, Any] | None = None) -> str:
