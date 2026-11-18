@@ -74,7 +74,9 @@ WORKER_SYSTEM = (
     "You are a senior engineer-researcher doing one task for a project, inside that project's workspace directory, with "
     "your full toolset (shell, files, web search, package installs). Stay in this directory for the work, never "
     "modify, move or delete anything outside it, and never perform irreversible external actions. Create and edit "
-    "files only with RELATIVE paths inside the current working directory (never your home directory or absolute paths elsewhere). Install what you "
+    "files only with RELATIVE paths inside the current working directory (never your home directory or absolute paths elsewhere), with ONE exception: "
+    "payload.dataDir is the project's data folder, outside the repository, for large downloads, models, datasets and virtual environments "
+    "(use it for anything big or regenerable, and never commit its contents; record file names, sizes and hashes in the repo instead). Install what you "
     "need into a local virtual environment inside the workspace. When your work satisfies an exit criterion, REGISTER A RUNNABLE CHECK for it: "
     "add it to .northstar/checks.json as {\"checks\": [{\"id\": \"short-id\", \"criterion\": \"the criterion in words\", \"command\": [\"python3\", \"-m\", \"unittest\", \"-q\"]}]} "
     "(an argv list, no shell string; it must exit 0 only when the criterion truly holds, be deterministic, finish within 3 minutes, and test real behaviour, "
@@ -261,7 +263,8 @@ class CliRunner:
             args = ["-p", "--output-format", "json", "--append-system-prompt", system]
             try:  # extra folders the project lists (read-only data, the context files): Claude Code's native flag
                 payload = json.loads(prompt)
-                folders = list(payload.get("readOnlyDataRoots") or [])[:5] + ([payload["contextDir"]] if payload.get("contextDir") else [])
+                folders = (list(payload.get("readOnlyDataRoots") or [])[:5] + ([payload["contextDir"]] if payload.get("contextDir") else [])
+                           + ([payload["dataDir"]] if mode == "write" and payload.get("dataDir") else []))
                 for root in folders:
                     if isinstance(root, str) and Path(root).is_dir():
                         args += ["--add-dir", root]
@@ -295,6 +298,12 @@ class CliRunner:
                     # Workers need the network (package installs, scholarly APIs, local services); the default sandbox blocks even
                     # localhost. File writes stay confined to the workspace. NORTHSTAR_CODEX_NETWORK=off restores the strict default.
                     args += ["-c", "sandbox_workspace_write.network_access=true"]
+                try:  # the project's data folder is writable from the Codex sandbox (the default sandbox only writes inside the repo)
+                    data_dir = json.loads(prompt).get("dataDir") if mode == "write" else None
+                except (ValueError, AttributeError):
+                    data_dir = None
+                if isinstance(data_dir, str) and Path(data_dir).is_dir():
+                    args += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps([data_dir])}"]
                 args += extra_args
                 args += ["-o", last.name, "-"]
                 self._run(args, f"{system}\n\n{prompt}", cwd, timeout)
@@ -747,6 +756,9 @@ class ProjectVP:
         """Run the worker with its context files, in the phase's persistent session when the harness supports it."""
         from .phases import phase_of
         payload = {**payload, "contextDir": str(self.write_context(project_id, state, work))}
+        data_dir = self.rt.workspace_root / project_id / "data"
+        data_dir.mkdir(mode=0o700, exist_ok=True)  # big downloads, models and virtual environments live here, outside the repository
+        payload = {**payload, "dataDir": str(data_dir)}
         declared = self.rt.integrations.get(project_id)
         if declared:  # tell the worker what it can call, so it uses the project's tools instead of guessing
             payload = {**payload, "integrations": [{"name": n, "tools": f"mcp__{n}__*", "description": sp.get("description", "")} for n, sp in declared.items()]}
