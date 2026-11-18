@@ -418,7 +418,8 @@ class PhasePlanner:
                   "newTasks": [w["title"] for w in new_tasks], "filed": filed, "at": datetime.now(timezone.utc).isoformat()}
         self._record(project_id, pid, record)
         if status == "complete":
-            self._complete_phase(project_id, phase, assessment, caveats, review["summary"] if review else "")
+            earlier = next((r["reviewSummary"] for r in reversed(records) if r.get("reviewSummary")), "")  # reviews are capped per phase
+            self._complete_phase(project_id, phase, assessment, caveats, review["summary"] if review else earlier)
         elif status == "needs_owner":
             self._ask_owner(project_id, phase, _clip(reply.get("ownerQuestion"), 1500) or "I need a decision from you to finish this phase.")
         elif not new_tasks:

@@ -104,5 +104,22 @@ class PhaseChecksTests(PhaseBase):
         self.assertEqual(self.phases()[0]["status"], "verifying")
 
 
+class CheckpointReviewTests(PhaseBase):
+    def test_once_reviews_are_used_up_the_checkpoint_still_shows_the_latest_real_review(self):
+        self.rt.plan_phases(self.pid)
+        self.accept()
+        gap = lambda n, summary: {"verdict": "gaps", "summary": summary,
+                                  "gaps": [{"title": f"Splitter mishandles case {n}", "detail": "seen in a real sample", "severity": "blocking"}]}
+        self.runner.reviews = [gap(1, "First look found the splitter mishandles case 1."), gap(2, "Second look found case 2.")]
+        for _ in range(3):
+            self.steer([True, True], status="complete")
+        self.run_ticks(30)
+        self.assertEqual(len(self.runner.review_calls), 2)                  # capped: the third assessment does not review again
+        text = next(q["questionText"] for q in self.rt.control.projector.replay(self.pid)["questions"].values()
+                    if q["questionId"].startswith("question.phase-") and q["status"] == "open")
+        self.assertIn("Second look found case 2.", text)
+        self.assertNotIn("not available this time", text)
+
+
 if __name__ == "__main__":
     unittest.main()
