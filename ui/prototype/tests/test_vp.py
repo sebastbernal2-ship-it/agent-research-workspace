@@ -782,3 +782,37 @@ class AutoRetryTests(VPBase):
         self.rt.vp.recover(self.pid)
         self.assertEqual(self.rt.vp.tick(self.pid), a["workId"])
         self.assertEqual(self.work()["Survey options"]["status"], "completed")
+
+
+class RelatedQuestionTests(VPBase):
+    def _block(self, title):
+        from ui.prototype.vp import SUBAGENT, VP
+        w = self.rt.vp._new_work(self.pid, title, "obj", "research", "ready", SUBAGENT, [], ["done"], None, VP)
+        orch = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"}
+        self.rt.control.transition_work(self.pid, w["workId"], "running", actor=orch)
+        self.rt.control.transition_work(self.pid, w["workId"], "waiting_human", actor=orch)
+        return w
+
+    def status(self, title):
+        return next(w["status"] for w in self.rt.control.projector.replay(self.pid)["workItems"].values() if w["title"] == title)
+
+    def open_vp(self):
+        return [q for q in self.rt.control.projector.replay(self.pid)["questions"].values() if q["status"] == "open" and q["questionId"].startswith("question.vp-")]
+
+    def test_a_task_blocked_on_a_near_duplicate_question_waits_on_the_open_one_and_resumes_with_its_answer(self):
+        self.align()
+        a, b = self._block("Task A"), self._block("Task B")
+        self.rt.vp._ask(self.pid, a, "Who can provide two independent blinded annotations and adjudicate disagreements for the sampled records?")
+        self.rt.vp._ask(self.pid, b, "Who will provide independent blinded annotations and adjudicate any disagreements on the records?")
+        self.assertEqual(len(self.open_vp()), 1)                    # the owner is asked once, not twice
+        self.assertEqual(self.status("Task B"), "waiting_human")
+        q = self.rt.get_question(self.pid, self.open_vp()[0]["questionId"])
+        self.rt.answer_question(self.pid, q["questionId"], {"expectedEtag": q["etag"], "text": "An AI reviewer from a different model is fine."})
+        self.assertEqual((self.status("Task A"), self.status("Task B")), ("ready", "ready"))  # one answer released both
+
+    def test_unrelated_questions_stay_separate(self):
+        self.align()
+        a, b = self._block("Task A"), self._block("Task B")
+        self.rt.vp._ask(self.pid, a, "Which GitHub repository should the pull request target?")
+        self.rt.vp._ask(self.pid, b, "Can you install DuckDB so the archive scan can proceed?")
+        self.assertEqual(len(self.open_vp()), 2)

@@ -274,12 +274,12 @@ class SessionHarnessTests(unittest.TestCase):
         self.assertIn("--session-id", rest[0])
         self.assertEqual(json.loads(path.read_text())["p:ph"], "fresh")
 
-    def test_codex_has_no_sessions_and_default_runner_prefers_claude_code(self):
+    def test_codex_has_no_sessions_and_default_runner_prefers_codex(self):
         with mock.patch("shutil.which", return_value="/bin/x"):
             self.assertFalse(V.CliRunner("codex").supports_sessions)
             with mock.patch.dict(os.environ, {"NORTHSTAR_WORKERS_CONFIG": "/nonexistent"}, clear=False):
                 os.environ.pop("NORTHSTAR_RUNNER", None)
-                self.assertEqual(V.default_runner().kind, "claude")
+                self.assertEqual(V.default_runner().kind, "codex")
 
 
 if __name__ == "__main__":

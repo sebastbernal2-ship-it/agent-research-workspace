@@ -841,6 +841,7 @@ class ProjectVP:
             return None
         try:
             self._settle_parents(project_id)
+            self.resume_waiting_on(project_id)
             auto = self.settings.auto_run(project_id)
             if self.phases.ensure_planned(project_id):  # planning is automatic once the interview is done
                 return project_id
@@ -1022,7 +1023,40 @@ class ProjectVP:
                 self._transition(project_id, parent["workId"], "ready", ORCHESTRATOR, "All steps finished.")
                 self._transition(project_id, parent["workId"], "completed", ORCHESTRATOR, "All steps finished after the owner's answer.")
 
+    PIGGYBACK = "WAITING ON QUESTION: "
+
+    def _related_open_question(self, state: dict[str, Any], question: str) -> str | None:
+        """An open VP question that asks (nearly) the same thing: one owner answer should cover every task blocked on it."""
+        from .issues import _content_words
+        mine = _content_words(question)
+        for q in state["questions"].values():
+            if q["status"] == "open" and q["questionId"].startswith("question.vp-"):
+                theirs = _content_words(q["questionText"])
+                if mine and theirs and len(mine & theirs) / len(mine | theirs) >= 0.3:
+                    return q["questionId"]
+        return None
+
+    def resume_waiting_on(self, project_id: str, question_id: str | None = None) -> int:
+        """Release tasks that were waiting on a related question that is no longer open (answered or dismissed)."""
+        state, count = self._state(project_id), 0
+        for work in state["workItems"].values():
+            if work["status"] != "waiting_human":
+                continue
+            marked = [m["content"][len(self.PIGGYBACK):] for m in state["messages"]
+                      if m["workId"] == work["workId"] and m["content"].startswith(self.PIGGYBACK)]
+            if not marked:
+                continue
+            target = state["questions"].get(marked[-1])
+            if target is None or target["status"] != "open":
+                self._transition(project_id, work["workId"], "ready", ORCHESTRATOR, "The question this waited on was closed; resuming.")
+                count += 1
+        return count
+
     def _ask(self, project_id: str, work: dict[str, Any], question: str) -> None:
+        related = self._related_open_question(self._state(project_id), question)
+        if related:  # do not open a near-duplicate: wait on the one the owner already has to answer
+            self._say(project_id, work["workId"], ORCHESTRATOR, "status", self.PIGGYBACK + related)
+            return
         now = datetime.now(timezone.utc).isoformat()
         self.rt.control.open_question({
             "recordType": "human_question", "schemaVersion": "0.1", "projectId": project_id,
