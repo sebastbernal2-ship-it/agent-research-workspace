@@ -65,7 +65,12 @@ class ModelServer:
             return self._text(f"this session has used its {MAX_CALLS} model calls", error=True)
         self.calls += 1
         try:
-            return self._text(self.runner.think(system, prompt))  # a pure text call: no tools, an empty working directory
+            answer = self.runner.think(system, prompt)  # a pure text call: no tools, an empty working directory
+            result = self._text(answer)
+            identity = getattr(self.runner, "last_identity", None)
+            if identity:  # which harness and model answered, and how that is known, so callers can record it honestly
+                result["content"].append({"type": "text", "text": "[answered by] " + json.dumps(identity, sort_keys=True)})
+            return result
         except VPError as exc:
             return self._text(f"the model call failed: {exc}", error=True)
 

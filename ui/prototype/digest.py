@@ -67,7 +67,9 @@ def build_digest(state: dict[str, Any], activity: list[dict[str, Any]], since: s
         (resolved if is_issue(w) else finished).append(row)
     phases = phase_summaries(state)
     checks = next((p["checks"] for p in reversed(phases) if p.get("checks")), [])
-    questions = [q for q in state["questions"].values() if q["status"] == "open" and not q["questionId"].startswith("question.memory")]
+    terminal = {"completed", "failed", "cancelled"}
+    questions = [q for q in state["questions"].values() if q["status"] == "open" and not q["questionId"].startswith("question.memory")
+                 and not (q["blocking"] and q["workIds"] and all(items.get(w, {}).get("status") in terminal for w in q["workIds"]))]
     digest = {
         "since": since, "until": now,
         "finished": finished[:MAX_ITEMS], "issuesResolved": resolved[:MAX_ITEMS],

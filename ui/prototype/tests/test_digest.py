@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from ui.prototype.tests.test_phases import PhaseBase
+from ui.prototype.tests.test_vp import VPBase
 
 
 class DigestTests(PhaseBase):
@@ -38,6 +39,27 @@ class DigestTests(PhaseBase):
     def test_unknown_project_cannot_be_marked(self):
         with self.assertRaises(Exception):
             self.rt.mark_seen("project.nope")
+
+
+class StaleQuestionTests(VPBase):
+    def test_an_open_question_whose_blocked_task_already_finished_is_hidden_from_needs_you_and_the_digest(self):
+        from ui.prototype.vp import SUBAGENT, VP
+        self.align()
+        w = self.rt.vp._new_work(self.pid, "Blocked once", "obj", "research", "ready", SUBAGENT, [], ["done"], None, VP)
+        orch = {"actorType": "agent", "actorId": "agent.orchestrator", "role": "orchestrator"}
+        self.rt.control.transition_work(self.pid, w["workId"], "running", actor=orch)
+        self.rt.vp._ask(self.pid, w, "Which repo should this target?")
+        open_ids = lambda: [q["questionId"] for q in self.rt.list_questions(self.pid)["questions"] if q["questionId"].startswith("question.vp-")]
+        self.assertEqual(len(open_ids()), 1)                                       # a live blocking question is shown
+        self.assertEqual(len(self.rt.project_digest(self.pid)["needsYou"]), 1)
+        # the task finishes some other way, leaving the ledger's question open and un-closable (the control plane forbids closing it)
+        store = self.rt.control.projector.replay(self.pid)["workItems"][w["workId"]]
+        self.assertEqual(store["status"], "waiting_human")
+        stale = self.rt._is_stale_question({"blocking": True, "workIds": [w["workId"]]}, {w["workId"]: {"status": "completed"}})
+        live = self.rt._is_stale_question({"blocking": True, "workIds": [w["workId"]]}, {w["workId"]: {"status": "waiting_human"}})
+        self.assertTrue(stale)
+        self.assertFalse(live)
+        self.assertFalse(self.rt._is_stale_question({"blocking": False, "workIds": [w["workId"]]}, {w["workId"]: {"status": "completed"}}))  # non-blocking stays
 
 
 if __name__ == "__main__":
