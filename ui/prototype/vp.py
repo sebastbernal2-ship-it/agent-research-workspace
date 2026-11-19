@@ -148,6 +148,7 @@ class PiRunner:
     def __init__(self, *, model: str = "gpt-6-luna", agent_dir: str | Path | None = None,
                  think_timeout: float = 120, work_timeout: float = 900, rotation: Any = None):
         self.rotation = rotation  # an AccountRotation: switch to the next account when this one is out of quota
+        self.last_identity: dict[str, Any] | None = None
         self._limited_until = 0.0
         self.executable = os.environ.get("PI_CLI_PATH") or shutil.which("pi")
         self.model, self.think_timeout, self.work_timeout = model, think_timeout, work_timeout
@@ -215,6 +216,8 @@ class PiRunner:
         text = result.stdout.decode("utf-8", errors="replace").strip()
         if not text:
             raise VPError("The model returned an empty response.")
+        account = self.rotation.live_name() if self.rotation else None
+        self.last_identity = {"harness": "pi", "model": self.model, "account": account, "source": "requested with --model; not confirmed by the response"}
         return text
 
     def think(self, system: str, payload: str) -> str:
@@ -223,6 +226,19 @@ class PiRunner:
 
     def work(self, system: str, prompt: str, cwd: Path) -> str:
         return self._run(["--thinking", "medium"], system, prompt, cwd, self.work_timeout, 256 * 1024)
+
+
+def codex_configured_model(codex_home: str | None = None) -> str | None:
+    """The model the Codex CLI is configured to use (config.toml). The CLI's own output does not name it."""
+    home = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        for line in (home / "config.toml").read_text(encoding="utf-8").splitlines():
+            m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
 
 
 class CliRunner:
@@ -378,6 +394,8 @@ class CliRunner:
                 text = str(data["result"]).strip()
             except (ValueError, KeyError, TypeError) as exc:
                 raise VPError("Claude returned an unreadable response.") from exc
+            used = sorted((data.get("modelUsage") or {}).keys()) if isinstance(data.get("modelUsage"), dict) else []
+            self.last_identity = {"harness": "claude", "model": ", ".join(used) or None, "source": "reported by the harness" if used else "unknown"}
             if session and mode == "write":
                 self._remember_session(session, str(data.get("session_id") or new_id or existing or "") or None)
         else:
@@ -397,6 +415,8 @@ class CliRunner:
                 args += ["-o", last.name, "-"]
                 self._run(args, f"{system}\n\n{prompt}", cwd, timeout)
                 text = last.read().strip()
+                configured = codex_configured_model(self.extra_env.get("CODEX_HOME"))
+                self.last_identity = {"harness": "codex", "model": configured, "source": "configured in config.toml; the CLI does not confirm it" if configured else "unknown"}
         if not text:
             raise VPError("The model returned an empty response.")
         return text
@@ -513,7 +533,10 @@ class RoutedRunner:
                     raise last
                 raise
             try:
-                return call(profile)
+                answer = call(profile)
+                name = next((n for n, p in self.profiles.items() if p is profile), None)
+                self.last_identity = {"profile": name, **(getattr(profile, "last_identity", None) or {"harness": getattr(profile, "kind", "?"), "model": None, "source": "unknown"})}
+                return answer
             except UsageLimit as exc:
                 last = exc
         raise last or VPError("No configured worker profile is available.")

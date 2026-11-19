@@ -47,7 +47,10 @@ class LedgerTests(PhaseBase):
         self.rt.vp.phases.activate(self.pid, False)
         order = [w["title"] for w in self.rt.vp._eligible(self.state(), False)]
         self.assertEqual(order[0], "Build splitter")                       # required phase work first
-        for _ in range(8):
+        self.rt.vp.tick(self.pid)                                           # the required task runs alone, before any backlog
+        ranked = [w["title"] for w in self.rt.vp._eligible(self.state(), False)]
+        self.assertEqual(ranked[:2], ["[Issue] High thing", "[Improvement] Medium thing"])   # then highest priority first (deterministic)
+        for _ in range(7):
             self.rt.vp.tick(self.pid)
         st = title_status(self.state())
         self.assertEqual(st["[Issue] High thing"], "completed")
@@ -57,7 +60,7 @@ class LedgerTests(PhaseBase):
         self.assertEqual(st["[Issue] Deferred thing"], "proposed")        # and so is anything the owner deferred
         starts = [c["yourTask"]["title"] for c in self.runner.worker_calls]
         self.assertLess(starts.index("Build splitter"), starts.index("[Issue] High thing"))
-        self.assertLess(starts.index("[Issue] High thing"), starts.index("[Improvement] Medium thing"))
+        # High and Medium share a parallel batch, so the order their worker threads start in is a race and is not asserted
         self.board.act(self.pid, direction["workId"], "do_now")           # promoted by the owner: now it runs
         for _ in range(3):
             self.rt.vp.tick(self.pid)

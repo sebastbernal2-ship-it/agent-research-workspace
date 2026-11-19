@@ -94,5 +94,34 @@ class PhaseChecksTests(PhaseBase):
         self.assertEqual(self.phases()[0]["status"], "verifying")
 
 
+class StuckPhaseQuestionTests(PhaseBase):
+    def open_question_text(self):
+        return next(q["questionText"] for q in self.rt.control.projector.replay(self.pid)["questions"].values()
+                    if q["questionId"].startswith("question.vp-") and q["status"] == "open")
+
+    def test_when_every_criterion_is_met_but_a_blocking_gap_remains_the_question_says_so_instead_of_an_empty_list(self):
+        self.rt.plan_phases(self.pid)
+        self.accept()
+        self.steer([True, True], status="complete")
+        self.runner.steers[-1]["visionGaps"] = [{"gap": "No real closed verdict was demonstrated end to end", "severity": "blocking"}]
+        with mock.patch("ui.prototype.phases.MAX_TASKS_PER_PHASE", 1):      # no room for more tasks: the VP has to ask
+            self.run_ticks(4)
+        text = self.open_question_text()
+        self.assertIn("All 2 exit criteria are evidenced", text)
+        self.assertIn("No real closed verdict was demonstrated end to end", text)
+        self.assertIn("accept the phase as complete", text)
+        self.assertNotIn(": .", text)                                       # the old text ended "...on my own: . What should I do?"
+
+    def test_unmet_criteria_are_still_listed_when_there_are_some(self):
+        self.rt.plan_phases(self.pid)
+        self.accept()
+        self.steer([True, False], status="continue")
+        with mock.patch("ui.prototype.phases.MAX_TASKS_PER_PHASE", 1):
+            self.run_ticks(4)
+        text = self.open_question_text()
+        self.assertIn("remaining exit criteria", text)
+        self.assertIn("Extraction reviewed", text)
+
+
 if __name__ == "__main__":
     unittest.main()

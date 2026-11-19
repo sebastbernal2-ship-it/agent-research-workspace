@@ -547,5 +547,39 @@ print("answer-from-" + live)
             router.think("sys", "p")                                          # nothing left: the scheduler pauses
 
 
+class ModelIdentityTests(unittest.TestCase):
+    def test_codex_configured_model_is_read_from_its_config_and_labelled_as_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "config.toml").write_text('model = "gpt-test-1"\nmodel_reasoning_effort = "medium"\n')
+            self.assertEqual(V.codex_configured_model(home), "gpt-test-1")
+            self.assertIsNone(V.codex_configured_model(str(Path(home) / "missing")))
+
+    def test_claude_reports_the_real_model_from_its_result_and_the_router_names_the_profile(self):
+        runner = V.CliRunner("claude")
+        runner.executable = "/bin/claude"
+        runner._run = lambda *a, **k: json.dumps({"result": "hi", "session_id": "s", "modelUsage": {"claude-test-9": {}}})
+        self.assertEqual(runner.think("sys", "p"), "hi")
+        self.assertEqual(runner.last_identity, {"harness": "claude", "model": "claude-test-9", "source": "reported by the harness"})
+        router = V.RoutedRunner({"main": runner}, {"vp": ["main"]})
+        router.think("sys", "p")
+        self.assertEqual(router.last_identity["profile"], "main")
+        self.assertEqual(router.last_identity["model"], "claude-test-9")
+
+    def test_ask_model_appends_who_answered_and_how_that_is_known(self):
+        from ui.prototype.model_mcp import ModelServer
+
+        class Runner:
+            last_identity = {"harness": "codex", "model": "gpt-test-1", "source": "configured in config.toml; the CLI does not confirm it"}
+
+            def think(self, system, prompt):
+                return "answer"
+
+        reply = ModelServer(Runner()).handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ask_model", "arguments": {"prompt": "x"}}})
+        blocks = [b["text"] for b in reply["result"]["content"]]
+        self.assertEqual(blocks[0], "answer")
+        self.assertIn('"model": "gpt-test-1"', blocks[1])
+        self.assertIn("does not confirm", blocks[1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1271,11 +1271,20 @@ class PrototypeRuntime:
             statuses = ("answered", "rejected", "cancelled", "expired", "superseded")
         else:
             raise ValueError("status must be open or resolved")
+        questions = self.application.list_questions(project_id, statuses=statuses)
+        if status == "open":  # a blocking question whose tasks have all finished blocks nothing and can no longer be answered
+            work = self.control.projector.replay(project_id)["workItems"]
+            questions = [q for q in questions if not self._is_stale_question(q, work)]
         return {
             "projectId": project_id,
             "status": status,
-            "questions": self.application.list_questions(project_id, statuses=statuses),
+            "questions": questions,
         }
+
+    @staticmethod
+    def _is_stale_question(question: dict[str, Any], work: dict[str, Any]) -> bool:
+        ids = question.get("workIds") or []
+        return bool(question.get("blocking") and ids and all(work.get(w, {}).get("status") in {"completed", "failed", "cancelled"} for w in ids))
 
     def get_question(self, project_id: str, question_id: str) -> dict[str, Any]:
         return self.application.get_question(project_id, question_id)

@@ -423,8 +423,15 @@ class PhasePlanner:
             queued = any(phase_of(now_items, w["workId"]) == pid and is_issue(w) and issue_kind(w) != "direction" and w["status"] not in TERMINAL
                          for w in now_items.values())
             if budget == 0 or not queued:  # nothing it can do on its own: ask instead of spinning
-                self._ask_owner(project_id, phase, "I can't see a way to close these remaining exit criteria on my own: "
-                                + "; ".join(a["criterion"] for a in assessment if not a["met"])[:900] + ". What should I do?")
+                unmet = [a["criterion"] for a in assessment if not a["met"]]
+                if unmet:
+                    text = "I can't see a way to close these remaining exit criteria on my own: " + "; ".join(unmet)[:700] + "."
+                else:  # every criterion is evidenced: say what is actually in the way instead of an empty list
+                    text = f"All {len(assessment)} exit criteria are evidenced, but I cannot clear what is still blocking the phase on my own."
+                if blocking:
+                    text += " Blocking: " + "; ".join(blocking)[:700] + "."
+                self._ask_owner(project_id, phase, text + " What should I do? For example: accept the phase as complete and handle this "
+                                "in a later phase, or tell me what to change.")
         return True
 
     # ---- independent review and quality passes ------------------------------------
